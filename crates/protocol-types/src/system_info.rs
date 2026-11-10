@@ -282,6 +282,51 @@ impl ApplicationSource {
     }
 }
 
+/// Identifies a list of applications, so a snapshot can leave out the list
+/// the server already holds: the SHA-256, in lowercase hex, of every field of
+/// every application in order, each with its length or whether it is set.
+/// The Agent and the server both hash a [`SystemInfo::sanitized`] list with
+/// this, so the list an Agent sends hashes the same on both sides.
+pub fn applications_hash(applications: &[Application]) -> String {
+    use sha2::{Digest, Sha256};
+
+    fn text(hasher: &mut Sha256, text: &str) {
+        hasher.update((text.len() as u64).to_le_bytes());
+        hasher.update(text.as_bytes());
+    }
+    fn optional(hasher: &mut Sha256, value: Option<&str>) {
+        match value {
+            Some(value) => {
+                hasher.update([1]);
+                text(hasher, value);
+            }
+            None => hasher.update([0]),
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update((applications.len() as u64).to_le_bytes());
+    for application in applications {
+        text(&mut hasher, &application.name);
+        optional(&mut hasher, application.version.as_deref());
+        optional(&mut hasher, application.publisher.as_deref());
+        optional(&mut hasher, application.architecture.as_deref());
+        match application.installed_at_unix_ms {
+            Some(at) => {
+                hasher.update([1]);
+                hasher.update(at.to_le_bytes());
+            }
+            None => hasher.update([0]),
+        }
+        text(&mut hasher, application.source.as_str());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// Text as a snapshot may carry it: without control characters or
 /// surrounding space, and at most [`MAX_SYSTEM_INFO_TEXT_CHARS`] long.
 pub fn clean_text(text: &str) -> String {
@@ -611,6 +656,37 @@ mod tests {
         assert_eq!(clean.applications[0].name, "app 00000");
         assert_eq!(clean.applications[0].version, None);
         assert_eq!(clean.problems.len(), 1, "{:?}", clean.problems);
+    }
+
+    #[test]
+    fn application_hashes_tell_lists_apart() {
+        let listed = sample().applications;
+        let hash = applications_hash(&listed);
+        assert_eq!(hash.len(), 64);
+        assert_eq!(applications_hash(&listed.clone()), hash);
+        // What the server receives hashes as what the Agent sent.
+        let json = serde_json::to_string(&sample()).unwrap();
+        let received = serde_json::from_str::<SystemInfo>(&json)
+            .unwrap()
+            .sanitized();
+        assert_eq!(applications_hash(&received.applications), hash);
+        assert_ne!(applications_hash(&[]), hash);
+
+        let mut changed = listed.clone();
+        changed[0].version = Some("3.0.13-0ubuntu3.6".into());
+        assert_ne!(applications_hash(&changed), hash);
+        let mut moved = listed.clone();
+        moved[0].version = None;
+        moved[0].publisher = Some("3.0.13-0ubuntu3.5".into());
+        assert_ne!(applications_hash(&moved), hash);
+        // A field's end can't be mistaken for the next one's start.
+        let mut split = listed.clone();
+        split[0].name = "opens".into();
+        split[0].version = Some("sl3.0.13-0ubuntu3.5".into());
+        assert_ne!(applications_hash(&split), hash);
+        let mut dated = listed;
+        dated[0].installed_at_unix_ms = Some(0);
+        assert_ne!(applications_hash(&dated), hash);
     }
 
     #[test]

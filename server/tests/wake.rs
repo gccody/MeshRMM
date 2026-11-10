@@ -51,9 +51,10 @@ fn snapshot(adapters: &[(&str, &str, Option<&str>, &str, u8)]) -> SystemInfo {
 async fn store(app: &App, device_id: &str, public_ip: &str, info: SystemInfo) {
     let ip: IpAddr = public_ip.parse().unwrap();
     assert!(
-        meshrmm_server::system_info::store(&app.state.database, device_id, ip, info)
+        meshrmm_server::system_info::store(&app.state.database, device_id, ip, info, None)
             .await
             .unwrap()
+            .is_some()
     );
 }
 

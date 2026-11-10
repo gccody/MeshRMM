@@ -1046,10 +1046,12 @@ async fn a_connect_still_does_what_is_pending() {
                 &app.state.database,
                 &desk.device_id,
                 elsewhere,
-                snapshot
+                snapshot,
+                None
             )
             .await
             .unwrap()
+            .is_some()
         );
         // A website watching update events hears the device come online.
         let mut events = admin.events(&server).await.unwrap();

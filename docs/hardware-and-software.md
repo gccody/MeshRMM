@@ -39,13 +39,36 @@ applications from the end of a larger one and says so in its problems.
 
 The coordinator collects: the Windows service's SYSTEM worker, the Mac's
 root daemon and the Linux root service, so firmware details and every user's
-applications are readable. It collects 10 seconds after the Agent starts,
-every 6 hours after that (`SYSTEM_INFO_INTERVAL_SECONDS`), and when the
-server sends `collect_system_info`. Collecting runs on a blocking thread, one
+applications are readable. It collects at a random moment between 10
+seconds and an hour after the Agent starts, then at a random moment between
+5.4 and 6 hours after each snapshot (`SYSTEM_INFO_INTERVAL_SECONDS`, less up
+to a tenth), drawn again each time, so Agents that started together, after a
+fleet update or a power cut, drift apart instead of sending together. It
+collects at once when the server sends `collect_system_info`, and after an
+application install or uninstall run finishes; the next one it collects on
+its own is counted from then. Collecting runs on a blocking thread, one
 snapshot at a time, so the control connection never waits for it; a request
 that arrives while one is being collected is answered by that one. The
 snapshot goes to the server as the `system_info` status message on the
 control connection (`agent/src/remote/system_info.rs`).
+
+The applications are nearly all of a snapshot's bytes and seldom change, so
+the Agent leaves out a list the server already holds:
+
+- The server says which list it holds, as `stored_applications` with its
+  `applications_hash` (none for no list), first thing on every connection,
+  after it stores a snapshot's list, and after a snapshot named a list it
+  doesn't hold.
+- A snapshot whose applications hash to that is sent without them and with
+  `applications_unchanged` set to the hash. Until the server has said, as at
+  the start of a connection, every snapshot carries its list.
+- Both sides hash with `applications_hash` in `crates/protocol-types`: the
+  SHA-256 of every field of every application in order, each with its length
+  or whether it is set, over the sanitized list. The Agent hashes the list it
+  would send, which is already sanitized and fitted; the server hashes the
+  list it received after sanitizing it again, which changes nothing, so the
+  two agree. Were they ever to disagree, the Agent's hash would never be the
+  one the server names, and it would send every list whole, as before.
 
 Each platform reads the operating system directly and runs a tool only where
 no stable file format exists:
@@ -79,11 +102,19 @@ for what each platform can't report.
 - `device_ip_addresses`: each adapter's addresses, prefix lengths, MAC and
   kind, which [Wake-on-LAN](wake-on-lan.md) chooses relays by;
 - `device_applications`: the applications, rewritten only when the list
-  changed;
+  changed, with the list's hash in `device_system_info`;
 - `device_application_changes`: what was installed, removed or updated
-  between two snapshots, kept for 90 days. The same name, source and
+  between two lists, kept for 90 days. The same name, source and
   architecture is one application, and one version replacing another is an
-  update. A device's first snapshot is where its history starts.
+  update. A device's first list is where its history starts.
+
+A snapshot that names its list (`applications_unchanged`) does no
+application work: when the hash is the one stored, the list and its history
+stay as they are, and the rest of the snapshot is stored as usual. When it
+isn't, after the device's rows were removed or a race, the rest is stored,
+the stored list (or none) is kept, and the server tells the Agent which list
+it holds and asks for a new snapshot, which then carries the list. A
+disagreement can cost a list sent whole, never a wrong list kept.
 
 The public address is the one the control connection comes from (behind
 trusted proxies, from `X-Forwarded-For`), recorded whenever the Agent

@@ -9,6 +9,13 @@
 //! one, and what was installed, removed or updated is kept in
 //! `device_application_changes` for [`CHANGES_RETENTION_MS`]. The public
 //! address a device connects from is recorded whenever its Agent connects.
+//!
+//! The server tells each Agent which list it holds, by
+//! [`applications_hash`], when it connects and after storing a list, and the
+//! Agent leaves an unchanged list out of its snapshots. The server keeps its
+//! list for such a snapshot only if the hash it names is the one stored, and
+//! otherwise asks for the list ([`Stored::Unknown`]): a disagreement can cost
+//! a whole list sent, never a wrong list kept.
 pub mod changes;
 pub mod search;
 
@@ -16,10 +23,10 @@ use std::{collections::HashMap, net::IpAddr};
 
 use meshrmm_protocol_types::{
     Hardware, Network, OperatingSystem, SYSTEM_INFO_INTERVAL_SECONDS, SignedInUser, SystemInfo,
+    applications_hash,
 };
 use sea_query::{Expr, ExprTrait, Func, LockType, OnConflict, Order, Query};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 
 use self::changes::{Change, StoredApplication};
 use crate::{
@@ -30,7 +37,6 @@ use crate::{
             DeviceApplicationChanges, DeviceApplications, DeviceIpAddresses, DeviceSystemInfo,
         },
     },
-    secrets::hex,
     time::{DAY_MS, HOUR_MS, SECOND_MS, now_ms},
     users::new_id,
 };
@@ -90,10 +96,28 @@ pub struct ChangeRecord {
     pub source: String,
 }
 
-/// Identifies an application list, so an unchanged one isn't rewritten.
-fn applications_hash(info: &SystemInfo) -> String {
-    let json = serde_json::to_vec(&info.applications).expect("applications serialize");
-    hex(&Sha256::digest(json))
+/// What became of a snapshot's applications.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stored {
+    /// The snapshot listed them, and the device now has that list, with
+    /// this hash.
+    Listed { applications_hash: String },
+    /// The snapshot said they are the list the device has, which it keeps.
+    Unchanged,
+    /// The snapshot said they are a list the device doesn't have (after its
+    /// rows were removed, say): it keeps the one it has, with this hash, or
+    /// none, until the Agent sends its list.
+    Unknown { applications_hash: Option<String> },
+}
+
+/// What a newly connected Agent's device has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Connected {
+    /// Its snapshot is missing or older than [`STALE_AFTER_MS`], so the Agent
+    /// should send a new one.
+    pub stale: bool,
+    /// The hash of its application list, if it has one.
+    pub applications_hash: Option<String>,
 }
 
 /// Text as PostgreSQL can store it: it can't hold NUL. Snapshots are
@@ -107,23 +131,29 @@ fn storable_option(text: &Option<String>) -> Option<String> {
 }
 
 /// Stores a device's new snapshot, received on a connection from
-/// `public_ip`, replacing its last one. Returns `false`, storing nothing, if
+/// `public_ip`, replacing its last one. `applications_unchanged` is the hash
+/// the snapshot named instead of listing its applications, which only keeps
+/// the stored list if it is that list's. Returns `None`, storing nothing, if
 /// the device is no longer enrolled.
 pub async fn store(
     database: &Database,
     device_id: &str,
     public_ip: IpAddr,
     info: SystemInfo,
-) -> db::Result<bool> {
+    applications_unchanged: Option<String>,
+) -> db::Result<Option<Stored>> {
     let mut info = info.sanitized();
-    let hash = applications_hash(&info);
+    // A snapshot that names its list lists nothing to keep.
     let applications = std::mem::take(&mut info.applications);
+    let listed = applications_unchanged
+        .is_none()
+        .then(|| applications_hash(&applications));
     let now = now_ms();
     let mut transaction = database.begin().await?;
     if !agents::is_active(&mut transaction, device_id).await? {
-        return Ok(false);
+        return Ok(None);
     }
-    let previous: Option<(String,)> = transaction
+    let previous: Option<(Option<String>,)> = transaction
         .fetch_optional(
             &Query::select()
                 .column(DeviceSystemInfo::ApplicationsHash)
@@ -159,6 +189,7 @@ pub async fn store(
             &Query::insert()
                 .into_table(DeviceSystemInfo::Table)
                 .columns(columns)
+                // A row first stored without a list has none.
                 .values_panic([
                     device_id.into(),
                     info.collected_at_unix_ms.into(),
@@ -173,22 +204,38 @@ pub async fn store(
                     storable_option(&info.hardware.model).into(),
                     storable_option(&info.hardware.serial_number).into(),
                     storable(&info.network.hostname).into(),
-                    hash.as_str().into(),
+                    listed.clone().into(),
                     details.into(),
                 ])
                 .on_conflict(
                     OnConflict::column(DeviceSystemInfo::DeviceId)
-                        .update_columns(columns.into_iter().skip(1))
+                        // The hash stays the stored list's unless a list
+                        // replaces it.
+                        .update_columns(columns.into_iter().skip(1).filter(|column| {
+                            listed.is_some()
+                                || !matches!(column, DeviceSystemInfo::ApplicationsHash)
+                        }))
                         .to_owned(),
                 )
                 .to_owned(),
         )
         .await?;
     replace_addresses(&mut transaction, device_id, &info).await?;
-    let unchanged = previous
-        .as_ref()
-        .is_some_and(|(previous,)| *previous == hash);
-    if !unchanged {
+    let held = previous.and_then(|(hash,)| hash);
+    let Some(hash) = listed else {
+        // No application work at all: the stored list stays whichever it is.
+        // The snapshot named a hash, so a device without a list never
+        // matches it.
+        transaction.commit().await?;
+        return Ok(Some(if held == applications_unchanged {
+            Stored::Unchanged
+        } else {
+            Stored::Unknown {
+                applications_hash: held,
+            }
+        }));
+    };
+    if held.as_deref() != Some(hash.as_str()) {
         let new: Vec<StoredApplication> = applications
             .into_iter()
             .map(|application| StoredApplication {
@@ -200,16 +247,18 @@ pub async fn store(
                 source: application.source.as_str().to_owned(),
             })
             .collect();
-        // A device's first snapshot is where its history starts, not a
-        // list of installs.
-        if previous.is_some() {
+        // A device's first list is where its history starts, not a list of
+        // installs.
+        if held.is_some() {
             let old = stored_applications(&mut transaction, device_id).await?;
             insert_changes(&mut transaction, device_id, now, &changes::diff(&old, &new)).await?;
         }
         replace_applications(&mut transaction, device_id, &new).await?;
     }
     transaction.commit().await?;
-    Ok(true)
+    Ok(Some(Stored::Listed {
+        applications_hash: hash,
+    }))
 }
 
 async fn replace_addresses(
@@ -365,18 +414,22 @@ async fn insert_changes(
 }
 
 /// Records the address the device's Agent just connected from, and returns
-/// whether the device's snapshot is missing or older than
-/// [`STALE_AFTER_MS`], so the Agent should send a new one.
+/// what the device has: whether its snapshot is missing or old, and its
+/// application list.
 pub async fn connected(
     database: &Database,
     device_id: &str,
     public_ip: IpAddr,
-) -> db::Result<bool> {
+) -> db::Result<Connected> {
     let public_ip = public_ip.to_string();
-    let stored: Option<(i64, Option<String>)> = database
+    let stored: Option<(i64, Option<String>, Option<String>)> = database
         .fetch_optional(
             &Query::select()
-                .columns([DeviceSystemInfo::ReceivedAt, DeviceSystemInfo::PublicIp])
+                .columns([
+                    DeviceSystemInfo::ReceivedAt,
+                    DeviceSystemInfo::PublicIp,
+                    DeviceSystemInfo::ApplicationsHash,
+                ])
                 .from(DeviceSystemInfo::Table)
                 .and_where(Expr::col(DeviceSystemInfo::DeviceId).eq(device_id))
                 .to_owned(),
@@ -385,7 +438,7 @@ pub async fn connected(
     // Agents mostly reconnect from where they were, and writing only a
     // change keeps their connect from taking SQLite's write lock. A snapshot
     // stored meanwhile records the address itself.
-    if let Some((_, stored_ip)) = &stored
+    if let Some((_, stored_ip, _)) = &stored
         && stored_ip.as_deref() != Some(public_ip.as_str())
     {
         database
@@ -398,7 +451,16 @@ pub async fn connected(
             )
             .await?;
     }
-    Ok(stored.is_none_or(|(received, _)| now_ms() - received > STALE_AFTER_MS))
+    Ok(match stored {
+        Some((received, _, applications_hash)) => Connected {
+            stale: now_ms() - received > STALE_AFTER_MS,
+            applications_hash,
+        },
+        None => Connected {
+            stale: true,
+            applications_hash: None,
+        },
+    })
 }
 
 /// Removes a deleted device's snapshot and history.

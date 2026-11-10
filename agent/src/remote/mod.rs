@@ -235,13 +235,16 @@ fn report_file_reply(
 }
 
 /// Sends a system information snapshot without waiting for it to be
-/// written. One that can't be queued is dropped: the server asks for a new
-/// one when the Agent reconnects and the one it has is old.
+/// written, without its applications when they are the list the server
+/// holds. One that can't be queued is dropped: the server asks for a new one
+/// when the Agent reconnects and the one it has is old.
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-fn report_system_info(socket: &SignalingConnection, system: meshrmm_protocol::SystemInfo) {
-    let status = AgentStatusMessage::SystemInfo {
-        system: Box::new(system),
-    };
+fn report_system_info(
+    socket: &SignalingConnection,
+    collector: &system_info::Collector,
+    system: meshrmm_protocol::SystemInfo,
+) {
+    let status = collector.report(system);
     let queued = match serde_json::to_string(&status) {
         Ok(text) => socket.queue(Message::Text(text.into())),
         Err(error) => Err(error.into()),
@@ -440,6 +443,8 @@ impl Coordinator {
         self.thumbnails.connected();
         // The server sends this connection's schedule first thing.
         self.update_schedule.connected();
+        // And the application list it holds.
+        self.system_info.connected();
         loop {
             if self
                 .active_session
@@ -468,7 +473,7 @@ impl Coordinator {
                 }
                 () = self.thumbnails.due() => self.thumbnails.refresh(&self.config),
                 metrics = self.metrics.next() => report_metrics(socket, metrics),
-                system = self.system_info.next() => report_system_info(socket, system),
+                system = self.system_info.next() => report_system_info(socket, &self.system_info, system),
                 results = self.wake.next() => report_wake_results(socket, results),
                 (request_id, reply) = self.files.next() => report_file_reply(socket, request_id, reply),
                 messages = self.monitors.next() => report_monitors(socket, &self.monitors, messages),
@@ -545,6 +550,10 @@ impl Coordinator {
                 AgentCommand::CollectSystemInfo => {
                     tracing::info!("the server asked for the system information");
                     self.system_info.request();
+                    return Ok(ControlFlow::Continue(()));
+                }
+                AgentCommand::StoredApplications { applications_hash } => {
+                    self.system_info.stored(applications_hash);
                     return Ok(ControlFlow::Continue(()));
                 }
                 AgentCommand::ScanUpdates { run_id } => {

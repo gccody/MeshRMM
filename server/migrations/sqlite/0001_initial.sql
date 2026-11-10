@@ -437,8 +437,10 @@ CREATE TABLE device_system_info (
   model TEXT,
   serial_number TEXT,
   hostname TEXT NOT NULL,
-  -- Identifies the applications list, so an unchanged one isn't rewritten.
-  applications_hash TEXT NOT NULL,
+  -- Identifies the applications list (meshrmm_protocol_types::applications_hash),
+  -- so an unchanged one isn't rewritten or sent. NULL for none: a snapshot
+  -- that named a list the server didn't hold.
+  applications_hash TEXT,
   details TEXT NOT NULL
 );
 

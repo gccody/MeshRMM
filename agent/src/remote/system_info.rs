@@ -1,5 +1,5 @@
 //! The computer's operating system, hardware, network and installed
-//! software, collected a little after the Agent connects, every
+//! software, collected a little after the Agent starts, about every
 //! [`INTERVAL`] after that, and when the server asks, and sent to the server
 //! on the control connection as one snapshot.
 //!
@@ -12,13 +12,21 @@
 //! a time, so the connection never waits for it. A part that cannot be read
 //! is left empty and named in the snapshot's problems; the rest still goes
 //! out.
+//!
+//! The applications are most of a snapshot and seldom change, so a snapshot
+//! leaves them out when they are the list the server said it holds
+//! (`AgentCommand::StoredApplications`), and names that list's hash
+//! instead. The snapshots the Agent collects on its own fall at random
+//! points ([`next_collection`]), so a fleet that started together, after an
+//! update or a power cut, doesn't send together.
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use meshrmm_protocol::{
-    MAX_SYSTEM_INFO_BYTES, SYSTEM_INFO_INTERVAL_SECONDS, SystemInfo, clean_text,
+    AgentStatusMessage, MAX_SYSTEM_INFO_BYTES, SYSTEM_INFO_INTERVAL_SECONDS, SystemInfo,
+    applications_hash, clean_text,
 };
 use tokio::task::JoinHandle;
-use tokio::time::{Interval, MissedTickBehavior, interval_at};
+use tokio::time::Instant;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -36,11 +44,19 @@ use self::macos as platform;
 #[cfg(windows)]
 use self::windows as platform;
 
-/// How often the Agent collects on its own.
+/// How often the Agent collects on its own, at most.
 pub const INTERVAL: Duration = Duration::from_secs(SYSTEM_INFO_INTERVAL_SECONDS);
-/// The first snapshot waits this long after the Agent starts, so it doesn't
-/// compete with connecting and the first sessions.
+/// The share of [`INTERVAL`] a snapshot the Agent collects on its own may
+/// come early by, at random, so devices that collected together drift apart
+/// and a snapshot is never older than the interval.
+const JITTER: f64 = 0.1;
+/// The soonest the first snapshot is collected after the Agent starts, so it
+/// doesn't compete with connecting and the first sessions.
 const FIRST_DELAY: Duration = Duration::from_secs(10);
+/// The latest the first snapshot is collected after the Agent starts: a
+/// fleet of 100,000 that starts together sends about 28 a second. The server
+/// asks at once for one it is missing or that is old.
+const FIRST_SPREAD: Duration = Duration::from_secs(60 * 60);
 /// A collection still running after this is given up on, so one stuck on a
 /// hung system service or file system doesn't stop every later snapshot.
 const COLLECT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -130,13 +146,50 @@ fn fit(mut info: SystemInfo) -> SystemInfo {
     info
 }
 
-/// Collects every [`INTERVAL`], and at once when the server asks, one
+/// How long after now the Agent next collects on its own: after it starts
+/// (`first`), between [`FIRST_DELAY`] and [`FIRST_SPREAD`]; after another
+/// snapshot, between [`INTERVAL`] less its [`JITTER`] and [`INTERVAL`]. A
+/// random `fraction` in `[0, 1)`, drawn for each one, picks the point.
+fn next_collection(first: bool, fraction: f64) -> Duration {
+    let fraction = fraction.clamp(0.0, 1.0);
+    if first {
+        FIRST_DELAY + (FIRST_SPREAD - FIRST_DELAY).mul_f64(fraction)
+    } else {
+        INTERVAL - INTERVAL.mul_f64(JITTER * fraction)
+    }
+}
+
+fn random_fraction() -> f64 {
+    meshrmm_signaling_client::random_fraction().unwrap_or(0.5)
+}
+
+/// The status message for a snapshot, given the hash of the application list
+/// the server holds (`stored`): without the applications when they are that
+/// list.
+fn report(system: SystemInfo, stored: Option<&str>) -> AgentStatusMessage {
+    let mut system = Box::new(system);
+    let unchanged = stored.filter(|stored| *stored == applications_hash(&system.applications));
+    let applications_unchanged = unchanged.map(|hash| {
+        system.applications = Vec::new();
+        hash.to_owned()
+    });
+    AgentStatusMessage::SystemInfo {
+        system,
+        applications_unchanged,
+    }
+}
+
+/// Collects about every [`INTERVAL`], and at once when the server asks, one
 /// snapshot at a time and off the signaling task.
 pub struct Collector {
-    timer: Interval,
+    /// When the Agent next collects on its own.
+    due: Instant,
     /// The collection running, and when it is given up on.
-    task: Option<(JoinHandle<SystemInfo>, tokio::time::Instant)>,
+    task: Option<(JoinHandle<SystemInfo>, Instant)>,
     requested: bool,
+    /// The hash of the application list this connection's server last said
+    /// it holds.
+    stored: Option<String>,
 }
 
 impl Collector {
@@ -144,13 +197,28 @@ impl Collector {
     /// before the interval ends. The server asks for a snapshot when the one
     /// it has is old.
     pub fn new() -> Self {
-        let mut timer = interval_at(tokio::time::Instant::now() + FIRST_DELAY, INTERVAL);
-        timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
         Self {
-            timer,
+            due: Instant::now() + next_collection(true, random_fraction()),
             task: None,
             requested: false,
+            stored: None,
         }
+    }
+
+    /// A connection started: its server says which application list it
+    /// holds first thing, and until then every snapshot carries its list.
+    pub fn connected(&mut self) {
+        self.stored = None;
+    }
+
+    /// The server said which application list it holds.
+    pub fn stored(&mut self, applications_hash: Option<String>) {
+        self.stored = applications_hash;
+    }
+
+    /// The status message that sends `system`.
+    pub fn report(&self, system: SystemInfo) -> AgentStatusMessage {
+        report(system, self.stored.as_deref())
     }
 
     /// The server asked for a new snapshot. One being collected already
@@ -183,15 +251,14 @@ impl Collector {
             }
             if self.requested {
                 self.requested = false;
-                // The next periodic snapshot is an interval after this one.
-                self.timer.reset();
             } else {
-                self.timer.tick().await;
+                tokio::time::sleep_until(self.due).await;
             }
-            self.task = Some((
-                tokio::task::spawn_blocking(collect),
-                tokio::time::Instant::now() + COLLECT_TIMEOUT,
-            ));
+            // The next one the Agent collects on its own is an interval
+            // after this one, whoever asked for this one.
+            let now = Instant::now();
+            self.due = now + next_collection(false, random_fraction());
+            self.task = Some((tokio::task::spawn_blocking(collect), now + COLLECT_TIMEOUT));
         }
     }
 }
@@ -223,6 +290,106 @@ mod tests {
         assert_eq!(fitted.problems.len(), 1);
         let small = fit(SystemInfo::default());
         assert!(small.problems.is_empty());
+    }
+
+    fn listing(names: &[&str]) -> SystemInfo {
+        SystemInfo {
+            applications: names
+                .iter()
+                .map(|name| Application {
+                    name: (*name).to_owned(),
+                    version: Some("1.0".into()),
+                    publisher: None,
+                    architecture: None,
+                    installed_at_unix_ms: None,
+                    source: ApplicationSource::Dpkg,
+                })
+                .collect(),
+            ..Default::default()
+        }
+        .sanitized()
+    }
+
+    /// How many applications a report sends, and the hash it names instead.
+    fn sent(message: AgentStatusMessage) -> (usize, Option<String>) {
+        let AgentStatusMessage::SystemInfo {
+            system,
+            applications_unchanged,
+        } = message
+        else {
+            panic!("not a snapshot: {message:?}");
+        };
+        (system.applications.len(), applications_unchanged)
+    }
+
+    #[tokio::test]
+    async fn only_a_list_the_server_does_not_hold_is_sent() {
+        let first = listing(&["curl", "openssl"]);
+        let hash = applications_hash(&first.applications);
+        let mut collector = Collector::new();
+        // Until the server says what it holds, the list goes out.
+        assert_eq!(sent(collector.report(first.clone())), (2, None));
+
+        // The server stored it: the same list is left out, and named.
+        collector.stored(Some(hash.clone()));
+        assert_eq!(
+            sent(collector.report(first.clone())),
+            (0, Some(hash.clone()))
+        );
+        // A changed one goes out whole, and once the server says it stored
+        // that one, it is left out in turn.
+        let second = listing(&["curl", "openssl", "vim"]);
+        let second_hash = applications_hash(&second.applications);
+        assert_eq!(sent(collector.report(second.clone())), (3, None));
+        collector.stored(Some(second_hash.clone()));
+        assert_eq!(
+            sent(collector.report(second.clone())),
+            (0, Some(second_hash))
+        );
+
+        // A server that holds another list, or none, gets the whole list.
+        collector.stored(Some(hash.clone()));
+        assert_eq!(sent(collector.report(second)), (3, None));
+        collector.stored(None);
+        assert_eq!(sent(collector.report(first.clone())), (2, None));
+        // As does a new connection's, until it says what it holds.
+        collector.stored(Some(hash));
+        collector.connected();
+        assert_eq!(sent(collector.report(first)), (2, None));
+        // An empty list is a list like any other.
+        collector.stored(Some(applications_hash(&[])));
+        assert_eq!(
+            sent(collector.report(listing(&[]))),
+            (0, Some(applications_hash(&[])))
+        );
+    }
+
+    #[test]
+    fn the_agents_own_snapshots_are_spread_out() {
+        assert_eq!(next_collection(true, 0.0), FIRST_DELAY);
+        assert_eq!(
+            next_collection(true, 0.5),
+            FIRST_DELAY + (FIRST_SPREAD - FIRST_DELAY) / 2
+        );
+        assert!(next_collection(true, 0.999) < FIRST_SPREAD);
+        assert!(next_collection(true, 0.999) > FIRST_SPREAD - Duration::from_secs(5));
+        let earliest = INTERVAL - INTERVAL.mul_f64(JITTER);
+        assert_eq!(next_collection(false, 0.0), INTERVAL);
+        assert_eq!(
+            next_collection(false, 0.5),
+            INTERVAL - INTERVAL.mul_f64(JITTER / 2.0)
+        );
+        assert!(next_collection(false, 0.999) > earliest);
+        // Two Agents' times differ with their random draws, and stay within
+        // bounds whatever they are.
+        assert_ne!(next_collection(false, 0.1), next_collection(false, 0.9));
+        assert_ne!(next_collection(true, 0.1), next_collection(true, 0.9));
+        for fraction in [-1.0, 2.0] {
+            let first = next_collection(true, fraction);
+            assert!((FIRST_DELAY..=FIRST_SPREAD).contains(&first), "{first:?}");
+            let later = next_collection(false, fraction);
+            assert!((earliest..=INTERVAL).contains(&later), "{later:?}");
+        }
     }
 
     #[test]
@@ -262,5 +429,13 @@ mod tests {
         );
         assert!(!info.applications.is_empty());
         assert_eq!(info.clone().sanitized(), info);
+        // The server hashes the list it receives, sanitized again, as the
+        // Agent hashes the list it sends.
+        let json = serde_json::to_vec(&info).unwrap();
+        let received: SystemInfo = serde_json::from_slice(&json).unwrap();
+        assert_eq!(
+            applications_hash(&received.sanitized().applications),
+            applications_hash(&info.applications)
+        );
     }
 }
