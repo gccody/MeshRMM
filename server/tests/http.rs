@@ -1,4 +1,5 @@
-//! The HTTP surface: health, errors, security headers and downloads.
+//! The HTTP surface: health, errors, security headers, compression and
+//! downloads.
 mod common;
 
 use axum::{
@@ -678,6 +679,270 @@ async fn a_request_that_finds_no_free_database_connection_is_told_to_retry() {
 
         transaction.rollback().await.unwrap();
         database.close().await;
+        app.finish().await;
+    }
+}
+
+/// What browsers send.
+const BROWSER_ENCODINGS: &str = "gzip, deflate, br, zstd";
+
+/// `GET path` as `browser`, asking for `encoding`, with the body as sent.
+async fn fetch(
+    browser: &mut common::Browser,
+    path: &str,
+    encoding: Option<&str>,
+) -> common::RawResponse {
+    let mut request = browser.request(axum::http::Method::GET, path);
+    if let Some(encoding) = encoding {
+        request = request.header(header::ACCEPT_ENCODING, encoding);
+    }
+    browser.bytes(request.body(Body::empty()).unwrap()).await
+}
+
+fn gunzip(bytes: &[u8]) -> Vec<u8> {
+    let mut decoded = Vec::new();
+    std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(bytes), &mut decoded).unwrap();
+    decoded
+}
+
+fn unbrotli(bytes: &[u8]) -> Vec<u8> {
+    let mut decoded = Vec::new();
+    std::io::Read::read_to_end(
+        &mut brotli_decompressor::Decompressor::new(bytes, 4096),
+        &mut decoded,
+    )
+    .unwrap();
+    decoded
+}
+
+type Decoder = fn(&[u8]) -> Vec<u8>;
+
+/// Whether `response` says it would differ for another `Accept-Encoding`.
+fn varies_by_encoding(response: &common::RawResponse) -> bool {
+    response
+        .header("vary")
+        .to_ascii_lowercase()
+        .contains("accept-encoding")
+}
+
+/// Whether `response` was sent exactly as its handler made it.
+fn sent_as_is(response: &common::RawResponse) -> bool {
+    !response.headers.contains_key(header::CONTENT_ENCODING) && !varies_by_encoding(response)
+}
+
+#[tokio::test]
+async fn large_api_json_is_compressed_for_clients_that_accept_it() {
+    for app in common::apps().await {
+        let name = app.name;
+        let mut admin = common::set_up(&app).await;
+
+        // Without Accept-Encoding, the body is sent as it is, with its
+        // length; caches are told other clients may get it compressed.
+        let plain = fetch(&mut admin, "/v1/permissions", None).await;
+        assert_eq!(plain.status, StatusCode::OK, "{name}");
+        assert!(plain.body.len() > 1024, "{name}: {}", plain.body.len());
+        assert!(!plain.headers.contains_key(header::CONTENT_ENCODING));
+        assert!(varies_by_encoding(&plain), "{name}: {:?}", plain.headers);
+        assert_eq!(plain.header("content-length"), plain.body.len().to_string());
+        assert_eq!(plain.header("cache-control"), "no-store");
+        let expected: serde_json::Value = serde_json::from_slice(&plain.body).unwrap();
+
+        let decoders: [(&str, Decoder); 2] = [("gzip", gunzip), ("br", unbrotli)];
+        for (encoding, decode) in decoders {
+            let compressed = fetch(&mut admin, "/v1/permissions", Some(encoding)).await;
+            assert_eq!(compressed.status, StatusCode::OK, "{name}");
+            assert_eq!(compressed.header("content-encoding"), encoding, "{name}");
+            assert!(
+                varies_by_encoding(&compressed),
+                "{name}: {:?}",
+                compressed.headers
+            );
+            assert_eq!(compressed.header("content-type"), "application/json");
+            assert_eq!(compressed.header("cache-control"), "no-store");
+            assert_eq!(compressed.header("x-content-type-options"), "nosniff");
+            assert!(!compressed.headers.contains_key(header::CONTENT_LENGTH));
+            assert!(
+                compressed.body.len() < plain.body.len() / 2,
+                "{name}: {encoding} made {} bytes {}",
+                plain.body.len(),
+                compressed.body.len()
+            );
+            let decoded: serde_json::Value =
+                serde_json::from_slice(&decode(&compressed.body)).unwrap();
+            assert_eq!(decoded, expected, "{name}: {encoding}");
+        }
+
+        // Browsers offer several encodings; brotli is chosen.
+        let browser = fetch(&mut admin, "/v1/permissions", Some(BROWSER_ENCODINGS)).await;
+        assert_eq!(browser.header("content-encoding"), "br", "{name}");
+
+        // SCIM's JSON is compressed too.
+        let created = admin
+            .post(
+                "/v1/settings/scim/tokens",
+                serde_json::json!({ "name": "Okta" }),
+            )
+            .await;
+        assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+        let secret = created.body["secret"].as_str().unwrap().to_owned();
+        let scim = |encoding: Option<&str>| {
+            let mut request = Request::get("/scim/v2/Schemas")
+                .header(header::AUTHORIZATION, format!("Bearer {secret}"));
+            if let Some(encoding) = encoding {
+                request = request.header(header::ACCEPT_ENCODING, encoding);
+            }
+            let mut browser = app.browser();
+            async move { browser.bytes(request.body(Body::empty()).unwrap()).await }
+        };
+        let plain = scim(None).await;
+        assert_eq!(plain.status, StatusCode::OK, "{name}");
+        assert!(!plain.headers.contains_key(header::CONTENT_ENCODING));
+        assert!(plain.body.len() > 1024, "{name}: {}", plain.body.len());
+        let compressed = scim(Some("gzip")).await;
+        assert_eq!(compressed.header("content-type"), "application/scim+json");
+        assert_eq!(compressed.header("content-encoding"), "gzip", "{name}");
+        assert_eq!(gunzip(&compressed.body), plain.body, "{name}");
+
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn small_api_responses_and_errors_are_sent_as_they_are() {
+    for app in common::apps().await {
+        let name = app.name;
+        let mut admin = common::set_up(&app).await;
+
+        let small = fetch(&mut admin, "/v1/instance", Some(BROWSER_ENCODINGS)).await;
+        assert_eq!(small.status, StatusCode::OK, "{name}");
+        assert!(small.body.len() < 1024, "{name}: {}", small.body.len());
+        assert!(sent_as_is(&small), "{name}: {:?}", small.headers);
+        assert_eq!(small.header("content-length"), small.body.len().to_string());
+        serde_json::from_slice::<serde_json::Value>(&small.body).unwrap();
+
+        // Errors are small JSON, from a handler or from no route at all.
+        let mut stranger = app.browser();
+        let refused = fetch(&mut stranger, "/v1/agents", Some(BROWSER_ENCODINGS)).await;
+        assert_eq!(refused.status, StatusCode::UNAUTHORIZED, "{name}");
+        assert!(sent_as_is(&refused), "{name}: {:?}", refused.headers);
+        let error: serde_json::Value = serde_json::from_slice(&refused.body).unwrap();
+        assert!(error["error"].is_string(), "{name}: {error}");
+        let missing = fetch(&mut admin, "/v1/nothing-here", Some(BROWSER_ENCODINGS)).await;
+        assert_eq!(missing.status, StatusCode::NOT_FOUND, "{name}");
+        assert!(sent_as_is(&missing), "{name}");
+        assert_eq!(missing.body, br#"{"error":"route not found"}"#);
+
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn images_and_file_downloads_are_sent_as_they_are() {
+    for app in common::apps().await {
+        let name = app.name;
+        let mut admin = common::set_up(&app).await;
+        let agent = app.enroll(&mut admin, "DESKTOP-1").await;
+        let thumbnail = format!("/v1/agents/{}/thumbnail", agent.device_id);
+
+        // A device without a thumbnail answers 204.
+        let none = fetch(&mut admin, &thumbnail, Some(BROWSER_ENCODINGS)).await;
+        assert_eq!(none.status, StatusCode::NO_CONTENT, "{name}");
+        assert!(sent_as_is(&none), "{name}: {:?}", none.headers);
+        assert!(none.body.is_empty());
+
+        // A JPEG, however compressible, is sent as it is, and revalidates.
+        let mut jpeg = vec![0u8; 64 * 1024];
+        jpeg[..3].copy_from_slice(&[0xff, 0xd8, 0xff]);
+        let upload = agent
+            .request(axum::http::Method::PUT, &thumbnail)
+            .header(header::CONTENT_TYPE, "image/jpeg")
+            .body(Body::from(jpeg.clone()))
+            .unwrap();
+        assert_eq!(agent.send(upload).await.status, StatusCode::NO_CONTENT);
+        let image = fetch(&mut admin, &thumbnail, Some(BROWSER_ENCODINGS)).await;
+        assert_eq!(image.status, StatusCode::OK, "{name}");
+        assert_eq!(image.header("content-type"), "image/jpeg");
+        assert!(sent_as_is(&image), "{name}: {:?}", image.headers);
+        assert_eq!(image.header("content-length"), jpeg.len().to_string());
+        assert_eq!(image.body, jpeg);
+        let request = admin
+            .request(axum::http::Method::GET, &thumbnail)
+            .header(header::ACCEPT_ENCODING, BROWSER_ENCODINGS)
+            .header(header::IF_NONE_MATCH, image.header("etag"))
+            .body(Body::empty())
+            .unwrap();
+        let unchanged = admin.bytes(request).await;
+        assert_eq!(unchanged.status, StatusCode::NOT_MODIFIED, "{name}");
+        assert!(sent_as_is(&unchanged), "{name}: {:?}", unchanged.headers);
+
+        // A toolbox file streams with its length.
+        let content = vec![b'a'; 300_000];
+        let digest = {
+            use sha2::Digest;
+            meshrmm_server::secrets::hex(&sha2::Sha256::digest(&content))
+        };
+        let request = admin
+            .request(
+                axum::http::Method::POST,
+                &format!("/v1/toolbox/files?name=big.txt&folder=Installers&sha256={digest}"),
+            )
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from(content.clone()))
+            .unwrap();
+        let uploaded = admin.bytes(request).await.json(name);
+        assert_eq!(uploaded.status, StatusCode::CREATED, "{:?}", uploaded.body);
+        let file_id = uploaded.body["id"].as_str().unwrap();
+        let downloaded = fetch(
+            &mut admin,
+            &format!("/v1/toolbox/files/{file_id}/content"),
+            Some(BROWSER_ENCODINGS),
+        )
+        .await;
+        assert_eq!(downloaded.status, StatusCode::OK, "{name}");
+        assert_eq!(
+            downloaded.header("content-type"),
+            "application/octet-stream"
+        );
+        assert!(sent_as_is(&downloaded), "{name}: {:?}", downloaded.headers);
+        assert_eq!(
+            downloaded.header("content-length"),
+            content.len().to_string()
+        );
+        assert_eq!(downloaded.body, content);
+
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn sockets_upgrade_through_the_compressing_router() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    for app in common::apps().await {
+        let name = app.name;
+        let server = app.serve().await;
+        let admin = common::set_up(&app).await;
+        let mut request = server.ws_url("/v1/events").into_client_request().unwrap();
+        let headers = request.headers_mut();
+        headers.insert(header::ORIGIN, common::ORIGIN.parse().unwrap());
+        headers.insert(
+            header::COOKIE,
+            admin.cookie.as_deref().unwrap().parse().unwrap(),
+        );
+        headers.insert(header::ACCEPT_ENCODING, BROWSER_ENCODINGS.parse().unwrap());
+        let (mut events, response) = tokio_tungstenite::connect_async(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS, "{name}");
+        assert!(
+            !response.headers().contains_key(header::CONTENT_ENCODING),
+            "{name}: {:?}",
+            response.headers()
+        );
+        assert!(!response.headers().contains_key(header::VARY), "{name}");
+        let snapshot = common::receive_json(&mut events).await;
+        assert_eq!(snapshot["type"], "snapshot", "{name}");
+
+        drop(events);
+        drop(server);
         app.finish().await;
     }
 }
