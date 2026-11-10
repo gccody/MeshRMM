@@ -62,7 +62,7 @@ export function FileList(props: Props) {
   const above = useRef<HTMLTableRowElement>(null);
   const below = useRef<HTMLTableRowElement>(null);
   // A new listing starts at the top.
-  const { first, last, onScroll } = useWindowedRows({ scroller, above, below }, total, ROW_HEIGHT, listKey);
+  const { first, last, onScroll } = useWindowedRows({ scroller, above, below }, total, ROW_HEIGHT, { listKey });
   const [dropTarget, setDropTarget] = useState<number | "list" | null>(null);
 
   useEffect(() => {

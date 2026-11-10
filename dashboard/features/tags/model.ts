@@ -33,6 +33,21 @@ export function tagsOf(ids: readonly string[] | undefined, tags: readonly Tag[])
   return tags.filter((tag) => wanted.has(tag.id));
 }
 
+// tagsOf for many devices: each device's tags, in the same order, found in
+// a map built once rather than by going through every tag.
+export function tagLookup(tags: readonly Tag[]): (ids: readonly string[] | undefined) => Tag[] {
+  const order = new Map(tags.map((tag, index) => [tag.id, index]));
+  return (ids) => {
+    if (!ids?.length) return [];
+    const found = new Set<number>();
+    for (const id of ids) {
+      const index = order.get(id);
+      if (index !== undefined) found.add(index);
+    }
+    return [...found].sort((a, b) => a - b).map((index) => tags[index]);
+  };
+}
+
 // Whether a device has any, or all, of `ids`. No IDs match every device.
 export function hasTags(agent: Pick<Agent, "tag_ids">, ids: readonly string[], match: TagMatch) {
   if (!ids.length) return true;

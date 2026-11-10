@@ -186,8 +186,12 @@ h1, h2, h3 { margin: 0; font-weight: 600; font-stretch: 88%; letter-spacing: -0.
 .led.updating { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
 .led.offline { background: transparent; box-shadow: inset 0 0 0 1.5px var(--text-3); }
 
-.device-wall { margin: 0; padding: 0; list-style: none; display: grid; grid-template-columns: repeat(auto-fill, minmax(236px, 1fr)); gap: 30px 22px; }
+/* The wall draws only the tiles near the screen, with padding for the rest.
+   Tiles that move as devices come and go must not drag the page along. */
+.device-wall { margin: 0; padding: 0; list-style: none; display: grid; grid-template-columns: repeat(auto-fill, minmax(236px, 1fr)); gap: 30px 22px; overflow-anchor: none; }
 .device-tile { min-width: 0; }
+/* Room for every line a tile can have, so every row is the same height. */
+.device-details { height: 126px; }
 .device-screen {
   position: relative; width: 100%; aspect-ratio: 16 / 10; border-radius: 8px; background: var(--screen);
   box-shadow: 0 0 0 1px var(--rule-strong), 0 10px 26px rgb(0 0 0 / 35%); transition: box-shadow .15s ease;

@@ -1,4 +1,4 @@
-import { type KeyboardEvent, useEffect, useRef, useState } from "react";
+import { type KeyboardEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router";
 import {
   Building2,
@@ -27,12 +27,13 @@ import {
   WifiOff,
 } from "lucide-react";
 import { usePopover } from "../../lib/use-popover";
+import { useGridRows, useWindowedRows } from "../../lib/use-windowed-rows";
 import { terminalPagePath } from "../terminal/model";
 import { filesPagePath } from "../files/model";
 import type { MetricsReading } from "../metrics/model";
 import { DeviceUsage } from "../metrics/usage-meter";
 import { HeaderActions } from "../workspace/header-actions";
-import { type TagMatch, matchesTagName, tagsOf } from "../tags/model";
+import { type TagMatch, matchesTagName, tagLookup } from "../tags/model";
 import { TagChip, TagChips } from "../tags/tag-chip";
 import { type AgentStatusFilter, type CompanyFilter, NO_COMPANY } from "./device-filters";
 import { companyName, matchesCompanyName } from "./model";
@@ -131,6 +132,9 @@ type TileState = {
   anyClosing: boolean;
 };
 
+// A tile's height and the gap below it before the first is measured.
+const TILE_ESTIMATE = 300;
+
 // The device's own page, with its resource usage.
 const devicePath = (agent: Agent) => `/device?id=${encodeURIComponent(agent.id)}`;
 
@@ -208,6 +212,16 @@ export function AgentOverview({
   const browserOffline = inventory.connection === "offline";
   const selectable = allowed.runScripts || allowed.deliverFiles || allowed.wake || allowed.editTags;
   const selectedCount = agents.filter((agent) => selection.ids.has(agent.id)).length;
+  // Looked up by every tile drawn, so built once, not once a tile.
+  const companyNames = useMemo(() => new Map(companies.map((candidate) => [candidate.id, candidate.name])), [companies]);
+  const tagsFor = useMemo(() => tagLookup(tags), [tags]);
+  // The device whose screen is shown full size, and the menu that asked.
+  // It stays open while its tile scrolls away, and closes if its device
+  // leaves the wall.
+  const [previewId, setPreviewId] = useState<string | null>(null);
+  const previewOpener = useRef<HTMLElement | null>(null);
+  const previewed = previewId === null ? undefined : filteredAgents.find((agent) => agent.id === previewId);
+  if (previewId !== null && !previewed) setPreviewId(null);
 
   return (
     <>
@@ -230,13 +244,15 @@ export function AgentOverview({
       {selectable && selectedCount > 0 && <SelectionBar count={selectedCount} allowed={allowed} selection={selection} shown={filteredAgents} chosen={agents.filter((agent) => selection.ids.has(agent.id))} onWake={onWake} onEditTags={onEditTags} />}
 
       {filteredAgents.length > 0 ? (
-        <ul className={`device-wall${stale ? " stale" : ""}${selectedCount > 0 ? " selecting" : ""}`} aria-label="Devices">
-          {filteredAgents.map((agent) => (
+        <DeviceWall agents={filteredAgents} className={`device-wall${stale ? " stale" : ""}${selectedCount > 0 ? " selecting" : ""}`}>
+          {(agent, index) => (
             <DeviceTile
               key={agent.id}
               agent={agent}
-              companyName={companyName(companies, agent.company_id)}
-              tags={tagsOf(agent.tag_ids, tags)}
+              position={index + 1}
+              setSize={filteredAgents.length}
+              companyName={(agent.company_id && companyNames.get(agent.company_id)) || null}
+              tags={tagsFor(agent.tag_ids)}
               reading={metrics.get(agent.id)}
               store={thumbnails}
               allowed={allowed}
@@ -259,9 +275,10 @@ export function AgentOverview({
               onWake={onWake}
               onMove={onMove}
               onEditTags={onEditTags}
+              onShowScreen={(opener) => { previewOpener.current = opener; setPreviewId(agent.id); }}
             />
-          ))}
-        </ul>
+          )}
+        </DeviceWall>
       ) : (
         <div className="empty-state">
           {!hasData ? <LoaderCircle size={22} className="spin" aria-hidden="true" /> : <Monitor size={22} aria-hidden="true" />}
@@ -270,7 +287,27 @@ export function AgentOverview({
           {hasFilters && <button className="secondary-button" onClick={onClearFilters}>Clear filters</button>}
         </div>
       )}
+      {previewed && <ScreenPreview agent={previewed} store={thumbnails} returnFocus={previewOpener} onClose={() => setPreviewId(null)} />}
     </>
+  );
+}
+
+// The devices as a grid of screens, as many to a row as fit. It draws only
+// the rows on screen and one either side, so a fleet of a hundred thousand
+// scrolls as easily as a few; the list's padding stands in for the rest.
+// Every tile is the same height, so every row is.
+function DeviceWall({ agents, className, children }: {
+  agents: Agent[];
+  className: string;
+  children: (agent: Agent, index: number) => ReactNode;
+}) {
+  const list = useRef<HTMLUListElement>(null);
+  const { columns, rowHeight } = useGridRows(list, TILE_ESTIMATE);
+  const { first, last } = useWindowedRows({ list }, agents.length, rowHeight, { columns, overscan: 1 });
+  return (
+    <ul ref={list} className={className} aria-label="Devices">
+      {agents.slice(first, last).map((agent, offset) => children(agent, first + offset))}
+    </ul>
   );
 }
 
@@ -458,8 +495,11 @@ function TagFilterList({ tags, chosen, match, onChange }: {
   );
 }
 
-function DeviceTile({ agent, companyName, tags, reading, store, allowed, selected, onSelect, state, onRemote, onRemoteBackground, onCloseSession, onDelete, onRunScript, onWake, onMove, onEditTags }: {
+function DeviceTile({ agent, position, setSize, companyName, tags, reading, store, allowed, selected, onSelect, state, onRemote, onRemoteBackground, onCloseSession, onDelete, onRunScript, onWake, onMove, onEditTags, onShowScreen }: {
   agent: Agent;
+  // Where it is on the wall, which draws only some of its tiles.
+  position: number;
+  setSize: number;
   companyName: string | null;
   tags: Tag[];
   reading: MetricsReading | undefined;
@@ -477,11 +517,9 @@ function DeviceTile({ agent, companyName, tags, reading, store, allowed, selecte
   onWake: (agents: Agent[], opener: HTMLElement) => void;
   onMove: (agent: Agent, opener: HTMLElement) => void;
   onEditTags: (agents: Agent[], opener: HTMLElement) => void;
+  onShowScreen: (opener: HTMLElement) => void;
 }) {
-  const [element, setElement] = useState<HTMLLIElement | null>(null);
-  const thumbnail = useDeviceScreen(store, agent, element);
-  const [previewOpen, setPreviewOpen] = useState(false);
-  const previewOpener = useRef<HTMLElement | null>(null);
+  const thumbnail = useDeviceScreen(store, agent);
   const busy = state.connecting || state.deleting || state.closing;
   const reachable = agent.connected && !state.browserOffline && !busy;
   const connectActions = hasBackgroundDesktop(agent) ? allowed : { ...allowed, connectBackground: false };
@@ -490,14 +528,9 @@ function DeviceTile({ agent, companyName, tags, reading, store, allowed, selecte
   const canOpenTerminal = reachable && allowed.terminal;
   const tone = agent.connected ? "online" : agent.updating_to ? "updating" : "offline";
 
-  const openPreview = (opener: HTMLElement) => {
-    previewOpener.current = opener;
-    setPreviewOpen(true);
-  };
-
   // The device's name links to the same page, so the screen is for pointers only.
   return (
-    <li ref={setElement} className={`device-tile ${tone}${busy ? " busy" : ""}${selected ? " selected" : ""}`}>
+    <li className={`device-tile ${tone}${busy ? " busy" : ""}${selected ? " selected" : ""}`} aria-posinset={position} aria-setsize={setSize}>
       <div className="device-screen">
         {selected !== null && (
           <label className="tile-select" title={selected ? "Chosen for a job" : "Choose for a job"}>
@@ -524,28 +557,29 @@ function DeviceTile({ agent, companyName, tags, reading, store, allowed, selecte
           </div>
         )}
       </div>
-      <div className="device-meta">
-        <i className={`led ${tone}`} aria-hidden="true" />
-        <strong title={agent.name}><Link to={devicePath(agent)}>{agent.name}</Link></strong>
-        <span className="sr-only">{tone === "online" ? "Online" : tone === "updating" ? `Updating to ${agent.updating_to}` : "Offline"}</span>
-        <DeviceMenu
-          agent={agent}
-          allowed={allowed}
-          state={state}
-          hasScreen={Boolean(thumbnail)}
-          onShowScreen={openPreview}
-          onCloseSession={onCloseSession}
-          onDelete={onDelete}
-          onWake={onWake}
-          onMove={onMove}
-          onEditTags={onEditTags}
-        />
+      <div className="device-details">
+        <div className="device-meta">
+          <i className={`led ${tone}`} aria-hidden="true" />
+          <strong title={agent.name}><Link to={devicePath(agent)}>{agent.name}</Link></strong>
+          <span className="sr-only">{tone === "online" ? "Online" : tone === "updating" ? `Updating to ${agent.updating_to}` : "Offline"}</span>
+          <DeviceMenu
+            agent={agent}
+            allowed={allowed}
+            state={state}
+            hasScreen={Boolean(thumbnail)}
+            onShowScreen={onShowScreen}
+            onCloseSession={onCloseSession}
+            onDelete={onDelete}
+            onWake={onWake}
+            onMove={onMove}
+            onEditTags={onEditTags}
+          />
+        </div>
+        {agent.system?.os && <p className="device-company" title={agent.system.os}><Laptop size={13} aria-hidden="true" /><span><span className="sr-only">Operating system: </span>{agent.system.os}</span></p>}
+        {companyName && <p className="device-company" title={companyName}><Building2 size={13} aria-hidden="true" /><span><span className="sr-only">Company: </span>{companyName}</span></p>}
+        {tags.length > 0 && <div className="device-tags"><TagChips tags={tags} limit={3} /></div>}
+        {reading && <DeviceUsage reading={reading} />}
       </div>
-      {agent.system?.os && <p className="device-company" title={agent.system.os}><Laptop size={13} aria-hidden="true" /><span><span className="sr-only">Operating system: </span>{agent.system.os}</span></p>}
-      {companyName && <p className="device-company" title={companyName}><Building2 size={13} aria-hidden="true" /><span><span className="sr-only">Company: </span>{companyName}</span></p>}
-      {tags.length > 0 && <div className="device-tags"><TagChips tags={tags} limit={3} /></div>}
-      {reading && <DeviceUsage reading={reading} />}
-      {previewOpen && thumbnail && <ScreenPreview agent={agent} thumbnail={thumbnail} returnFocus={previewOpener} onClose={() => setPreviewOpen(false)} />}
     </li>
   );
 }

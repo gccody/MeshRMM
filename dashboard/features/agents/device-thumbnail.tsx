@@ -1,36 +1,29 @@
-import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useSyncExternalStore } from "react";
 import { X } from "lucide-react";
 import { ModalDialog } from "../../lib/modal-dialog";
 import type { Thumbnail, ThumbnailStore } from "./thumbnails";
 import type { Agent } from "./types";
 
-// Tiles load their images a little before they scroll into view.
-const VISIBILITY_MARGIN = "200px";
+// A tile waits this long before asking for its image, so tiles that only
+// scroll past ask for nothing.
+const SETTLE_DELAY_MS = 150;
 
 const formatUpdated = (date: Date | null) =>
   date?.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) ?? null;
 
-// Whether the element is on screen or about to be.
-function useNearViewport(element: HTMLElement | null) {
-  const [near, setNear] = useState(false);
-  useEffect(() => {
-    if (!element) return;
-    const observer = new IntersectionObserver(([entry]) => setNear(entry.isIntersecting), { rootMargin: VISIBILITY_MARGIN });
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, [element]);
-  return near;
+// The device's latest screen image, as far as this page has loaded it.
+function useThumbnail(store: ThumbnailStore, id: string): Thumbnail | null {
+  const subscribe = useCallback((listener: () => void) => store.subscribe(id, listener), [store, id]);
+  return useSyncExternalStore(subscribe, () => store.snapshot(id), () => null);
 }
 
-// The device's latest screen image, kept current while its tile is visible
-// and the page is in front. A hidden tab checks again as soon as it is shown.
-export function useDeviceScreen(store: ThumbnailStore, agent: Agent, element: HTMLElement | null): Thumbnail | null {
+// The device's latest screen image, kept current while its tile is drawn
+// and the page is in front. The wall draws only the tiles on screen or
+// about to be. A hidden tab checks again as soon as it is shown.
+export function useDeviceScreen(store: ThumbnailStore, agent: Agent): Thumbnail | null {
   const { id, connected } = agent;
-  const visible = useNearViewport(element);
-  const subscribe = useCallback((listener: () => void) => store.subscribe(id, listener), [store, id]);
-  const thumbnail = useSyncExternalStore(subscribe, () => store.snapshot(id), () => null);
+  const thumbnail = useThumbnail(store, id);
   useEffect(() => {
-    if (!visible) return;
     let timer: number | undefined;
     let cancelled = false;
     const check = async () => {
@@ -40,23 +33,26 @@ export function useDeviceScreen(store: ThumbnailStore, agent: Agent, element: HT
       if (!cancelled && delay !== null) timer = window.setTimeout(() => void check(), delay);
     };
     const onVisibilityChange = () => void check();
-    void check();
+    timer = window.setTimeout(() => void check(), SETTLE_DELAY_MS);
     document.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
       cancelled = true;
       window.clearTimeout(timer);
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, [store, id, connected, visible]);
+  }, [store, id, connected]);
   return thumbnail;
 }
 
-export function ScreenPreview({ agent, thumbnail, returnFocus, onClose }: {
+// A device's screen image at full size, while it has one.
+export function ScreenPreview({ agent, store, returnFocus, onClose }: {
   agent: Agent;
-  thumbnail: Thumbnail;
+  store: ThumbnailStore;
   returnFocus: React.RefObject<HTMLElement | null>;
   onClose: () => void;
 }) {
+  const thumbnail = useThumbnail(store, agent.id);
+  if (!thumbnail) return null;
   const updated = formatUpdated(thumbnail.updatedAt);
   const titleId = `thumbnail-title-${agent.id}`;
   return (
