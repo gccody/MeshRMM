@@ -29,7 +29,11 @@
 //!
 //! Snapshots asked for while one is being read share it until it fixes its
 //! revision: a requester that subscribed before then gets every later change
-//! from its subscription, and was sent no change the snapshot lacks.
+//! from its subscription, and was sent no change the snapshot lacks. Event
+//! sockets take changes from their own subscription ([`Presence::frames`]),
+//! where each change, like each snapshot, is [`Shared`]: its JSON is made
+//! once, by the first socket that sends it, and every other socket sends the
+//! same bytes.
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -43,7 +47,7 @@ use sea_query::{Expr, ExprTrait, Query};
 use serde::Serialize;
 use tokio::sync::{Mutex, broadcast, watch};
 
-use super::AgentHub;
+use super::{AgentHub, Serializations, Shared};
 use crate::{
     db::{
         self, Database,
@@ -158,7 +162,7 @@ impl From<SnapshotFailed> for ApiError {
     }
 }
 
-type Built = Result<Arc<PresenceEvent>, SnapshotFailed>;
+type Built = Result<Shared<PresenceEvent>, SnapshotFailed>;
 /// A snapshot being built; it holds the result once there is one.
 type Build = watch::Receiver<Option<Built>>;
 
@@ -178,6 +182,10 @@ struct Inner {
     /// The snapshot being built that requesters may still share.
     building: std::sync::Mutex<Option<Build>>,
     events: broadcast::Sender<Arc<PresenceEvent>>,
+    /// The same changes, for event sockets.
+    frames: broadcast::Sender<Shared<PresenceEvent>>,
+    /// The JSON made of changes and snapshots for event sockets.
+    serializations: Serializations,
     /// Bumped when users' access may have changed, so event sockets check
     /// their user's session and permissions again at once.
     access: watch::Sender<u64>,
@@ -290,6 +298,8 @@ impl Presence {
                 tickets: AtomicU64::new(0),
                 building: std::sync::Mutex::default(),
                 events: broadcast::channel(EVENT_BACKLOG).0,
+                frames: broadcast::channel(EVENT_BACKLOG).0,
+                serializations: Serializations::default(),
                 access: watch::channel(0).0,
             }),
         }
@@ -301,9 +311,20 @@ impl Presence {
         self.inner.events.subscribe()
     }
 
+    /// The same changes for an event socket, each serialised once for every
+    /// socket that sends it.
+    pub fn frames(&self) -> broadcast::Receiver<Shared<PresenceEvent>> {
+        self.inner.frames.subscribe()
+    }
+
+    /// How many changes and snapshots had their JSON made for event sockets.
+    pub fn serializations(&self) -> u64 {
+        self.inner.serializations.count()
+    }
+
     /// Every device, company and tag as they are now. Requesters that ask
-    /// while a snapshot is being read share it.
-    pub async fn snapshot(&self) -> Result<Arc<PresenceEvent>, SnapshotFailed> {
+    /// while a snapshot is being read share it, and its JSON.
+    pub async fn snapshot(&self) -> Result<Shared<PresenceEvent>, SnapshotFailed> {
         loop {
             let (leader, mut build) = {
                 let mut building = self
@@ -367,7 +388,7 @@ impl Presence {
         &self,
         read: FleetRead,
         closing: Option<Closing<'_>>,
-    ) -> Arc<PresenceEvent> {
+    ) -> Shared<PresenceEvent> {
         let FleetRead {
             ticket,
             rows,
@@ -423,13 +444,16 @@ impl Presence {
         sort(&mut agents);
         sort_companies(&mut companies);
         tags::sort(&mut tags);
-        Arc::new(PresenceEvent::Snapshot {
-            revision: state.revision,
-            agents,
-            companies,
-            tags,
-            generated_at_unix_ms: now_ms(),
-        })
+        Shared::new(
+            PresenceEvent::Snapshot {
+                revision: state.revision,
+                agents,
+                companies,
+                tags,
+                generated_at_unix_ms: now_ms(),
+            },
+            &self.inner.serializations,
+        )
     }
 
     /// Publishes the device's current state, if it changed.
@@ -648,8 +672,7 @@ impl Presence {
                 agent_id: device_id.to_owned(),
             },
         };
-        // Nobody listening is fine.
-        let _ = self.inner.events.send(Arc::new(event));
+        self.send(event);
     }
 
     fn publish_company(
@@ -673,7 +696,7 @@ impl Presence {
                 company_id: company_id.to_owned(),
             },
         };
-        let _ = self.inner.events.send(Arc::new(event));
+        self.send(event);
     }
 
     fn publish_tag(&self, state: &mut State, ticket: u64, tag_id: &str, tag: Option<Tag>) {
@@ -691,7 +714,18 @@ impl Presence {
                 tag_id: tag_id.to_owned(),
             },
         };
-        let _ = self.inner.events.send(Arc::new(event));
+        self.send(event);
+    }
+
+    /// Tells subscribers and event sockets of a change, in the order changes
+    /// are published. Nobody listening is fine.
+    fn send(&self, event: PresenceEvent) {
+        let event = Arc::new(event);
+        let _ = self.inner.events.send(Arc::clone(&event));
+        let _ = self
+            .inner
+            .frames
+            .send(Shared::new(event, &self.inner.serializations));
     }
 }
 
@@ -1096,14 +1130,21 @@ mod tests {
         let together = futures_util::future::join_all((0..10).map(|_| presence.snapshot())).await;
         let first = together[0].as_ref().unwrap();
         for snapshot in &together {
-            assert!(Arc::ptr_eq(snapshot.as_ref().unwrap(), first));
+            assert!(Shared::ptr_eq(snapshot.as_ref().unwrap(), first));
         }
+        // And its JSON: each socket that gets the build sends the same bytes.
+        let sent = together
+            .iter()
+            .map(|snapshot| snapshot.as_ref().unwrap().json())
+            .collect::<Vec<_>>();
+        assert_eq!(presence.serializations(), 1);
+        assert!(sent.iter().all(|json| json == &sent[0]));
 
         // One asked for after that build gets a new one.
         rename(&presence, "a", "Laptop").await;
         presence.refresh("a").await;
         let later = presence.snapshot().await.unwrap();
-        assert!(!Arc::ptr_eq(&later, first));
+        assert!(!Shared::ptr_eq(&later, first));
         let (revision, agents) = devices(&later);
         assert!(revision > first.revision());
         assert_eq!(agents["a"].name, "Laptop");

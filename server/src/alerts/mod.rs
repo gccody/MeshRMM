@@ -60,7 +60,7 @@ use crate::{
     db::tables::{ScriptRuns, UpdateRuns},
     http::AppState,
     notifications::{self, Notification},
-    realtime::Metrics,
+    realtime::{Metrics, Serializations, Shared},
     settings,
     time::{DAY_MS, now_ms},
     toolbox::run_status,
@@ -124,7 +124,9 @@ pub struct Engine {
 #[derive(Debug)]
 struct Inner {
     tracker: Mutex<Tracker>,
-    events: broadcast::Sender<Arc<AlertEvent>>,
+    events: broadcast::Sender<Shared<AlertEvent>>,
+    /// The JSON made of its events, once each for every event socket.
+    serializations: Serializations,
     /// Judges the rules at once.
     now: Notify,
     /// Judges the rules soon, spaced after the last evaluation.
@@ -142,6 +144,7 @@ impl Default for Engine {
             inner: Arc::new(Inner {
                 tracker: Mutex::default(),
                 events: broadcast::channel(EVENT_BACKLOG).0,
+                serializations: Serializations::default(),
                 now: Notify::new(),
                 soon: Notify::new(),
                 changes: Mutex::default(),
@@ -154,8 +157,15 @@ impl Default for Engine {
 }
 
 impl Engine {
-    pub fn subscribe(&self) -> broadcast::Receiver<Arc<AlertEvent>> {
+    /// Alert events from now on, each serialised once for every event socket
+    /// that sends it.
+    pub fn subscribe(&self) -> broadcast::Receiver<Shared<AlertEvent>> {
         self.inner.events.subscribe()
+    }
+
+    /// How many alert events had their JSON made.
+    pub fn serializations(&self) -> u64 {
+        self.inner.serializations.count()
     }
 
     /// Judges the rules soon, with whatever else is waiting, such as after a
@@ -255,7 +265,10 @@ impl Engine {
 
     pub(crate) fn publish(&self, event: AlertEvent) {
         // Nobody listening is fine.
-        let _ = self.inner.events.send(Arc::new(event));
+        let _ = self
+            .inner
+            .events
+            .send(Shared::new(event, &self.inner.serializations));
     }
 }
 

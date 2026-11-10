@@ -197,10 +197,21 @@ task.
   a snapshot at the same time share one read of the fleet.
   Disabling a user or removing their `devices.view` permission closes their
   sockets at once (see [access changes](#access-changes)).
+  What every socket sends alike is serialised once for all of them: each
+  change and snapshot, alert event and update event is broadcast as a
+  `Shared` event (`server/src/realtime/shared.rs`), whose JSON the first
+  socket to send it makes and the others send as the same bytes. Only job
+  events, shaped for each viewer, are serialised per socket.
 - **Metrics**: the latest resource readings of each Agent, held in memory.
   Its writer task stores the finished minutes of every device together
-  every 5 seconds, in one transaction. See
-  [devices](devices.md#resource-monitoring).
+  every 5 seconds, in one transaction. While any event socket is open, one
+  feed task (`server/src/realtime/metrics/feed.rs`) scans every 5 seconds
+  for the readings since its last scan, serialises them once and broadcasts
+  them to every socket. A socket that opens, refreshes or falls behind first
+  sends every online device's latest reading, shared with the sockets that
+  ask before the next tick, and then the ticks: of the first, only the
+  readings numbered after its full set, so none is missed or sent twice.
+  See [devices](devices.md#resource-monitoring).
 - **Alerts**: the engine's task reads presence and the metrics, keeping each
   device's readings only as far back as the enabled CPU and memory rules
   look, raises and resolves alerts, and broadcasts them; event sockets of users who may see

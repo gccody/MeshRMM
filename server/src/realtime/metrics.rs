@@ -12,6 +12,13 @@
 //! [`FLUSH_INTERVAL`], all in one transaction, so a minute reaches the history
 //! within that long. Writing each on its own would be one statement per
 //! device per minute: 167 a second for 10,000 Agents.
+//!
+//! The website's event sockets get new readings from one feed
+//! (`metrics/feed.rs`): every [`FEED_INTERVAL`] it scans once for the
+//! readings since its last scan and serialises them once, however many
+//! sockets listen.
+mod feed;
+
 use std::{
     collections::{BTreeMap, HashMap, VecDeque, btree_map::Entry},
     sync::{Arc, Mutex},
@@ -22,6 +29,7 @@ use meshrmm_protocol_types::{METRICS_INTERVAL_SECONDS, SystemMetrics};
 use sea_query::{Expr, ExprTrait, InsertStatement, OnConflict, Order, Query};
 use serde::{Deserialize, Serialize};
 
+pub use self::feed::{FEED_INTERVAL, FeedWork, Subscription};
 use crate::{
     db::{self, Database, tables::DeviceMetrics},
     time::{DAY_MS, HOUR_MS, MINUTE_MS, SECOND_MS, now_ms},
@@ -441,6 +449,8 @@ pub struct Metrics {
     /// Held while writing, so a device's history isn't deleted between a
     /// flush taking its minutes and storing them.
     writer: Arc<tokio::sync::Mutex<Writer>>,
+    /// What the website's event sockets send.
+    feed: Arc<feed::Feed>,
 }
 
 impl Metrics {
@@ -454,6 +464,7 @@ impl Metrics {
             state: Arc::default(),
             pending: Arc::new(Mutex::new(Pending::new(limit))),
             writer: Arc::default(),
+            feed: Arc::default(),
         }
     }
 
@@ -893,13 +904,6 @@ fn buckets(rows: Vec<Row>, step: i64) -> Vec<Point> {
         }
     }
     points.iter().map(Totals::point).collect()
-}
-
-/// What the website's event socket sends about devices' resource usage.
-#[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum MetricsEvent {
-    Metrics { readings: Vec<Reading> },
 }
 
 #[cfg(test)]
