@@ -2266,3 +2266,195 @@ async fn a_policy_changed_after_planning_its_firing_does_not_start_its_old_job()
         app.finish().await;
     }
 }
+
+/// Inserts `count` unfinished update scan jobs straight into the database,
+/// each waiting for `device_id`, for more jobs than creating each one
+/// allows. Returns their IDs.
+async fn waiting_jobs(app: &App, device_id: &str, count: usize) -> Vec<String> {
+    use meshrmm_server::db::tables::{JobDevices, Jobs};
+    use sea_query::Query;
+    let now = now_ms();
+    let ids = (0..count)
+        .map(|_| uuid::Uuid::new_v4().to_string())
+        .collect::<Vec<_>>();
+    for chunk in ids.chunks(400) {
+        let mut jobs = Query::insert();
+        jobs.into_table(Jobs::Table).columns([
+            Jobs::Id,
+            Jobs::Kind,
+            Jobs::ItemId,
+            Jobs::ItemName,
+            Jobs::Target,
+            Jobs::TargetLabel,
+            Jobs::Offline,
+            Jobs::ExpiresAt,
+            Jobs::RequestedByUserId,
+            Jobs::CreatedAt,
+        ]);
+        let mut devices = Query::insert();
+        devices.into_table(JobDevices::Table).columns([
+            JobDevices::JobId,
+            JobDevices::DeviceId,
+            JobDevices::State,
+            JobDevices::UpdatedAt,
+        ]);
+        for id in chunk {
+            jobs.values_panic([
+                id.as_str().into(),
+                "update_scan".into(),
+                "".into(),
+                "Scan for updates".into(),
+                "devices".into(),
+                "1 device".into(),
+                "wait".into(),
+                (now + HOUR_MS).into(),
+                "tester".into(),
+                now.into(),
+            ]);
+            devices.values_panic([
+                id.as_str().into(),
+                device_id.into(),
+                "waiting".into(),
+                now.into(),
+            ]);
+        }
+        app.db().execute(&jobs).await.unwrap();
+        app.db().execute(&devices).await.unwrap();
+    }
+    ids
+}
+
+/// The statements reading jobs that don't exist by these IDs takes.
+async fn statements_to_read(app: &App, ids: &[String]) -> u64 {
+    let before = app.db().counts();
+    automation::jobs::by_ids(&mut app.db(), ids, now_ms())
+        .await
+        .unwrap();
+    (app.db().counts() - before).statements
+}
+
+#[tokio::test]
+async fn any_number_of_jobs_is_read_a_chunk_of_ids_at_a_time() {
+    use automation::{dispatch::QUEUE_CHUNK, jobs};
+    // Both databases bind a few tens of thousands of values to a statement
+    // at most; a chunk stays well under either.
+    const { assert!(QUEUE_CHUNK < 32_766) };
+    for app in apps().await {
+        let name = app.name;
+        // More IDs than either database binds in one statement. Looking jobs
+        // up needs only their IDs, not the jobs.
+        let ids = (0..70_000).map(|n| format!("job-{n}")).collect::<Vec<_>>();
+        assert!(
+            jobs::by_ids(&mut app.db(), &ids, now_ms())
+                .await
+                .unwrap()
+                .is_empty(),
+            "{name}"
+        );
+        assert_eq!(
+            statements_to_read(&app, &ids[..QUEUE_CHUNK]).await,
+            1,
+            "{name}: a chunk is one statement"
+        );
+        assert_eq!(
+            statements_to_read(&app, &ids[..QUEUE_CHUNK + 1]).await,
+            2,
+            "{name}: one more is another"
+        );
+
+        // A pass recounts every unfinished job, more than a chunk of them,
+        // and still starts the queued device.
+        let away = fleet(&app, "AWAY", 1).await;
+        waiting_jobs(&app, &away[0], QUEUE_CHUNK + 1).await;
+        let desk = fleet(&app, "DESK", 1).await;
+        let mut connection = app.state.agents.connect(&desk[0]);
+        let scan = create_job(&app, automation::jobs::Target::Devices(desk)).await;
+        let recounted = app.state.automation.jobs_recounted();
+        pass(&app, now_ms()).await;
+        assert_eq!(
+            app.state.automation.jobs_recounted() - recounted,
+            QUEUE_CHUNK as u64 + 2,
+            "{name}"
+        );
+        let mut scans = 0;
+        while let Ok(message) = connection.commands.try_recv() {
+            if matches!(
+                message,
+                meshrmm_server::realtime::ToAgent::Command(AgentCommand::ScanUpdates { .. })
+            ) {
+                scans += 1;
+            }
+        }
+        assert_eq!(scans, 1, "{name}");
+        let started = jobs::get(&mut app.db(), &scan, now_ms())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(started.counts.running, 1, "{name}");
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn a_connected_device_with_a_full_backlog_waits_its_turn_rather_than_being_missed() {
+    use meshrmm_server::db::tables::ScriptRuns;
+    use sea_query::{Expr, ExprTrait, Query};
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let busy = app.enroll(&mut admin, "BUSY").await;
+        let away = app.enroll(&mut admin, "AWAY").await;
+        let mut busy_connection = app.state.agents.connect(&busy.device_id);
+        let away_connection = app.state.agents.connect(&away.device_id);
+        let script = create_script(&mut admin, "Inventory", "powershell", false).await;
+        let started = start_job(
+            &mut admin,
+            json!({
+                "script_id": script, "run_as": "system", "target": "devices",
+                "device_ids": [busy.device_id, away.device_id], "offline": "skip",
+            }),
+        )
+        .await;
+        let id = started["id"].as_str().unwrap();
+        // BUSY's Agent stops reading for a while; AWAY goes offline.
+        while app
+            .state
+            .agents
+            .send(&busy.device_id, AgentCommand::CollectSystemInfo)
+        {}
+        drop(away_connection);
+        let now = now_ms();
+        pass(&app, now).await;
+        let outcome = |job: &Value, device: &str| {
+            outcomes(job)
+                .into_iter()
+                .find(|(name, _)| name == device)
+                .unwrap()
+                .1
+        };
+        let waiting = job(&mut admin, id).await;
+        assert_eq!(outcome(&waiting, "BUSY"), "queued", "{name}: {waiting}");
+        assert_eq!(outcome(&waiting, "AWAY"), "missed", "{name}");
+        let busy_runs = || {
+            Query::select()
+                .column(ScriptRuns::Id)
+                .from(ScriptRuns::Table)
+                .and_where(Expr::col(ScriptRuns::DeviceId).eq(busy.device_id.as_str()))
+                .to_owned()
+        };
+        let runs_of_busy: Vec<(String,)> = app.db().fetch_all(&busy_runs()).await.unwrap();
+        assert!(
+            runs_of_busy.is_empty(),
+            "{name}: nothing was written for it"
+        );
+
+        // Its Agent catches up, and the next pass starts it.
+        assert_eq!(runs(&mut busy_connection).len(), 0);
+        pass(&app, now + SECOND_MS).await;
+        assert_eq!(runs(&mut busy_connection).len(), 1, "{name}");
+        let running = job(&mut admin, id).await;
+        assert_eq!(outcome(&running, "BUSY"), "running", "{name}");
+        assert_eq!(outcome(&running, "AWAY"), "missed", "{name}");
+        app.finish().await;
+    }
+}

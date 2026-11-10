@@ -144,7 +144,14 @@ runs report, or have no result.
 Waiting devices are queued as soon as their Agent connects. A device that
 disconnects between being queued and being started waits again (or is
 missed, if the job skips offline devices); a run that never reached its
-Agent is removed rather than reported as failed.
+Agent is removed rather than reported as failed. A connected device whose
+Agent is so far behind that its 32 waiting commands fill its backlog isn't
+offline: it stays queued, with nothing recorded, and starts on a later pass
+once its Agent catches up. The pass holds a place in the backlog before it
+records the run, so the run can't be left with nowhere to go. An Agent that
+stops reading altogether stops taking messages on its socket too, and its
+connection ends within the socket's send timeout or the minute its silence
+is allowed; from then on it is offline as above.
 
 The work for an Agent that connects is that device's alone: the server
 queues its waiting parts by its ID, and Agents that connect together are
@@ -398,7 +405,11 @@ should read the lists again.
   `RECONCILE_INTERVAL_MS` (a minute), after a restart and when a policy
   fires, also queues every waiting device whose Agent is connected, misses
   deleted devices' parts (deleting a device misses them at once; this is
-  for a server that stopped in between) and recounts every unfinished job.
+  for a server that stopped in between) and recounts every unfinished job,
+  reading them `dispatch::QUEUE_CHUNK` (500) IDs to a statement
+  (`jobs::by_ids`), so however many are unfinished no statement comes near
+  what SQLite (32,766) or PostgreSQL (65,535) binds; every list the engine
+  names in a statement is chunked the same way.
   The dispatcher's limits come from `dispatch::limits` with the count of
   connected Agents (`AgentHub::count`); its floors and caps are the
   constants `MIN_BATCH`, `MAX_BATCH`, `MIN_IN_FLIGHT` and `MAX_IN_FLIGHT`.
@@ -471,7 +482,12 @@ should read the lists again.
   policy changed between planning its firing and claiming it. A job's
   counts, the dispatcher's next batch and a page of its devices cost the
   same statements for a job of 20 devices and one of 2,000, and a large job's queued devices
-  don't keep a small job's from the front of the batch.
+  don't keep a small job's from the front of the batch. Jobs are read by ID
+  a chunk at a time, however many (70,000 IDs, more than either database
+  binds at once), and a pass with more unfinished jobs than a chunk still
+  starts its devices. A connected device whose command backlog is full
+  stays queued and starts once it has room, while one that went offline is
+  still missed.
 - `cargo test -p meshrmm-server --test job_outcomes` keeps the old way of
   working out each device's outcome, by joining it to its run, and checks
   that the stored outcomes and the counts say the same for a job of each

@@ -138,8 +138,15 @@ In a policy's job, online devices are skipped (**Online already**), each
 offline device is woken (**Waiting to come online**), and its outcome is
 **Came online** when its Agent connects within 10 minutes, **Didn't come
 online** after that, or **Failed** with the reason when no relay could send
-the packets. Wake jobs never wait for offline devices, and a wake policy
-can't run on enrollment, as a new device is online.
+the packets. A device is started and its request recorded together, so
+none is left started with no request behind it. If the request can't be
+recorded (the database refusing the write), nothing is: the device stays
+queued and is tried again on the next passes, and after a minute of that
+it fails with "MeshRMM couldn't record the device's wake request, so it
+wasn't woken". A relay whose Agent is connected but too far behind to take
+the request fails its part saying so, rather than as gone offline. Wake
+jobs never wait for offline devices, and a wake policy can't run on
+enrollment, as a new device is online.
 
 ## Permissions and audit
 
@@ -195,7 +202,8 @@ error, reported_at}]}`. A job's devices carry `wake_id`.
 - `cargo test -p meshrmm-server wake` (unit tests of relay choice and
   plans) and `--test wake`: waking through a relay, devices coming online,
   no relay, failing relays, permissions, waking many, and wake policies and
-  their jobs; relays matching those chosen from every online device, on a
+  their jobs, with requests that can't be recorded tried again and then
+  failed; relays matching those chosen from every online device, on a
   fleet made by hand and on random ones; a wake, and a wake job, costing
   the same statements however many devices are online elsewhere; and
   devices found under their latest addresses until deleted. `--test

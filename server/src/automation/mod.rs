@@ -83,6 +83,10 @@ struct Inner {
     /// engine's work.
     full_passes: AtomicU64,
     recounted: AtomicU64,
+    /// Wake jobs' queued devices whose wake requests couldn't be recorded,
+    /// by job, with when that first happened. Kept in memory: a restart
+    /// gives them their retries again.
+    wake_failures: Mutex<HashMap<String, HashMap<String, i64>>>,
 }
 
 #[derive(Debug, Default)]
@@ -152,6 +156,7 @@ impl Default for Engine {
                 pending: Mutex::default(),
                 full_passes: AtomicU64::new(0),
                 recounted: AtomicU64::new(0),
+                wake_failures: Mutex::default(),
             }),
         }
     }
@@ -206,6 +211,47 @@ impl Engine {
     /// How many times it has recounted a job.
     pub fn jobs_recounted(&self) -> u64 {
         self.inner.recounted.load(Ordering::Relaxed)
+    }
+
+    /// Notes that the wake requests of the job's `devices` couldn't be
+    /// recorded at `now`. Returns those that have failed for `retry_ms`.
+    fn wakes_failed(
+        &self,
+        job_id: &str,
+        devices: &[String],
+        now: i64,
+        retry_ms: i64,
+    ) -> Vec<String> {
+        let mut failures = self.wake_failures();
+        let job = failures.entry(job_id.to_owned()).or_default();
+        devices
+            .iter()
+            .filter(|device_id| now - *job.entry((*device_id).clone()).or_insert(now) >= retry_ms)
+            .cloned()
+            .collect()
+    }
+
+    /// Forgets the failures of the job's `devices`, whose wakes were
+    /// recorded or have failed.
+    fn wakes_settled(&self, job_id: &str, devices: &[String]) {
+        let mut failures = self.wake_failures();
+        let Some(job) = failures.get_mut(job_id) else {
+            return;
+        };
+        for device_id in devices {
+            job.remove(device_id);
+        }
+        if job.is_empty() {
+            failures.remove(job_id);
+        }
+    }
+
+    fn wake_failures(&self) -> std::sync::MutexGuard<'_, HashMap<String, HashMap<String, i64>>> {
+        // Nothing panics while holding the lock, so a poisoned one is whole.
+        self.inner
+            .wake_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn pending(&self) -> std::sync::MutexGuard<'_, Pending> {

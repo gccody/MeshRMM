@@ -1683,3 +1683,223 @@ async fn relays_are_those_choosing_from_every_online_device_gives() {
         );
     }
 }
+
+/// Makes the database refuse new wake requests, as a write failing under
+/// load would, or accept them again.
+async fn refuse_wakes(app: &App, refuse: bool) {
+    use sqlx::Connection;
+    let statements: &[&str] = match (app.name, refuse) {
+        ("sqlite", true) => &[
+            "CREATE TRIGGER refuse_wakes BEFORE INSERT ON wake_requests \
+             BEGIN SELECT RAISE(ABORT, 'refused'); END",
+        ],
+        ("sqlite", false) => &["DROP TRIGGER refuse_wakes"],
+        (_, true) => &[
+            "CREATE FUNCTION refuse_wakes() RETURNS trigger LANGUAGE plpgsql \
+             AS $$ BEGIN RAISE EXCEPTION 'refused'; END $$",
+            "CREATE TRIGGER refuse_wakes BEFORE INSERT ON wake_requests \
+             FOR EACH ROW EXECUTE FUNCTION refuse_wakes()",
+        ],
+        (_, false) => &[
+            "DROP TRIGGER refuse_wakes ON wake_requests",
+            "DROP FUNCTION refuse_wakes()",
+        ],
+    };
+    let url = app.state.config.database_url();
+    if app.name == "sqlite" {
+        let mut connection = sqlx::SqliteConnection::connect(&url).await.unwrap();
+        for statement in statements {
+            sqlx::raw_sql(*statement)
+                .execute(&mut connection)
+                .await
+                .unwrap();
+        }
+        connection.close().await.unwrap();
+    } else {
+        let mut connection = sqlx::PgConnection::connect(&url).await.unwrap();
+        for statement in statements {
+            sqlx::raw_sql(*statement)
+                .execute(&mut connection)
+                .await
+                .unwrap();
+        }
+        connection.close().await.unwrap();
+    }
+}
+
+/// The job's devices that are started with neither a wake request nor a
+/// failure of their own: those the dispatcher would never try again.
+async fn started_without_a_request(app: &App, job_id: &str) -> Vec<String> {
+    use sea_query::Expr;
+    let column = |table: &str, column: &str| Expr::col((Alias::new(table), Alias::new(column)));
+    let rows: Vec<(String,)> = app
+        .db()
+        .fetch_all(
+            &Query::select()
+                .column(Alias::new("device_id"))
+                .from(Alias::new("job_devices"))
+                .and_where(column("job_devices", "job_id").eq(job_id))
+                .and_where(column("job_devices", "state").eq("started"))
+                .and_where(
+                    column("job_devices", "result")
+                        .is_null()
+                        .or(column("job_devices", "result").ne("failed")),
+                )
+                .and_where(
+                    Expr::exists(
+                        Query::select()
+                            .expr(Expr::cust("1"))
+                            .from(Alias::new("wake_requests"))
+                            .and_where(
+                                column("wake_requests", "job_id")
+                                    .equals((Alias::new("job_devices"), Alias::new("job_id"))),
+                            )
+                            .and_where(
+                                column("wake_requests", "device_id")
+                                    .equals((Alias::new("job_devices"), Alias::new("device_id"))),
+                            )
+                            .to_owned(),
+                    )
+                    .not(),
+                )
+                .to_owned(),
+        )
+        .await
+        .unwrap();
+    rows.into_iter().map(|(id,)| id).collect()
+}
+
+/// How many wake requests the job has.
+async fn job_requests(app: &App, job_id: &str) -> usize {
+    let rows: Vec<(String,)> = app
+        .db()
+        .fetch_all(
+            &Query::select()
+                .column(Alias::new("id"))
+                .from(Alias::new("wake_requests"))
+                .and_where(sea_query::Expr::col(Alias::new("job_id")).eq(job_id))
+                .to_owned(),
+        )
+        .await
+        .unwrap();
+    rows.len()
+}
+
+#[tokio::test]
+async fn a_wake_job_whose_requests_cannot_be_recorded_tries_again_and_then_fails() {
+    use automation::dispatch::WAKE_RETRY_MS;
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let asleep = app.enroll(&mut admin, "ASLEEP").await;
+        app.enroll(&mut admin, "STRANDED").await;
+        let awake = app.enroll(&mut admin, "AWAKE").await;
+        for (device_id, mac, address) in [
+            (&asleep.device_id, "AA:00:00:00:00:01", "192.168.1.21"),
+            (&awake.device_id, "AA:00:00:00:00:03", "192.168.1.2"),
+        ] {
+            store(
+                &app,
+                device_id,
+                "203.0.113.5",
+                snapshot(&[("Ethernet", "ethernet", Some(mac), address, 24)]),
+            )
+            .await;
+        }
+        let mut awake_connection = app.state.agents.connect(&awake.device_id);
+        let policy = admin
+            .post(
+                "/v1/automation-policies",
+                json!({
+                    "name": "Wake for patching", "action": "wake", "target": "all",
+                    "trigger": "daily", "time": "01:50", "time_zone": "UTC", "offline": "skip",
+                }),
+            )
+            .await;
+        assert_eq!(policy.status, StatusCode::CREATED, "{:?}", policy.body);
+        let run_path = format!(
+            "/v1/automation-policies/{}/run",
+            policy.body["id"].as_str().unwrap()
+        );
+        let outcome = |job: &Value, device: &str| {
+            job["devices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["device_name"] == device)
+                .map(|entry| (entry["outcome"].clone(), entry["detail"].clone()))
+                .unwrap()
+        };
+
+        // The requests can't be recorded: nothing is, and the devices stay
+        // queued for the next pass.
+        let job_id = admin.post(&run_path, json!({})).await.body["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        refuse_wakes(&app, true).await;
+        let now = now_ms();
+        automation::pass(&app.state, now).await.unwrap();
+        let job = common::job_with_devices(&mut admin, &job_id).await;
+        assert_eq!(outcome(&job, "ASLEEP").0, "queued", "{name}: {job}");
+        assert_eq!(outcome(&job, "STRANDED").0, "queued", "{name}");
+        assert_eq!(outcome(&job, "AWAKE").0, "skipped", "{name}");
+        assert_eq!(job_requests(&app, &job_id).await, 0, "{name}");
+        assert!(started_without_a_request(&app, &job_id).await.is_empty());
+
+        // Once they can be, the next pass wakes ASLEEP, and STRANDED, with no
+        // relay, fails saying why.
+        refuse_wakes(&app, false).await;
+        automation::pass(&app.state, now + SECOND_MS).await.unwrap();
+        assert_eq!(packets(&mut awake_connection).await.len(), 1, "{name}");
+        let job = common::job_with_devices(&mut admin, &job_id).await;
+        assert_eq!(outcome(&job, "ASLEEP").0, "running", "{name}: {job}");
+        let (stranded, why) = outcome(&job, "STRANDED");
+        assert_eq!(stranded, "failed", "{name}");
+        assert!(
+            why.as_str()
+                .unwrap()
+                .contains("hasn't sent its hardware and network details"),
+            "{name}: {why}"
+        );
+        assert_eq!(job_requests(&app, &job_id).await, 2, "{name}");
+        assert!(started_without_a_request(&app, &job_id).await.is_empty());
+
+        // Requests that can't be recorded for a minute fail, saying so, and
+        // the job finishes.
+        let job_id = admin.post(&run_path, json!({})).await.body["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        refuse_wakes(&app, true).await;
+        let now = now + 2 * SECOND_MS;
+        automation::pass(&app.state, now).await.unwrap();
+        automation::pass(&app.state, now + WAKE_RETRY_MS - SECOND_MS)
+            .await
+            .unwrap();
+        let job = common::job_with_devices(&mut admin, &job_id).await;
+        assert_eq!(outcome(&job, "ASLEEP").0, "queued", "{name}: {job}");
+        automation::pass(&app.state, now + WAKE_RETRY_MS)
+            .await
+            .unwrap();
+        automation::pass(&app.state, now + WAKE_RETRY_MS + SECOND_MS)
+            .await
+            .unwrap();
+        let job = common::job_with_devices(&mut admin, &job_id).await;
+        for device in ["ASLEEP", "STRANDED"] {
+            assert_eq!(
+                outcome(&job, device),
+                (
+                    json!("failed"),
+                    json!("MeshRMM couldn't record the device's wake request, so it wasn't woken")
+                ),
+                "{name}: {job}"
+            );
+        }
+        assert!(job["finished_at_unix_ms"].is_i64(), "{name}: {job}");
+        assert_eq!(job_requests(&app, &job_id).await, 0, "{name}");
+        assert!(started_without_a_request(&app, &job_id).await.is_empty());
+        refuse_wakes(&app, false).await;
+        app.finish().await;
+    }
+}
