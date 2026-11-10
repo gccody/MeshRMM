@@ -473,8 +473,12 @@ mod tests {
     #[derive(Default)]
     struct Script {
         started: Mutex<Vec<String>>,
+        /// Signalled when an operation starts.
+        began: Condvar,
         let_go: Mutex<bool>,
-        changed: Condvar,
+        /// Signalled when the hung operations are let go. A condition
+        /// variable of its own: one may only ever be waited on with one mutex.
+        released: Condvar,
     }
 
     impl Script {
@@ -492,11 +496,11 @@ mod tests {
                             .lock()
                             .unwrap()
                             .push(request.request_id.clone());
-                        script.changed.notify_all();
+                        script.began.notify_all();
                         if request.request_id.starts_with("hung") {
                             let mut let_go = script.let_go.lock().unwrap();
                             while !*let_go {
-                                let_go = script.changed.wait(let_go).unwrap();
+                                let_go = script.released.wait(let_go).unwrap();
                             }
                         }
                         FileReply::Upload { received: 1 }
@@ -515,7 +519,7 @@ mod tests {
             tokio::task::spawn_blocking(move || {
                 let mut started = script.started.lock().unwrap();
                 while started.len() < count {
-                    let (now, waited) = script.changed.wait_timeout(started, BOUND).unwrap();
+                    let (now, waited) = script.began.wait_timeout(started, BOUND).unwrap();
                     assert!(!waited.timed_out(), "only {} started", now.len());
                     started = now;
                 }
@@ -526,7 +530,7 @@ mod tests {
 
         fn let_go(&self) {
             *self.let_go.lock().unwrap() = true;
-            self.changed.notify_all();
+            self.released.notify_all();
         }
     }
 
