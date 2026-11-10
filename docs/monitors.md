@@ -182,8 +182,15 @@ to start a Windows service, two for `systemctl` and `launchctl`); if the
 Agent still says it succeeded after that, the attempt is recorded as
 succeeded and the device checks again. A script attempt is lost with its run,
 which is lost as any toolbox run is (its time limit and two minutes), such as
-when the device restarts during it; the next attempt or giving up follows as
-after any attempt. A script run that fails counts for
+when the device restarts during it, or if its run is gone from the
+history; the next attempt or giving up follows as after any attempt. An
+attempt starts, ends, and self-healing gives up, each in one database
+transaction with what goes with it (the alert's state, a script's run,
+marking the channels told), so the server stopping or a write failing part
+way leaves the alert as it was for the next evaluation. Should an alert
+still be found running an attempt with none running, the next evaluation
+moves it on as after a failed attempt, recording one that never started as
+`failed`, saying so. A script run that fails counts for
 [script failed](alerts.md#rules) rules like any other run. Adding
 self-healing to a rule acts on the alerts it raises from then on; taking it
 off stops it on the rule's open alerts.
@@ -307,7 +314,10 @@ carries `output`, `notified` and the `remediation_*` columns;
   raising and resolving alerts as one by one), Check now, targets and
   platforms, restarting a service and resolving as `remediated`, attempts
   waiting their turn and failing with a notification, lost actions and late
-  answers, lost script runs, script self-healing for a load rule, `cleared`
+  answers, lost script runs and runs gone from the history, an attempt that
+  fails to start leaving nothing claimed, alerts left running with no
+  attempt running moved on once, an attempt's result and a pass arriving
+  together ending it once, script self-healing for a load rule, `cleared`
   rather than `remediated` after failed or skipped attempts, alerts resolved
   during an attempt, taking self-healing off a quiet rule, stopping for a
   problem that keeps coming back, permissions (including for probes and

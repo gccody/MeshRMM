@@ -19,6 +19,17 @@
 //! rule's alerts on a device [`REPEAT_FIXES`] times in [`REPEAT_WINDOW_MS`],
 //! the next alert isn't healed, and its channels hear that self-healing
 //! stopped.
+//!
+//! Each change of an alert's self-healing is one transaction with what it
+//! depends on: claiming an attempt with recording it (and creating its
+//! script's run), recording how it ended with the alert waiting again, and
+//! giving up with marking the channels told. So the server stopping or a
+//! write failing part way leaves the alert as it was, for the next pass. An
+//! attempt that never ends on its own is ended by [`tick`]: a built-in
+//! action unanswered past [`ACTION_GRACE_MS`] is lost, and a script attempt
+//! follows its run, which is lost as any run is, or is lost if the run is
+//! gone. Should an alert still be found running with no attempt running,
+//! [`tick`] moves it on as after a failed attempt.
 use meshrmm_protocol_types::{
     AgentCommand, MAX_MONITOR_OUTPUT_BYTES, MonitorAction, MonitorActionResult, RunAs,
     ScriptLanguage, ScriptRunRequest, ScriptRunStatus, truncate_text,
@@ -64,6 +75,8 @@ const HEALED_SLACK_MS: i64 = MINUTE_MS;
 /// again; it doesn't count as an attempt.
 const OFFLINE_RETRY_MS: i64 = MINUTE_MS;
 const OFFLINE: &str = "The device went offline before it could act";
+/// A restart or an end for a rule whose monitor has no service or process.
+const NOTHING_TO_ACT_ON: &str = "Its monitor has no service or process to act on";
 
 /// How an attempt went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -199,21 +212,14 @@ pub async fn begin(
             "Self-healing fixed this {fixes} times in the past {} hours and the problem came back each time",
             REPEAT_WINDOW_MS / (60 * MINUTE_MS)
         );
-        skip(state, rule, &alert, remediation.action, &why, now).await?;
-        let stopped = set_state(
-            &mut database,
-            alert_id,
-            Some(RemediationState::Failed),
-            None,
-            Some(RemediationState::Waiting),
-        )
-        .await?;
+        let stopped = skip(state, rule, &alert, remediation.action, &why, now)
+            .await?
+            .is_some();
         if stopped {
             tracing::info!(
                 alert_id,
                 "self-healing stopped: the problem keeps coming back"
             );
-            alert_store::mark_notified(&mut database, alert_id).await?;
         }
         return Ok(stopped);
     }
@@ -348,7 +354,7 @@ impl Attempt {
 /// notifying, but no longer do, notify now, and alerts waiting for an
 /// attempt the rule no longer makes stop waiting.
 pub async fn rule_saved(state: &AppState, rule: &Rule) -> anyhow::Result<()> {
-    if !rule.enabled {
+    if !rule.enabled || (rule.remediation.is_some() && !rule.notifies_at_once()) {
         return Ok(());
     }
     let mut database = &state.database;
@@ -357,10 +363,13 @@ pub async fn rule_saved(state: &AppState, rule: &Rule) -> anyhow::Result<()> {
         .into_iter()
         .filter(|alert| alert.rule_id == rule.id);
     for alert in open {
+        // Its self-healing stopping and its channels hearing of it change
+        // together, so neither is left half done.
+        let mut transaction = state.database.begin().await?;
         let mut changed = false;
         if rule.remediation.is_none() {
             changed = set_state(
-                &mut database,
+                &mut transaction,
                 &alert.id,
                 None,
                 None,
@@ -369,8 +378,9 @@ pub async fn rule_saved(state: &AppState, rule: &Rule) -> anyhow::Result<()> {
             .await?;
         }
         let notice = (rule.notifies_at_once()
-            && alert_store::mark_notified(&mut database, &alert.id).await?)
+            && alert_store::mark_notified(&mut transaction, &alert.id).await?)
             .then_some(Notice::Raised);
+        transaction.commit().await?;
         if changed || notice.is_some() {
             alerts::announce(state, rule, &alert.id, notice).await?;
         }
@@ -379,8 +389,9 @@ pub async fn rule_saved(state: &AppState, rule: &Rule) -> anyhow::Result<()> {
 }
 
 /// Marks built-in actions that were never answered as lost, records script
-/// attempts whose run ended or vanished unrecorded, and makes the attempts
-/// that are due. The alert engine calls it with each evaluation.
+/// attempts whose run ended or vanished unrecorded, moves on alerts left
+/// running without a running attempt, and makes the attempts that are due.
+/// The alert engine calls it with each evaluation.
 pub async fn tick(state: &AppState, now: i64) -> anyhow::Result<()> {
     let database = &state.database;
     let scripts: Vec<(String,)> = database
@@ -420,6 +431,10 @@ pub async fn tick(state: &AppState, now: i64) -> anyhow::Result<()> {
             now,
         )
         .await?;
+    }
+    let interrupted: Vec<(String,)> = database.fetch_all(&interrupted_alerts()).await?;
+    for (id,) in interrupted {
+        interrupted_attempt(state, &id, now).await?;
     }
     let due_alerts: Vec<(String,)> = database
         .fetch_all(
@@ -461,31 +476,53 @@ async fn due(state: &AppState, alert_id: &str, now: i64) -> anyhow::Result<()> {
     }
     let Some(remediation) = rule.remediation.clone() else {
         // The rule no longer heals itself: its channels hear of the alert
-        // now if they waited for self-healing to fail.
-        set_state(&mut database, alert_id, None, None, None).await?;
-        let notice = alert_store::mark_notified(&mut database, alert_id)
+        // now if they waited for self-healing to fail, so both change
+        // together.
+        let mut transaction = state.database.begin().await?;
+        set_state(&mut transaction, alert_id, None, None, None).await?;
+        let notice = alert_store::mark_notified(&mut transaction, alert_id)
             .await?
             .then_some(Notice::Raised);
+        transaction.commit().await?;
         return alerts::announce(state, &rule, alert_id, notice).await;
     };
     if alert.remediation_attempts >= i64::from(remediation.attempts) {
         return give_up(state, &rule, &alert).await;
     }
-    let problem = match super::problem(&mut database, &rule).await? {
-        Some(problem) => Some(problem),
+    // What the attempt runs is read before its transaction, which holds
+    // SQLite's one writer.
+    let start = match super::problem(&mut database, &rule).await? {
+        Some(problem) => Err(problem),
         None if remediation.action == RemediationKind::Script => {
             let script_id = remediation.script_id.as_deref().unwrap_or_default();
             runnable(&mut database, script_id, &alert.device_id)
                 .await?
-                .err()
+                .map(|(script, language)| Start::Script { script, language })
         }
-        None => None,
+        None => remediation
+            .agent_action(rule.monitor.as_ref())
+            .map(Start::Action)
+            .ok_or_else(|| NOTHING_TO_ACT_ON.to_owned()),
     };
-    if let Some(problem) = problem {
-        // Every attempt would be skipped the same way.
-        skip(state, &rule, &alert, remediation.action, &problem, now).await?;
-        return give_up(state, &rule, &alert).await;
-    }
+    let start = match start {
+        Ok(start) => start,
+        Err(problem) => {
+            // Every attempt would be skipped the same way.
+            let Some(unheard) =
+                skip(state, &rule, &alert, remediation.action, &problem, now).await?
+            else {
+                return Ok(());
+            };
+            tracing::info!(alert_id, "self-healing gave up");
+            return alerts::announce(
+                state,
+                &rule,
+                alert_id,
+                unheard.then_some(Notice::RemediationFailed),
+            )
+            .await;
+        }
+    };
     if !state.agents.is_connected(&alert.device_id) {
         set_state(
             &mut database,
@@ -497,9 +534,69 @@ async fn due(state: &AppState, alert_id: &str, now: i64) -> anyhow::Result<()> {
         .await?;
         return Ok(());
     }
+    let Some(started) = start_attempt(state, &rule, &alert, &remediation, start, now).await? else {
+        return Ok(());
+    };
+    if !state.agents.send(&alert.device_id, started.command) {
+        settle(
+            state,
+            &started.attempt_id,
+            Finished {
+                status: AttemptStatus::Failed,
+                exit_code: None,
+                detail: OFFLINE.to_owned(),
+                output: String::new(),
+            },
+            started.run_id.as_deref(),
+            now,
+        )
+        .await?;
+    }
+    tracing::info!(
+        alert_id,
+        attempt = alert.remediation_attempts + 1,
+        action = remediation.action.as_str(),
+        "started a self-healing attempt"
+    );
+    alerts::announce(state, &rule, alert_id, None).await
+}
+
+/// What an attempt runs on the device.
+enum Start {
+    Script {
+        script: RunnableScript,
+        language: ScriptLanguage,
+    },
+    Action(meshrmm_protocol_types::RemediationAction),
+}
+
+/// An attempt that was recorded, and what to send the device to make it.
+struct Started {
+    attempt_id: String,
+    /// A script attempt's run.
+    run_id: Option<String>,
+    command: AgentCommand,
+}
+
+/// Claims the alert's next attempt and records it, with a script's run and
+/// in the audit log, in one transaction: a failure part way through, or the
+/// server stopping, leaves the alert waiting for the next pass rather than
+/// running an attempt nothing records. `None` if another pass claimed it
+/// first, or the alert resolved.
+async fn start_attempt(
+    state: &AppState,
+    rule: &Rule,
+    alert: &Alert,
+    remediation: &super::settings::Remediation,
+    start: Start,
+    now: i64,
+) -> anyhow::Result<Option<Started>> {
+    let attempt = alert.remediation_attempts + 1;
+    let attempt_id = new_id();
+    let mut transaction = state.database.begin().await?;
     // Claim the attempt, so two passes can't both make it, nor one make it
     // on an alert that just resolved.
-    let claimed = database
+    let claimed = transaction
         .execute(
             &Query::update()
                 .table(Alerts::Table)
@@ -509,7 +606,7 @@ async fn due(state: &AppState, alert_id: &str, now: i64) -> anyhow::Result<()> {
                     Alerts::RemediationAttempts,
                     Expr::col(Alerts::RemediationAttempts).add(1),
                 )
-                .and_where(Expr::col(Alerts::Id).eq(alert_id))
+                .and_where(Expr::col(Alerts::Id).eq(alert.id.as_str()))
                 .and_where(Expr::col(Alerts::State).ne(alert_store::State::Resolved.as_str()))
                 .and_where(
                     Expr::col(Alerts::RemediationState).eq(RemediationState::Waiting.as_str()),
@@ -519,78 +616,124 @@ async fn due(state: &AppState, alert_id: &str, now: i64) -> anyhow::Result<()> {
         )
         .await?;
     if claimed != 1 {
-        return Ok(());
+        return Ok(None);
     }
-    let attempt = alert.remediation_attempts + 1;
-    let started = match remediation.action {
-        RemediationKind::Script => {
+    let owner = rule.owner_user_id.as_deref();
+    let started = match start {
+        Start::Script { script, language } => {
             let run_as = remediation.run_as.unwrap_or(RunAs::System);
-            let script_id = remediation.script_id.clone().unwrap_or_default();
-            start_script(state, &rule, &alert, attempt, &script_id, run_as, now).await?
+            let script_id = remediation.script_id.as_deref().unwrap_or_default();
+            let run_id = new_id();
+            toolbox::insert_run(
+                &mut transaction,
+                NewRun {
+                    id: &run_id,
+                    device_id: &alert.device_id,
+                    script_id,
+                    script_name: &script.name,
+                    language,
+                    requested_by_user_id: owner.unwrap_or_default(),
+                    source: Source::Remediation,
+                    run_as,
+                    timeout_seconds: script.timeout_seconds,
+                    job_id: None,
+                    created_at: now,
+                },
+            )
+            .await?;
+            insert(
+                &mut transaction,
+                &attempt_id,
+                alert,
+                attempt,
+                RemediationKind::Script,
+                &script.name,
+                Some(run_as),
+                Some(&run_id),
+                owner,
+                now,
+            )
+            .await?;
+            audit::record(
+                &mut transaction,
+                &actor(rule),
+                "script.run",
+                Target::device(&alert.device_id),
+                json!({
+                    "run_id": run_id,
+                    "script_id": script_id,
+                    "script_name": script.name,
+                    "run_as": run_as.as_str(),
+                    "source": Source::Remediation.as_str(),
+                    "owner_user_id": rule.owner_user_id,
+                }),
+            )
+            .await?;
+            record(
+                &mut transaction,
+                rule,
+                alert,
+                attempt,
+                RemediationKind::Script,
+                &script.name,
+            )
+            .await?;
+            Started {
+                attempt_id,
+                run_id: Some(run_id.clone()),
+                command: AgentCommand::RunScript {
+                    run: ScriptRunRequest {
+                        run_id,
+                        language,
+                        body: script.body,
+                        run_as,
+                        timeout_seconds: u32::try_from(script.timeout_seconds).unwrap_or(300),
+                    },
+                },
+            }
         }
-        kind => {
-            let Some(action) = remediation.agent_action(rule.monitor.as_ref()) else {
-                return Ok(());
-            };
+        Start::Action(action) => {
             let target = match &action {
                 meshrmm_protocol_types::RemediationAction::RestartService { name }
                 | meshrmm_protocol_types::RemediationAction::EndProcess { name } => name.clone(),
             };
-            let id = new_id();
-            let mut transaction = state.database.begin().await?;
             insert(
                 &mut transaction,
-                &id,
-                &alert,
+                &attempt_id,
+                alert,
                 attempt,
-                kind,
+                remediation.action,
                 &target,
                 None,
                 None,
-                rule.owner_user_id.as_deref(),
+                owner,
                 now,
             )
             .await?;
-            record(&mut transaction, &rule, &alert, attempt, kind, &target).await?;
-            transaction.commit().await?;
-            let sent = state.agents.send(
-                &alert.device_id,
-                AgentCommand::RunMonitorAction {
+            record(
+                &mut transaction,
+                rule,
+                alert,
+                attempt,
+                remediation.action,
+                &target,
+            )
+            .await?;
+            Started {
+                attempt_id: attempt_id.clone(),
+                run_id: None,
+                command: AgentCommand::RunMonitorAction {
                     action: MonitorAction {
-                        action_id: id.clone(),
+                        action_id: attempt_id,
                         monitor_id: rule.id.clone(),
                         action,
                     },
                 },
-            );
-            if sent {
-                Ok(())
-            } else {
-                Err((id, OFFLINE.to_owned()))
             }
         }
     };
-    if let Err((attempt_id, detail)) = started {
-        finish(
-            state,
-            &attempt_id,
-            Finished {
-                status: AttemptStatus::Failed,
-                exit_code: None,
-                detail,
-                output: String::new(),
-            },
-            now,
-        )
-        .await?;
-    }
-    tracing::info!(
-        alert_id,
-        attempt,
-        action = remediation.action.as_str(),
-        "started a self-healing attempt"
-    );
-    alerts::announce(state, &rule, alert_id, None).await
+    transaction.commit().await?;
+    Ok(Some(started))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -697,7 +840,9 @@ fn attempt_target(rule: &Rule) -> (String, Option<RunAs>) {
     }
 }
 
-/// Records an attempt that couldn't start, and counts it.
+/// Records an attempt that couldn't start, counts it, and gives up on the
+/// alert's self-healing, together. `None` if the alert had stopped waiting
+/// for an attempt; otherwise whether its channels hadn't heard of it yet.
 async fn skip(
     state: &AppState,
     rule: &Rule,
@@ -705,7 +850,7 @@ async fn skip(
     kind: RemediationKind,
     why: &str,
     now: i64,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<bool>> {
     let (target, run_as) = attempt_target(rule);
     let attempt = alert.remediation_attempts + 1;
     let id = new_id();
@@ -760,31 +905,49 @@ async fn skip(
         }),
     )
     .await?;
+    let Some(unheard) = fail(&mut transaction, &alert.id).await? else {
+        return Ok(None);
+    };
     transaction.commit().await?;
     tracing::warn!(alert_id = alert.id, why, "skipped a self-healing attempt");
-    Ok(())
+    Ok(Some(unheard))
 }
 
 /// Self-healing has given up: channels that haven't heard of the alert yet
 /// hear now.
 async fn give_up(state: &AppState, rule: &Rule, alert: &Alert) -> anyhow::Result<()> {
-    let mut database = &state.database;
-    if !set_state(
-        &mut database,
+    let mut transaction = state.database.begin().await?;
+    let Some(unheard) = fail(&mut transaction, &alert.id).await? else {
+        return Ok(());
+    };
+    transaction.commit().await?;
+    tracing::info!(alert_id = alert.id, "self-healing gave up");
+    alerts::announce(
+        state,
+        rule,
         &alert.id,
+        unheard.then_some(Notice::RemediationFailed),
+    )
+    .await
+}
+
+/// Marks a waiting alert's self-healing failed, and its channels told, in
+/// one transaction, so a failure isn't left unannounced. `None` if it
+/// wasn't waiting; otherwise whether the channels hadn't heard of the alert
+/// yet.
+async fn fail(executor: &mut impl Executor, alert_id: &str) -> db::Result<Option<bool>> {
+    if !set_state(
+        executor,
+        alert_id,
         Some(RemediationState::Failed),
         None,
         Some(RemediationState::Waiting),
     )
     .await?
     {
-        return Ok(());
+        return Ok(None);
     }
-    tracing::info!(alert_id = alert.id, "self-healing gave up");
-    let notice = alert_store::mark_notified(&mut database, &alert.id)
-        .await?
-        .then_some(Notice::RemediationFailed);
-    alerts::announce(state, rule, &alert.id, notice).await
+    Ok(Some(alert_store::mark_notified(executor, alert_id).await?))
 }
 
 #[derive(sqlx::FromRow)]
@@ -839,131 +1002,6 @@ async fn runnable(
     }
 }
 
-/// Starts the rule's script on the device as an ordinary toolbox run, as
-/// its owner. Returns the attempt's ID and why, if it couldn't.
-async fn start_script(
-    state: &AppState,
-    rule: &Rule,
-    alert: &Alert,
-    attempt: i64,
-    script_id: &str,
-    run_as: RunAs,
-    now: i64,
-) -> anyhow::Result<Result<(), (String, String)>> {
-    let mut transaction = state.database.begin().await?;
-    let id = new_id();
-    let (script, language) = match runnable(&mut transaction, script_id, &alert.device_id).await? {
-        Ok(found) => found,
-        Err(why) => {
-            // Changed since it was checked a moment ago.
-            insert(
-                &mut transaction,
-                &id,
-                alert,
-                attempt,
-                RemediationKind::Script,
-                &attempt_target(rule).0,
-                Some(run_as),
-                None,
-                rule.owner_user_id.as_deref(),
-                now,
-            )
-            .await?;
-            transaction.commit().await?;
-            return Ok(Err((id, why)));
-        }
-    };
-    let owner = rule.owner_user_id.clone().unwrap_or_default();
-    let run_id = new_id();
-    toolbox::insert_run(
-        &mut transaction,
-        NewRun {
-            id: &run_id,
-            device_id: &alert.device_id,
-            script_id,
-            script_name: &script.name,
-            language,
-            requested_by_user_id: &owner,
-            source: Source::Remediation,
-            run_as,
-            timeout_seconds: script.timeout_seconds,
-            job_id: None,
-            created_at: now,
-        },
-    )
-    .await?;
-    insert(
-        &mut transaction,
-        &id,
-        alert,
-        attempt,
-        RemediationKind::Script,
-        &script.name,
-        Some(run_as),
-        Some(&run_id),
-        rule.owner_user_id.as_deref(),
-        now,
-    )
-    .await?;
-    audit::record(
-        &mut transaction,
-        &actor(rule),
-        "script.run",
-        Target::device(&alert.device_id),
-        json!({
-            "run_id": run_id,
-            "script_id": script_id,
-            "script_name": script.name,
-            "run_as": run_as.as_str(),
-            "source": Source::Remediation.as_str(),
-            "owner_user_id": rule.owner_user_id,
-        }),
-    )
-    .await?;
-    record(
-        &mut transaction,
-        rule,
-        alert,
-        attempt,
-        RemediationKind::Script,
-        &script.name,
-    )
-    .await?;
-    transaction.commit().await?;
-    let sent = state.agents.send(
-        &alert.device_id,
-        AgentCommand::RunScript {
-            run: ScriptRunRequest {
-                run_id: run_id.clone(),
-                language,
-                body: script.body,
-                run_as,
-                timeout_seconds: u32::try_from(script.timeout_seconds).unwrap_or(300),
-            },
-        },
-    );
-    if sent {
-        return Ok(Ok(()));
-    }
-    state
-        .database
-        .execute(
-            &Query::update()
-                .table(ScriptRuns::Table)
-                .value(ScriptRuns::Status, ScriptRunStatus::Failed.as_str())
-                .value(
-                    ScriptRuns::Error,
-                    "The device is offline, so the script did not run.",
-                )
-                .value(ScriptRuns::CompletedAt, now)
-                .and_where(Expr::col(ScriptRuns::Id).eq(run_id.as_str()))
-                .and_where(Expr::col(ScriptRuns::Status).eq(ScriptRunStatus::Pending.as_str()))
-                .to_owned(),
-        )
-        .await?;
-    Ok(Err((id, OFFLINE.to_owned())))
-}
-
 /// How an attempt ended.
 struct Finished {
     status: AttemptStatus,
@@ -981,8 +1019,24 @@ async fn finish(
     finished: Finished,
     now: i64,
 ) -> anyhow::Result<bool> {
-    let mut database = &state.database;
-    let updated = database
+    settle(state, attempt_id, finished, None, now).await
+}
+
+/// [`finish`], also failing the script run `unsent`, which never reached
+/// the device. The attempt's outcome, its alert waiting again and the run
+/// are written in one transaction: an attempt that ended always leaves its
+/// alert waiting, so its next attempt or giving up follows.
+async fn settle(
+    state: &AppState,
+    attempt_id: &str,
+    finished: Finished,
+    unsent: Option<&str>,
+    now: i64,
+) -> anyhow::Result<bool> {
+    // Read before the transaction, which holds SQLite's one writer.
+    let found = attempt_alert(state, attempt_id).await?;
+    let mut transaction = state.database.begin().await?;
+    let updated = transaction
         .execute(
             &Query::update()
                 .table(AlertRemediations::Table)
@@ -1002,35 +1056,170 @@ async fn finish(
                 .to_owned(),
         )
         .await?;
+    // Another pass, or the device's answer, ended it first.
     if updated != 1 {
         return Ok(false);
     }
-    let Some((alert, rule)) = attempt_alert(state, attempt_id).await? else {
+    if let Some(run_id) = unsent {
+        transaction
+            .execute(
+                &Query::update()
+                    .table(ScriptRuns::Table)
+                    .value(ScriptRuns::Status, ScriptRunStatus::Failed.as_str())
+                    .value(
+                        ScriptRuns::Error,
+                        "The device is offline, so the script did not run.",
+                    )
+                    .value(ScriptRuns::CompletedAt, now)
+                    .and_where(Expr::col(ScriptRuns::Id).eq(run_id))
+                    .and_where(Expr::col(ScriptRuns::Status).eq(ScriptRunStatus::Pending.as_str()))
+                    .to_owned(),
+            )
+            .await?;
+    }
+    if let Some((alert, rule)) = &found {
+        set_state(
+            &mut transaction,
+            &alert.id,
+            Some(RemediationState::Waiting),
+            Some(now + wait(rule)),
+            Some(RemediationState::Running),
+        )
+        .await?;
+    }
+    transaction.commit().await?;
+    let Some((alert, rule)) = found else {
         return Ok(true);
     };
-    let alert_id = alert.id.clone();
     tracing::info!(
-        alert_id,
+        alert_id = alert.id,
         attempt_id,
         status = finished.status.as_str(),
         "a self-healing attempt finished"
     );
-    let wait = rule
-        .remediation
+    check_again(state, &alert, &rule);
+    alerts::announce(state, &rule, &alert.id, None).await?;
+    Ok(true)
+}
+
+/// The rule's wait after an attempt finishes.
+fn wait(rule: &Rule) -> i64 {
+    rule.remediation
         .as_ref()
         .map_or(1, |remediation| i64::from(remediation.retry_minutes))
-        * MINUTE_MS;
-    set_state(
-        &mut database,
-        &alert_id,
-        Some(RemediationState::Waiting),
-        Some(now + wait),
-        Some(RemediationState::Running),
-    )
-    .await?;
+        * MINUTE_MS
+}
+
+/// Alerts left running an attempt with no attempt running: the server
+/// stopped, or a write failed, between claiming an attempt and recording
+/// it, or between recording how an attempt ended and moving its alert on.
+/// They are found through `idx_alerts_remediation`, and each one's attempts
+/// through `idx_alert_remediations_alert`.
+fn interrupted_alerts() -> sea_query::SelectStatement {
+    Query::select()
+        .column(Alerts::Id)
+        .from(Alerts::Table)
+        .and_where(Expr::col(Alerts::RemediationState).eq(RemediationState::Running.as_str()))
+        .and_where(Expr::col(Alerts::State).ne(alert_store::State::Resolved.as_str()))
+        .and_where(Expr::exists(running_attempt()).not())
+        .to_owned()
+}
+
+/// A running attempt of the alert in the outer statement.
+fn running_attempt() -> sea_query::SelectStatement {
+    Query::select()
+        .expr(Expr::val(1))
+        .from(AlertRemediations::Table)
+        .and_where(
+            Expr::col((AlertRemediations::Table, AlertRemediations::AlertId))
+                .equals((Alerts::Table, Alerts::Id)),
+        )
+        .and_where(
+            Expr::col((AlertRemediations::Table, AlertRemediations::Status))
+                .eq(AttemptStatus::Running.as_str()),
+        )
+        .to_owned()
+}
+
+/// Why an attempt that was claimed but never recorded failed.
+const NEVER_STARTED: &str = "It never started: the server stopped or failed as it began";
+
+/// Moves on an alert left running with no attempt running, as after any
+/// attempt that failed: it waits the rule's wait for its next attempt, or
+/// to give up, and the device checks again. An attempt it claimed but never
+/// recorded is recorded as failed, saying so. It happens only while the
+/// alert is still running with no attempt running, so two passes, or a pass
+/// and an attempt's result, move it on once.
+async fn interrupted_attempt(state: &AppState, alert_id: &str, now: i64) -> anyhow::Result<()> {
+    let mut database = &state.database;
+    let Some(alert) = alert_store::get(&mut database, alert_id).await? else {
+        return Ok(());
+    };
+    let Some(rule) = rules::by_id(&mut database, &alert.rule_id).await? else {
+        return Ok(());
+    };
+    let recorded = last_attempt(&mut database, alert_id)
+        .await?
+        .map_or(0, |last| last.attempt);
+    let unrecorded = rule
+        .remediation
+        .as_ref()
+        .filter(|_| alert.remediation_attempts > recorded);
+    let mut transaction = state.database.begin().await?;
+    let moved = transaction
+        .execute(
+            &Query::update()
+                .table(Alerts::Table)
+                .value(Alerts::RemediationState, RemediationState::Waiting.as_str())
+                .value(Alerts::NextRemediationAt, now + wait(&rule))
+                .and_where(Expr::col(Alerts::Id).eq(alert_id))
+                .and_where(
+                    Expr::col(Alerts::RemediationState).eq(RemediationState::Running.as_str()),
+                )
+                .and_where(Expr::col(Alerts::State).ne(alert_store::State::Resolved.as_str()))
+                .and_where(Expr::exists(running_attempt()).not())
+                .to_owned(),
+        )
+        .await?;
+    if moved != 1 {
+        return Ok(());
+    }
+    if let Some(remediation) = unrecorded {
+        let (target, run_as) = attempt_target(&rule);
+        let id = new_id();
+        insert(
+            &mut transaction,
+            &id,
+            &alert,
+            alert.remediation_attempts,
+            remediation.action,
+            &target,
+            run_as,
+            None,
+            rule.owner_user_id.as_deref(),
+            now,
+        )
+        .await?;
+        transaction
+            .execute(
+                &Query::update()
+                    .table(AlertRemediations::Table)
+                    .value(AlertRemediations::Status, AttemptStatus::Failed.as_str())
+                    .value(AlertRemediations::Detail, NEVER_STARTED)
+                    .value(AlertRemediations::FinishedAt, now)
+                    .and_where(Expr::col(AlertRemediations::Id).eq(id.as_str()))
+                    .to_owned(),
+            )
+            .await?;
+    }
+    transaction.commit().await?;
+    tracing::warn!(
+        alert_id,
+        attempt = alert.remediation_attempts,
+        "moved on self-healing left running without a running attempt"
+    );
     check_again(state, &alert, &rule);
-    alerts::announce(state, &rule, &alert_id, None).await?;
-    Ok(true)
+    alerts::announce(state, &rule, alert_id, None).await
 }
 
 /// The attempt's alert and its rule.
