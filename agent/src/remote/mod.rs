@@ -317,7 +317,8 @@ pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
             ));
         }
         Coordinator {
-            // Created once, so reconnecting does not capture again before the interval ends.
+            // Created once, so reconnecting does not capture again before the
+            // interval ends, or send an image the server already has.
             thumbnails: thumbnail::Thumbnails::new(mode),
             // Likewise, so the first sample after a reconnect still measures
             // from the previous one.
@@ -431,6 +432,7 @@ impl Coordinator {
             .await
             .context("could not send the application activity")?;
         self.monitors.connected();
+        self.thumbnails.connected();
         loop {
             if self
                 .active_session

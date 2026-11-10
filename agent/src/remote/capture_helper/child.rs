@@ -78,9 +78,9 @@ pub fn run_child() -> anyhow::Result<()> {
             output.flush()?;
             Ok(())
         }
-        ParentCommand::CaptureThumbnail => {
+        ParentCommand::CaptureThumbnail(previous) => {
             crate::remote::thumbnail::follow_input_desktop();
-            let thumbnail = crate::remote::thumbnail::capture_primary_display()
+            let thumbnail = crate::remote::thumbnail::capture_primary_display(previous.as_ref())
                 .map_err(|error| format!("{error:#}"));
             let mut output = io::stdout().lock();
             write_thumbnail(&mut output, &thumbnail)?;
@@ -307,7 +307,7 @@ impl CaptureStream {
                 }
                 Ok(Ok(
                     ParentCommand::EnumerateDisplays
-                    | ParentCommand::CaptureThumbnail
+                    | ParentCommand::CaptureThumbnail(_)
                     | ParentCommand::StartFiles
                     | ParentCommand::StartClipboard
                     | ParentCommand::StartChatHelper { .. }

@@ -35,6 +35,7 @@ use super::connection_approval::{ApprovalPrompt, Decision};
 use super::connection_notification::ConnectionNotification;
 use super::input::WindowsInputController;
 use super::platform::ScreenInput;
+use super::thumbnail::{Capture, Signature};
 use super::virtual_display::{HeadlessTarget, VirtualDisplay};
 use crate::win32::{HandleListAttribute, OwnedHandle, create_pipe, wide};
 
@@ -140,8 +141,9 @@ enum ParentCommand {
     PromptCredentials,
     AutofillCredentials(Vec<u8>),
     EnumerateDisplays,
-    /// Replies with a JPEG of the primary display on the input desktop, then exits.
-    CaptureThumbnail,
+    /// Replies with a JPEG of the primary display on the input desktop,
+    /// unless it looks like the given image, then exits.
+    CaptureThumbnail(Option<Signature>),
     StartFiles,
     StartClipboard,
     StartChatHelper {
@@ -615,12 +617,13 @@ impl RunningHelper {
     }
 }
 
-/// A JPEG of the console's primary display, captured by a one-shot LocalSystem
-/// helper that follows the input desktop, such as the lock screen.
-pub fn capture_thumbnail() -> anyhow::Result<Vec<u8>> {
+/// A JPEG of the console's primary display, unless it looks like `previous`,
+/// captured by a one-shot LocalSystem helper that follows the input desktop,
+/// such as the lock screen.
+pub fn capture_thumbnail(previous: Option<&Signature>) -> anyhow::Result<Capture> {
     ask_system_helper(
         preferred_desktop(),
-        ParentCommand::CaptureThumbnail,
+        ParentCommand::CaptureThumbnail(previous.cloned()),
         THUMBNAIL_TIMEOUT,
         "screen thumbnail capture",
         read_thumbnail,

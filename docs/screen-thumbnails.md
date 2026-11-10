@@ -1,8 +1,9 @@
 # Screen thumbnails
 
 The Devices page shows a small image of each device's main display. Choosing
-it opens a larger preview. Online devices refresh it every five minutes. An
-offline device keeps the last image it sent, shown in grayscale.
+it opens a larger preview. Online devices refresh it about every five minutes
+when the screen has changed, and at least once an hour. An offline device
+keeps the last image it sent, shown in grayscale.
 
 ## Data path
 
@@ -25,8 +26,24 @@ each device, replacing it in one step, and reading it needs `devices.view`.
 Bandwidth is kept down at each step:
 
 - The Agent captures only while it is connected to the control plane, and one
-  capture runs at a time. It does not upload an image that is identical to the
-  last one the server accepted.
+  capture runs at a time. Whoever captures (the desktop helper, the session
+  helper, or a console Agent itself) first reduces the scaled pixels to a
+  32x20 grid of average brightness and compares it with the grid of the last
+  image the server accepted. When fewer than five cells moved by more than
+  10 of 255 levels, the screen looks the same: nothing is encoded or
+  uploaded. A clock ticking or a cursor blinking stays under that; a new
+  window, a dialog or the lock screen does not. After eleven skipped captures,
+  about an hour, the next one is sent anyway, so a subtle change or an image
+  the server lost, as after restoring a backup, is put right within the hour.
+- Captures are spread out across a fleet. The first comes at a random point
+  in the Agent's first minute. A capture that falls due while the Agent is
+  offline moves to a random point of the five minutes after it reconnects, so
+  Agents that reconnect together after an outage don't upload together. Each
+  interval after that is 5 minutes, give or take 15 seconds.
+- Uploads share one HTTPS client for the life of the Agent process, so each
+  resumes the previous TLS 1.3 session instead of a full handshake when the
+  server still has it. The client closes each connection once its upload is
+  done; no idle connection is kept between uploads.
 - The website loads images only for tiles on or near the screen, only while
   the tab is visible, and only for devices that are online, apart from one
   load of an offline device's last image. It revalidates with the image's
@@ -50,13 +67,15 @@ thumbnail.
 On a Mac, the root coordinator asks the session helper on the console for the
 image: the signed-in user's, or the login window's. The helper captures one
 frame of the main display with ScreenCaptureKit, already scaled to at most
-640x400, and AppKit encodes it as a JPEG at quality 0.7. A capture that
-fails, as when the coordinator starts before the session helper connects, is
-tried again after 30 seconds, up to four times, before waiting for the next
-five-minute refresh; Windows Agents retry the same way.
+640x400, and AppKit encodes it as a JPEG at quality 0.7. A capture or upload
+that fails, as when the coordinator starts before the session helper
+connects, is tried again after 30 seconds, up to four times, before waiting
+for the next refresh; Windows and Linux Agents retry the same way. An image
+that failed to upload is not taken as the server's, so the next capture is
+compared with the image the server has.
 
 ## Setup
 
 Nothing to set up: the server creates `thumbnails/` in its data directory.
-Back it up with the rest of the data directory, or don't; the next upload
-replaces a lost image.
+Back it up with the rest of the data directory, or don't; each online device
+uploads its image again within the hour.

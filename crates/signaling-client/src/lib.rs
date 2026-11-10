@@ -69,15 +69,20 @@ impl ReconnectBackoff {
 /// at the same moment spread their retries out instead of arriving together.
 /// For loops that show no countdown: the viewer shows the delay it waits.
 pub fn jittered(delay: Duration) -> Duration {
-    let fraction = match getrandom::u64() {
+    scaled(delay, random_fraction().unwrap_or(1.0))
+}
+
+/// A random fraction in `[0, 1)`, or `None` when the operating system has no
+/// random source.
+pub fn random_fraction() -> Option<f64> {
+    match getrandom::u64() {
         // The top 53 bits, which an `f64` holds exactly, as a fraction of 1.
-        Ok(random) => (random >> 11) as f64 / (1_u64 << 53) as f64,
+        Ok(random) => Some((random >> 11) as f64 / (1_u64 << 53) as f64),
         Err(error) => {
-            tracing::warn!(%error, "no random source for reconnect jitter");
-            1.0
+            tracing::warn!(%error, "no random source for jitter");
+            None
         }
-    };
-    scaled(delay, fraction)
+    }
 }
 
 /// `delay` scaled into `[delay / 2, delay]` by `fraction` in `[0, 1]`.

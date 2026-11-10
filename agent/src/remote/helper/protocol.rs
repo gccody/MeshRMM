@@ -9,8 +9,10 @@ use meshrmm_protocol::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::remote::thumbnail::{Capture, Signature};
+
 /// Bumped whenever a message changes; the coordinator refuses other helpers.
-pub(crate) const VERSION: u32 = 6;
+pub(crate) const VERSION: u32 = 7;
 /// A 2560x1600 keyframe is well under this.
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -85,8 +87,9 @@ pub(crate) enum Request {
     ClearClipboard,
     LockScreen,
     LogOut,
-    /// A JPEG of the main display for the dashboard.
-    Thumbnail,
+    /// A JPEG of the main display for the dashboard, unless it looks like
+    /// the given image.
+    Thumbnail(Option<Signature>),
     /// Tells the user a terminal opened on their computer, with the
     /// company's connection notification.
     ShowTerminalNotice(String),
@@ -106,7 +109,7 @@ pub(crate) enum Reply {
         active_display: Display,
         format: VideoFormat,
     },
-    Thumbnail(Vec<u8>),
+    Thumbnail(Capture),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

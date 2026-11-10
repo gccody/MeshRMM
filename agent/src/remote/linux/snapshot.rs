@@ -7,12 +7,14 @@ use anyhow::Context;
 
 use super::capture::{self, CaptureSettings};
 use super::encoder::{PixelLayout, RawFrame};
+use crate::remote::thumbnail::{Capture, Layout, Pixels, Signature, encode_if_changed};
 
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const QUALITY: u8 = 70;
 
-/// The main display, scaled to fit the thumbnail box, as a JPEG.
-pub(crate) fn main_display_jpeg() -> anyhow::Result<Vec<u8>> {
+/// The main display, scaled to fit the thumbnail box, as a JPEG unless it
+/// looks like `previous`.
+pub(crate) fn main_display(previous: Option<&Signature>) -> anyhow::Result<Capture> {
     let mut backend = capture::detect()?;
     let outputs = backend.outputs()?;
     let output = super::display::choose(&outputs, None)?;
@@ -35,16 +37,15 @@ pub(crate) fn main_display_jpeg() -> anyhow::Result<Vec<u8>> {
         .context("the display server sent no frame for the thumbnail")?;
     drop(stream);
     let (width, height, rgb) = image;
-    let mut jpeg = Vec::new();
-    jpeg_encoder::Encoder::new(&mut jpeg, QUALITY)
-        .encode(&rgb, width, height, jpeg_encoder::ColorType::Rgb)
-        .context("could not encode the thumbnail")?;
-    anyhow::ensure!(
-        jpeg.len() <= crate::remote::thumbnail::MAX_BYTES,
-        "the {} byte thumbnail is too large",
-        jpeg.len()
-    );
-    Ok(jpeg)
+    let (columns, rows) = (usize::from(width), usize::from(height));
+    let pixels = Pixels::new(&rgb, columns, rows, columns * 3, Layout::RGB)?;
+    encode_if_changed(Signature::of(&pixels), previous, || {
+        let mut jpeg = Vec::new();
+        jpeg_encoder::Encoder::new(&mut jpeg, QUALITY)
+            .encode(&rgb, width, height, jpeg_encoder::ColorType::Rgb)
+            .context("could not encode the thumbnail")?;
+        Ok(jpeg)
+    })
 }
 
 /// The frame fitted in the thumbnail box, as RGB, by averaging the source
@@ -90,7 +91,9 @@ mod tests {
     #[test]
     #[ignore = "captures the session's screen"]
     fn captures_the_main_display() {
-        let jpeg = main_display_jpeg().unwrap();
+        let Capture::Changed { jpeg, .. } = main_display(None).unwrap() else {
+            panic!("a capture without an image to compare with was not encoded");
+        };
         assert_eq!(&jpeg[..2], &[0xff, 0xd8]);
         std::fs::write("/tmp/meshrmm-snapshot.jpg", jpeg).unwrap();
     }

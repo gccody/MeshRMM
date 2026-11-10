@@ -717,7 +717,7 @@ fn desktop_targets_alternate() {
 fn command_name(command: &ParentCommand) -> u8 {
     match command {
         ParentCommand::EnumerateDisplays => COMMAND_ENUMERATE_DISPLAYS,
-        ParentCommand::CaptureThumbnail => COMMAND_CAPTURE_THUMBNAIL,
+        ParentCommand::CaptureThumbnail(_) => COMMAND_CAPTURE_THUMBNAIL,
         ParentCommand::Start { .. } => COMMAND_START,
         ParentCommand::SetWallpaperHidden(_) => 19,
         ParentCommand::SetPreventIdleLock(_) => 21,
@@ -749,14 +749,27 @@ fn command_name(command: &ParentCommand) -> u8 {
 
 #[test]
 fn thumbnail_replies_round_trip_within_their_bounds() {
-    let mut bytes = Vec::new();
-    write_command(&mut bytes, &ParentCommand::CaptureThumbnail).unwrap();
-    assert!(matches!(
-        read_command(bytes.as_slice()).unwrap(),
-        ParentCommand::CaptureThumbnail
-    ));
+    use crate::remote::thumbnail::{Capture, Signature};
+
+    let signature = Signature::from_bytes(&[7; Signature::BYTES]);
+    for previous in [None, Some(signature.clone())] {
+        let mut bytes = Vec::new();
+        write_command(
+            &mut bytes,
+            &ParentCommand::CaptureThumbnail(previous.clone()),
+        )
+        .unwrap();
+        let ParentCommand::CaptureThumbnail(read) = read_command(bytes.as_slice()).unwrap() else {
+            panic!("not a thumbnail command");
+        };
+        assert_eq!(read, previous);
+    }
     for reply in [
-        Ok(vec![0xff, 0xd8, 0xff, 0xe0]),
+        Ok(Capture::Changed {
+            signature: signature.clone(),
+            jpeg: vec![0xff, 0xd8, 0xff, 0xe0],
+        }),
+        Ok(Capture::Unchanged),
         Err("no display".to_owned()),
     ] {
         let mut bytes = Vec::new();
@@ -764,9 +777,14 @@ fn thumbnail_replies_round_trip_within_their_bounds() {
         assert_eq!(read_thumbnail(&mut bytes.as_slice()).unwrap(), reply);
     }
     let maximum = crate::remote::thumbnail::MAX_BYTES;
-    assert!(write_thumbnail(&mut Vec::new(), &Ok(vec![0; maximum + 1])).is_err());
+    let oversized = Capture::Changed {
+        signature,
+        jpeg: vec![0; maximum + 1],
+    };
+    assert!(write_thumbnail(&mut Vec::new(), &Ok(oversized)).is_err());
     let mut oversized = vec![0];
+    oversized.extend_from_slice(&[0; Signature::BYTES]);
     oversized.extend_from_slice(&(maximum as u32 + 1).to_le_bytes());
     assert!(read_thumbnail(&mut oversized.as_slice()).is_err());
-    assert!(read_thumbnail(&mut [2_u8, 0, 0, 0, 0].as_slice()).is_err());
+    assert!(read_thumbnail(&mut [3_u8, 0, 0, 0, 0].as_slice()).is_err());
 }
