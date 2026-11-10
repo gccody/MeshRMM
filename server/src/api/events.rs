@@ -15,8 +15,8 @@
 //! and `updates_resync` if they missed some. The socket stays authorized by
 //! the session cookie it opened with: it checks the session and the
 //! `devices.view` permission again every half minute, and at once after a
-//! signed-in user changes something, and closes with 4001 when either is
-//! gone.
+//! change that can take access away (to users, roles, sessions or sign-in
+//! settings), and closes with 4001 when either is gone.
 use std::{
     net::IpAddr,
     time::{Duration, Instant},

@@ -283,6 +283,5 @@ pub async fn update_group(
         .find(|group| group.id == id)
         .ok_or_else(|| ApiError::not_found("no such group"))?;
     transaction.commit().await?;
-    state.presence.recheck_access();
     Ok(Json(view))
 }

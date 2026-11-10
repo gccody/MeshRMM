@@ -493,3 +493,81 @@ async fn sso_callbacks_must_come_back_to_the_browser_that_started() {
         app.finish().await;
     }
 }
+
+/// Signs `sub` in through the provider, as a member of the group that makes
+/// them an administrator, and opens their event socket.
+async fn watching(
+    app: &App,
+    provider: &MockProvider,
+    server: &common::Server,
+    sub: &str,
+) -> (common::Ws, std::time::Instant, String) {
+    let (mut browser, _) = sign_in(
+        app,
+        provider,
+        json!({ "sub": sub, "email": format!("{sub}@example.com"), "email_verified": true, "groups": ["rmm-admins"] }),
+    )
+    .await;
+    let account = browser.get("/v1/account").await;
+    assert_eq!(account.body["is_administrator"], true, "{:?}", account.body);
+    let id = account.body["user"]["id"].as_str().unwrap().to_owned();
+    let mut socket = browser.events(server).await.unwrap();
+    let opened = std::time::Instant::now();
+    common::receive_json(&mut socket).await;
+    (socket, opened, id)
+}
+
+#[tokio::test]
+async fn losing_roles_from_sso_groups_closes_sockets_at_once() {
+    // Well before the socket's own check, every 30 seconds.
+    let prompt = std::time::Duration::from_secs(30);
+    let provider = MockProvider::start().await;
+    for app in common::apps().await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = common::set_up(&app).await;
+        // Only the group grants anything.
+        let grouped = settings(&provider, json!({ "default_role_id": null }));
+        let saved = admin.put("/v1/settings/sso", grouped.clone()).await;
+        assert_eq!(saved.status, StatusCode::OK, "{name}: {:?}", saved.body);
+
+        // The group no longer grants a role.
+        let (mut socket, opened, _) = watching(&app, &provider, &server, "ada").await;
+        let ungrouped = settings(
+            &provider,
+            json!({ "default_role_id": null, "group_roles": [] }),
+        );
+        let saved = admin.put("/v1/settings/sso", ungrouped).await;
+        assert_eq!(saved.status, StatusCode::OK, "{name}: {:?}", saved.body);
+        assert_eq!(common::receive_close(&mut socket).await, 4001, "{name}");
+        assert!(opened.elapsed() < prompt, "{name}");
+        admin.put("/v1/settings/sso", grouped).await;
+
+        // The user's SSO identity is unlinked.
+        let (mut socket, opened, id) = watching(&app, &provider, &server, "bob").await;
+        let unlinked = admin
+            .post(&format!("/v1/users/{id}/unlink-sso"), json!({}))
+            .await;
+        assert_eq!(
+            unlinked.status,
+            StatusCode::NO_CONTENT,
+            "{name}: {:?}",
+            unlinked.body
+        );
+        assert_eq!(common::receive_close(&mut socket).await, 4001, "{name}");
+        assert!(opened.elapsed() < prompt, "{name}");
+
+        // SSO is turned off.
+        let (mut socket, opened, _) = watching(&app, &provider, &server, "cy").await;
+        let deleted = admin.delete("/v1/settings/sso").await;
+        assert_eq!(
+            deleted.status,
+            StatusCode::NO_CONTENT,
+            "{name}: {:?}",
+            deleted.body
+        );
+        assert_eq!(common::receive_close(&mut socket).await, 4001, "{name}");
+        assert!(opened.elapsed() < prompt, "{name}");
+        app.finish().await;
+    }
+}
