@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
+    dispatch::QUEUE_CHUNK,
     jobs::{self, DeviceState, NewJob, Offline, Payload, Target, TargetKind},
     schedule::{self, MAX_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES, Trigger, Weekdays},
 };
@@ -439,20 +440,20 @@ impl Valid {
             spec.check_references(executor).await?;
         }
         self.target.check_references(executor).await?;
-        if !self.channel_ids.is_empty() {
-            let found: Vec<(String,)> = executor
+        let mut found = 0;
+        for chunk in self.channel_ids.chunks(QUEUE_CHUNK) {
+            let rows: Vec<(String,)> = executor
                 .fetch_all(
                     &Query::select()
                         .column(NotificationChannels::Id)
                         .from(NotificationChannels::Table)
-                        .and_where(
-                            Expr::col(NotificationChannels::Id).is_in(self.channel_ids.clone()),
-                        )
+                        .and_where(Expr::col(NotificationChannels::Id).is_in(chunk.iter().cloned()))
                         .to_owned(),
                 )
                 .await?;
-            count(found.len(), self.channel_ids.len(), "notification channel")?;
+            found += rows.len();
         }
+        count(found, self.channel_ids.len(), "notification channel")?;
         Ok(())
     }
 }

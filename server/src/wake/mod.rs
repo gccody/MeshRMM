@@ -44,6 +44,7 @@ use crate::{
         tables::{Agents, DeviceIpAddresses, DeviceSystemInfo, Users, WakeRelays, WakeRequests},
     },
     http::AppState,
+    realtime::Unsent,
     time::{MINUTE_MS, SECOND_MS, now_ms},
     users::new_id,
 };
@@ -566,14 +567,63 @@ pub async fn start(
 ) -> db::Result<HashMap<String, String>> {
     // Everything is read before the transaction: on SQLite it holds the one
     // writer connection.
-    let plans = plans(&mut &state.database, targets, |device_id| {
-        state.agents.is_connected(device_id)
-    })
-    .await?;
-    let now = now_ms();
+    let planned = plan_wakes(state, targets).await?;
+    let mut transaction = state.database.begin().await?;
+    let recorded = record(&mut transaction, &planned, targets, requester, now_ms()).await?;
+    transaction.commit().await?;
+    let ids = recorded.ids.clone();
+    send(state, recorded).await;
+    Ok(ids)
+}
+
+/// How to wake each of a set of devices, read before anything is written.
+#[derive(Debug)]
+pub struct Planned(HashMap<String, Plan>);
+
+impl Planned {
+    /// Whether the device is enrolled, so [`record`] records a request for
+    /// it: with its relays, or why it has none.
+    pub fn covers(&self, device_id: &str) -> bool {
+        self.0.contains_key(device_id)
+    }
+}
+
+/// Works out how to wake each of `targets` that is enrolled, through the
+/// devices online now. Only reads.
+pub async fn plan_wakes(state: &AppState, targets: &[String]) -> db::Result<Planned> {
+    Ok(Planned(
+        plans(&mut &state.database, targets, |device_id| {
+            state.agents.is_connected(device_id)
+        })
+        .await?,
+    ))
+}
+
+/// Requests recorded by [`record`], whose relays [`send`] asks for the
+/// packets once their transaction commits.
+#[derive(Debug)]
+pub struct Recorded {
+    /// The requests' IDs by device.
+    pub ids: HashMap<String, String>,
+    /// Each relay's name and packets.
+    packets: BTreeMap<String, (String, Vec<WakePacket>)>,
+}
+
+/// Records, in the caller's transaction, a request for each of `targets`
+/// that `planned` covers, with its relays or why it has none, and for a
+/// job's request writes its device's outcome. A job's devices must be
+/// started already in the same transaction. Reads nothing else: on SQLite
+/// the transaction holds the one writer.
+pub async fn record(
+    transaction: &mut db::Transaction,
+    planned: &Planned,
+    targets: &[String],
+    requester: Requester<'_>,
+    now: i64,
+) -> db::Result<Recorded> {
+    let plans = &planned.0;
     let mut ids = HashMap::new();
     let mut packets: BTreeMap<String, (String, Vec<WakePacket>)> = BTreeMap::new();
-    let mut transaction = state.database.begin().await?;
     for target in targets {
         let Some(plan) = plans.get(target) else {
             continue;
@@ -617,7 +667,7 @@ pub async fn start(
         if requester.job_id.is_some() {
             // The job's device runs until the device comes online, or fails
             // with no relay.
-            jobs::runs_changed(&mut transaction, RunTable::Wake, Changed::Id(&id), now).await?;
+            jobs::runs_changed(transaction, RunTable::Wake, Changed::Id(&id), now).await?;
         }
         for relay in &plan.relays {
             for (broadcast, prefix_length) in &relay.subnets {
@@ -658,7 +708,7 @@ pub async fn start(
         }
         if let Some(actor) = requester.actor {
             audit::record(
-                &mut transaction,
+                transaction,
                 actor,
                 "agent.wake",
                 AuditTarget::device(target),
@@ -675,16 +725,31 @@ pub async fn start(
         }
         ids.insert(target.clone(), id);
     }
-    transaction.commit().await?;
+    Ok(Recorded { ids, packets })
+}
+
+/// Asks the relays of requests that [`record`] recorded, and committed, to
+/// send the packets. A relay that can't be asked fails its part.
+pub async fn send(state: &AppState, recorded: Recorded) {
     let mut waiting = Vec::new();
-    for (relay_id, (name, packets)) in packets {
+    for (relay_id, (name, packets)) in recorded.packets {
         for chunk in packets.chunks(MAX_WAKE_PACKETS) {
             waiting.extend(chunk.iter().map(|packet| packet.wake_id.clone()));
             let command = AgentCommand::SendWakePackets {
                 packets: chunk.to_vec(),
             };
-            if !state.agents.send(&relay_id, command) {
-                let error = format!("{name} went offline before it got the request");
+            let sent = state
+                .agents
+                .reserve(&relay_id)
+                .map(|place| place.send(command));
+            let error = match sent {
+                Ok(true) => None,
+                Err(Unsent::Full) => Some(format!("{name} was too far behind to take the request")),
+                Ok(false) | Err(Unsent::Offline) => {
+                    Some(format!("{name} went offline before it got the request"))
+                }
+            };
+            if let Some(error) = error {
                 let results = chunk
                     .iter()
                     .map(|packet| WakePacketResult {
@@ -707,7 +772,6 @@ pub async fn start(
             }
         });
     }
-    Ok(ids)
 }
 
 /// Records what a relay reported for its packets.

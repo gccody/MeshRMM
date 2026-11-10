@@ -13,7 +13,7 @@ use std::time::Duration;
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
 
 pub use self::{
-    hub::{AgentConnection, AgentHub, ToAgent},
+    hub::{AgentConnection, AgentHub, Reserved, ToAgent, Unsent},
     metrics::Metrics,
     presence::Presence,
     sessions::Sessions,

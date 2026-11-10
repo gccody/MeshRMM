@@ -29,6 +29,7 @@ use sea_query::{Expr, ExprTrait, InsertStatement, Order, Query};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use super::dispatch::QUEUE_CHUNK;
 use crate::{
     applications::{
         jobs::RunAction,
@@ -1442,22 +1443,25 @@ pub async fn list(
     with_counts(executor, rows, now).await
 }
 
-/// Jobs by ID, with their counts, whoever started them.
+/// Jobs by ID, with their counts, whoever started them: [`QUEUE_CHUNK`]
+/// to a statement, however many, such as every unfinished job.
 pub async fn by_ids(
     executor: &mut impl Executor,
     ids: &[String],
     now: i64,
 ) -> db::Result<Vec<Job>> {
-    if ids.is_empty() {
-        return Ok(Vec::new());
+    let mut rows: Vec<JobRow> = Vec::new();
+    for chunk in ids.chunks(QUEUE_CHUNK) {
+        rows.extend(
+            executor
+                .fetch_all::<JobRow, _>(
+                    &job_select()
+                        .and_where(Expr::col((Jobs::Table, Jobs::Id)).is_in(chunk.iter().cloned()))
+                        .to_owned(),
+                )
+                .await?,
+        );
     }
-    let rows: Vec<JobRow> = executor
-        .fetch_all(
-            &job_select()
-                .and_where(Expr::col((Jobs::Table, Jobs::Id)).is_in(ids.iter().cloned()))
-                .to_owned(),
-        )
-        .await?;
     with_counts(executor, rows, now).await
 }
 

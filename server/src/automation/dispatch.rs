@@ -47,7 +47,8 @@ use crate::{
         },
     },
     http::AppState,
-    time::SECOND_MS,
+    realtime::Unsent,
+    time::{MINUTE_MS, SECOND_MS},
     toolbox::{self, DELIVERY_WINDOW_MS, NewDelivery, NewRun, RUN_REPORT_GRACE_MS, Source},
     updates::runs::{
         self as update_runs, INSTALL_REPORT_WINDOW_MS, Install, Kind as UpdateKind,
@@ -882,35 +883,81 @@ async fn wake_queued(state: &AppState, batch: u64, now: i64) -> anyhow::Result<b
     Ok(queued >= batch)
 }
 
-/// Wakes a wake job's queued devices that are still offline, and skips
-/// those that came online meanwhile.
+/// How long a wake job's devices whose wake requests can't be recorded are
+/// tried again, on each pass, before they fail.
+pub const WAKE_RETRY_MS: i64 = MINUTE_MS;
+const WAKE_UNRECORDED: &str =
+    "MeshRMM couldn't record the device's wake request, so it wasn't woken";
+
+/// Wakes a wake job's queued devices that are still offline, skips those
+/// that came online meanwhile and misses those deleted. If the wake requests
+/// can't be recorded, nothing is: the devices stay queued and are tried
+/// again on the next passes, and fail once they have failed for
+/// [`WAKE_RETRY_MS`].
 async fn start_wakes(
     state: &AppState,
     job: &JobRow,
     devices: &[String],
     now: i64,
 ) -> anyhow::Result<()> {
+    let Err(error) = try_wakes(state, job, devices, now).await else {
+        state.automation.wakes_settled(&job.id, devices);
+        return Ok(());
+    };
+    tracing::warn!(
+        job_id = job.id,
+        error = format!("{error:#}"),
+        "could not record a wake job's wake requests"
+    );
+    let failed = state
+        .automation
+        .wakes_failed(&job.id, devices, now, WAKE_RETRY_MS);
+    if failed.is_empty() {
+        return Ok(());
+    }
+    // Started with a result of its own: it holds no wake request.
+    fail_wakes(state, job, &failed, now).await?;
+    state.automation.wakes_settled(&job.id, &failed);
+    Ok(())
+}
+
+/// Starts the wakes of a wake job's queued devices, and skips or misses
+/// those it can't wake, in one transaction with their wake requests: all of
+/// it is recorded, or none.
+async fn try_wakes(
+    state: &AppState,
+    job: &JobRow,
+    devices: &[String],
+    now: i64,
+) -> anyhow::Result<()> {
+    let asleep = devices
+        .iter()
+        .filter(|device_id| !state.agents.is_connected(device_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    // Read before the transaction: on SQLite it holds the one writer.
+    let planned = crate::wake::plan_wakes(state, &asleep).await?;
     let mut claimed = Vec::new();
     let mut transaction = state.database.begin().await?;
     for device_id in devices {
-        let online = state.agents.is_connected(device_id);
-        let (next, detail) = if online {
+        let (next, detail) = if !asleep.contains(device_id) {
             (DeviceState::Skipped, Some("The device is online already"))
+        } else if !planned.covers(device_id) {
+            (DeviceState::Missed, Some(DELETED))
         } else {
             (DeviceState::Started, None)
         };
+        let started = next == DeviceState::Started;
         let updated = transaction
             .execute(
                 &Query::update()
                     .table(JobDevices::Table)
                     .value(JobDevices::State, next.as_str())
                     .value(JobDevices::Detail, detail)
-                    // A woken device has no result until its wake request is
-                    // recorded, which writes how the request stands, and
-                    // keeps none if it never is.
+                    // Its wake request, recorded next, writes how it stands.
                     .value(
                         JobDevices::Result,
-                        (!online).then_some(Outcome::NoResult.as_str()),
+                        started.then_some(Outcome::NoResult.as_str()),
                     )
                     .value(JobDevices::UpdatedAt, now)
                     .and_where(Expr::col(JobDevices::JobId).eq(job.id.as_str()))
@@ -919,41 +966,78 @@ async fn start_wakes(
                     .to_owned(),
             )
             .await?;
-        if updated == 1 && !online {
+        if updated == 1 && started {
             claimed.push(device_id.clone());
         }
     }
+    let recorded = crate::wake::record(
+        &mut transaction,
+        &planned,
+        &claimed,
+        crate::wake::Requester {
+            user_id: &job.requested_by_user_id,
+            job_id: Some(&job.id),
+            actor: None,
+        },
+        crate::time::now_ms(),
+    )
+    .await?;
     transaction.commit().await?;
-    if !claimed.is_empty() {
-        crate::wake::start(
-            state,
-            &claimed,
-            crate::wake::Requester {
-                user_id: &job.requested_by_user_id,
-                job_id: Some(&job.id),
-                actor: None,
-            },
-        )
-        .await?;
+    crate::wake::send(state, recorded).await;
+    Ok(())
+}
+
+/// Fails the wake job's queued devices whose wake requests couldn't be
+/// recorded for [`WAKE_RETRY_MS`].
+async fn fail_wakes(
+    state: &AppState,
+    job: &JobRow,
+    devices: &[String],
+    now: i64,
+) -> db::Result<()> {
+    for chunk in devices.chunks(QUEUE_CHUNK) {
+        state
+            .database
+            .execute(
+                &Query::update()
+                    .table(JobDevices::Table)
+                    .value(JobDevices::State, DeviceState::Started.as_str())
+                    .value(JobDevices::Detail, WAKE_UNRECORDED)
+                    .value(JobDevices::Result, Outcome::Failed.as_str())
+                    .value(JobDevices::UpdatedAt, now)
+                    .and_where(Expr::col(JobDevices::JobId).eq(job.id.as_str()))
+                    .and_where(Expr::col(JobDevices::DeviceId).is_in(chunk.iter().cloned()))
+                    .and_where(Expr::col(JobDevices::State).eq(DeviceState::Queued.as_str()))
+                    .to_owned(),
+            )
+            .await?;
     }
     Ok(())
 }
 
-/// Starts the job on a queued device: records the run or delivery and
-/// hands it to the Agent. A device that went offline waits again, or is
-/// missed. Returns whether it started.
+/// Starts the job on a queued device: holds a place in its Agent's backlog,
+/// records the run or delivery and hands it to the Agent in that place. A
+/// device that went offline waits again, or is missed. One whose backlog is
+/// full is online but behind: it stays queued, with nothing written, and is
+/// tried again on the next pass. Its Agent catches up, or its socket stops
+/// taking messages and the connection ends, after which it is offline.
+/// Returns whether it started.
 async fn start(state: &AppState, job: &JobRow, device_id: &str, now: i64) -> anyhow::Result<bool> {
-    if !state.agents.is_connected(device_id) {
-        unqueue(
-            &mut &state.database,
-            job,
-            device_id,
-            DeviceState::Queued,
-            now,
-        )
-        .await?;
-        return Ok(false);
-    }
+    let place = match state.agents.reserve(device_id) {
+        Ok(place) => place,
+        Err(Unsent::Full) => return Ok(false),
+        Err(Unsent::Offline) => {
+            unqueue(
+                &mut &state.database,
+                job,
+                device_id,
+                DeviceState::Queued,
+                now,
+            )
+            .await?;
+            return Ok(false);
+        }
+    };
     let Some(kind) = Kind::parse(&job.kind) else {
         tracing::error!(job_id = job.id, "stored job is invalid");
         return Ok(false);
@@ -1162,7 +1246,7 @@ async fn start(state: &AppState, job: &JobRow, device_id: &str, now: i64) -> any
     let Some(command) = command else {
         return Ok(true);
     };
-    if state.agents.send(device_id, command) {
+    if place.send(command) {
         if matches!(kind, Kind::UpdateScan | Kind::UpdateInstall) {
             crate::updates::publish_run(state, &id).await;
             crate::updates::publish_device(state, device_id).await;

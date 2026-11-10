@@ -64,6 +64,36 @@ struct Registered {
     sender: mpsc::Sender<ToAgent>,
 }
 
+/// Why a message couldn't be queued for an Agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unsent {
+    /// The device has no connection.
+    Offline,
+    /// It is connected, but so far behind that its backlog is full.
+    Full,
+}
+
+/// A place held in a connected Agent's backlog by [`AgentHub::reserve`].
+/// Dropping it gives the place back.
+#[derive(Debug)]
+pub struct Reserved {
+    permit: mpsc::OwnedPermit<ToAgent>,
+    sender: mpsc::Sender<ToAgent>,
+}
+
+impl Reserved {
+    /// Queues `message` in the held place. Returns whether the connection
+    /// was still open: one that closed since the place was held doesn't get
+    /// it.
+    pub fn send(self, message: impl Into<ToAgent>) -> bool {
+        if self.sender.is_closed() {
+            return false;
+        }
+        self.permit.send(message.into());
+        true
+    }
+}
+
 /// A connected Agent's end of the hub. Dropping it unregisters the
 /// connection, unless a newer one has replaced it.
 #[derive(Debug)]
@@ -149,6 +179,23 @@ impl AgentHub {
         }
     }
 
+    /// Holds a place in the backlog of the device's connection for one
+    /// message, so a caller can record what it sends first and still be sure
+    /// of a place. Says why there is none: the device isn't connected, or
+    /// its backlog is full.
+    pub fn reserve(&self, device_id: &str) -> Result<Reserved, Unsent> {
+        let sender = self
+            .lock()
+            .get(device_id)
+            .map(|registered| registered.sender.clone())
+            .ok_or(Unsent::Offline)?;
+        match sender.clone().try_reserve_owned() {
+            Ok(permit) => Ok(Reserved { permit, sender }),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(Unsent::Full),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(Unsent::Offline),
+        }
+    }
+
     /// Queues `message` for every connection, returning how many accepted
     /// it. The connections are only copied under the lock.
     pub fn send_to_all(&self, message: impl Into<ToAgent>) -> usize {
@@ -231,6 +278,30 @@ mod tests {
             assert!(connection.commands.recv().await.is_some());
         }
         assert_eq!(connection.commands.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn a_reserved_place_tells_a_full_backlog_from_an_offline_agent() {
+        let hub = AgentHub::default();
+        assert_eq!(hub.reserve("device-1").unwrap_err(), Unsent::Offline);
+        let mut connection = hub.connect("device-1");
+        let held = hub.reserve("device-1").unwrap();
+        for _ in 1..COMMAND_BACKLOG {
+            assert!(hub.send("device-1", AgentCommand::Uninstall));
+        }
+        assert!(
+            !hub.send("device-1", AgentCommand::Uninstall),
+            "the held place is taken"
+        );
+        assert_eq!(hub.reserve("device-1").unwrap_err(), Unsent::Full);
+        assert!(held.send(AgentCommand::Uninstall));
+        assert_eq!(hub.reserve("device-1").unwrap_err(), Unsent::Full);
+        assert!(connection.commands.recv().await.is_some());
+        let held = hub.reserve("device-1").unwrap();
+        hub.disconnect("device-1");
+        drop(connection);
+        assert!(!held.send(AgentCommand::Uninstall), "it went away");
+        assert_eq!(hub.reserve("device-1").unwrap_err(), Unsent::Offline);
     }
 
     #[test]
