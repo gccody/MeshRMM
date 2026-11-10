@@ -57,6 +57,10 @@ pub struct Timeouts {
     pub slow_request: Duration,
     /// From asking the Agent for a transfer until its socket connects.
     pub agent_connect: Duration,
+    /// A peer that takes this long to send or take a piece of a transfer,
+    /// the browser or the Agent, is gone. Long, since a browser may pause a
+    /// download.
+    pub stall: Duration,
     /// A download's ID lasts this long after its last use.
     pub download: Duration,
     /// An unfinished upload's ID lasts this long after its last use.
@@ -69,6 +73,7 @@ impl Default for Timeouts {
             request: Duration::from_secs(30),
             slow_request: Duration::from_secs(120),
             agent_connect: Duration::from_secs(20),
+            stall: Duration::from_secs(10 * 60),
             download: Duration::from_secs(12 * 60 * 60),
             upload: Duration::from_secs(24 * 60 * 60),
         }
