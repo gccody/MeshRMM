@@ -396,9 +396,18 @@ A slow or hung part of the Agent must not stall the rest. The code keeps to
 these rules:
 
 - Each WebSocket has its own network task. Ping, pong and liveness detection
-  keep running while command handling waits. Application messages use bounded
-  queues; a full queue closes the connection instead of blocking the network
-  task. Socket and control-channel writes have a five-second deadline.
+  keep running while command handling waits, and reading goes on while a
+  large message is written. Application messages use bounded queues; a full
+  queue closes the connection instead of blocking the network task. A
+  signaling socket write fails once the socket has taken nothing for 30
+  seconds, with no limit in total, so a large report still gets through a
+  slow uplink; while the server takes such a write in, the connection counts
+  as alive though its pongs wait behind it. Control-channel writes have a
+  five-second deadline.
+- An update or application report the control connection fails to send goes
+  first on the next connection, but only until three connections in a row
+  have failed to send it. It is then dropped, and the server counts the runs
+  it answers as lost, so one report can't keep the device reconnecting.
 - Capture start, display changes, desktop recovery and stop run on a
   cancellable native thread with a bounded command queue, never on a tokio
   worker. Dropping it does not join the thread.

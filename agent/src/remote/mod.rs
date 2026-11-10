@@ -80,6 +80,8 @@ mod toolbox;
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 mod transport;
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+mod unsent;
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 mod updates;
 #[cfg(unix)]
 pub(crate) mod user_database;
@@ -116,6 +118,40 @@ use self::signaling::{
     ControlAttempt, ControlReconnect, agent_connection_url, authenticated_websocket,
 };
 
+/// An update or application report the connection is writing. Each source
+/// has one at a time, so its reports keep their order, and the one a
+/// connection doesn't get through is the one kept for the next.
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+struct Writing {
+    report: unsent::Report,
+    written: std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>,
+}
+
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+impl Writing {
+    /// Hands `report` to `socket`, which may take minutes to write a large
+    /// one on a slow link, so the coordinator waits for it alongside the
+    /// server's commands rather than before them.
+    fn start(socket: &SignalingConnection, report: unsent::Report) -> Self {
+        let written: std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>> =
+            match serde_json::to_string(&report.message) {
+                Ok(text) => Box::pin(socket.sending(Message::Text(text.into()))),
+                Err(error) => Box::pin(std::future::ready(Err(error.into()))),
+            };
+        Self { report, written }
+    }
+}
+
+/// Completes when the report `writing` holds is written or has failed;
+/// never without one.
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+async fn written(writing: &mut Option<Writing>) -> anyhow::Result<()> {
+    match writing {
+        Some(writing) => (&mut writing.written).await,
+        None => std::future::pending().await,
+    }
+}
+
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 struct ActiveSession {
     session_id: RemoteSessionId,
@@ -140,12 +176,18 @@ fn replays_session(
 }
 
 /// Tells the server the Agent is going offline to install `version`, so the dashboard shows
-/// the update instead of an unexplained outage. The stop goes ahead if this fails.
+/// the update instead of an unexplained outage. The stop goes ahead if this fails, or if a large
+/// report ahead of it keeps it waiting.
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 async fn announce_update(socket: &SignalingConnection, version: String) {
     let status = AgentStatusMessage::Updating { version };
     let sent = match serde_json::to_string(&status) {
-        Ok(text) => socket.send(Message::Text(text.into())).await,
+        Ok(text) => tokio::time::timeout(
+            Duration::from_secs(5),
+            socket.send(Message::Text(text.into())),
+        )
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out behind other messages"))),
         Err(error) => Err(error.into()),
     };
     match sent {
@@ -341,6 +383,8 @@ pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
             files: files::Files::new(),
             // Likewise, so monitors keep running while the Agent reconnects.
             monitors: monitors::Monitors::new(mode),
+            writing_update: None,
+            writing_application: None,
             config,
             mode,
             link,
@@ -367,6 +411,8 @@ struct Coordinator {
     wake: wake::Relay,
     files: files::Files,
     monitors: monitors::Monitors,
+    writing_update: Option<Writing>,
+    writing_application: Option<Writing>,
     active_session: Option<ActiveSession>,
     // Outlives session tasks, which end whenever the viewer drops its
     // connection, so the close action runs only once the session ends.
@@ -434,6 +480,25 @@ impl Coordinator {
     /// Handles the server's messages until the connection ends, returning whether the Agent is
     /// stopping.
     async fn serve(&mut self, socket: &mut SignalingConnection) -> anyhow::Result<bool> {
+        let ended = self.serve_messages(socket).await;
+        // A report still being written when the connection ended goes first
+        // on the next, unless it got through.
+        use futures_util::FutureExt;
+        if let Some(mut writing) = self.writing_update.take()
+            && !matches!((&mut writing.written).now_or_never(), Some(Ok(())))
+        {
+            self.updates.unsent(writing.report);
+        }
+        if let Some(mut writing) = self.writing_application.take() {
+            match (&mut writing.written).now_or_never() {
+                Some(Ok(())) => self.applications.delivered(&writing.report.message),
+                _ => self.applications.unsent(writing.report),
+            }
+        }
+        ended
+    }
+
+    async fn serve_messages(&mut self, socket: &mut SignalingConnection) -> anyhow::Result<bool> {
         // Before anything the server sends on this connection, so the
         // server knows which application runs from before it ended.
         let activity = serde_json::to_string(&self.applications.activity())?;
@@ -486,33 +551,36 @@ impl Coordinator {
                     self.updates.scan(None);
                     self.applications.scan(None);
                 }
-                report = self.updates.next() => {
-                    if let AgentStatusMessage::UpdateScan { scan, .. } = &report {
+                report = self.updates.next(), if self.writing_update.is_none() => {
+                    if let AgentStatusMessage::UpdateScan { scan, .. } = &report.message {
                         self.update_schedule.scanned(scan, updates::now_unix_ms());
                     }
-                    let sent = match serde_json::to_string(&report) {
-                        Ok(text) => socket.send(Message::Text(text.into())).await,
-                        Err(error) => Err(error.into()),
-                    };
-                    if let Err(error) = sent {
-                        self.updates.unsent(report);
+                    self.writing_update = Some(Writing::start(socket, report));
+                }
+                result = written(&mut self.writing_update) => {
+                    let writing = self.writing_update.take();
+                    if let Err(error) = result {
+                        if let Some(writing) = writing {
+                            self.updates.unsent(writing.report);
+                        }
                         return Err(error).context("could not send an update report");
                     }
                 }
-                report = self.applications.next() => {
+                report = self.applications.next(), if self.writing_application.is_none() => {
                     // A finished run changed what is installed.
-                    if matches!(report, AgentStatusMessage::ApplicationResult { .. }) {
+                    if matches!(report.message, AgentStatusMessage::ApplicationResult { .. }) {
                         self.system_info.request();
                     }
-                    let sent = match serde_json::to_string(&report) {
-                        Ok(text) => socket.send(Message::Text(text.into())).await,
-                        Err(error) => Err(error.into()),
-                    };
-                    if let Err(error) = sent {
-                        self.applications.unsent(report);
-                        return Err(error).context("could not send an application report");
+                    self.writing_application = Some(Writing::start(socket, report));
+                }
+                result = written(&mut self.writing_application) => {
+                    if let Some(writing) = self.writing_application.take() {
+                        if let Err(error) = result {
+                            self.applications.unsent(writing.report);
+                            return Err(error).context("could not send an application report");
+                        }
+                        self.applications.delivered(&writing.report.message);
                     }
-                    self.applications.delivered(&report);
                 }
                 () = self.link.stopped() => {
                     if let Some(version) = self.link.update_version() {

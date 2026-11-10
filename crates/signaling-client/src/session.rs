@@ -199,9 +199,7 @@ mod tests {
             let mut open = open.clone();
             Box::pin(async move {
                 open.wait_for(|open| *open).await?;
-                let (socket, _) =
-                    tokio_tungstenite::connect_async(format!("ws://{address}")).await?;
-                Ok(socket)
+                crate::plain_websocket(address).await
             })
         });
         (connect, accepted, gate)
