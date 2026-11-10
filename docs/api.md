@@ -58,20 +58,25 @@ A token may do what its permissions allow **and** what its user's roles
 grant at the moment of the request. Take a permission away from a role and
 every token of its members loses it at once; disable or delete a user and
 their tokens stop working. A token limited to some permissions is never
-treated as the Administrator role, even if its user holds it, so the
-administrator-only settings (email, single sign-on, directory sync) need an
-unlimited token of an administrator.
+treated as the Administrator role, even if its user holds it, so managing
+administrators or granting the Administrator role needs an unlimited token
+of an administrator.
 
 Some routes refuse tokens whatever their permissions (`403
-api_token_not_allowed`), so that a leaked token can't create more
-credentials or take over its user's account:
+api_token_not_allowed`), so that a leaked token can't create credentials
+that outlast it or take over an account, and revoking it is enough:
 
 - signing in and out, and everything under `/v1/account` (profile,
   password, two-factor authentication, passkeys, sessions);
 - making API tokens (`POST /v1/api-tokens`); listing and revoking them work;
 - the sign-in policy and API token settings (`/v1/settings/authentication`),
   single sign-on and SCIM settings;
-- password reset links and two-factor resets for other users;
+- email settings (`/v1/settings/smtp`, reading and testing them included),
+  since email carries every invitation and password reset link;
+- inviting people, and renewing or revoking invitations
+  (`/v1/invitations`); listing them works;
+- password reset links, two-factor resets and unlinking single sign-on
+  (`/v1/users/{id}/unlink-sso`) for other users;
 - the website's event socket (`/v1/events`), terminals, and starting remote
   sessions (`/v1/remote/handoffs`), which belong to a person at a browser.
 

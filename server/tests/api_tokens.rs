@@ -141,10 +141,21 @@ async fn tokens_act_for_their_user_within_their_scope() {
         .await;
         assert_eq!(tag.code(), "permission_denied", "{name}");
         // Nor is a scoped administrator's token the Administrator role.
-        assert_eq!(
-            get(&app, &scoped, "/v1/settings/smtp").await.code(),
-            "permission_denied"
-        );
+        let admin_id = current.body["token"]["user"]["id"].as_str().unwrap();
+        let (_, managing) = make(
+            &mut admin,
+            json!({ "name": "Manage users", "expires_in_days": 7, "permissions": ["users.manage"] }),
+        )
+        .await;
+        let renamed = call(
+            &app,
+            &managing,
+            Method::PATCH,
+            &format!("/v1/users/{admin_id}"),
+            Some(json!({ "display_name": "Eve" })),
+        )
+        .await;
+        assert_eq!(renamed.code(), "permission_denied", "{name}");
         assert_eq!(
             get(&app, &scoped, "/v1/api-tokens/current").await.body["permissions"],
             json!(["devices.view"])
@@ -178,6 +189,18 @@ async fn tokens_act_for_their_user_within_their_scope() {
             ),
             (Method::GET, "/v1/settings/scim", None),
             (Method::GET, "/v1/settings/sso", None),
+            (Method::GET, "/v1/settings/smtp", None),
+            (Method::DELETE, "/v1/settings/smtp", None),
+            (
+                Method::POST,
+                "/v1/invitations",
+                Some(json!({ "email": "eve@example.com", "role_ids": [] })),
+            ),
+            (
+                Method::POST,
+                "/v1/users/someone/unlink-sso",
+                Some(json!({})),
+            ),
             (Method::GET, "/v1/events", None),
             (Method::POST, "/v1/remote/handoffs", Some(json!({}))),
         ] {
@@ -520,6 +543,181 @@ async fn unknown_tokens_are_rate_limited_like_sign_ins() {
         assert_eq!(
             admin.get("/v1/agents").await.status,
             StatusCode::OK,
+            "{name}"
+        );
+        app.finish().await;
+    }
+}
+
+/// Even an administrator's unlimited token can't do what would outlast
+/// revoking it: invite someone, point the server's email (which carries
+/// every invitation and reset link) somewhere else, or change how a user
+/// signs in. The website still can.
+#[tokio::test]
+async fn tokens_cant_invite_reroute_email_or_unlink_sso() {
+    for app in common::apps().await {
+        let name = app.name;
+        let mut admin = common::set_up(&app).await;
+        // Added before email is set up, so the invitation link comes back.
+        let (_, tech_id) = common::add_user(&app, &mut admin, "tech@example.com", &[]).await;
+        app.db()
+            .execute(
+                &Query::update()
+                    .table("users")
+                    .value("oidc_subject", "tech-at-the-provider")
+                    .and_where(Expr::col("id").eq(tech_id.as_str()))
+                    .to_owned(),
+            )
+            .await
+            .unwrap();
+        // Nobody reads the stored password back, not even on the website.
+        let with_password = admin
+            .put(
+                "/v1/settings/smtp",
+                json!({
+                    "host": "smtp.example.com",
+                    "security": "tls",
+                    "username": "mailer",
+                    "password": "smtp password",
+                    "from": "Acme IT <rmm@example.com>",
+                }),
+            )
+            .await;
+        let read = admin.get("/v1/settings/smtp").await;
+        for response in [&with_password, &read] {
+            assert_eq!(response.status, StatusCode::OK, "{name}");
+            assert_eq!(response.body["has_password"], true, "{name}");
+            assert!(
+                !response.body.to_string().contains("smtp password"),
+                "{name}: {:?}",
+                response.body
+            );
+        }
+        // The fake server takes mail without signing in.
+        let mut smtp = common::FakeSmtp::start().await;
+        let configured = admin
+            .put(
+                "/v1/settings/smtp",
+                json!({
+                    "host": "127.0.0.1",
+                    "port": smtp.port,
+                    "security": "none",
+                    "password": null,
+                    "from": "Acme IT <rmm@example.com>",
+                }),
+            )
+            .await;
+        assert_eq!(configured.status, StatusCode::OK, "{name}");
+        let invited = admin
+            .post(
+                "/v1/invitations",
+                json!({ "email": "pending@example.com", "role_ids": ["technician"] }),
+            )
+            .await;
+        assert_eq!(invited.status, StatusCode::CREATED, "{name}");
+        assert_eq!(invited.body["emailed"], true, "{name}: {:?}", invited.body);
+        smtp.next().await;
+        let invitation = invited.body["invitation"].clone();
+        let invitation_id = invitation["id"].as_str().unwrap().to_owned();
+        let mails = smtp.connections.load(std::sync::atomic::Ordering::SeqCst);
+
+        let (token_id, secret) = make(
+            &mut admin,
+            json!({ "name": "Admin script", "expires_in_days": 7 }),
+        )
+        .await;
+        for (method, path, body) in [
+            (
+                Method::POST,
+                "/v1/invitations".to_owned(),
+                Some(json!({ "email": "eve@example.com", "role_ids": ["administrator"] })),
+            ),
+            (
+                Method::POST,
+                format!("/v1/invitations/{invitation_id}/renew"),
+                Some(json!({})),
+            ),
+            (
+                Method::DELETE,
+                format!("/v1/invitations/{invitation_id}"),
+                None,
+            ),
+            (Method::GET, "/v1/settings/smtp".to_owned(), None),
+            (
+                Method::PUT,
+                "/v1/settings/smtp".to_owned(),
+                Some(json!({
+                    "host": "mail.attacker.example",
+                    "security": "tls",
+                    "from": "Acme IT <rmm@attacker.example>",
+                })),
+            ),
+            (Method::DELETE, "/v1/settings/smtp".to_owned(), None),
+            (
+                Method::POST,
+                "/v1/settings/smtp/test".to_owned(),
+                Some(json!({ "to": "eve@attacker.example" })),
+            ),
+            (
+                Method::POST,
+                format!("/v1/users/{tech_id}/unlink-sso"),
+                Some(json!({})),
+            ),
+        ] {
+            let response = call(&app, &secret, method, &path, body).await;
+            assert_eq!(response.status, StatusCode::FORBIDDEN, "{name}: {path}");
+            assert_eq!(response.code(), "api_token_not_allowed", "{name}: {path}");
+        }
+        // Listing invitations reads no link or secret, like listing users.
+        let listed = get(&app, &secret, "/v1/invitations").await;
+        assert_eq!(listed.status, StatusCode::OK, "{name}");
+
+        // Nothing changed, and the token did nothing the audit log saw.
+        assert_eq!(listed.body, json!([invitation]), "{name}");
+        let email = admin.get("/v1/settings/smtp").await;
+        assert_eq!(email.body["host"], "127.0.0.1", "{name}");
+        assert_eq!(
+            smtp.connections.load(std::sync::atomic::Ordering::SeqCst),
+            mails,
+            "{name}"
+        );
+        let tech = admin.get(&format!("/v1/users/{tech_id}")).await;
+        assert_eq!(tech.body["sso_linked"], true, "{name}");
+        let audit = admin
+            .get(&format!("/v1/audit?api_token_id={token_id}"))
+            .await;
+        assert_eq!(audit.body["events"], json!([]), "{name}");
+
+        // The website still does all of it.
+        let renewed = admin
+            .post(&format!("/v1/invitations/{invitation_id}/renew"), json!({}))
+            .await;
+        assert_eq!(renewed.status, StatusCode::OK, "{name}: {:?}", renewed.body);
+        assert!(smtp.next().await.contains("pending@example.com"), "{name}");
+        let test = admin.post("/v1/settings/smtp/test", json!({})).await;
+        assert_eq!(
+            test.status,
+            StatusCode::NO_CONTENT,
+            "{name}: {:?}",
+            test.body
+        );
+        assert!(smtp.next().await.contains("Email is working"), "{name}");
+        let revoked = admin
+            .delete(&format!("/v1/invitations/{invitation_id}"))
+            .await;
+        assert_eq!(revoked.status, StatusCode::NO_CONTENT, "{name}");
+        assert_eq!(admin.get("/v1/invitations").await.body, json!([]));
+        let unlinked = admin
+            .post(&format!("/v1/users/{tech_id}/unlink-sso"), json!({}))
+            .await;
+        assert_eq!(unlinked.status, StatusCode::NO_CONTENT, "{name}");
+        let tech = admin.get(&format!("/v1/users/{tech_id}")).await;
+        assert_eq!(tech.body["sso_linked"], false, "{name}");
+        let removed = admin.delete("/v1/settings/smtp").await;
+        assert_eq!(removed.status, StatusCode::NO_CONTENT, "{name}");
+        assert_eq!(
+            admin.get("/v1/settings/smtp").await.body["configured"],
+            false,
             "{name}"
         );
         app.finish().await;

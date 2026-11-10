@@ -176,13 +176,25 @@ fn administration_routes() -> Router<AppState> {
             website_only_route(post(users::password_reset)),
         )
         .route("/users/{id}/sign-out", post(users::sign_out))
-        .route("/users/{id}/unlink-sso", post(users::unlink_sso))
+        .route(
+            "/users/{id}/unlink-sso",
+            website_only_route(post(users::unlink_sso)),
+        )
+        // An invited administrator's account would outlast the token that
+        // invited them. The list holds no links, so tokens may read it, like
+        // the user list.
         .route(
             "/invitations",
-            get(invitations::list).post(invitations::create),
+            get(invitations::list).merge(website_only_route(post(invitations::create))),
         )
-        .route("/invitations/{id}", delete(invitations::revoke))
-        .route("/invitations/{id}/renew", post(invitations::renew))
+        .route(
+            "/invitations/{id}",
+            website_only_route(delete(invitations::revoke)),
+        )
+        .route(
+            "/invitations/{id}/renew",
+            website_only_route(post(invitations::renew)),
+        )
         .route("/roles", get(roles::list).post(roles::create))
         .route("/roles/{id}", patch(roles::update).delete(roles::delete))
         .route("/permissions", get(roles::permissions))
@@ -193,13 +205,20 @@ fn administration_routes() -> Router<AppState> {
                 get(settings::get_authentication).patch(settings::update_authentication),
             ),
         )
+        // Email carries every invitation and password reset link, so whoever
+        // points it elsewhere can take over accounts.
         .route(
             "/settings/smtp",
-            get(settings::get_smtp)
-                .put(settings::put_smtp)
-                .delete(settings::delete_smtp),
+            website_only_route(
+                get(settings::get_smtp)
+                    .put(settings::put_smtp)
+                    .delete(settings::delete_smtp),
+            ),
         )
-        .route("/settings/smtp/test", post(settings::test_smtp))
+        .route(
+            "/settings/smtp/test",
+            website_only_route(post(settings::test_smtp)),
+        )
         .route("/settings/scim", website_only_route(get(scim::get)))
         .route(
             "/settings/scim/tokens",
@@ -467,9 +486,10 @@ fn remote_routes() -> Router<AppState> {
 
 /// Routes only the website may use, whatever the token's permissions:
 /// signing in and the account's own security, anything that makes
-/// credentials or changes how people sign in, and the website's sockets and
-/// remote session starts. So a leaked token can't make itself more tokens or
-/// take over an account.
+/// credentials or changes how people sign in (invitations, email, which
+/// carries the sign-in links, and SSO links included), and the website's
+/// sockets and remote session starts. So a leaked token can't make itself
+/// more tokens or take over an account, and revoking it is enough.
 async fn website_only(request: axum::extract::Request, next: middleware::Next) -> Response {
     if crate::api_tokens::bearer(request.headers()).is_some() {
         return api_token_not_allowed().into_response();
