@@ -330,6 +330,7 @@ fn capture_loop_inner(
         desktop_pending: false,
         desktop_cached: false,
         separate_cursor_visible: false,
+        pointer: PointerHistory::new(),
         encoder,
         converter,
         cursor_compositor,
@@ -454,6 +455,7 @@ struct CaptureLoop {
     desktop_pending: bool,
     desktop_cached: bool,
     separate_cursor_visible: bool,
+    pointer: PointerHistory,
     encoder: Encoder,
     converter: Converter,
     cursor_compositor: Option<CursorCompositor>,
@@ -498,6 +500,11 @@ impl CaptureLoop {
             {
                 self.separate_cursor_visible = frame.frame_info().PointerPosition.Visible.as_bool();
             }
+            // Check on every pass, not only with new frames, so a pointer
+            // drawn between two frames is not missed.
+            let pointer_drawn =
+                self.cursor_compositor.is_some() && crate::cursor::system_pointer_drawn();
+            self.pointer.checked(pointer_drawn);
             let capture_idle = frame.is_none() && desktop_texture.is_none();
             let mut access_units = self.encoder.poll()?;
             if frame
@@ -509,7 +516,7 @@ impl CaptureLoop {
                 ));
             }
             if let Some(frame) = frame.as_ref() {
-                self.track_damage(frame, capture_cursor);
+                self.track_damage(frame, capture_cursor, pointer_drawn);
             }
             let new_capture = frame.is_some() || desktop_texture.is_some();
             if new_capture {
@@ -559,7 +566,12 @@ impl CaptureLoop {
         Ok(())
     }
 
-    fn track_damage(&mut self, frame: &DxgiDuplicationFrame<'_>, capture_cursor: bool) {
+    fn track_damage(
+        &mut self,
+        frame: &DxgiDuplicationFrame<'_>,
+        capture_cursor: bool,
+        pointer_drawn: bool,
+    ) {
         let Some(cursor) = self.cursor_compositor.as_ref() else {
             return;
         };
@@ -568,6 +580,7 @@ impl CaptureLoop {
         if desktop_changed {
             cursor.update(&self.context, frame.texture());
             self.desktop_cached = true;
+            self.pointer.desktop_taken(pointer_drawn);
         }
         // AcquireNextFrame also wakes for pointer-only movement. Encoding
         // those unchanged desktops advances the GOP and wastes bandwidth
@@ -602,7 +615,12 @@ impl CaptureLoop {
                         .cursor_compositor
                         .as_ref()
                         .ok_or(Error::InvalidDisplayDimensions)?
-                        .compose(&self.context, capture_cursor, self.separate_cursor_visible)?,
+                        .compose(
+                            &self.context,
+                            capture_cursor,
+                            self.separate_cursor_visible,
+                            self.pointer.desktop_may_hold_pointer(),
+                        )?,
                 };
                 let yuv = self.converter.convert(texture)?;
                 self.cached_yuv = Some(yuv.clone());
@@ -719,6 +737,41 @@ impl CaptureStats {
     }
 }
 
+/// Whether Windows drew its pointer while the cached desktop could have been
+/// composed, so DXGI may have baked one into it.
+struct PointerHistory {
+    since_desktop: bool,
+    desktop: bool,
+}
+
+impl PointerHistory {
+    /// Nothing was checked before the first desktop.
+    fn new() -> Self {
+        Self {
+            since_desktop: true,
+            desktop: true,
+        }
+    }
+
+    /// Records one check of the system pointer, made on every capture pass
+    /// so a pointer drawn between two desktop images is not missed.
+    fn checked(&mut self, drawn: bool) {
+        self.since_desktop |= drawn;
+    }
+
+    /// A new desktop image was taken just before the latest check. It was
+    /// composed after the previous image was taken, so a pointer baked into
+    /// it was drawn at one of the checks since then.
+    fn desktop_taken(&mut self, drawn: bool) {
+        self.desktop = self.since_desktop;
+        self.since_desktop = drawn;
+    }
+
+    fn desktop_may_hold_pointer(&self) -> bool {
+        self.desktop
+    }
+}
+
 fn duplication_error(error: DuplicationError) -> Error {
     Error::DesktopDuplication(error.to_string())
 }
@@ -731,7 +784,32 @@ fn needs_pointer_frame(desktop_changed: bool, pointer_changed: bool, capture_cur
 
 #[cfg(test)]
 mod tests {
-    use super::needs_pointer_frame;
+    use super::{PointerHistory, needs_pointer_frame};
+
+    #[test]
+    fn a_desktop_may_hold_a_pointer_drawn_at_any_check_since_the_previous_one() {
+        // Unknown before the first desktop.
+        let mut pointer = PointerHistory::new();
+        assert!(pointer.desktop_may_hold_pointer());
+        let take = |pointer: &mut PointerHistory, checks: &[bool]| {
+            for &drawn in checks {
+                pointer.checked(drawn);
+            }
+            pointer.desktop_taken(*checks.last().unwrap());
+            pointer.desktop_may_hold_pointer()
+        };
+        assert!(take(&mut pointer, &[false]));
+        // Hidden throughout, as while typing: the image is used as it is.
+        assert!(!take(&mut pointer, &[false]));
+        assert!(!take(&mut pointer, &[false, false, false]));
+        // Drawn only between two images, as a drag that ends at once.
+        assert!(take(&mut pointer, &[false, true, false]));
+        assert!(!take(&mut pointer, &[false]));
+        // Drawn as an image was taken: that image and the next may hold it.
+        assert!(take(&mut pointer, &[true]));
+        assert!(take(&mut pointer, &[false]));
+        assert!(!take(&mut pointer, &[false]));
+    }
 
     #[test]
     fn hidden_pointer_motion_does_not_schedule_video_but_desktop_damage_does() {
