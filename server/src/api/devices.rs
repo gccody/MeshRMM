@@ -9,7 +9,7 @@ use axum::{
 use meshrmm_protocol_types::AgentCommand;
 use sea_query::{Expr, ExprTrait, Query};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt;
 
 use crate::{
     agents::{self, parse_id},
@@ -18,7 +18,8 @@ use crate::{
     db::tables::Agents,
     http::{ApiError, AppState},
     rbac::Permission,
-    secrets::{hex, new_token, token_hash},
+    secrets::{new_token, token_hash},
+    storage,
     time::now_ms,
 };
 
@@ -181,6 +182,11 @@ fn requested_etag(header: &str) -> Option<&str> {
     (!etag.is_empty() && !etag.contains([',', '"', '*'])).then_some(etag)
 }
 
+/// `tag` quoted, as an `ETag` header value.
+fn etag_value(tag: &str) -> HeaderValue {
+    HeaderValue::from_str(&format!("\"{tag}\"")).expect("hex is a valid header value")
+}
+
 /// `GET /v1/agents/{id}/thumbnail`: the device's latest screen thumbnail.
 /// Answers a matching `If-None-Match` with 304, so an unchanged image is not
 /// sent again, and a device without an image with 204, which browsers do not
@@ -198,26 +204,19 @@ pub async fn thumbnail(
         header::CACHE_CONTROL,
         HeaderValue::from_static("private, no-cache"),
     );
+    let no_image = || (StatusCode::NO_CONTENT, [cache_control.clone()]).into_response();
     // A deleted device's image is gone, even if removing its file failed.
     if !agents::is_active(&mut &state.database, &id).await? {
-        return Ok((StatusCode::NO_CONTENT, [cache_control]).into_response());
+        return Ok(no_image());
     }
     let path = state.storage.thumbnail(&id);
-    let (bytes, modified) = match tokio::fs::read(&path).await {
-        Ok(bytes) => {
-            let modified = tokio::fs::metadata(&path)
-                .await
-                .and_then(|metadata| metadata.modified())
-                .ok();
-            (bytes, modified)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((StatusCode::NO_CONTENT, [cache_control]).into_response());
-        }
+    // A browser with the current image is answered from the file's metadata
+    // alone, without reading it.
+    let tag = match tokio::fs::metadata(&path).await {
+        Ok(metadata) => storage::version(&metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(no_image()),
         Err(error) => return Err(anyhow::Error::from(error).into()),
     };
-    let tag = hex(&Sha256::digest(&bytes)[..16]);
-    let etag = HeaderValue::from_str(&format!("\"{tag}\"")).expect("hex is a valid header value");
     let unchanged = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|value| value.to_str().ok())
@@ -226,10 +225,24 @@ pub async fn thumbnail(
     if unchanged {
         return Ok((
             StatusCode::NOT_MODIFIED,
-            [cache_control, (header::ETAG, etag)],
+            [cache_control, (header::ETAG, etag_value(&tag))],
         )
             .into_response());
     }
+    // The ETag and Last-Modified sent come from the opened file, so they
+    // describe its bytes even if a new image replaces it meanwhile.
+    let mut file = match tokio::fs::File::open(&path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(no_image()),
+        Err(error) => return Err(anyhow::Error::from(error).into()),
+    };
+    let metadata = file.metadata().await.map_err(anyhow::Error::from)?;
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    file.read_to_end(&mut bytes)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let etag = etag_value(&storage::version(&metadata));
+    let modified = metadata.modified().ok();
     let mut response = (
         [
             cache_control,

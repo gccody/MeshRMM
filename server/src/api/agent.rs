@@ -18,6 +18,7 @@ use crate::{
     db::tables::{FileDeliveries, ScriptRuns},
     http::{ApiError, AppState, client_ip::ClientIp},
     realtime::coordinator,
+    storage::Durability,
     time::now_ms,
     toolbox::{self, DELIVERY_WINDOW_MS},
 };
@@ -141,9 +142,11 @@ pub async fn put_thumbnail(
         return Err(problem);
     }
     let path = state.storage.thumbnail(&agent.device_id);
+    // Not flushed to disk: the Agent sends another within the hour, and a
+    // large fleet sends hundreds a second.
     state
         .storage
-        .write(path.clone(), bytes)
+        .write(path.clone(), bytes, Durability::Replaceable)
         .await
         .map_err(anyhow::Error::from)?;
     // The device may have been deleted while the image was written.

@@ -116,6 +116,8 @@ async fn devices_list_online_first_and_deleting_one_uninstalls_its_agent() {
             upload(&zed, jpeg(1, 100)).await.status,
             StatusCode::NO_CONTENT
         );
+        let zed_thumbnail = app.state.storage.thumbnail(&zed.device_id);
+        assert!(zed_thumbnail.exists(), "{name}");
         let (mut viewer, _) =
             common::user_with(&app, &mut admin, "viewer@example.com", &["devices.view"]).await;
         let refused = viewer
@@ -143,6 +145,7 @@ async fn devices_list_online_first_and_deleting_one_uninstalls_its_agent() {
             StatusCode::NO_CONTENT,
             "deleting the device removes its thumbnail"
         );
+        assert!(!zed_thumbnail.exists(), "{name}");
         assert_eq!(
             admin
                 .delete(&format!("/v1/agents/{}", zed.device_id))
@@ -426,6 +429,33 @@ async fn thumbnails_are_small_jpegs_served_with_validators() {
         );
         assert_eq!(replaced.body, jpeg(2, 1000));
         assert_ne!(replaced.header("etag"), etag);
+        let etag = replaced.header("etag").to_owned();
+        // Right after the last one and the same size, so most likely within
+        // one tick of the file system's clock.
+        assert_eq!(
+            upload(&agent, jpeg(3, 1000)).await.status,
+            StatusCode::NO_CONTENT
+        );
+        let same_size = thumbnail(&mut admin, &agent.device_id, Some(&etag)).await;
+        assert_eq!(same_size.status, StatusCode::OK, "{name}");
+        assert_eq!(same_size.body, jpeg(3, 1000));
+        assert_ne!(same_size.header("etag"), etag);
+        let etag = same_size.header("etag").to_owned();
+        // The server doesn't compare images: one sent again is new.
+        assert_eq!(
+            upload(&agent, jpeg(3, 1000)).await.status,
+            StatusCode::NO_CONTENT
+        );
+        let again = thumbnail(&mut admin, &agent.device_id, Some(&etag)).await;
+        assert_eq!(again.status, StatusCode::OK, "{name}");
+        assert_eq!(again.body, jpeg(3, 1000));
+        assert_ne!(again.header("etag"), etag);
+        assert_eq!(
+            thumbnail(&mut admin, &agent.device_id, Some(again.header("etag")))
+                .await
+                .status,
+            StatusCode::NOT_MODIFIED
+        );
         assert_eq!(
             thumbnail(&mut admin, &other.device_id, None).await.status,
             StatusCode::NO_CONTENT,
@@ -440,13 +470,23 @@ async fn thumbnails_are_small_jpegs_served_with_validators() {
                 .status,
             StatusCode::FORBIDDEN
         );
+        let listed = |dir: std::path::PathBuf| {
+            let mut names = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        // In a folder named by the device ID's first two digits.
         let thumbnails = app.state.config.data_dir.join("thumbnails");
-        let mut stored = std::fs::read_dir(thumbnails)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect::<Vec<_>>();
-        stored.sort();
-        assert_eq!(stored, [format!("{}.jpg", agent.device_id)], "{name}");
+        let shard = &agent.device_id[..2];
+        assert_eq!(listed(thumbnails.clone()), [shard], "{name}");
+        assert_eq!(
+            listed(thumbnails.join(shard)),
+            [format!("{}.jpg", agent.device_id)],
+            "{name}"
+        );
         app.finish().await;
     }
 }

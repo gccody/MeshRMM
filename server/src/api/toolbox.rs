@@ -24,7 +24,7 @@ use crate::{
     auth::Authorized,
     db::tables::{ToolboxFiles, ToolboxScripts},
     http::{ApiError, AppState, JsonBody},
-    storage::ReceiveError,
+    storage::{Durability, ReceiveError},
     time::now_ms,
     toolbox::{self, FileRow, Kind, ScriptRow, ToolboxUser},
     users::new_id,
@@ -469,7 +469,13 @@ pub async fn upload_file(
     let path = state.storage.toolbox_file(&id);
     let received = state
         .storage
-        .receive(&path, body.into_data_stream(), max_bytes, Some(&sha256))
+        .receive(
+            &path,
+            body.into_data_stream(),
+            max_bytes,
+            Some(&sha256),
+            Durability::Durable,
+        )
         .await
         .map_err(|error| match error {
             ReceiveError::TooLarge(_) => too_large(),

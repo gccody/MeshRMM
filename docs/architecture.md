@@ -129,7 +129,8 @@ input.
 - `secrets`: the instance key, which encrypts secrets in the database and
   signs TURN credentials.
 - `storage`: files in the data directory (thumbnails, toolbox library),
-  written atomically.
+  written atomically. Library files are flushed to disk before they take
+  their name; thumbnails, which Agents send again, are not.
 - `system_info`: devices' hardware and software snapshots, the application
   change log and their searches. See
   [hardware and software](hardware-and-software.md).
