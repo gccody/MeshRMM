@@ -1,5 +1,13 @@
 //! Routes the Agent calls with its own credential: its control connection,
-//! its screen thumbnail, and the outcome of toolbox runs and deliveries.
+//! its screen thumbnail, and the outcome of toolbox runs and deliveries,
+//! update installs and application runs.
+//!
+//! The Agent keeps each outcome until one of these routes answers it with a
+//! success, and sends it again otherwise, so an outcome the server already
+//! has is answered with a success and changes nothing. One for a run already
+//! counted as lost (or interrupted) replaces that: the run did happen. A
+//! client error tells the Agent to drop the outcome: the device has no such
+//! run, or the report is malformed.
 use axum::{
     body::{Body, Bytes},
     extract::{Path, State, WebSocketUpgrade},
@@ -8,8 +16,8 @@ use axum::{
 };
 use futures_util::StreamExt;
 use meshrmm_protocol_types::{
-    FileDeliveryReport, FileDeliveryStatus, MAX_SCRIPT_OUTPUT_BYTES, MAX_SYSTEM_INFO_BYTES,
-    ScriptRunReport, ScriptRunStatus, truncate_output,
+    ApplicationRunResult, FileDeliveryReport, FileDeliveryStatus, MAX_SCRIPT_OUTPUT_BYTES,
+    MAX_SYSTEM_INFO_BYTES, ScriptRunReport, ScriptRunStatus, UpdateInstallResult, truncate_output,
 };
 use sea_query::{Expr, ExprTrait, Query};
 
@@ -26,7 +34,8 @@ use crate::{
 
 /// Matches the Agent's limit. A 640 by 400 JPEG is normally 20–80 KiB.
 pub const MAX_THUMBNAIL_BYTES: usize = 512 * 1024;
-/// An Agent's report: two output streams at their limit, escaped as JSON.
+/// An Agent's report: two output streams at their limit, escaped as JSON,
+/// and more than an install or application run result can be.
 pub const MAX_REPORT_BYTES: usize = 8 * 1024 * 1024;
 const JPEG_MAGIC: [u8; 3] = [0xff, 0xd8, 0xff];
 const MAX_RAN_AS_CHARS: usize = 256;
@@ -224,12 +233,22 @@ pub async fn report_script_run(
                 .value(ScriptRuns::CompletedAt, now)
                 .and_where(Expr::col(ScriptRuns::Id).eq(run_id.as_str()))
                 .and_where(Expr::col(ScriptRuns::DeviceId).eq(agent.device_id.as_str()))
-                .and_where(Expr::col(ScriptRuns::Status).eq(ScriptRunStatus::Pending.as_str()))
+                .and_where(Expr::col(ScriptRuns::Status).is_in([
+                    ScriptRunStatus::Pending.as_str(),
+                    ScriptRunStatus::Lost.as_str(),
+                ]))
                 .to_owned(),
         )
         .await?;
     if updated == 0 {
-        return Err(ApiError::not_found("no pending run has this ID"));
+        drop(transaction);
+        let known = Query::select()
+            .column(ScriptRuns::Id)
+            .from(ScriptRuns::Table)
+            .and_where(Expr::col(ScriptRuns::Id).eq(run_id.as_str()))
+            .and_where(Expr::col(ScriptRuns::DeviceId).eq(agent.device_id.as_str()))
+            .to_owned();
+        return reported_before(&state, known, "no run has this ID").await;
     }
     jobs::runs_changed(
         &mut transaction,
@@ -344,6 +363,8 @@ pub async fn report_file_delivery(
                 .value(FileDeliveries::CompletedAt, now)
                 .and_where(Expr::col(FileDeliveries::Id).eq(delivery_id.as_str()))
                 .and_where(Expr::col(FileDeliveries::DeviceId).eq(agent.device_id.as_str()))
+                // A delivery past its window is only shown as lost; it stays
+                // pending here, so its late outcome is still taken.
                 .and_where(
                     Expr::col(FileDeliveries::Status).eq(FileDeliveryStatus::Pending.as_str()),
                 )
@@ -351,7 +372,14 @@ pub async fn report_file_delivery(
         )
         .await?;
     if updated == 0 {
-        return Err(ApiError::not_found("no pending delivery has this ID"));
+        drop(transaction);
+        let known = Query::select()
+            .column(FileDeliveries::Id)
+            .from(FileDeliveries::Table)
+            .and_where(Expr::col(FileDeliveries::Id).eq(delivery_id.as_str()))
+            .and_where(Expr::col(FileDeliveries::DeviceId).eq(agent.device_id.as_str()))
+            .to_owned();
+        return reported_before(&state, known, "no delivery has this ID").await;
     }
     jobs::runs_changed(
         &mut transaction,
@@ -363,6 +391,55 @@ pub async fn report_file_delivery(
     transaction.commit().await?;
     state.automation.device_changed(&agent.device_id);
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The answer to a toolbox outcome that changed nothing: a success if
+/// `known` finds the device's run or delivery, which has finished already,
+/// so the outcome was reported before, and `unknown` otherwise.
+async fn reported_before(
+    state: &AppState,
+    known: sea_query::SelectStatement,
+    unknown: &'static str,
+) -> Result<StatusCode, ApiError> {
+    let found: Option<(String,)> = state.database.fetch_optional(&known).await?;
+    match found {
+        Some(_) => Ok(StatusCode::NO_CONTENT),
+        None => Err(ApiError::not_found(unknown)),
+    }
+}
+
+/// `POST /v1/agents/{id}/update-runs/{run_id}/result`: how an install
+/// finished.
+pub async fn report_update_install(
+    State(state): State<AppState>,
+    Path((device_id, run_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<StatusCode, ApiError> {
+    let (agent, run_id) = reporting_agent(&state, &headers, &device_id, &run_id, "run").await?;
+    let result: UpdateInstallResult = read_report(&headers, body).await?;
+    if crate::updates::install_reported(&state, &agent.device_id, &run_id, result).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found("no install has this ID"))
+    }
+}
+
+/// `POST /v1/agents/{id}/application-runs/{run_id}/result`: how an
+/// application run finished.
+pub async fn report_application_run(
+    State(state): State<AppState>,
+    Path((device_id, run_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<StatusCode, ApiError> {
+    let (agent, run_id) = reporting_agent(&state, &headers, &device_id, &run_id, "run").await?;
+    let result: ApplicationRunResult = read_report(&headers, body).await?;
+    if crate::applications::result_reported(&state, &agent.device_id, &run_id, result).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found("no application run has this ID"))
+    }
 }
 
 #[cfg(test)]

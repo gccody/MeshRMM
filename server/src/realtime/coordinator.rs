@@ -123,11 +123,6 @@ pub async fn serve(
                                 updates::progress_reported(&state, &device_id, &run_id, &message, percent).await;
                             }
                         }
-                        Ok(AgentStatusMessage::UpdateInstall { run_id, result }) => {
-                            if state.agents.is_current(&device_id, connection.id) {
-                                updates::install_reported(&state, &device_id, &run_id, *result).await;
-                            }
-                        }
                         Ok(AgentStatusMessage::ApplicationActivity { run_ids }) => {
                             if state.agents.is_current(&device_id, connection.id) {
                                 crate::applications::activity_reported(&state, &device_id, &run_ids, connected_at).await;
@@ -141,11 +136,6 @@ pub async fn serve(
                         Ok(AgentStatusMessage::ApplicationProgress { run_id, message }) => {
                             if state.agents.is_current(&device_id, connection.id) {
                                 crate::applications::progress_reported(&state, &device_id, &run_id, &message).await;
-                            }
-                        }
-                        Ok(AgentStatusMessage::ApplicationResult { run_id, result }) => {
-                            if state.agents.is_current(&device_id, connection.id) {
-                                crate::applications::result_reported(&state, &device_id, &run_id, *result).await;
                             }
                         }
                         Ok(AgentStatusMessage::WakePacketsSent { results }) => {
@@ -274,7 +264,10 @@ async fn greet(
         ),
     }
     // Before any snapshot is asked for, so it leaves out a list the server
-    // has.
+    // has. Always sent: an Agent confirms a freshly installed build of
+    // itself once it has handled the first text message after connecting
+    // (`record_connection` in agent/src/remote/mod.rs), so every connect
+    // must get at least one.
     let message = ToAgent::Command(AgentCommand::StoredApplications {
         applications_hash: system.applications_hash,
     })

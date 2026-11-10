@@ -6,8 +6,11 @@
 //! The coordinator runs them as root or SYSTEM, like update scans. Each scan
 //! or run gets its own thread, one at a time, so the control connection
 //! never waits for a package manager or an installer. A scan asked for while
-//! a run works is answered by the scan after it. Results wait in a queue that
-//! outlives reconnects, so a run that finishes offline is still reported.
+//! a run works is answered by the scan after it. A run's result goes to the
+//! [`outbox`](crate::remote::outbox), which keeps it on disk until the server
+//! acknowledges it, so a run that finishes offline, or before the Agent
+//! restarts, is still reported. Scans and progress wait in a queue that
+//! outlives reconnects.
 //!
 //! A run scans first, so it knows what is installed and outdated, works
 //! through its applications one at a time, each with
@@ -29,6 +32,7 @@ use meshrmm_protocol::{
 use tokio::sync::mpsc;
 
 use crate::remote::config::{Config, ExecutionMode};
+use crate::remote::outbox::{Final, Outbox};
 use crate::remote::process;
 use crate::remote::service_link::ActivityGuard;
 use crate::remote::unsent::{ATTEMPTS, Report, Unsent};
@@ -213,20 +217,23 @@ pub struct Applications {
     /// A report the connection failed to send, sent first on the next one.
     unsent: Unsent,
     waiting: Arc<Mutex<Waiting>>,
-    /// The server's scans and runs this Agent has yet to report: going on,
-    /// or done with the report waiting to be sent. Each connection starts
-    /// by telling the server (see [`Applications::activity`]); one the
-    /// server waits for that isn't here won't be reported, because the
+    /// Where run results go.
+    outbox: Arc<Outbox>,
+    /// The server's scans this Agent has yet to report: going on, or done
+    /// with the report waiting to be sent. With the run going on and the
+    /// runs whose results the outbox holds, it is what each connection
+    /// starts by telling the server (see [`Applications::activity`]); one
+    /// the server waits for that isn't there won't be reported, because the
     /// Agent restarted or never got it.
     owed: Vec<String>,
 }
 
 impl Applications {
-    pub fn new() -> Self {
-        Self::with(Work::DEVICE)
+    pub fn new(outbox: Arc<Outbox>) -> Self {
+        Self::with(Work::DEVICE, outbox)
     }
 
-    fn with(work: Work) -> Self {
+    fn with(work: Work, outbox: Arc<Outbox>) -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
         Self {
             work,
@@ -234,29 +241,32 @@ impl Applications {
             receiver,
             unsent: Unsent::default(),
             waiting: Arc::default(),
+            outbox,
             owed: Vec::new(),
         }
     }
 
     /// The first report on a connection: what the server still gets
-    /// reports for.
+    /// reports for. That includes a run whose result the outbox holds, even
+    /// one from before the Agent restarted, so the server doesn't count it
+    /// as interrupted before its result arrives.
     pub fn activity(&self) -> AgentStatusMessage {
-        AgentStatusMessage::ApplicationActivity {
-            run_ids: self.owed.clone(),
-        }
+        let mut run_ids = self.owed.clone();
+        // The run going on before the outbox: a run's result is stored
+        // before the run is cleared, so it is always in one or the other.
+        let running = lock(&self.waiting).run.as_ref().map(|(id, _)| id.clone());
+        run_ids.extend(running);
+        run_ids.extend(self.outbox.application_runs());
+        let mut seen = std::collections::HashSet::new();
+        run_ids.retain(|id| seen.insert(id.clone()));
+        AgentStatusMessage::ApplicationActivity { run_ids }
     }
 
-    /// `report` reached the connection, so the server has what it answers,
-    /// or was given up on, so it never will.
+    /// `report` reached the connection, so the server has the scans it
+    /// answers, or was given up on, so it never will.
     pub fn delivered(&mut self, report: &AgentStatusMessage) {
-        match report {
-            AgentStatusMessage::ApplicationScan { run_ids, .. } => {
-                self.owed.retain(|id| !run_ids.contains(id));
-            }
-            AgentStatusMessage::ApplicationResult { run_id, .. } => {
-                self.owed.retain(|id| id != run_id);
-            }
-            _ => {}
+        if let AgentStatusMessage::ApplicationScan { run_ids, .. } = report {
+            self.owed.retain(|id| !run_ids.contains(id));
         }
     }
 
@@ -304,7 +314,7 @@ impl Applications {
     }
 
     /// The server asked for a run. `activity` keeps the Agent from updating
-    /// until its result is reported.
+    /// until its result is in the outbox.
     pub fn run(
         &mut self,
         config: &Config,
@@ -312,25 +322,27 @@ impl Applications {
         request: ApplicationRunRequest,
         activity: ActivityGuard,
     ) {
-        self.owed.push(request.run_id.clone());
         let mut waiting = lock(&self.waiting);
         if let Some((running, _)) = &waiting.run {
             let result = ApplicationRunResult::failed(format!(
                 "The device is already installing applications (run {running}). Try again when it finishes."
             ));
-            let _ = self.sender.send(Report::answering(
-                AgentStatusMessage::ApplicationResult {
+            drop(waiting);
+            self.outbox.add(
+                Final::ApplicationRun {
                     run_id: request.run_id,
-                    result: Box::new(result),
+                    result,
                 },
-                Some(activity),
-            ));
+                crate::remote::updates::now_unix_ms(),
+            );
+            drop(activity);
             return;
         }
         waiting.run = Some((request.run_id.clone(), Vec::new()));
         drop(waiting);
         let sender = self.sender.clone();
         let shared = Arc::clone(&self.waiting);
+        let outbox = Arc::clone(&self.outbox);
         let run_id = request.run_id.clone();
         let config = config.clone();
         let run_now = self.work.run;
@@ -353,34 +365,38 @@ impl Applications {
                     error = ?result.error,
                     "application run finished"
                 );
+                // Stored before the run is cleared, so a connection made
+                // meanwhile says the Agent still has it (see `activity`).
+                outbox.add(
+                    Final::ApplicationRun {
+                        run_id: request.run_id.clone(),
+                        result: result.sanitized(),
+                    },
+                    crate::remote::updates::now_unix_ms(),
+                );
+                drop(activity);
                 let run_ids = lock(&shared)
                     .run
                     .take()
                     .map(|(_, runs)| runs)
                     .unwrap_or_default();
-                let _ = sender.send(Report::answering(
-                    AgentStatusMessage::ApplicationResult {
-                        run_id: request.run_id.clone(),
-                        result: Box::new(result.sanitized()),
-                    },
-                    Some(activity),
-                ));
-                let _ = sender.send(Report::new(AgentStatusMessage::ApplicationScan {
+                let mut scan = Report::new(AgentStatusMessage::ApplicationScan {
                     run_ids,
                     scan: Box::new(scan),
-                }));
+                });
+                scan.after_run = true;
+                let _ = sender.send(scan);
             });
         if let Err(error) = spawned {
             tracing::error!(%error, "could not start a thread for an application run");
-            lock(&self.waiting).run = None;
-            let _ = self
-                .sender
-                .send(Report::new(AgentStatusMessage::ApplicationResult {
+            self.outbox.add(
+                Final::ApplicationRun {
                     run_id,
-                    result: Box::new(ApplicationRunResult::failed(
-                        "The Agent could not start the run.",
-                    )),
-                }));
+                    result: ApplicationRunResult::failed("The Agent could not start the run."),
+                },
+                crate::remote::updates::now_unix_ms(),
+            );
+            lock(&self.waiting).run = None;
         }
     }
 
@@ -412,7 +428,6 @@ impl Applications {
             self.delivered(&message);
             let run_ids = match &message {
                 AgentStatusMessage::ApplicationScan { run_ids, .. } => run_ids.clone(),
-                AgentStatusMessage::ApplicationResult { run_id, .. } => vec![run_id.clone()],
                 _ => Vec::new(),
             };
             tracing::warn!(
@@ -996,27 +1011,52 @@ pub(crate) fn extension(path: &Path) -> String {
 mod tests {
     use super::*;
 
+    fn outbox() -> Arc<Outbox> {
+        Arc::new(Outbox::in_memory())
+    }
+
     #[test]
     fn connections_start_with_the_runs_still_owed() {
-        let mut applications = Applications::new();
+        let outbox = outbox();
+        let mut applications = Applications::with(Work::DEVICE, Arc::clone(&outbox));
         assert_eq!(
             applications.activity(),
             AgentStatusMessage::ApplicationActivity { run_ids: vec![] },
             "a new Agent owes nothing"
         );
-        applications.owed = vec!["run".into(), "scan-1".into(), "scan-2".into()];
+        applications.owed = vec!["scan-1".into(), "scan-2".into()];
+        lock(&applications.waiting).run = Some(("running".into(), vec![]));
         applications.delivered(&AgentStatusMessage::ApplicationProgress {
-            run_id: "run".into(),
+            run_id: "running".into(),
             message: "Installing".into(),
-        });
-        applications.delivered(&AgentStatusMessage::ApplicationResult {
-            run_id: "run".into(),
-            result: Box::new(ApplicationRunResult::failed("x")),
         });
         applications.delivered(&AgentStatusMessage::ApplicationScan {
             run_ids: vec!["scan-1".into()],
             scan: Box::default(),
         });
+        assert_eq!(
+            applications.activity(),
+            AgentStatusMessage::ApplicationActivity {
+                run_ids: vec!["scan-2".into(), "running".into()]
+            }
+        );
+        // A run whose result waits in the outbox is still owed, so the server
+        // doesn't count it as interrupted; once delivered it is not.
+        outbox.add(
+            Final::ApplicationRun {
+                run_id: "finished".into(),
+                result: ApplicationRunResult::failed("x"),
+            },
+            0,
+        );
+        lock(&applications.waiting).run = None;
+        assert_eq!(
+            applications.activity(),
+            AgentStatusMessage::ApplicationActivity {
+                run_ids: vec!["scan-2".into(), "finished".into()]
+            }
+        );
+        assert!(outbox.take(Duration::ZERO).is_some());
         assert_eq!(
             applications.activity(),
             AgentStatusMessage::ApplicationActivity {
@@ -1026,24 +1066,24 @@ mod tests {
     }
 
     #[test]
-    fn a_result_no_connection_could_send_stops_going_first_and_is_no_longer_owed() {
+    fn a_scan_no_connection_could_send_stops_going_first_and_is_no_longer_owed() {
         use futures_util::FutureExt;
-        let mut applications = Applications::new();
-        applications.owed = vec!["run".into(), "other".into()];
-        let result = AgentStatusMessage::ApplicationResult {
-            run_id: "run".into(),
-            result: Box::new(ApplicationRunResult::failed("x")),
+        let mut applications = Applications::with(Work::DEVICE, outbox());
+        applications.owed = vec!["scan".into(), "other".into()];
+        let scan = AgentStatusMessage::ApplicationScan {
+            run_ids: vec!["scan".into()],
+            scan: Box::default(),
         };
-        let mut report = Report::new(result.clone());
+        let mut report = Report::new(scan.clone());
         for _ in 1..ATTEMPTS {
             applications.unsent(report);
             // The next connection sends it first, and says it is coming.
             report = applications.next().now_or_never().expect("sent first");
-            assert_eq!(report.message, result);
+            assert_eq!(report.message, scan);
             assert_eq!(
                 applications.activity(),
                 AgentStatusMessage::ApplicationActivity {
-                    run_ids: vec!["run".into(), "other".into()]
+                    run_ids: vec!["scan".into(), "other".into()]
                 }
             );
         }
@@ -1054,14 +1094,15 @@ mod tests {
                 run_ids: vec!["other".into()],
                 scan: Box::default(),
             }));
-        assert!(
-            matches!(
-                applications.next().now_or_never().unwrap().message,
-                AgentStatusMessage::ApplicationScan { .. }
-            ),
+        assert_eq!(
+            applications.next().now_or_never().unwrap().message,
+            AgentStatusMessage::ApplicationScan {
+                run_ids: vec!["other".into()],
+                scan: Box::default(),
+            },
             "what came after it goes first instead"
         );
-        // So the server counts the run lost when the Agent next connects.
+        // So the server counts the scan lost when the Agent next connects.
         assert_eq!(
             applications.activity(),
             AgentStatusMessage::ApplicationActivity {
@@ -1100,12 +1141,16 @@ mod tests {
     }
 
     #[test]
-    fn runs_and_scans_keep_the_agent_busy_until_their_report_is_handed_over() {
+    fn runs_keep_the_agent_busy_until_their_result_is_stored_and_scans_until_sent() {
         let link = crate::remote::service_link::ServiceLink::new(false);
-        let mut applications = Applications::with(Work {
-            scan: waiting_scan,
-            run: waiting_run,
-        });
+        let outbox = outbox();
+        let mut applications = Applications::with(
+            Work {
+                scan: waiting_scan,
+                run: waiting_run,
+            },
+            Arc::clone(&outbox),
+        );
         let config = Config {
             config_path: PathBuf::new(),
             server: "https://rmm.example.com".into(),
@@ -1137,23 +1182,27 @@ mod tests {
         assert!(link.busy(), "running");
         *lock(&LET_GO) = true;
         GOING.notify_all();
-        let result = next(&mut applications);
-        assert!(matches!(
-            result.message,
-            AgentStatusMessage::ApplicationResult { .. }
-        ));
-        assert!(link.busy(), "the result is not on the connection yet");
-        // The connection couldn't send it: it waits for the next one.
-        applications.unsent(result);
-        assert!(link.busy());
-        drop(next(&mut applications));
+        // The scan after the run comes once its result is stored, which
+        // outlives the Agent, so it no longer holds an update.
+        let scan = next(&mut applications);
+        assert!(scan.after_run, "what is installed changed");
         assert!(!link.busy());
-        drop(next(&mut applications));
+        assert_eq!(
+            outbox.take(Duration::ZERO),
+            Some(Final::ApplicationRun {
+                run_id: "run".into(),
+                result: ApplicationRunResult::failed("a stand-in"),
+            })
+        );
 
         applications.scan(None, link.activity());
         let scan = next(&mut applications);
+        assert!(!scan.after_run);
         assert!(link.busy(), "the scan is not on the connection yet");
-        drop(scan);
+        // The connection couldn't send it: it waits for the next one.
+        applications.unsent(scan);
+        assert!(link.busy());
+        drop(next(&mut applications));
         assert!(!link.busy());
     }
 

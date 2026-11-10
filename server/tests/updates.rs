@@ -584,9 +584,8 @@ async fn users_scan_and_install_on_a_device_and_see_its_history() {
         assert_eq!(page["devices"][0]["security"], 1);
         assert_eq!(page["totals"]["security"], 1);
 
-        send_json(
-            &mut control,
-            json!({ "type": "update_install", "run_id": install_id, "result": {
+        desk
+            .report(&format!("update-runs/{install_id}/result"), json!({
                 "status": "partial",
                 "items": [
                     { "id": "openssl", "title": "openssl", "category": "security", "outcome": "installed", "reboot_required": true },
@@ -594,9 +593,8 @@ async fn users_scan_and_install_on_a_device_and_see_its_history() {
                 ],
                 "reboot_required": true,
                 "reboot_scheduled_at_unix_ms": 1_700_000_600_000_i64,
-            } }),
-        )
-        .await;
+            }))
+            .await;
         report_scan(
             &mut control,
             &[],
@@ -649,14 +647,34 @@ async fn users_scan_and_install_on_a_device_and_see_its_history() {
         assert_eq!(audited[0].metadata["reboot"], "if_required");
         assert_eq!(audit_events(&app, "update.scan").await.len(), 1);
 
-        // A report for a run of another device, or a finished one, is ignored.
-        send_json(
-            &mut control,
-            json!({ "type": "update_install", "run_id": install_id, "result": { "status": "succeeded" } }),
-        )
-        .await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(run(&mut tech, &install_id).await["status"], "partial");
+        // The Agent sends a result again when the answer to it never
+        // arrived: it is taken, and changes nothing.
+        let before = run(&mut tech, &install_id).await;
+        let again = desk
+            .report(
+                &format!("update-runs/{install_id}/result"),
+                json!({ "status": "succeeded", "items": [
+                    { "id": "other", "title": "other", "category": "other", "outcome": "installed" },
+                ] }),
+            )
+            .await;
+        assert_eq!(
+            again.status,
+            StatusCode::NO_CONTENT,
+            "{name}: {:?}",
+            again.body
+        );
+        assert_eq!(run(&mut tech, &install_id).await, before, "{name}");
+        // Another device has no such install, so its Agent drops the result.
+        let other = app.enroll(&mut admin, "Other").await;
+        let refused = other
+            .report(
+                &format!("update-runs/{install_id}/result"),
+                json!({ "status": "succeeded" }),
+            )
+            .await;
+        assert_eq!(refused.status, StatusCode::NOT_FOUND, "{name}");
+        assert_eq!(run(&mut tech, &install_id).await, before);
 
         // Installing needs the permission.
         let (mut looker, _) = user_with(
@@ -810,14 +828,12 @@ async fn update_jobs_and_policies_run_on_each_device() {
         let run_id = command["install"]["run_id"].as_str().unwrap().to_owned();
         let job = common::job_with_devices(&mut admin, &job_id).await;
         assert_eq!(outcome(&job, "Desk"), "running", "{name}");
-        send_json(
-            &mut control,
-            json!({ "type": "update_install", "run_id": run_id, "result": {
+        desk
+            .report(&format!("update-runs/{run_id}/result"), json!({
                 "status": "succeeded",
                 "items": [{ "id": "kb1", "title": "KB1", "category": "security", "outcome": "installed" }],
-            } }),
-        )
-        .await;
+            }))
+            .await;
         run_where(&mut admin, &run_id, |run| run["status"] == "succeeded").await;
         automation::pass(&app.state, now_ms()).await.unwrap();
         let job = common::job_with_devices(&mut admin, &job_id).await;
@@ -1065,11 +1081,11 @@ async fn pending_updates_restarts_and_failed_installs_raise_alerts() {
             )
             .await;
         let run_id = started.body["id"].as_str().unwrap().to_owned();
-        send_json(
-            &mut control,
-            json!({ "type": "update_install", "run_id": run_id, "result": {
+        desk.report(
+            &format!("update-runs/{run_id}/result"),
+            json!({
                 "status": "failed", "error": "Another program is using the package manager",
-            } }),
+            }),
         )
         .await;
         let mut raised = Vec::new();
@@ -1122,6 +1138,67 @@ async fn runs_the_agent_never_reports_are_lost() {
         let lost = run(&mut admin, &run_id).await;
         assert_eq!(lost["status"], "lost", "{name}");
         assert_eq!(lost["error"], "The device never reported how it went");
+
+        // An install's result that arrives after its run was counted as lost,
+        // such as one the Agent kept while the server was down, replaces that:
+        // the install did run.
+        let mut control = desk.connect(&server).await.unwrap();
+        report_scan(
+            &mut control,
+            &[],
+            scan("apt", vec![update("openssl", "security")], false),
+        )
+        .await;
+        eventually(&mut admin, &desk.device_id, |updates| {
+            updates["status"]["received_at"].is_number()
+        })
+        .await;
+        let started = admin
+            .post(
+                &format!("/v1/agents/{}/updates/install", desk.device_id),
+                json!({ "reboot": "never" }),
+            )
+            .await;
+        assert_eq!(
+            started.status,
+            StatusCode::ACCEPTED,
+            "{name}: {:?}",
+            started.body
+        );
+        let install_id = started.body["id"].as_str().unwrap().to_owned();
+        updates::sweep(&app.state, now_ms() + 24 * HOUR_MS)
+            .await
+            .unwrap();
+        assert_eq!(
+            run(&mut admin, &install_id).await["status"],
+            "lost",
+            "{name}"
+        );
+        let late = desk
+            .report(
+                &format!("update-runs/{install_id}/result"),
+                json!({ "status": "succeeded", "items": [
+                    { "id": "openssl", "title": "openssl", "category": "security", "outcome": "installed" },
+                ] }),
+            )
+            .await;
+        assert_eq!(
+            late.status,
+            StatusCode::NO_CONTENT,
+            "{name}: {:?}",
+            late.body
+        );
+        let found = run(&mut admin, &install_id).await;
+        assert_eq!(found["status"], "succeeded", "{name}");
+        assert_eq!(found["error"], Value::Null);
+        assert_eq!(found["installed"], 1);
+        assert_eq!(found["items"].as_array().unwrap().len(), 1);
+        let shown = eventually(&mut admin, &desk.device_id, |updates| {
+            updates["status"]["last_install"]["status"] == "succeeded"
+        })
+        .await;
+        assert_eq!(shown["status"]["last_install"]["id"], install_id, "{name}");
+        drop(control);
         app.finish().await;
     }
 }

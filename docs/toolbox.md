@@ -158,7 +158,15 @@ On the Agent:
   Agent's root-only support folder. Linux does the same with bash, keeping
   root's scripts in `/var/lib/meshrmm-agent/scripts`.
 - An Agent runs at most 8 scripts and 4 downloads at once and refuses more.
-  Reports are retried for about a minute while the server is unreachable.
+- The Agent writes each result to its private `results` folder, beside its
+  configuration, before it first sends it, and removes it once the server
+  answers with a success; it reads the folder again when it starts. Server
+  errors (5xx, 401, 408, 429) and an unreachable server are retried, a
+  little later each time up to 10 minutes apart and at once when the control
+  connection comes back, for up to a week; any other refusal is final. It
+  keeps at most 1,000 results and 64 MiB, dropping the oldest. The server
+  answers a result it already has with a success and changes nothing, and
+  one for a run it already counted as lost replaces that.
 
 Every script change, upload, run and delivery is recorded in the audit log (`toolbox.script_*`, `toolbox.file_*`, `script.run`,
 `file.deliver`); a job is recorded once, as `job.start`. The scheduled

@@ -125,9 +125,12 @@ a whole **succeeded** (every chosen update installed, or none was pending),
 was **partial**, or **failed** (nothing installed, or it couldn't start, such
 as when another program holds the package manager); one the Agent hasn't
 reported five hours after it started is **lost**; the Agent gives an install
-four hours ([below](#time-limits)), so it reports a failed install first. An
-[Agent update](devices.md#agent-updates) waits for an install or scan, and
-for its result to reach the server. A
+four hours ([below](#time-limits)), so it reports a failed install first. The
+Agent keeps an install's result on disk until the server has it, so one that
+finishes while the server is unreachable, or before the Agent or the device
+restarts, still arrives, and replaces **lost** if it arrives that late. An
+[Agent update](devices.md#agent-updates) waits for an install until its
+result is stored, and for a scan until it reaches the server. A
 device installs one thing at a time: a second install while one runs fails
 at once, and on the device page **Install** is refused (`409
 install_running`).
@@ -287,10 +290,14 @@ reboot_error, created_at, completed_at, items}`. The event socket sends
   {received_ms_ago, reboot_pending}}}` (on connecting with the last scan, on
   an interval change without), `scan_updates {run_id}` and `install_updates
   {install}`; the Agent sends
-  `update_scan {run_ids, scan}`, `update_progress` and `update_install
-  {run_id, result}` on the control connection. Reports wait in a queue that
-  outlives reconnects. One three connections in a row fail to send is
-  dropped, and its run is lost.
+  `update_scan {run_ids, scan}` and `update_progress` on the control
+  connection, where they wait in a queue that outlives reconnects; a scan
+  three connections in a row fail to send is dropped, and its run is lost.
+  An install's result goes to `POST /v1/agents/{id}/update-runs/{run}/result`
+  through the Agent's outbox (`agent/src/remote/outbox.rs`), which keeps it
+  on disk until the server answers it with a success, and retries server
+  errors and an unreachable server for up to a week. The server answers a
+  result it already has with a success and changes nothing.
 - Agent: `agent/src/remote/updates.rs` (one operation at a time, choosing
   what to install, the restart), `schedule.rs` (when to scan) with
   `windows.rs` (WUA COM), `macos.rs`,

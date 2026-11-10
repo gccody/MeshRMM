@@ -344,6 +344,14 @@ fn device_routes() -> Router<AppState> {
             "/agents/{id}/file-deliveries/{delivery_id}/result",
             post(agent::report_file_delivery),
         )
+        .route(
+            "/agents/{id}/update-runs/{run_id}/result",
+            post(agent::report_update_install),
+        )
+        .route(
+            "/agents/{id}/application-runs/{run_id}/result",
+            post(agent::report_application_run),
+        )
 }
 
 fn application_routes() -> Router<AppState> {

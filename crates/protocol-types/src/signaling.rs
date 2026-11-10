@@ -241,11 +241,6 @@ pub enum AgentStatusMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         percent: Option<u8>,
     },
-    /// How an install went.
-    UpdateInstall {
-        run_id: String,
-        result: Box<crate::UpdateInstallResult>,
-    },
     /// What became of each packet of a [`AgentCommand::SendWakePackets`].
     WakePacketsSent {
         results: Vec<crate::WakePacketResult>,
@@ -274,11 +269,6 @@ pub enum AgentStatusMessage {
     ApplicationProgress {
         run_id: String,
         message: String,
-    },
-    /// How an application run went.
-    ApplicationResult {
-        run_id: String,
-        result: Box<crate::ApplicationRunResult>,
     },
     /// Monitor results: see [`crate::MonitorResult`].
     MonitorResults {
@@ -580,15 +570,6 @@ mod tests {
             serde_json::from_str::<AgentStatusMessage>(&json).unwrap(),
             scan
         );
-        let result = AgentStatusMessage::UpdateInstall {
-            run_id: "run-1".into(),
-            result: Box::new(crate::UpdateInstallResult::failed("locked")),
-        };
-        let json = serde_json::to_string(&result).unwrap();
-        assert_eq!(
-            serde_json::from_str::<AgentStatusMessage>(&json).unwrap(),
-            result
-        );
     }
 
     #[test]
@@ -654,18 +635,10 @@ mod tests {
             serde_json::from_str::<AgentCommand>(&json).unwrap(),
             install
         );
-        let result = AgentStatusMessage::ApplicationResult {
-            run_id: "run-1".into(),
-            result: Box::new(crate::ApplicationRunResult::failed("busy")),
-        };
-        let json = serde_json::to_string(&result).unwrap();
         assert_eq!(
-            json,
-            r#"{"type":"application_result","run_id":"run-1","result":{"status":"failed","error":"busy","items":[]}}"#
-        );
-        assert_eq!(
-            serde_json::from_str::<AgentStatusMessage>(&json).unwrap(),
-            result
+            serde_json::to_string(&crate::ApplicationRunResult::failed("busy")).unwrap(),
+            r#"{"status":"failed","error":"busy","items":[]}"#,
+            "as the Agent posts it"
         );
         let scan = AgentStatusMessage::ApplicationScan {
             run_ids: vec![],

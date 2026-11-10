@@ -527,9 +527,8 @@ async fn scans_install_update_and_uninstall_on_a_device() {
             run["progress"] == "Installing Tool (2 of 2)"
         })
         .await;
-        send_json(
-            &mut control,
-            json!({ "type": "application_result", "run_id": run_id, "result": {
+        desk
+            .report(&format!("application-runs/{run_id}/result"), json!({
                 "status": "partial",
                 "items": [
                     { "index": 0, "name": "Firefox", "source": "winget", "package_id": "Mozilla.Firefox",
@@ -537,9 +536,8 @@ async fn scans_install_update_and_uninstall_on_a_device() {
                     { "index": 1, "name": "Tool", "source": "custom", "outcome": "failed",
                       "exit_code": 1603, "error": "The installer exited with 1603", "output": "Fatal error during installation." },
                 ],
-            } }),
-        )
-        .await;
+            }))
+            .await;
         let done = run_where(&mut admin, &run_id, |run| run["status"] == "partial").await;
         assert_eq!(done["failed"], 1, "{name}");
         assert_eq!(done["items"][1]["exit_code"], 1603);
@@ -581,9 +579,9 @@ async fn scans_install_update_and_uninstall_on_a_device() {
             "{name}"
         );
         let update_id = update.body["id"].as_str().unwrap().to_owned();
-        send_json(
-            &mut control,
-            json!({ "type": "application_result", "run_id": update_id, "result": { "status": "succeeded", "items": [] } }),
+        desk.report(
+            &format!("application-runs/{update_id}/result"),
+            json!({ "status": "succeeded", "items": [] }),
         )
         .await;
         run_where(&mut admin, &update_id, |run| run["status"] == "succeeded").await;
@@ -614,9 +612,9 @@ async fn scans_install_update_and_uninstall_on_a_device() {
         );
         assert_eq!(audit_events(&app, "application.uninstall").await.len(), 1);
         let uninstall_id = uninstall.body["id"].as_str().unwrap().to_owned();
-        send_json(
-            &mut control,
-            json!({ "type": "application_result", "run_id": uninstall_id, "result": { "status": "succeeded", "items": [] } }),
+        desk.report(
+            &format!("application-runs/{uninstall_id}/result"),
+            json!({ "status": "succeeded", "items": [] }),
         )
         .await;
         run_where(&mut admin, &uninstall_id, |run| {
@@ -834,14 +832,12 @@ async fn application_jobs_and_policies_run_on_each_device() {
         let job = common::job_with_devices(&mut admin, &job_id).await;
         assert_eq!(outcome(&job, "Desk")["outcome"], "running", "{name}");
         assert_eq!(outcome(&job, "Desk")["application_run_id"], run_id);
-        send_json(
-            &mut control,
-            json!({ "type": "application_result", "run_id": run_id, "result": {
+        desk
+            .report(&format!("application-runs/{run_id}/result"), json!({
                 "status": "failed",
                 "items": [{ "index": 0, "name": "Firefox", "outcome": "failed", "error": "winget failed", "output": "" }],
-            } }),
-        )
-        .await;
+            }))
+            .await;
         run_where(&mut admin, &run_id, |run| run["status"] == "failed").await;
         let job = common::job_with_devices(&mut admin, &job_id).await;
         assert_eq!(outcome(&job, "Desk")["outcome"], "failed", "{name}");
@@ -1083,15 +1079,13 @@ async fn outdated_and_failed_applications_raise_alerts() {
             )
             .await;
         let run_id = started.body["id"].as_str().unwrap().to_owned();
-        send_json(
-            &mut control,
-            json!({ "type": "application_result", "run_id": run_id, "result": {
+        desk
+            .report(&format!("application-runs/{run_id}/result"), json!({
                 "status": "failed",
                 "items": [{ "index": 0, "name": "Firefox", "outcome": "failed", "exit_code": 2316632080_i64,
                             "error": "No applicable installer", "output": "" }],
-            } }),
-        )
-        .await;
+            }))
+            .await;
         let mut raised = Vec::new();
         for _ in 0..100 {
             raised = alerts_of(&mut admin).await;
@@ -1412,6 +1406,110 @@ async fn runs_a_restarted_agent_no_longer_has_are_lost_at_once() {
 }
 
 #[tokio::test]
+async fn results_an_agent_still_holds_are_taken_once_even_after_an_interruption() {
+    for app in apps().await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let firefox_id = add_application(&mut admin, firefox()).await;
+        let desk = app.enroll(&mut admin, "Desk").await;
+        let result = json!({
+            "status": "succeeded",
+            "items": [{ "index": 0, "name": "Firefox", "outcome": "succeeded", "output": "" }],
+        });
+
+        let control = desk.connect(&server).await.unwrap();
+        let held = start_install(&mut admin, &desk.device_id, &firefox_id).await;
+        drop(control);
+        backdate_runs(&app, &desk.device_id).await;
+        // The Agent restarted with the run's result in its outbox, and says
+        // it still has the run, so it isn't settled as interrupted.
+        let mut control = desk.connect(&server).await.unwrap();
+        send_json(
+            &mut control,
+            json!({ "type": "application_activity", "run_ids": [held] }),
+        )
+        .await;
+        // Reports are handled in order: once this shows, so has the above.
+        send_json(
+            &mut control,
+            json!({ "type": "application_progress", "run_id": held, "message": "Done" }),
+        )
+        .await;
+        run_where(&mut admin, &held, |run| run["progress"] == "Done").await;
+        assert_eq!(run(&mut admin, &held).await["status"], "pending", "{name}");
+        let reported = desk
+            .report(&format!("application-runs/{held}/result"), result.clone())
+            .await;
+        assert_eq!(
+            reported.status,
+            StatusCode::NO_CONTENT,
+            "{name}: {:?}",
+            reported.body
+        );
+        let done = run(&mut admin, &held).await;
+        assert_eq!(done["status"], "succeeded", "{name}");
+        // Sent again, as when the answer never reached the Agent: taken, and
+        // changes nothing.
+        let again = desk
+            .report(
+                &format!("application-runs/{held}/result"),
+                json!({ "status": "failed", "error": "a different story", "items": [] }),
+            )
+            .await;
+        assert_eq!(again.status, StatusCode::NO_CONTENT, "{name}");
+        assert_eq!(run(&mut admin, &held).await, done, "{name}");
+        // Another device has no such run, so its Agent drops the result.
+        let other = app.enroll(&mut admin, "Other").await;
+        assert_eq!(
+            other
+                .report(&format!("application-runs/{held}/result"), result.clone())
+                .await
+                .status,
+            StatusCode::NOT_FOUND,
+            "{name}"
+        );
+
+        // A run settled as interrupted whose result arrives after all: the
+        // run did happen, so its result replaces that.
+        let interrupted = start_install(&mut admin, &desk.device_id, &firefox_id).await;
+        drop(control);
+        backdate_runs(&app, &desk.device_id).await;
+        let mut control = desk.connect(&server).await.unwrap();
+        send_json(&mut control, json!({ "type": "application_activity" })).await;
+        let lost = run_where(&mut admin, &interrupted, |run| run["status"] != "pending").await;
+        assert_eq!(lost["error"], applications::runs::INTERRUPTED, "{name}");
+        let late = desk
+            .report(&format!("application-runs/{interrupted}/result"), result)
+            .await;
+        assert_eq!(
+            late.status,
+            StatusCode::NO_CONTENT,
+            "{name}: {:?}",
+            late.body
+        );
+        let found = run(&mut admin, &interrupted).await;
+        assert_eq!(found["status"], "succeeded", "{name}");
+        assert_eq!(found["error"], Value::Null);
+        assert_eq!(found["items"].as_array().unwrap().len(), 1);
+        drop(control);
+        app.finish().await;
+    }
+}
+
+/// Asks `device_id` to install `application_id`, returning the run's ID.
+async fn start_install(admin: &mut Browser, device_id: &str, application_id: &str) -> String {
+    let started = admin
+        .post(
+            &format!("/v1/agents/{device_id}/application-runs"),
+            json!({ "action": "install", "application_ids": [application_id] }),
+        )
+        .await;
+    assert_eq!(started.status, StatusCode::ACCEPTED, "{:?}", started.body);
+    started.body["id"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
 async fn runs_the_agent_never_reports_are_lost() {
     for app in apps().await {
         let name = app.name;
@@ -1618,15 +1716,13 @@ async fn what_a_device_cant_use_is_skipped_without_alerts() {
         let command = command_of(&mut control, "run_applications").await;
         let run_id = command["run"]["run_id"].as_str().unwrap().to_owned();
         let reason = "winget and Chocolatey aren't installed";
-        send_json(
-            &mut control,
-            json!({ "type": "application_result", "run_id": run_id, "result": {
+        desk
+            .report(&format!("application-runs/{run_id}/result"), json!({
                 "status": "skipped",
                 "error": reason,
                 "items": [{ "index": 0, "name": "Firefox", "outcome": "skipped", "error": reason, "output": "" }],
-            } }),
-        )
-        .await;
+            }))
+            .await;
         let finished = run_where(&mut admin, &run_id, |run| run["status"] == "skipped").await;
         assert_eq!(finished["skipped"], 1, "{name}: {finished:?}");
         assert_eq!(finished["failed"], 0);

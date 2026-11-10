@@ -6,9 +6,11 @@
 //! collection. Each scan or install runs on its own thread, one at a time,
 //! so the control connection never waits for a package manager. A scan asked
 //! for while one runs is answered by the running one; one asked for during an
-//! install is answered by the scan that follows every install. Results wait
-//! in a queue that outlives reconnects, so an install that finishes while the
-//! Agent is offline is still reported.
+//! install is answered by the scan that follows every install. An install's
+//! result goes to the [`outbox`](crate::remote::outbox), which keeps it on
+//! disk until the server acknowledges it, so an install that finishes while
+//! the Agent is offline, or before it restarts, is still reported. Scans and
+//! progress wait in a queue that outlives reconnects.
 //!
 //! A scan has [`UPDATE_SCAN_TIMEOUT_SECONDS`] and an install, with the scans
 //! around it, [`UPDATE_INSTALL_TIMEOUT_SECONDS`]: every program it runs, and
@@ -32,6 +34,7 @@ use meshrmm_protocol::{
 };
 use tokio::sync::mpsc;
 
+use crate::remote::outbox::{Final, Outbox};
 use crate::remote::service_link::ActivityGuard;
 use crate::remote::unsent::{ATTEMPTS, Report, Unsent};
 
@@ -191,6 +194,8 @@ impl Progress {
 /// What the coordinator's handle and the scan and install threads share.
 struct Shared {
     sender: mpsc::UnboundedSender<Report>,
+    /// Where install results go.
+    outbox: Arc<Outbox>,
     waiting: Mutex<Waiting>,
     gate: Mutex<Gate>,
     /// Signalled when a turn is let go of or a stray returns.
@@ -209,17 +214,18 @@ pub struct Updates {
 }
 
 impl Updates {
-    pub fn new() -> Self {
-        Self::with(Box::new(Computer), Limits::AGENT)
+    pub fn new(outbox: Arc<Outbox>) -> Self {
+        Self::with(Box::new(Computer), Limits::AGENT, outbox)
     }
 
-    fn with(runner: Box<dyn Runner>, limits: Limits) -> Self {
+    fn with(runner: Box<dyn Runner>, limits: Limits, outbox: Arc<Outbox>) -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
         Self {
             receiver,
             unsent: Unsent::default(),
             shared: Arc::new(Shared {
                 sender,
+                outbox,
                 waiting: Mutex::default(),
                 gate: Mutex::default(),
                 turn: Condvar::new(),
@@ -248,7 +254,7 @@ impl Updates {
     }
 
     /// The server asked for an install. `activity` keeps the Agent from
-    /// updating until its result is reported.
+    /// updating until its result is in the outbox.
     pub fn install(&mut self, request: UpdateInstallRequest, activity: ActivityGuard) {
         let shared = &self.shared;
         let mut waiting = lock(&shared.waiting);
@@ -256,13 +262,14 @@ impl Updates {
             let result = UpdateInstallResult::failed(format!(
                 "The device is already installing updates (run {running}). Try again when it finishes."
             ));
-            let _ = shared.sender.send(Report::answering(
-                AgentStatusMessage::UpdateInstall {
+            shared.outbox.add(
+                Final::UpdateInstall {
                     run_id: request.run_id,
-                    result: Box::new(result),
+                    result,
                 },
-                Some(activity),
-            ));
+                now_unix_ms(),
+            );
+            drop(activity);
             return;
         }
         waiting.install = Some((request.run_id.clone(), Vec::new()));
@@ -280,14 +287,13 @@ impl Updates {
         if let Err(error) = spawned {
             tracing::error!(%error, "could not start a thread for an update install");
             lock(&shared.waiting).install = None;
-            let _ = shared
-                .sender
-                .send(Report::new(AgentStatusMessage::UpdateInstall {
+            shared.outbox.add(
+                Final::UpdateInstall {
                     run_id,
-                    result: Box::new(UpdateInstallResult::failed(
-                        "The Agent could not start the install.",
-                    )),
-                }));
+                    result: UpdateInstallResult::failed("The Agent could not start the install."),
+                },
+                now_unix_ms(),
+            );
         }
     }
 
@@ -313,7 +319,6 @@ impl Updates {
         if let Some(message) = self.unsent.failed(report) {
             let run_ids = match &message {
                 AgentStatusMessage::UpdateScan { run_ids, .. } => run_ids.clone(),
-                AgentStatusMessage::UpdateInstall { run_id, .. } => vec![run_id.clone()],
                 _ => Vec::new(),
             };
             tracing::warn!(
@@ -385,19 +390,20 @@ impl Shared {
             reboot_scheduled_at = ?result.reboot_scheduled_at_unix_ms,
             "update install finished"
         );
+        self.outbox.add(
+            Final::UpdateInstall {
+                run_id: request.run_id.clone(),
+                result: result.sanitized(),
+            },
+            now_unix_ms(),
+        );
+        drop(activity);
         let mut waiting = lock(&self.waiting);
         let run_ids = waiting
             .install
             .take()
             .map(|(_, runs)| runs)
             .unwrap_or_default();
-        let _ = self.sender.send(Report::answering(
-            AgentStatusMessage::UpdateInstall {
-                run_id: request.run_id.clone(),
-                result: Box::new(result.sanitized()),
-            },
-            Some(activity),
-        ));
         match scan {
             Some(scan) => {
                 drop(waiting);
@@ -847,7 +853,11 @@ mod tests {
     };
 
     fn updates(fake: &Arc<Fake>) -> Updates {
-        Updates::with(Box::new(Arc::clone(fake)), LIMITS)
+        Updates::with(
+            Box::new(Arc::clone(fake)),
+            LIMITS,
+            Arc::new(Outbox::in_memory()),
+        )
     }
 
     /// A hold on an Agent of its own, for work whose holds a test ignores.
@@ -881,12 +891,19 @@ mod tests {
         report_within(updates, Duration::from_secs(30)).expect("a report")
     }
 
+    /// The next install result in the outbox.
     #[track_caller]
-    fn install_result(report: AgentStatusMessage) -> (String, UpdateInstallResult) {
-        match report {
-            AgentStatusMessage::UpdateInstall { run_id, result } => (run_id, *result),
+    fn next_install(updates: &Updates) -> (String, UpdateInstallResult) {
+        match updates.shared.outbox.take(Duration::from_secs(30)) {
+            Some(Final::UpdateInstall { run_id, result }) => (run_id, result),
             other => panic!("not an install result: {other:?}"),
         }
+    }
+
+    /// Whether nothing more is reported within a moment.
+    fn quiet(updates: &mut Updates) -> bool {
+        report_within(updates, Duration::from_millis(300)).is_none()
+            && updates.shared.outbox.take(Duration::ZERO).is_none()
     }
 
     #[track_caller]
@@ -908,11 +925,11 @@ mod tests {
         updates.install(install_of("stuck"), activity());
         updates.scan(Some("asked meanwhile".into()), activity());
         updates.install(install_of("refused"), activity());
-        let (run_id, result) = install_result(next_report(&mut updates));
+        let (run_id, result) = next_install(&updates);
         assert_eq!(run_id, "refused");
         assert!(result.error.unwrap().contains("already installing"));
 
-        let (run_id, result) = install_result(next_report(&mut updates));
+        let (run_id, result) = next_install(&updates);
         assert!(started.elapsed() >= LIMITS.install + LIMITS.grace);
         assert_eq!(run_id, "stuck");
         assert_eq!(result.status, UpdateInstallStatus::Failed);
@@ -930,14 +947,14 @@ mod tests {
         // An install is accepted, and starts once the stuck one returns.
         updates.install(install_of("next"), activity());
         fake.let_go();
-        let (run_id, result) = install_result(next_report(&mut updates));
+        let (run_id, result) = next_install(&updates);
         assert_eq!(run_id, "next");
         assert_eq!(result.status, UpdateInstallStatus::Succeeded);
         assert_eq!(fake.installs(), 2);
         let (run_ids, _) = scan_result(next_report(&mut updates));
         assert!(run_ids.is_empty());
         // The stuck install's own result, when it came, wasn't reported.
-        assert!(report_within(&mut updates, Duration::from_millis(300)).is_none());
+        assert!(quiet(&mut updates));
     }
 
     #[test]
@@ -948,14 +965,14 @@ mod tests {
         });
         let mut updates = updates(&fake);
         updates.install(install_of("stuck"), activity());
-        let (_, result) = install_result(next_report(&mut updates));
+        let (_, result) = next_install(&updates);
         assert!(result.error.unwrap().contains("did not answer"));
         let (run_ids, scan) = scan_result(next_report(&mut updates));
         assert!(run_ids.is_empty());
         assert_eq!(scan.error, None);
 
         updates.install(install_of("next"), activity());
-        let (run_id, result) = install_result(next_report(&mut updates));
+        let (run_id, result) = next_install(&updates);
         assert_eq!(run_id, "next");
         assert_eq!(
             result.error.unwrap(),
@@ -992,7 +1009,7 @@ mod tests {
 
         // An install doesn't wait for it.
         updates.install(install_of("install"), activity());
-        let (run_id, result) = install_result(next_report(&mut updates));
+        let (run_id, result) = next_install(&updates);
         assert_eq!(run_id, "install");
         assert_eq!(result.status, UpdateInstallStatus::Succeeded);
         let _ = scan_result(next_report(&mut updates));
@@ -1004,7 +1021,7 @@ mod tests {
         assert_eq!(run_ids, ["third"]);
         assert_eq!(scan.error, None);
         assert_eq!(fake.scans(), 2);
-        assert!(report_within(&mut updates, Duration::from_millis(300)).is_none());
+        assert!(quiet(&mut updates));
     }
 
     #[test]
@@ -1021,7 +1038,7 @@ mod tests {
             scan.error.unwrap(),
             "The scan stopped on an error in the Agent: a parser met output it didn't expect"
         );
-        assert!(report_within(&mut updates, Duration::from_millis(300)).is_none());
+        assert!(quiet(&mut updates));
 
         // Its turn was let go of: the next scan runs at once.
         let started = Instant::now();
@@ -1042,7 +1059,7 @@ mod tests {
         let mut updates = updates(&fake);
         updates.install(install_of("panics"), activity());
         updates.scan(Some("asked meanwhile".into()), activity());
-        let (run_id, result) = install_result(next_report(&mut updates));
+        let (run_id, result) = next_install(&updates);
         assert_eq!(run_id, "panics");
         assert_eq!(result.status, UpdateInstallStatus::Failed);
         assert_eq!(
@@ -1055,17 +1072,17 @@ mod tests {
 
         let started = Instant::now();
         updates.install(install_of("next"), activity());
-        let (run_id, result) = install_result(next_report(&mut updates));
+        let (run_id, result) = next_install(&updates);
         assert!(started.elapsed() < LIMITS.install);
         assert_eq!(run_id, "next");
         assert_eq!(result.status, UpdateInstallStatus::Succeeded);
         assert_eq!(fake.installs(), 2);
         let _ = scan_result(next_report(&mut updates));
-        assert!(report_within(&mut updates, Duration::from_millis(300)).is_none());
+        assert!(quiet(&mut updates));
     }
 
     #[test]
-    fn installs_and_scans_keep_the_agent_busy_until_their_report_is_handed_over() {
+    fn installs_keep_the_agent_busy_until_their_result_is_stored_and_scans_until_sent() {
         let fake = Arc::new(Fake {
             hanging_installs: 1,
             ..Default::default()
@@ -1083,16 +1100,13 @@ mod tests {
         updates.install(install_of("install"), link.activity());
         assert!(link.busy(), "installing");
         fake.let_go();
-        let result = report(&mut updates);
-        assert!(matches!(
-            result.message,
-            AgentStatusMessage::UpdateInstall { .. }
-        ));
-        assert!(link.busy(), "the result is not on the connection yet");
-        drop(result);
-        assert!(!link.busy());
-        // The scan after it is not a job's result.
+        // The scan after the install comes once its result is stored and the
+        // install has let go: its result outlives the Agent, so it doesn't
+        // hold an update.
         let _ = scan_result(report(&mut updates).message);
+        assert!(!link.busy());
+        let (run_id, _) = next_install(&updates);
+        assert_eq!(run_id, "install");
 
         let fake = Arc::new(Fake {
             hanging_scans: 1,

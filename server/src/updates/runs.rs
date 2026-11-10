@@ -627,7 +627,8 @@ pub async fn finish_install(
                 .and_where(Expr::col(UpdateRuns::Id).eq(run_id))
                 .and_where(Expr::col(UpdateRuns::DeviceId).eq(device_id))
                 .and_where(Expr::col(UpdateRuns::Kind).eq(Kind::Install.as_str()))
-                .and_where(Expr::col(UpdateRuns::Status).eq("pending"))
+                // A lost install did run: its result replaces the guess.
+                .and_where(Expr::col(UpdateRuns::Status).is_in(["pending", "lost"]))
                 .to_owned(),
         )
         .await?;
@@ -678,6 +679,26 @@ pub async fn finish_install(
         executor.execute(&insert).await?;
     }
     Ok(true)
+}
+
+/// Whether the device has the install `run_id`, in any state.
+pub async fn install_exists(
+    executor: &mut impl Executor,
+    device_id: &str,
+    run_id: &str,
+) -> db::Result<bool> {
+    let found: Option<(String,)> = executor
+        .fetch_optional(
+            &Query::select()
+                .column(UpdateRuns::Id)
+                .from(UpdateRuns::Table)
+                .and_where(Expr::col(UpdateRuns::Id).eq(run_id))
+                .and_where(Expr::col(UpdateRuns::DeviceId).eq(device_id))
+                .and_where(Expr::col(UpdateRuns::Kind).eq(Kind::Install.as_str()))
+                .to_owned(),
+        )
+        .await?;
+    Ok(found.is_some())
 }
 
 /// Writes how the run went into its job device's outcome, if it is a job's,

@@ -476,13 +476,23 @@ async fn report_run(
         "{name}: {:?}",
         reported.body
     );
+    // The Agent sends a result again when the answer to it never arrived:
+    // it is taken, and changes nothing.
+    let before = admin.get(&format!("/v1/script-runs/{run_id}")).await.body;
+    let mut different = report;
+    different["stdout"] = json!("another run's output");
     assert_eq!(
         agent
-            .report(&format!("script-runs/{run_id}/result"), report)
+            .report(&format!("script-runs/{run_id}/result"), different)
             .await
             .status,
-        StatusCode::NOT_FOUND,
-        "a run is reported once"
+        StatusCode::NO_CONTENT,
+        "{name}"
+    );
+    assert_eq!(
+        admin.get(&format!("/v1/script-runs/{run_id}")).await.body,
+        before,
+        "{name}: a run is recorded once"
     );
 }
 
@@ -711,6 +721,134 @@ async fn unreported_runs_are_shown_as_lost() {
             ))
             .await;
         assert_eq!(run.body["status"], "lost", "{}", app.name);
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn results_that_arrive_after_a_run_was_lost_replace_it() {
+    for app in common::apps().await {
+        let name = app.name;
+        let mut admin = common::set_up(&app).await;
+        let agent = app.enroll(&mut admin, "DESKTOP-1").await;
+        let script_id = create_script(&mut admin, "Slow").await;
+        let _connection = app.state.agents.connect(&agent.device_id);
+        let started = admin
+            .post(
+                &format!("/v1/agents/{}/script-runs", agent.device_id),
+                json!({ "script_id": script_id, "run_as": "system" }),
+            )
+            .await;
+        assert_eq!(started.status, StatusCode::CREATED, "{name}");
+        let run_id = started.body["id"].as_str().unwrap().to_owned();
+        let content = b"late".to_vec();
+        let file_id = upload(&admin, "late.txt", &content, true, &sha256(&content))
+            .await
+            .body["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let delivered = admin
+            .post(
+                &format!("/v1/agents/{}/file-deliveries", agent.device_id),
+                json!({ "file_id": file_id, "destination": "public" }),
+            )
+            .await;
+        assert_eq!(
+            delivered.status,
+            StatusCode::CREATED,
+            "{name}: {:?}",
+            delivered.body
+        );
+        let delivery_id = delivered.body["id"].as_str().unwrap().to_owned();
+        // The server counted both as lost while the Agent kept their
+        // results: the run was swept, the delivery's window passed.
+        app.db()
+            .execute(
+                &sea_query::Query::update()
+                    .table(sea_query::Alias::new("script_runs"))
+                    .value(sea_query::Alias::new("status"), "lost")
+                    .to_owned(),
+            )
+            .await
+            .unwrap();
+        backdate(
+            &app,
+            "file_deliveries",
+            meshrmm_server::time::now_ms() - 31 * 60 * 1000,
+        )
+        .await;
+        assert_eq!(
+            admin.get(&format!("/v1/script-runs/{run_id}")).await.body["status"],
+            "lost"
+        );
+        assert_eq!(
+            admin
+                .get(&format!("/v1/file-deliveries/{delivery_id}"))
+                .await
+                .body["status"],
+            "lost"
+        );
+
+        let reported = agent
+            .report(
+                &format!("script-runs/{run_id}/result"),
+                json!({ "status": "completed", "ran_as": "SYSTEM", "exit_code": 0, "stdout": "ran after all", "stderr": "" }),
+            )
+            .await;
+        assert_eq!(
+            reported.status,
+            StatusCode::NO_CONTENT,
+            "{name}: {:?}",
+            reported.body
+        );
+        let run = admin.get(&format!("/v1/script-runs/{run_id}")).await.body;
+        assert_eq!(run["status"], "completed", "{name}: the run did happen");
+        assert_eq!(run["stdout"], "ran after all");
+        let reported = agent
+            .report(
+                &format!("file-deliveries/{delivery_id}/result"),
+                json!({ "status": "delivered", "path": "C:\\Users\\Public\\Documents\\late.txt" }),
+            )
+            .await;
+        assert_eq!(
+            reported.status,
+            StatusCode::NO_CONTENT,
+            "{name}: {:?}",
+            reported.body
+        );
+        let delivery = admin
+            .get(&format!("/v1/file-deliveries/{delivery_id}"))
+            .await
+            .body;
+        assert_eq!(delivery["status"], "delivered", "{name}");
+        // Once more, as an Agent that missed the answer would.
+        let again = agent
+            .report(
+                &format!("file-deliveries/{delivery_id}/result"),
+                json!({ "status": "failed", "error": "a different story" }),
+            )
+            .await;
+        assert_eq!(again.status, StatusCode::NO_CONTENT, "{name}");
+        assert_eq!(
+            admin
+                .get(&format!("/v1/file-deliveries/{delivery_id}"))
+                .await
+                .body,
+            delivery
+        );
+        // A delivery the device never had is refused, so the Agent drops it.
+        assert_eq!(
+            agent
+                .report(
+                    "file-deliveries/00000000-0000-4000-8000-000000000000/result",
+                    json!({ "status": "delivered" }),
+                )
+                .await
+                .status,
+            StatusCode::NOT_FOUND,
+            "{name}"
+        );
         app.finish().await;
     }
 }

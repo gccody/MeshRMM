@@ -613,7 +613,9 @@ pub async fn finish(
                 .and_where(Expr::col(ApplicationRuns::Id).eq(run_id))
                 .and_where(Expr::col(ApplicationRuns::DeviceId).eq(device_id))
                 .and_where(Expr::col(ApplicationRuns::Action).ne(Action::Scan.as_str()))
-                .and_where(Expr::col(ApplicationRuns::Status).eq("pending"))
+                // A lost or interrupted run did happen: its result replaces
+                // the guess.
+                .and_where(Expr::col(ApplicationRuns::Status).is_in(["pending", "lost"]))
                 .to_owned(),
         )
         .await?;
@@ -665,6 +667,27 @@ pub async fn finish(
             .await?;
     }
     Ok(true)
+}
+
+/// Whether the device has the install, update or uninstall run `run_id`, in
+/// any state.
+pub async fn run_exists(
+    executor: &mut impl Executor,
+    device_id: &str,
+    run_id: &str,
+) -> db::Result<bool> {
+    let found: Option<(String,)> = executor
+        .fetch_optional(
+            &Query::select()
+                .column(ApplicationRuns::Id)
+                .from(ApplicationRuns::Table)
+                .and_where(Expr::col(ApplicationRuns::Id).eq(run_id))
+                .and_where(Expr::col(ApplicationRuns::DeviceId).eq(device_id))
+                .and_where(Expr::col(ApplicationRuns::Action).ne(Action::Scan.as_str()))
+                .to_owned(),
+        )
+        .await?;
+    Ok(found.is_some())
 }
 
 /// Marks runs the Agent never reported as lost. Returns them, with their

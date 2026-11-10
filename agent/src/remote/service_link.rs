@@ -6,10 +6,13 @@
 //! stdin, so the coordinator can tell the server why the Agent is going offline.
 //!
 //! The coordinator is busy while it holds an [`ActivityGuard`]: for a remote session, terminal
-//! or file transfer while it is open, and for an update install or scan, an application run or
-//! scan, a toolbox script or file, or a self-healing action from when it is accepted until its
-//! result reaches the connection. A result waiting for a connection keeps it busy for at most
-//! [`RESULT_HOLD`] after its job ends, since an Agent that is offline cannot deliver it.
+//! or file transfer while it is open; for an update install, an application run or a toolbox
+//! script or file from when it is accepted until its result is in the
+//! [`outbox`](crate::remote::outbox), which keeps it on disk for the build that replaces this
+//! one to deliver; and for an update or application scan or a self-healing action from when it
+//! is accepted until its result reaches the connection. Those results are kept only in memory,
+//! and one waiting for a connection keeps the coordinator busy for at most [`RESULT_HOLD`] after
+//! its job ends, since an Agent that is offline cannot deliver it.
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::sync::{Arc, Mutex};
@@ -24,9 +27,10 @@ pub const IDLE: &str = "idle";
 /// Written by the service, followed by the release version, before it stops the coordinator to
 /// install an automatic update.
 pub const UPDATING_PREFIX: &str = "updating ";
-/// How long a job's result keeps the Agent busy once the job has ended, if the connection has
-/// not taken it by then. Results are kept only in memory, so an update that waited longer for an
-/// Agent that is offline would not save them, only hold up the update.
+/// How long a scan's or self-healing action's result keeps the Agent busy once the job has
+/// ended, if the connection has not taken it by then. These are kept only in memory, so an update
+/// that waited longer for an Agent that is offline would not save them, only hold up the update.
+/// Final results the outbox keeps don't hold the Agent at all once stored.
 pub const RESULT_HOLD: Duration = Duration::from_secs(10 * 60);
 /// How often an attached coordinator looks for results whose hold ran out, to tell the service.
 const HOLD_CHECK: Duration = Duration::from_secs(30);

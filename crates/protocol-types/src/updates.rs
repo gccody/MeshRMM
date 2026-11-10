@@ -5,9 +5,12 @@
 //! ([`crate::AgentCommand::SetUpdateScanSchedule`]), asks for scans people
 //! and jobs want and for installs on the control connection
 //! ([`crate::AgentCommand::ScanUpdates`], [`crate::AgentCommand::InstallUpdates`]),
-//! and the Agent reports on it ([`crate::AgentStatusMessage::UpdateScan`],
-//! [`crate::AgentStatusMessage::UpdateProgress`],
-//! [`crate::AgentStatusMessage::UpdateInstall`]).
+//! and the Agent reports scans and progress on it
+//! ([`crate::AgentStatusMessage::UpdateScan`],
+//! [`crate::AgentStatusMessage::UpdateProgress`]). An install's
+//! [`UpdateInstallResult`] is posted over HTTPS to
+//! `/v1/agents/{id}/update-runs/{run_id}/result` until the server
+//! acknowledges it.
 use serde::{Deserialize, Serialize};
 
 use crate::{clean_optional, clean_text};

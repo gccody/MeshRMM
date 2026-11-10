@@ -2,8 +2,10 @@
 //! reports how they went. See docs/toolbox.md.
 //!
 //! Each run or delivery gets its own thread, off the coordinator's signaling
-//! loop, and reports over HTTPS with the Agent's credential, so a result
-//! survives a signaling reconnect.
+//! loop, and hands its result to the [`outbox`](crate::remote::outbox), which
+//! keeps it on disk and delivers it over HTTPS with the Agent's credential
+//! until the server acknowledges it, so a result survives a signaling
+//! reconnect, a server outage and an Agent restart.
 //!
 //! A script runs as SYSTEM, or as the signed-in user when asked; with nobody
 //! signed in it runs as SYSTEM instead. A file goes to the signed-in user's
@@ -151,6 +153,7 @@ use self::windows as platform;
 mod shared {
     use std::io::{Read, Write};
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -163,12 +166,12 @@ mod shared {
 
     use super::{MAX_RUNNING_DELIVERIES, MAX_RUNNING_SCRIPTS, platform};
     use crate::remote::config::{Config, ExecutionMode};
+    use crate::remote::outbox::{Final, Outbox};
     use crate::remote::service_link::ActivityGuard;
+    use crate::remote::updates::now_unix_ms;
 
     static RUNNING_SCRIPTS: AtomicUsize = AtomicUsize::new(0);
     static RUNNING_DELIVERIES: AtomicUsize = AtomicUsize::new(0);
-    /// Reports are retried this many times, a little longer apart each time.
-    const REPORT_ATTEMPTS: u32 = 6;
     const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
     /// A place among a limited number of concurrent jobs, given back on drop.
@@ -191,17 +194,23 @@ mod shared {
         }
     }
 
-    /// Runs `run` on its own thread and reports how it went. `activity`
-    /// keeps the Agent from updating until the report is sent or given up on.
+    /// Runs `run` on its own thread and hands how it went to `outbox`.
+    /// `activity` keeps the Agent from updating until it is stored.
     pub(crate) fn run_script(
-        config: &Config,
+        outbox: &Arc<Outbox>,
         mode: ExecutionMode,
         run: ScriptRunRequest,
         activity: ActivityGuard,
     ) {
-        let config = config.clone();
+        let outbox = Arc::clone(outbox);
         start_script(mode, run, activity, move |run_id, report| {
-            send_report(&config, &["script-runs", run_id, "result"], report);
+            outbox.add(
+                Final::ScriptRun {
+                    run_id: run_id.to_owned(),
+                    report: report.clone(),
+                },
+                now_unix_ms(),
+            );
         });
     }
 
@@ -241,7 +250,6 @@ mod shared {
                     error = ?report.error,
                     "toolbox script finished"
                 );
-                activity.finished();
                 send(&run.run_id, &report);
                 drop(activity);
             });
@@ -266,16 +274,18 @@ mod shared {
         platform::execute_script(mode, run)
     }
 
-    /// Saves `delivery`'s file on its own thread and reports how it went.
-    /// `activity` keeps the Agent from updating until the report is sent or
-    /// given up on.
+    /// Saves `delivery`'s file on its own thread and hands how it went to
+    /// `outbox`. `activity` keeps the Agent from updating until it is
+    /// stored.
     pub(crate) fn deliver_file(
         config: &Config,
+        outbox: &Arc<Outbox>,
         mode: ExecutionMode,
         delivery: FileDeliveryRequest,
         activity: ActivityGuard,
     ) {
         let config = config.clone();
+        let outbox = Arc::clone(outbox);
         let slot = Slot::take(&RUNNING_DELIVERIES, MAX_RUNNING_DELIVERIES);
         let spawned = std::thread::Builder::new()
             .name("meshrmm-toolbox-file".into())
@@ -304,11 +314,12 @@ mod shared {
                         }
                     }
                 };
-                activity.finished();
-                send_report(
-                    &config,
-                    &["file-deliveries", &delivery.delivery_id, "result"],
-                    &report,
+                outbox.add(
+                    Final::FileDelivery {
+                        delivery_id: delivery.delivery_id,
+                        report,
+                    },
+                    now_unix_ms(),
                 );
                 drop(activity);
             });
@@ -415,42 +426,6 @@ mod shared {
             .tls_config(crate::enrollment::https_tls_config())
             .build()
             .new_agent()
-    }
-
-    /// Posts a result to `/v1/agents/{device}/{path}`, retrying while the
-    /// server cannot be reached. A refusal is final.
-    fn send_report(config: &Config, path: &[&str], report: &impl serde::Serialize) {
-        let mut segments = vec!["v1", "agents", config.device_id.as_str()];
-        segments.extend_from_slice(path);
-        let url =
-            match meshrmm_signaling_client::endpoint_url(&config.server, &segments, &[], false) {
-                Ok(url) => url,
-                Err(error) => {
-                    tracing::error!(%error, "could not build the toolbox report URL");
-                    return;
-                }
-            };
-        let http = http(Duration::from_secs(60));
-        for attempt in 1..=REPORT_ATTEMPTS {
-            match http
-                .post(url.as_str())
-                .header("Authorization", &format!("Bearer {}", config.agent_token))
-                .send_json(report)
-            {
-                Ok(_) => return,
-                Err(ureq::Error::StatusCode(status)) => {
-                    tracing::warn!(status, url = %url, "the server refused a toolbox report");
-                    return;
-                }
-                Err(error) if attempt < REPORT_ATTEMPTS => {
-                    tracing::warn!(%error, attempt, "could not send a toolbox report; retrying");
-                    std::thread::sleep(Duration::from_secs(2_u64.pow(attempt)));
-                }
-                Err(error) => {
-                    tracing::error!(%error, url = %url, "could not send a toolbox report");
-                }
-            }
-        }
     }
 }
 
@@ -613,7 +588,7 @@ mod tests {
 
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     #[test]
-    fn scripts_keep_the_agent_busy_until_their_report_is_sent() {
+    fn scripts_keep_the_agent_busy_until_their_result_is_stored() {
         use std::time::{Duration, Instant};
 
         let link = crate::remote::service_link::ServiceLink::new(false);
@@ -646,13 +621,13 @@ mod tests {
             (run_id.as_str(), status),
             ("run", meshrmm_protocol::ScriptRunStatus::Failed)
         );
-        assert!(link.busy(), "the report is being sent");
+        assert!(link.busy(), "the result is being stored");
         release.send(()).unwrap();
         let until = Instant::now() + Duration::from_secs(30);
         while link.busy() {
             assert!(
                 Instant::now() < until,
-                "still busy once the report was sent"
+                "still busy once the result was stored"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
