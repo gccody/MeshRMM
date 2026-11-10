@@ -12,8 +12,8 @@ use sea_query::{Expr, ExprTrait, Func, LockType, Order, Query as Sql};
 use serde_json::{Map, Value, json};
 
 use super::{
-    GROUP_SCHEMA, ListQuery, Projection, ScimBody, ScimClient, ScimError, base_url, filter,
-    list_response, meta,
+    GROUP_SCHEMA, ListQuery, Projection, ScimBody, ScimClient, ScimError, base_url,
+    ensure_administrator_remains, filter, list_response, meta,
     patch::{Operation, PatchRequest},
     scim_json, text,
 };
@@ -24,6 +24,7 @@ use crate::{
         tables::{ScimGroupMembers, ScimGroups, Users},
     },
     http::AppState,
+    rbac::ADMINISTRATOR_ROLE_ID,
     time::now_ms,
     users::new_id,
 };
@@ -38,6 +39,14 @@ struct GroupRow {
     role_id: Option<String>,
     created_at: i64,
     updated_at: i64,
+}
+
+impl GroupRow {
+    /// Members leaving the group, or its deletion, can take the role from
+    /// the last administrator.
+    fn grants_administrator(&self) -> bool {
+        self.role_id.as_deref() == Some(ADMINISTRATOR_ROLE_ID)
+    }
 }
 
 #[derive(Debug)]
@@ -446,6 +455,9 @@ async fn update(
             .await?;
     }
     add_members(&mut transaction, id, &added).await?;
+    if !removed.is_empty() && group.grants_administrator() {
+        ensure_administrator_remains(&mut transaction).await?;
+    }
     audit::record(
         &mut transaction,
         &client.actor,
@@ -505,6 +517,9 @@ pub async fn delete(
                 .to_owned(),
         )
         .await?;
+    if group.grants_administrator() {
+        ensure_administrator_remains(&mut transaction).await?;
+    }
     audit::record(
         &mut transaction,
         &client.actor,

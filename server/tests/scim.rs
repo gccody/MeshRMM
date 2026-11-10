@@ -318,15 +318,260 @@ async fn deprovisioning_ends_access_but_keeps_an_administrator() {
                 json!([{ "op": "replace", "path": "active", "value": false }]),
             )
             .await;
-        assert_eq!(
-            refused.status,
-            StatusCode::CONFLICT,
-            "{name}: {:?}",
-            refused.body
-        );
+        assert_last_administrator(name, &refused);
         let refused = scim.delete(&format!("/Users/{admin_id}")).await;
-        assert_eq!(refused.status, StatusCode::CONFLICT, "{name}");
+        assert_last_administrator(name, &refused);
         assert_eq!(admin.get("/v1/account").await.status, StatusCode::OK);
+        app.finish().await;
+    }
+}
+
+/// A SCIM change refused because it would leave no enabled administrator.
+#[track_caller]
+fn assert_last_administrator(name: &str, refused: &Response) {
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{name}: {:?}",
+        refused.body
+    );
+    assert_eq!(refused.body["scimType"], "mutability", "{name}");
+    assert!(
+        refused.body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("without an enabled administrator"),
+        "{name}: {:?}",
+        refused.body
+    );
+}
+
+fn group(display_name: &str, member_ids: &[&str]) -> Value {
+    json!({
+        "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+        "displayName": display_name,
+        "members": member_ids
+            .iter()
+            .map(|id| json!({ "value": id }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// Creates a group of `member_ids` whose members hold the Administrator
+/// role, and returns its ID.
+async fn administrators_group(
+    scim: &Scim<'_>,
+    admin: &mut Browser,
+    display_name: &str,
+    member_ids: &[&str],
+) -> String {
+    let created = scim.post("/Groups", group(display_name, member_ids)).await;
+    assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+    let id = created.body["id"].as_str().unwrap().to_owned();
+    let mapped = admin
+        .patch(
+            &format!("/v1/settings/scim/groups/{id}"),
+            json!({ "role_id": "administrator" }),
+        )
+        .await;
+    assert_eq!(mapped.status, StatusCode::OK, "{:?}", mapped.body);
+    id
+}
+
+async fn member_count(scim: &Scim<'_>, group_id: &str) -> usize {
+    let group = scim.get(&format!("/Groups/{group_id}")).await;
+    assert_eq!(group.status, StatusCode::OK, "{:?}", group.body);
+    group.body["members"].as_array().unwrap().len()
+}
+
+fn members_change(op: &str, user_id: &str) -> Value {
+    json!([{ "op": op, "path": "members", "value": [{ "value": user_id }] }])
+}
+
+#[tokio::test]
+async fn scim_keeps_an_administrator_who_holds_the_role_through_a_group() {
+    for app in common::apps().await {
+        let name = app.name;
+        let mut admin = common::set_up(&app).await;
+        let admin_id = admin.get("/v1/account").await.body["user"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let scim = token(&app, &mut admin).await;
+        let (mut second, second_id) =
+            common::add_user(&app, &mut admin, "second@example.com", &["technician"]).await;
+        let admins = administrators_group(&scim, &mut admin, "Admins", &[&second_id]).await;
+        let backup = administrators_group(&scim, &mut admin, "Backup admins", &[]).await;
+
+        // An administrator through a group counts for the direct paths: the
+        // first administrator may step down.
+        let stepped_down = admin
+            .patch(
+                &format!("/v1/users/{admin_id}"),
+                json!({ "role_ids": ["technician"] }),
+            )
+            .await;
+        assert_eq!(
+            stepped_down.status,
+            StatusCode::OK,
+            "{name}: {:?}",
+            stepped_down.body
+        );
+
+        // Now the second user is the only administrator, through Admins. A
+        // disabled member of another administrators' group doesn't count.
+        let (_, dormant_id) = common::add_user(&app, &mut second, "dormant@example.com", &[]).await;
+        let added = scim
+            .patch(
+                &format!("/Groups/{backup}"),
+                members_change("Add", &dormant_id),
+            )
+            .await;
+        assert_eq!(added.status, StatusCode::OK, "{name}: {:?}", added.body);
+        let disabled = scim
+            .patch(
+                &format!("/Users/{dormant_id}"),
+                json!([{ "op": "replace", "path": "active", "value": false }]),
+            )
+            .await;
+        assert_eq!(
+            disabled.status,
+            StatusCode::OK,
+            "{name}: {:?}",
+            disabled.body
+        );
+
+        let removed = scim
+            .patch(
+                &format!("/Groups/{admins}"),
+                members_change("Remove", &second_id),
+            )
+            .await;
+        assert_last_administrator(name, &removed);
+        let emptied = scim
+            .put(&format!("/Groups/{admins}"), group("Admins", &[]))
+            .await;
+        assert_last_administrator(name, &emptied);
+        let deleted = scim.delete(&format!("/Groups/{admins}")).await;
+        assert_last_administrator(name, &deleted);
+        let deactivated = scim
+            .patch(
+                &format!("/Users/{second_id}"),
+                json!([{ "op": "replace", "path": "active", "value": false }]),
+            )
+            .await;
+        assert_last_administrator(name, &deactivated);
+        let deprovisioned = scim.delete(&format!("/Users/{second_id}")).await;
+        assert_last_administrator(name, &deprovisioned);
+        let unmapped = second
+            .patch(
+                &format!("/v1/settings/scim/groups/{admins}"),
+                json!({ "role_id": null }),
+            )
+            .await;
+        assert_eq!(unmapped.code(), "last_administrator", "{name}");
+        // A deleted member of an administrators' group doesn't count either.
+        let deleted = scim.delete(&format!("/Users/{dormant_id}")).await;
+        assert_eq!(deleted.status, StatusCode::NO_CONTENT, "{name}");
+        let deleted = scim.delete(&format!("/Groups/{admins}")).await;
+        assert_last_administrator(name, &deleted);
+        // Nothing changed.
+        assert_eq!(member_count(&scim, &admins).await, 1, "{name}");
+        let account = second.get("/v1/account").await;
+        assert_eq!(account.body["is_administrator"], true, "{name}");
+        assert!(
+            common::audit_events(&app, "scim.group_update")
+                .await
+                .iter()
+                .all(|event| event.metadata.get("members_removed").is_none()),
+            "{name}"
+        );
+        assert!(
+            common::audit_events(&app, "scim.group_delete")
+                .await
+                .is_empty(),
+            "{name}"
+        );
+
+        // With an administrator through another group, the same change goes
+        // through.
+        let added = scim
+            .patch(
+                &format!("/Groups/{backup}"),
+                members_change("Add", &admin_id),
+            )
+            .await;
+        assert_eq!(added.status, StatusCode::OK, "{name}: {:?}", added.body);
+        let removed = scim
+            .patch(
+                &format!("/Groups/{admins}"),
+                members_change("Remove", &second_id),
+            )
+            .await;
+        assert_eq!(removed.status, StatusCode::OK, "{name}: {:?}", removed.body);
+        assert_eq!(member_count(&scim, &admins).await, 0, "{name}");
+        let account = second.get("/v1/account").await;
+        assert_eq!(account.body["is_administrator"], false, "{name}");
+
+        // The first administrator now holds the role only through Backup
+        // admins; given it directly too, the group can go.
+        let deleted = scim.delete(&format!("/Groups/{backup}")).await;
+        assert_last_administrator(name, &deleted);
+        let restored = admin
+            .patch(
+                &format!("/v1/users/{admin_id}"),
+                json!({ "role_ids": ["administrator"] }),
+            )
+            .await;
+        assert_eq!(
+            restored.status,
+            StatusCode::OK,
+            "{name}: {:?}",
+            restored.body
+        );
+        let deleted = scim.delete(&format!("/Groups/{backup}")).await;
+        assert_eq!(deleted.status, StatusCode::NO_CONTENT, "{name}");
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn concurrent_group_deletions_keep_an_administrator() {
+    for app in common::apps().await {
+        let name = app.name;
+        let mut admin = common::set_up(&app).await;
+        let admin_id = admin.get("/v1/account").await.body["user"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let scim = token(&app, &mut admin).await;
+        let (_, second_id) =
+            common::add_user(&app, &mut admin, "second@example.com", &["technician"]).await;
+        let first = administrators_group(&scim, &mut admin, "First", &[&admin_id]).await;
+        let second = administrators_group(&scim, &mut admin, "Second", &[&second_id]).await;
+        let stepped_down = admin
+            .patch(
+                &format!("/v1/users/{admin_id}"),
+                json!({ "role_ids": ["technician"] }),
+            )
+            .await;
+        assert_eq!(stepped_down.status, StatusCode::OK, "{name}");
+
+        // Either deletion alone leaves an administrator; together they would
+        // leave none, so the second to run sees the first and is refused.
+        let (first, second) = (format!("/Groups/{first}"), format!("/Groups/{second}"));
+        let (a, b) = tokio::join!(scim.delete(&first), scim.delete(&second));
+        let mut statuses = [a.status, b.status];
+        statuses.sort();
+        assert_eq!(
+            statuses,
+            [StatusCode::NO_CONTENT, StatusCode::BAD_REQUEST],
+            "{name}: {:?} {:?}",
+            a.body,
+            b.body
+        );
+        let remaining = scim.get("/Groups").await;
+        assert_eq!(remaining.body["totalResults"], 1, "{name}");
         app.finish().await;
     }
 }

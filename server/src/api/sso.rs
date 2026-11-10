@@ -293,13 +293,16 @@ async fn finish(
         .await?;
         return Err(Failure::Disabled);
     }
-    sync_groups(
+    // Without a groups claim the user is in no SSO group.
+    oidc::replace_user_groups(
         &mut transaction,
         &user.id,
         provider
             .groups_claim
             .as_ref()
-            .and(identity.groups.as_deref()),
+            .and(identity.groups.as_deref())
+            .unwrap_or_default(),
+        ip,
     )
     .await?;
     let client = Client::new(ip, headers);
@@ -418,35 +421,6 @@ async fn account_for(
     )
     .await?;
     users::by_id(transaction, &id).await?.ok_or(Failure::Failed)
-}
-
-/// Replaces the user's SSO groups with `groups`, or clears them when the
-/// provider has no groups claim.
-async fn sync_groups(
-    executor: &mut impl Executor,
-    user_id: &str,
-    groups: Option<&[String]>,
-) -> crate::db::Result<()> {
-    executor
-        .execute(
-            &Sql::delete()
-                .from_table(UserOidcGroups::Table)
-                .and_where(Expr::col(UserOidcGroups::UserId).eq(user_id))
-                .to_owned(),
-        )
-        .await?;
-    let Some(groups) = groups.filter(|groups| !groups.is_empty()) else {
-        return Ok(());
-    };
-    let mut insert = Sql::insert();
-    insert
-        .into_table(UserOidcGroups::Table)
-        .columns([UserOidcGroups::UserId, UserOidcGroups::GroupName]);
-    for group in groups {
-        insert.values_panic([user_id.into(), group.as_str().into()]);
-    }
-    executor.execute(&insert).await?;
-    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]

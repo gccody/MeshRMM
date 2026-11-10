@@ -5,12 +5,12 @@
 //! implicitly, including ones added by later releases, so it can't be emptied.
 use std::{collections::BTreeSet, fmt, str::FromStr};
 
-use sea_query::{Expr, ExprTrait, Order, Query};
+use sea_query::{Expr, ExprTrait, LockType, Order, Query};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::db::{
     self, Executor,
-    tables::{EffectiveUserRoles, RolePermissions, Roles},
+    tables::{EffectiveUserRoles, RolePermissions, Roles, Settings, Users},
 };
 
 /// The ID (and `builtin` value) of the role with every permission.
@@ -207,6 +207,48 @@ pub async fn user_roles(executor: &mut impl Executor, user_id: &str) -> db::Resu
         .await?;
     let ids = ids.into_iter().map(|(id,)| id).collect::<Vec<_>>();
     load_roles(executor, Some(&ids)).await
+}
+
+/// Whether an enabled user still holds the Administrator role, assigned to
+/// them or through an identity provider's group. Every change that can take
+/// the role from someone, or disable or delete them, calls this inside its
+/// transaction after making the change, and keeps the change only if an
+/// administrator remains.
+pub async fn administrator_remains(executor: &mut impl Executor) -> db::Result<bool> {
+    // Two transactions removing different administrators would each still
+    // count the other. Locking one shared row first makes the second wait
+    // and then count what the first committed. (SQLite's write lock already
+    // serializes them; sea-query leaves FOR UPDATE out there.)
+    let _: Option<(i64,)> = executor
+        .fetch_optional(
+            &Query::select()
+                .column(Settings::Id)
+                .from(Settings::Table)
+                .and_where(Expr::col(Settings::Id).eq(1))
+                .lock(LockType::Update)
+                .to_owned(),
+        )
+        .await?;
+    let administrator: Option<(String,)> = executor
+        .fetch_optional(
+            &Query::select()
+                .column((Users::Table, Users::Id))
+                .from(Users::Table)
+                .inner_join(
+                    EffectiveUserRoles::Table,
+                    Expr::col((EffectiveUserRoles::Table, EffectiveUserRoles::UserId))
+                        .equals((Users::Table, Users::Id)),
+                )
+                .and_where(
+                    Expr::col((EffectiveUserRoles::Table, EffectiveUserRoles::RoleId))
+                        .eq(ADMINISTRATOR_ROLE_ID),
+                )
+                .and_where(Expr::col((Users::Table, Users::Disabled)).eq(false))
+                .limit(1)
+                .to_owned(),
+        )
+        .await?;
+    Ok(administrator.is_some())
 }
 
 /// Every permission any of `roles` grants.
