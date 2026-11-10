@@ -36,6 +36,9 @@ use crate::{
     website::Website,
 };
 
+/// How long a client told the server is busy waits before trying again.
+const BUSY_RETRY_SECONDS: u64 = 5;
+
 /// What every request handler can reach.
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -147,6 +150,17 @@ impl ApiError {
         .with_retry_after(seconds)
     }
 
+    /// Every database connection stayed busy for the pool's acquire timeout:
+    /// the request did nothing and may be sent again shortly.
+    pub fn server_busy() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the server is busy; try again in a moment",
+        )
+        .with_code("server_busy")
+        .with_retry_after(BUSY_RETRY_SECONDS)
+    }
+
     pub fn with_code(mut self, code: &'static str) -> Self {
         self.code = Some(code);
         self
@@ -222,9 +236,14 @@ impl<T: DeserializeOwned, S: Send + Sync> FromRequest<S> for JsonBody<T> {
     }
 }
 
-/// A database failure is logged and reported to the client without detail.
+/// A database failure is logged and reported to the client without detail,
+/// except that a pool with no free connection asks the client to retry.
 impl From<sqlx::Error> for ApiError {
     fn from(error: sqlx::Error) -> Self {
+        if matches!(error, sqlx::Error::PoolTimedOut) {
+            tracing::warn!("no database connection came free in time; answered busy");
+            return Self::server_busy();
+        }
         tracing::error!(%error, "database error");
         Self::internal()
     }

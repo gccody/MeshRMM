@@ -344,6 +344,14 @@ mode. To put it elsewhere:
 url = "sqlite:///srv/meshrmm/meshrmm.db"
 ```
 
+SQLite lets one connection write at a time, so the server writes through one
+connection and reads through a pool of read-only ones. Writes wait their turn
+in the server; reads don't wait for writes.
+`max_connections` sets the number of readers, by default twice the CPUs, at
+least 4 and at most 32. Each connection maps up to 256 MiB of the file, which
+the operating system shares between them, and caches up to 8 MiB of pages
+(64 MiB for the writer).
+
 ### PostgreSQL
 
 Create a database and a user that owns it:
@@ -356,11 +364,20 @@ sudo -u postgres createdb --owner meshrmm meshrmm
 ```toml
 [database]
 url = "postgres://meshrmm:<password>@db.internal/meshrmm"
-max_connections = 10
 ```
 
 Add `?sslmode=require` to the URL if PostgreSQL is on another machine.
 `MESHRMM_DATABASE__URL` keeps the password out of the file.
+
+The server opens up to `max_connections` connections, by default four times
+its CPUs, at least 10 and at most 50. Together with anything else that uses
+the PostgreSQL server, they must fit its `max_connections` (100 by default).
+
+On either backend, a request that finds every connection it could use busy for
+`acquire_timeout_seconds` (5 by default), or a SQLite write that waits for the
+writer for `write_timeout_seconds` (10), does nothing and is answered
+`503 Service Unavailable` with `Retry-After`. Opening a new connection counts
+toward the wait.
 
 Both backends hold the same data; choose one at install. The server creates
 its tables on first start and applies any new migrations when an upgraded

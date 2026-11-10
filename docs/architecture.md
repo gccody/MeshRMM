@@ -103,7 +103,13 @@ input.
   because the backend is chosen at run time. Each backend has its own
   migrations directory (`migrations/sqlite`, `migrations/postgres`), kept in
   step by `tests/schema_parity.rs`. The server applies migrations when it
-  starts.
+  starts. On SQLite every transaction and every statement other than a
+  `SELECT` goes through one writer connection, so writes queue in the server
+  instead of contending for SQLite's lock; `SELECT`s go to a pool of
+  `query_only` connections. A transaction holds the writer until it ends, so
+  it must not wait on a write outside itself or on slow work. A pool that
+  stays exhausted for its acquire timeout fails the request with `503` and
+  `Retry-After`.
 - `http`: the router, client IP resolution, same-origin checks and security
   headers. `website`: the embedded pages.
 - `serve`: the listener, on axum-server, in each TLS mode: socket options,

@@ -2,10 +2,13 @@
 //! and maintenance.
 mod common;
 
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 use meshrmm_server::{
-    db::Database,
+    db::{Database, Limits, tables::Companies},
     maintenance,
     time::{DAY_MS, MINUTE_MS},
 };
@@ -651,6 +654,109 @@ async fn a_table_the_purge_fails_on_does_not_stop_the_rest() {
         assert_eq!(purged.failed, ["remote_sessions"], "{}", test.name);
         assert_eq!(purged.rows("device_metrics"), 1, "{}", test.name);
         assert_eq!(count(database, "device_metrics").await, 0, "{}", test.name);
+        test.drop_database().await;
+    }
+}
+
+fn company(id: &str) -> sea_query::InsertStatement {
+    Query::insert()
+        .into_table(Companies::Table)
+        .columns([
+            Companies::Id,
+            Companies::Name,
+            Companies::CreatedAt,
+            Companies::UpdatedAt,
+        ])
+        .values_panic([id.into(), id.into(), NOW.into(), NOW.into()])
+        .to_owned()
+}
+
+#[tokio::test]
+async fn concurrent_writes_wait_their_turn_instead_of_failing_as_locked() {
+    for test in common::databases().await {
+        let database = Database::connect_with(
+            &test.url,
+            Limits {
+                connections: 4,
+                acquire_timeout: Duration::from_secs(30),
+                write_timeout: Duration::from_secs(30),
+            },
+        )
+        .await
+        .unwrap();
+        // More writers than connections, and transactions that between them
+        // hold the write lock for longer than SQLite's busy timeout (5 s).
+        let writes = (0..60).map(|i| {
+            let database = database.clone();
+            tokio::spawn(async move {
+                if i % 6 == 0 {
+                    let mut transaction = database.begin().await?;
+                    transaction.execute(&company(&format!("t{i}"))).await?;
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    transaction.commit().await
+                } else {
+                    database.execute(&company(&format!("s{i}"))).await.map(drop)
+                }
+            })
+        });
+        for (i, write) in futures_util::future::join_all(writes)
+            .await
+            .into_iter()
+            .enumerate()
+        {
+            write
+                .unwrap()
+                .unwrap_or_else(|error| panic!("{}: write {i} failed: {error}", test.name));
+        }
+        assert_eq!(count(&database, "companies").await, 60, "{}", test.name);
+        database.close().await;
+        test.drop_database().await;
+    }
+}
+
+#[tokio::test]
+async fn reads_proceed_while_a_transaction_holds_the_writer() {
+    for test in common::databases().await {
+        let database = &test.database;
+        let mut transaction = database.begin().await.unwrap();
+        transaction.execute(&company("pending")).await.unwrap();
+        let during = tokio::time::timeout(Duration::from_secs(2), count(database, "companies"))
+            .await
+            .unwrap_or_else(|_| panic!("{}: a read waited for the transaction", test.name));
+        assert_eq!(during, 0, "{}: saw an uncommitted write", test.name);
+        transaction.commit().await.unwrap();
+        // Committed, it's visible to the next read at once.
+        assert_eq!(count(database, "companies").await, 1, "{}", test.name);
+        test.drop_database().await;
+    }
+}
+
+#[tokio::test]
+async fn a_write_with_no_free_connection_fails_at_its_timeout() {
+    for test in common::databases().await {
+        let timeout = Duration::from_millis(200);
+        let database = Database::connect_with(
+            &test.url,
+            Limits {
+                connections: 1,
+                acquire_timeout: timeout,
+                write_timeout: timeout,
+            },
+        )
+        .await
+        .unwrap();
+        let transaction = database.begin().await.unwrap();
+        let started = Instant::now();
+        let error = database.execute(&company("late")).await.unwrap_err();
+        assert!(
+            matches!(error, sqlx::Error::PoolTimedOut),
+            "{}: {error}",
+            test.name
+        );
+        assert!(started.elapsed() < Duration::from_secs(2), "{}", test.name);
+        transaction.rollback().await.unwrap();
+        database.execute(&company("in time")).await.unwrap();
+        database.close().await;
         test.drop_database().await;
     }
 }

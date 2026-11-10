@@ -150,6 +150,9 @@ pub struct SnapshotFailed(Arc<sqlx::Error>);
 
 impl From<SnapshotFailed> for ApiError {
     fn from(error: SnapshotFailed) -> Self {
+        if matches!(*error.0, sqlx::Error::PoolTimedOut) {
+            return Self::server_busy();
+        }
         tracing::error!(%error, "could not read the devices for a presence snapshot");
         Self::internal()
     }
@@ -844,8 +847,14 @@ mod tests {
     }
 
     async fn presence() -> Presence {
-        // One connection: each connection to `:memory:` is its own database.
-        let database = Database::connect("sqlite::memory:", 1)
+        // Long waits: a busy test machine can take seconds to open one.
+        let wait = Duration::from_secs(30);
+        let limits = crate::db::Limits {
+            connections: 1,
+            acquire_timeout: wait,
+            write_timeout: wait,
+        };
+        let database = Database::connect_with("sqlite::memory:", limits)
             .await
             .expect("an in-memory database opens");
         database.migrate().await.expect("the schema applies");
