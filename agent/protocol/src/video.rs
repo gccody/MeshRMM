@@ -163,8 +163,8 @@ pub struct ReassemblyConfig {
 impl Default for ReassemblyConfig {
     fn default() -> Self {
         Self {
-            // Allow one bounded SCTP retransmission on typical WAN RTTs before
-            // declaring an access unit incomplete.
+            // Allow one bounded SCTP retransmission on typical WAN RTTs after
+            // a frame's latest fragment before declaring it incomplete.
             stale_after: Duration::from_millis(250),
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             max_packets: DEFAULT_MAX_PACKETS,
@@ -198,7 +198,10 @@ struct PendingFrame {
     encode_complete_timestamp_us: u64,
     send_timestamp_us: u64,
     keyframe: bool,
-    first_packet_at_us: u64,
+    /// When the latest new fragment arrived. A frame paced out over longer
+    /// than `stale_after` (a large keyframe at a low bitrate) stays pending
+    /// while its fragments keep coming.
+    last_packet_at_us: u64,
     total_bytes: usize,
     received: usize,
     fragments: Vec<Option<Vec<u8>>>,
@@ -230,7 +233,7 @@ impl FrameReassembler {
 
     pub fn expire_stale(&mut self, now_us: u64) -> bool {
         let expired = self.pending.as_ref().is_some_and(|pending| {
-            now_us.saturating_sub(pending.first_packet_at_us)
+            now_us.saturating_sub(pending.last_packet_at_us)
                 >= self.config.stale_after.as_micros() as u64
         });
         if expired {
@@ -294,7 +297,7 @@ impl FrameReassembler {
                 encode_complete_timestamp_us: packet.encode_complete_timestamp_us,
                 send_timestamp_us: packet.send_timestamp_us,
                 keyframe: packet.keyframe,
-                first_packet_at_us: received_at_us,
+                last_packet_at_us: received_at_us,
                 total_bytes: 0,
                 received: 0,
                 fragments: vec![None; packet.packet_count as usize],
@@ -325,6 +328,7 @@ impl FrameReassembler {
         }
         pending.total_bytes += packet.payload.len();
         pending.received += 1;
+        pending.last_packet_at_us = received_at_us;
         *slot = Some(packet.payload);
 
         if pending.received != pending.fragments.len() {
@@ -501,6 +505,39 @@ mod tests {
         });
         assert_eq!(assembler.push(packet, 1_000), ReassemblyOutcome::Accepted);
         assert!(assembler.expire_stale(11_000));
+        assert_eq!(assembler.stats().incomplete_frames_dropped, 1);
+    }
+
+    /// A large keyframe paced out at a low bitrate takes far longer than
+    /// `stale_after` to arrive; it expires only once its fragments stop.
+    #[test]
+    fn a_frame_whose_fragments_keep_arriving_does_not_expire() {
+        let keyframe = frame(1, &[7; 100]);
+        let packets = fragment_frame(&keyframe, 10).unwrap();
+        let mut assembler = FrameReassembler::new(ReassemblyConfig::default());
+        let stale_after_us = ReassemblyConfig::default().stale_after.as_micros() as u64;
+        // A fragment every 100 ms: the last arrives 900 ms after the first.
+        let (last, others) = packets.split_last().unwrap();
+        for (index, packet) in others.iter().enumerate() {
+            let now_us = 1_000_000 + index as u64 * 100_000;
+            assert_eq!(
+                assembler.push(packet.clone(), now_us),
+                ReassemblyOutcome::Accepted
+            );
+            assert!(!assembler.expire_stale(now_us + 99_000));
+        }
+        assert_eq!(
+            assembler.push(last.clone(), 1_900_000),
+            ReassemblyOutcome::Completed(keyframe)
+        );
+        assert_eq!(assembler.stats().incomplete_frames_dropped, 0);
+
+        // One that stops arriving still expires after `stale_after`.
+        let stalled = fragment_frame(&frame(2, &[7; 100]), 10).unwrap();
+        assembler.push(stalled[0].clone(), 2_000_000);
+        assembler.push(stalled[1].clone(), 2_100_000);
+        assert!(!assembler.expire_stale(2_100_000 + stale_after_us - 1));
+        assert!(assembler.expire_stale(2_100_000 + stale_after_us));
         assert_eq!(assembler.stats().incomplete_frames_dropped, 1);
     }
 

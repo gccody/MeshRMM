@@ -56,6 +56,18 @@ pub(super) fn video_pacing_bitrate(ceiling: u32, audio_bits_per_second: u32) -> 
         .max(ceiling / 2)
 }
 
+// Frames the encoder makes while the sender paces out a large keyframe wait
+// behind it. As many as are sent in this long at the pacing rate may wait
+// (see `LatestFrameSlot::set_byte_budget`): the latency they add once the
+// keyframe is through.
+const VIDEO_BACKLOG_MS: u32 = 250;
+
+/// The bytes of waiting frames the sender sends in `VIDEO_BACKLOG_MS` at
+/// `pacing_bits_per_second` (see [`video_pacing_bitrate`]).
+pub(super) fn video_backlog_bytes(pacing_bits_per_second: u32) -> usize {
+    bitrate_duration_bytes(pacing_bits_per_second, VIDEO_BACKLOG_MS)
+}
+
 /// Cuts the bitrate by a quarter at most every 500 ms while the video queue
 /// is congested, and raises it after each healthy second: by a quarter while
 /// it is below 90% of the rate the last cut was made from, by 5% from there to
