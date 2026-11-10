@@ -1,5 +1,14 @@
 import { type AuthorizedFetch, expectJson, requestError } from "../../lib/http";
-import type { Application, ApplicationChange, FleetApplication, InstalledOn, Snapshot } from "./model";
+import {
+  type Application,
+  type ApplicationChange,
+  type InstalledPage,
+  type Snapshot,
+  type SoftwareFilters,
+  type SoftwarePage,
+  installedOnPagePath,
+  softwarePagePath,
+} from "./model";
 
 const device = (id: string) => `/v1/agents/${encodeURIComponent(id)}`;
 
@@ -31,14 +40,15 @@ export async function requestRefresh(authorizedFetch: AuthorizedFetch, deviceId:
   await response.body?.cancel();
 }
 
-export async function fetchSoftware(authorizedFetch: AuthorizedFetch, params: URLSearchParams) {
-  const query = params.toString();
-  const response = await authorizedFetch(`/v1/software${query ? `?${query}` : ""}`);
-  return expectJson<{ applications: FleetApplication[]; truncated: boolean }>(response, "The applications could not be loaded.");
+// A page of applications for the filters, from `offset`.
+export async function fetchSoftware(authorizedFetch: AuthorizedFetch, filters: SoftwareFilters, offset: number) {
+  const response = await authorizedFetch(softwarePagePath(filters, offset));
+  return expectJson<SoftwarePage>(response, "The applications could not be loaded.");
 }
 
-export async function fetchInstalledOn(authorizedFetch: AuthorizedFetch, params: URLSearchParams) {
-  const response = await authorizedFetch(`/v1/software/devices?${params}`);
-  return (await expectJson<{ devices: InstalledOn[] }>(response, "The devices could not be loaded.")).devices;
+// A page of one application's copies, from `offset`.
+export async function fetchInstalledOn(authorizedFetch: AuthorizedFetch, params: URLSearchParams, offset: number) {
+  const response = await authorizedFetch(installedOnPagePath(params, offset));
+  return expectJson<InstalledPage>(response, "The devices could not be loaded.");
 }
 

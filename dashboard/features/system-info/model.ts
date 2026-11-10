@@ -111,7 +111,7 @@ export type ApplicationChange = {
   source: string;
 };
 
-// `GET /v1/software`.
+// An application across the devices, from `GET /v1/software`.
 export type FleetApplication = {
   name: string;
   publisher: string | null;
@@ -119,7 +119,12 @@ export type FleetApplication = {
   versions: { version: string | null; devices: number }[];
 };
 
-// `GET /v1/software/devices`.
+// `GET /v1/software`: a page of the applications, how many match, and
+// whether more follow.
+export type SoftwarePage = { applications: FleetApplication[]; matching: number; truncated: boolean };
+
+// A copy of an application on a device, from `GET /v1/software/devices`.
+// A device with two versions has two.
 export type InstalledOn = {
   device_id: string;
   device_name: string;
@@ -131,6 +136,10 @@ export type InstalledOn = {
   installed_at: number | null;
   source: string;
 };
+
+// `GET /v1/software/devices`: a page of an application's copies, and how
+// many there are.
+export type InstalledPage = { devices: InstalledOn[]; matching: number };
 
 export type ApplicationSortKey = "name" | "version" | "publisher" | "installed_at" | "source";
 export type SortDirection = "ascending" | "descending";
@@ -221,6 +230,25 @@ export function softwareParams({ query, company, tag }: SoftwareFilters) {
   return params;
 }
 
+// Applications, or one application's copies, the pages ask for at a time.
+export const SOFTWARE_PAGE_SIZE = 100;
+
+// The address of a page from `offset`: `params` with the page's bounds.
+function pagePath(route: string, params: URLSearchParams, offset: number, limit: number) {
+  params.set("limit", String(limit));
+  if (offset > 0) params.set("offset", String(offset));
+  return `${route}?${params}`;
+}
+
+// `GET /v1/software` for the filters' page from `offset`.
+export const softwarePagePath = (filters: SoftwareFilters, offset: number, limit = SOFTWARE_PAGE_SIZE) =>
+  pagePath("/v1/software", softwareParams(filters), offset, limit);
+
+// The filters a list of applications is loaded for, as one string to compare.
+export const softwareKey = (filters: SoftwareFilters) => softwareParams(filters).toString();
+
+export const applicationName = (application: FleetApplication) => application.name;
+
 // `GET /v1/software/devices` for one application, or one version of it.
 export function installedOnParams(name: string, version: string | null | undefined, company: string, tag = "") {
   const params = new URLSearchParams({ name });
@@ -230,3 +258,12 @@ export function installedOnParams(name: string, version: string | null | undefin
   if (tag) params.set("tag", tag);
   return params;
 }
+
+// `GET /v1/software/devices` for the page of copies from `offset`.
+export const installedOnPagePath = (params: URLSearchParams, offset: number, limit = SOFTWARE_PAGE_SIZE) =>
+  pagePath("/v1/software/devices", new URLSearchParams(params), offset, limit);
+
+// Tells one copy from another: a device can have an application in several
+// versions, from several sources or for several architectures.
+export const copyId = (copy: InstalledOn) =>
+  [copy.device_id, copy.version, copy.source, copy.architecture, copy.publisher, copy.installed_at].map((part) => part ?? "").join("\n");

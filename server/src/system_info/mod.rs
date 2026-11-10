@@ -16,8 +16,14 @@
 //! list for such a snapshot only if the hash it names is the one stored, and
 //! otherwise asks for the list ([`Stored::Unknown`]): a disagreement can cost
 //! a whole list sent, never a wrong list kept.
+//!
+//! Each device's application count is kept on its `device_system_info` row,
+//! and the fleet's counts of each application in [`software`]'s summary,
+//! both written in the transaction that writes the device's rows, so the
+//! searches read neither by grouping `device_applications`.
 pub mod changes;
 pub mod search;
+mod software;
 
 use std::{collections::HashMap, net::IpAddr};
 
@@ -48,7 +54,7 @@ pub const STALE_AFTER_MS: i64 = SYSTEM_INFO_INTERVAL_SECONDS as i64 * SECOND_MS 
 /// How long application changes are kept.
 pub const CHANGES_RETENTION_MS: i64 = 90 * DAY_MS;
 /// Rows per insert, well within both databases' bind parameter limits.
-const INSERT_CHUNK: usize = 500;
+pub(crate) const INSERT_CHUNK: usize = 500;
 
 /// What the device list shows and searches for each device.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -148,6 +154,7 @@ pub async fn store(
     let listed = applications_unchanged
         .is_none()
         .then(|| applications_hash(&applications));
+    let application_count = i64::try_from(applications.len()).expect("lists are bounded");
     let now = now_ms();
     let mut transaction = database.begin().await?;
     if !agents::is_active(&mut transaction, device_id).await? {
@@ -182,6 +189,7 @@ pub async fn store(
         DeviceSystemInfo::SerialNumber,
         DeviceSystemInfo::Hostname,
         DeviceSystemInfo::ApplicationsHash,
+        DeviceSystemInfo::ApplicationCount,
         DeviceSystemInfo::Details,
     ];
     transaction
@@ -205,15 +213,27 @@ pub async fn store(
                     storable_option(&info.hardware.serial_number).into(),
                     storable(&info.network.hostname).into(),
                     listed.clone().into(),
+                    // The list's rows, written below when they change: the
+                    // same list has the same count.
+                    if listed.is_some() {
+                        application_count
+                    } else {
+                        0
+                    }
+                    .into(),
                     details.into(),
                 ])
                 .on_conflict(
                     OnConflict::column(DeviceSystemInfo::DeviceId)
-                        // The hash stays the stored list's unless a list
-                        // replaces it.
+                        // The hash and the count stay the stored list's
+                        // unless a list replaces it.
                         .update_columns(columns.into_iter().skip(1).filter(|column| {
                             listed.is_some()
-                                || !matches!(column, DeviceSystemInfo::ApplicationsHash)
+                                || !matches!(
+                                    column,
+                                    DeviceSystemInfo::ApplicationsHash
+                                        | DeviceSystemInfo::ApplicationCount
+                                )
                         }))
                         .to_owned(),
                 )
@@ -247,13 +267,16 @@ pub async fn store(
                 source: application.source.as_str().to_owned(),
             })
             .collect();
+        // Read for a first list too, which has none, so the fleet's counts
+        // lose exactly the rows replaced.
+        let old = stored_applications(&mut transaction, device_id).await?;
         // A device's first list is where its history starts, not a list of
         // installs.
         if held.is_some() {
-            let old = stored_applications(&mut transaction, device_id).await?;
             insert_changes(&mut transaction, device_id, now, &changes::diff(&old, &new)).await?;
         }
         replace_applications(&mut transaction, device_id, &new).await?;
+        software::adjust(&mut transaction, &software::Delta::between(&old, &new)).await?;
     }
     transaction.commit().await?;
     Ok(Some(Stored::Listed {
@@ -463,9 +486,24 @@ pub async fn connected(
     })
 }
 
-/// Removes a deleted device's snapshot and history.
+/// Removes a deleted device's snapshot and history, and its applications
+/// from the fleet's counts.
 pub async fn forget(database: &Database, device_id: &str) -> db::Result<()> {
     let mut transaction = database.begin().await?;
+    // A store for the device in progress commits first, so the rows read
+    // next are the ones removed.
+    let _: Option<(String,)> = transaction
+        .fetch_optional(
+            &Query::select()
+                .column(DeviceSystemInfo::DeviceId)
+                .from(DeviceSystemInfo::Table)
+                .and_where(Expr::col(DeviceSystemInfo::DeviceId).eq(device_id))
+                .lock(LockType::Update)
+                .to_owned(),
+        )
+        .await?;
+    let old = stored_applications(&mut transaction, device_id).await?;
+    software::adjust(&mut transaction, &software::Delta::between(&old, &[])).await?;
     transaction
         .execute(
             &Query::delete()
@@ -595,47 +633,46 @@ pub async fn summaries(
     Ok(summaries)
 }
 
-pub(crate) type SnapshotRow = (String, i64, i64, Option<String>, String);
+/// A stored snapshot's columns, in [`SNAPSHOT_COLUMNS`]' order.
+pub(crate) type SnapshotRow = (String, i64, i64, Option<String>, i64, String);
+
+/// The columns of `device_system_info` a [`Snapshot`] is made from.
+pub(crate) const SNAPSHOT_COLUMNS: [DeviceSystemInfo; 6] = [
+    DeviceSystemInfo::DeviceId,
+    DeviceSystemInfo::CollectedAt,
+    DeviceSystemInfo::ReceivedAt,
+    DeviceSystemInfo::PublicIp,
+    DeviceSystemInfo::ApplicationCount,
+    DeviceSystemInfo::Details,
+];
 
 /// The device's latest snapshot, if it has one.
 pub async fn load(database: &Database, device_id: &str) -> db::Result<Option<Snapshot>> {
     let row: Option<SnapshotRow> = database
         .fetch_optional(
             &Query::select()
-                .columns([
-                    DeviceSystemInfo::DeviceId,
-                    DeviceSystemInfo::CollectedAt,
-                    DeviceSystemInfo::ReceivedAt,
-                    DeviceSystemInfo::PublicIp,
-                    DeviceSystemInfo::Details,
-                ])
+                .columns(SNAPSHOT_COLUMNS)
                 .from(DeviceSystemInfo::Table)
                 .and_where(Expr::col(DeviceSystemInfo::DeviceId).eq(device_id))
                 .to_owned(),
         )
         .await?;
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    let counts = search::application_counts(database, Some(device_id)).await?;
-    Ok(snapshot(row, &counts))
+    // A snapshot that can't be read is shown as none, so the Agent's next
+    // one replaces it.
+    Ok(row.and_then(|row| snapshot(row).ok()))
 }
 
-/// A stored row as the API returns it, or `None` if its details can't be
-/// read, which only a snapshot from a release with another format can cause.
+/// A stored row as the API returns it. Its details can't be read only after
+/// a release changed their format without the database being recreated,
+/// which is logged.
 pub(crate) fn snapshot(
-    (device_id, collected_at, received_at, public_ip, details): SnapshotRow,
-    application_counts: &HashMap<String, i64>,
-) -> Option<Snapshot> {
-    let info: SystemInfo = match serde_json::from_str(&details) {
-        Ok(info) => info,
-        Err(error) => {
-            tracing::warn!(device_id, %error, "could not read a stored system information snapshot");
-            return None;
-        }
-    };
-    Some(Snapshot {
-        application_count: application_counts.get(&device_id).copied().unwrap_or(0),
+    (device_id, collected_at, received_at, public_ip, application_count, details): SnapshotRow,
+) -> Result<Snapshot, serde_json::Error> {
+    let info: SystemInfo = serde_json::from_str(&details).inspect_err(|error| {
+        tracing::warn!(device_id, %error, "could not read a stored system information snapshot");
+    })?;
+    Ok(Snapshot {
+        application_count,
         device_id,
         collected_at,
         received_at,

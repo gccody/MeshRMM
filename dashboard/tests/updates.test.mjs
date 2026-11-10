@@ -192,24 +192,24 @@ test("the fleet is asked for a page at a time with the filters", () => {
 test("further pages join the list they were asked for", () => {
   const all = fleetKey(NO_FILTERS);
   const first = applyFleetAnswer(null, { kind: "page", key: all, ticket: 1, offset: 0, page: page(["a", "b"], { matching: 5 }) }, all);
-  assert.deepEqual(first.devices.map((device) => device.device_id), ["a", "b"]);
+  assert.deepEqual(first.items.map((device) => device.device_id), ["a", "b"]);
   assert.equal(first.matching, 5);
   assert.deepEqual(first.totals, TOTALS);
   // The fleet moved between pages: "b" comes again, and stays where it was.
   const second = applyFleetAnswer(first, { kind: "page", key: all, ticket: 2, offset: 2, page: page(["b", "c", "d"], { matching: 6 }) }, all);
-  assert.deepEqual(second.devices.map((device) => device.device_id), ["a", "b", "c", "d"]);
+  assert.deepEqual(second.items.map((device) => device.device_id), ["a", "b", "c", "d"]);
   assert.equal(second.matching, 6);
   // A page of other filters doesn't join, nor one asked for before the
   // list was loaded again.
   const other = fleetKey({ ...NO_FILTERS, status: "pending" });
   assert.equal(applyFleetAnswer(second, { kind: "page", key: other, ticket: 3, offset: 4, page: page(["x"]) }, all), second);
   const reloaded = applyFleetAnswer(second, { kind: "page", key: all, ticket: 5, offset: 0, page: page(["d", "a"]) }, all);
-  assert.deepEqual(reloaded.devices.map((device) => device.device_id), ["d", "a"], "a reload starts over");
+  assert.deepEqual(reloaded.items.map((device) => device.device_id), ["d", "a"], "a reload starts over");
   assert.equal(applyFleetAnswer(reloaded, { kind: "page", key: all, ticket: 4, offset: 4, page: page(["y"]) }, all), reloaded);
   // New filters start a new list.
   const narrowed = applyFleetAnswer(reloaded, { kind: "page", key: other, ticket: 6, offset: 0, page: page(["c"]) }, other);
   assert.equal(narrowed.key, other);
-  assert.deepEqual(narrowed.devices.map((device) => device.device_id), ["c"]);
+  assert.deepEqual(narrowed.items.map((device) => device.device_id), ["c"]);
 });
 
 test("a newer request's answer always wins over an older one's", () => {
@@ -228,14 +228,14 @@ test("a newer request's answer always wins over an older one's", () => {
   const counted = applyFleetAnswer(newer, { kind: "counts", key: security, ticket: 6, page: page([], { matching: 7, totals: { ...TOTALS, devices: 9 } }) }, security);
   assert.equal(counted.matching, 7);
   assert.equal(counted.totals.devices, 9);
-  assert.deepEqual(counted.devices, newer.devices, "counts leave the rows");
+  assert.deepEqual(counted.items, newer.items, "counts leave the rows");
   assert.equal(applyFleetAnswer(counted, { kind: "counts", key: security, ticket: 5, page: page([], { matching: 1, totals: TOTALS }) }, security), counted);
   const elsewhere = applyFleetAnswer(counted, { kind: "counts", key: all, ticket: 7, page: page([], { matching: 2, totals: { ...TOTALS, devices: 10 } }) }, security);
   assert.equal(elsewhere.matching, 7);
   assert.equal(elsewhere.totals.devices, 10);
   // A page asked for before the newest counts keeps them.
   const more = applyFleetAnswer(elsewhere, { kind: "page", key: security, ticket: 6, offset: 1, page: page(["c"], { matching: 3 }) }, security);
-  assert.deepEqual(more.devices.map((device) => device.device_id), ["b", "c"]);
+  assert.deepEqual(more.items.map((device) => device.device_id), ["b", "c"]);
   assert.equal(more.totals.devices, 10);
   assert.equal(more.matching, 7);
 });
@@ -244,8 +244,8 @@ test("events patch loaded rows in place and the counts are read again at most ev
   const all = fleetKey(NO_FILTERS);
   const list = applyFleetAnswer(null, { kind: "page", key: all, ticket: 1, offset: 0, page: page(["a", "b"]) }, all);
   const patched = patchFleetRow(list, summary("b", { pending: 4, installing: true }));
-  assert.deepEqual(patched.devices.map((device) => [device.device_id, device.pending]), [["a", 0], ["b", 4]]);
-  assert.equal(patched.devices[1].installing, true);
+  assert.deepEqual(patched.items.map((device) => [device.device_id, device.pending]), [["a", 0], ["b", 4]]);
+  assert.equal(patched.items[1].installing, true);
   assert.equal(patchFleetRow(list, summary("unloaded", { pending: 9 })), list, "a device not loaded stays out");
   assert.equal(patchFleetRow(null, summary("a")), null);
 

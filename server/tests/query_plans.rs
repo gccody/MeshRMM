@@ -9,6 +9,7 @@ use meshrmm_server::{
     applications::tables::{ApplicationRunItems, ApplicationRuns},
     db::tables::{AlertRemediations, Alerts, FileDeliveries, ScriptRuns, UpdateRuns},
     maintenance,
+    system_info::search::{self, CompanyFilter, DeviceFilter, Scope},
     updates::store::{self, FleetFilter, FleetStatus},
     wake,
 };
@@ -330,6 +331,42 @@ fn statements() -> Vec<(&'static str, Statement, &'static [&'static str])> {
     ];
     statements.extend(fleet_statements());
     statements.extend(
+        software_statements()
+            .into_iter()
+            .filter(|(_, _, indexes)| !indexes.is_empty()),
+    );
+    let scope = Scope::default();
+    statements.extend([
+        (
+            "the device search's application filter",
+            Statement::Select(search::devices_count_query(&DeviceFilter {
+                application: Some("fire".into()),
+                ..DeviceFilter::default()
+            })),
+            // The rows of the matching names, or each device's rows.
+            &[
+                "idx_device_applications_name",
+                "idx_device_applications_device",
+            ][..],
+        ),
+        (
+            "a page of the devices with an application",
+            Statement::Select(search::installed_page_query(
+                "Firefox",
+                Some(Some("130.0")),
+                &scope,
+                100,
+                200,
+            )),
+            &["idx_device_applications_name"][..],
+        ),
+        (
+            "the count of the devices with an application",
+            Statement::Select(search::installed_count_query("Firefox", None, &scope)),
+            &["idx_device_applications_name"][..],
+        ),
+    ]);
+    statements.extend(
         maintenance::batch_statements(NOW)
             .into_iter()
             .map(|(table, delete)| {
@@ -384,6 +421,135 @@ fn fleet_statements() -> Vec<(&'static str, Statement, &'static [&'static str])>
             status_key,
         ),
     ]
+}
+
+/// The device search's and the whole fleet's software reads. Each is cut to
+/// a page in the database; the software reads look up the summary by its
+/// keys, and a page of devices reads its snapshots by theirs. A search by
+/// part of a name can use no index: it reads the summary, one row per
+/// application name rather than per device, and lists none here.
+fn software_statements() -> Vec<(&'static str, Statement, &'static [&'static str])> {
+    let whole = Scope::default();
+    let narrowed = DeviceFilter {
+        query: Some("desk".into()),
+        os: Some("windows".into()),
+        model: Some("dell".into()),
+        serial_number: Some("ser".into()),
+        ip: Some("10.1".into()),
+        application: None,
+        scope: Scope {
+            company: Some(CompanyFilter::None),
+            tag: Some("tag".into()),
+        },
+    };
+    // Joining a device's snapshot and its device, by either's key.
+    let snapshot_key: &[&str] = &[
+        "sqlite_autoindex_device_system_info_1",
+        "device_system_info_pkey",
+        "sqlite_autoindex_agents_1",
+        "agents_pkey",
+    ];
+    let versions_key: &[&str] = &[
+        "sqlite_autoindex_software_versions_1",
+        "software_versions_pkey",
+    ];
+    let names: &[&str] = &[
+        "idx_software_names_devices",
+        "sqlite_autoindex_software_names_1",
+        "software_names_pkey",
+    ];
+    vec![
+        (
+            "the count of the device search's devices",
+            Statement::Select(search::devices_count_query(&DeviceFilter::default())),
+            snapshot_key,
+        ),
+        (
+            "the count of the devices a search matches",
+            Statement::Select(search::devices_count_query(&narrowed)),
+            snapshot_key,
+        ),
+        (
+            "a page of the device search's devices",
+            Statement::Select(search::devices_page_query(
+                &DeviceFilter::default(),
+                100,
+                200,
+            )),
+            snapshot_key,
+        ),
+        (
+            "a page of the devices a search matches",
+            Statement::Select(search::devices_page_query(&narrowed, 100, 0)),
+            snapshot_key,
+        ),
+        (
+            "the count of the fleet's applications",
+            Statement::Select(search::software_count_query(None, &whole)),
+            names,
+        ),
+        (
+            "the count of the fleet's applications a search matches",
+            Statement::Select(search::software_count_query(Some("fire"), &whole)),
+            &[],
+        ),
+        (
+            "a page of the applications on the most devices",
+            Statement::Select(search::software_names_query(None, &whole, 100, 200)),
+            &["idx_software_names_devices"],
+        ),
+        (
+            "a page of the applications a search matches",
+            Statement::Select(search::software_names_query(Some("fire"), &whole, 100, 0)),
+            &[],
+        ),
+        (
+            "the versions of a page of applications",
+            Statement::Select(search::software_versions_query(
+                vec!["Firefox".into(), "7-Zip".into()],
+                &whole,
+            )),
+            versions_key,
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn the_fleet_searches_read_no_device_applications() {
+    let mut misses = Vec::new();
+    let mut note = |backend: &str, query: &str, plan: &str| {
+        if plan.contains("device_applications") {
+            misses.push(format!(
+                "on {backend}, {query} reads device_applications:\n{plan}"
+            ));
+        }
+    };
+    let sqlite = common::sqlite().await;
+    let mut connection = SqliteConnection::connect(&sqlite.url).await.unwrap();
+    for (query, statement, _) in software_statements() {
+        note(
+            "SQLite",
+            query,
+            &sqlite_plan(&mut connection, &statement).await,
+        );
+    }
+    connection.close().await.unwrap();
+    sqlite.drop_database().await;
+
+    if let Some(admin_url) = common::postgres_admin_url() {
+        let postgres = common::postgres(&admin_url).await;
+        let mut connection = PgConnection::connect(&postgres.url).await.unwrap();
+        for (query, statement, _) in software_statements() {
+            note(
+                "PostgreSQL",
+                query,
+                &postgres_plan(&mut connection, &statement).await,
+            );
+        }
+        connection.close().await.unwrap();
+        postgres.drop_database().await;
+    }
+    assert!(misses.is_empty(), "{}", misses.join("\n\n"));
 }
 
 /// The tables that grow with each device's updates and runs, which the

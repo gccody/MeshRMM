@@ -4,9 +4,13 @@ import {
   DEFAULT_APPLICATION_SORT,
   describeOs,
   formatLinkSpeed,
+  copyId,
+  installedOnPagePath,
   installedOnParams,
   nextSort,
   parseSoftwareFilters,
+  softwareKey,
+  softwarePagePath,
   softwareParams,
   sortAdapters,
   sourceLabel,
@@ -77,4 +81,26 @@ test("the software search keeps its filters in the address", () => {
   assert.equal(installedOnParams("App", "1.0", "none").toString(), "name=App&version=1.0&company=none");
   assert.equal(installedOnParams("App", null, "").toString(), "name=App&unversioned=true");
   assert.equal(installedOnParams("App", undefined, "", "t1").toString(), "name=App&tag=t1");
+});
+
+test("the software pages ask for a page at a time with the filters", () => {
+  const filters = { query: " fire ", company: "none", tag: "t1" };
+  assert.equal(softwarePagePath(filters, 0), "/v1/software?q=fire&company=none&tag=t1&limit=100");
+  assert.equal(softwarePagePath({ query: "", company: "", tag: "" }, 200), "/v1/software?limit=100&offset=200");
+  assert.equal(softwareKey(filters), softwareKey({ ...filters, query: "fire" }), "the same search");
+  assert.notEqual(softwareKey(filters), softwareKey({ ...filters, tag: "" }));
+  const firefox = installedOnParams("Firefox", undefined, "none");
+  assert.equal(installedOnPagePath(firefox, 0), "/v1/software/devices?name=Firefox&company=none&limit=100");
+  assert.equal(installedOnPagePath(firefox, 100, 50), "/v1/software/devices?name=Firefox&company=none&limit=50&offset=100");
+  assert.equal(firefox.toString(), "name=Firefox&company=none", "the filters stay as they were");
+});
+
+test("each copy of an application on a device is told apart", () => {
+  const copy = (version, source = "windows", architecture = null) => ({
+    device_id: "d1", device_name: "Desk", platform: "windows", company_id: null,
+    version, publisher: null, architecture, installed_at: null, source,
+  });
+  const ids = [copy("1.0"), copy("2.0"), copy("1.0", "windows_user"), copy("1.0", "windows", "x86"), copy(null)].map(copyId);
+  assert.equal(new Set(ids).size, ids.length);
+  assert.equal(copyId(copy("1.0")), copyId(copy("1.0")));
 });

@@ -358,6 +358,7 @@ pub enum DeviceSystemInfo {
     SerialNumber,
     Hostname,
     ApplicationsHash,
+    ApplicationCount,
     Details,
 }
 
@@ -383,6 +384,24 @@ pub enum DeviceApplications {
     Architecture,
     InstalledAt,
     Source,
+}
+
+/// How many devices have each application name, kept with `device_applications`.
+#[derive(Iden, Clone, Copy)]
+pub enum SoftwareNames {
+    Table,
+    Name,
+    Devices,
+}
+
+/// How many devices have each version of an application from each publisher.
+#[derive(Iden, Clone, Copy)]
+pub enum SoftwareVersions {
+    Table,
+    Name,
+    Version,
+    Publisher,
+    Devices,
 }
 
 #[derive(Iden, Clone, Copy)]

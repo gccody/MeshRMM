@@ -441,6 +441,9 @@ CREATE TABLE device_system_info (
   -- so an unchanged one isn't rewritten or sent. NULL for none: a snapshot
   -- that named a list the server didn't hold.
   applications_hash TEXT,
+  -- How many rows the device has in device_applications, written with them,
+  -- so a page of devices shows its count without grouping every list.
+  application_count INTEGER NOT NULL,
   details TEXT NOT NULL
 );
 
@@ -479,6 +482,29 @@ CREATE TABLE device_applications (
 
 CREATE INDEX idx_device_applications_device ON device_applications (device_id);
 CREATE INDEX idx_device_applications_name ON device_applications (name);
+
+-- How many devices have each application, changed in the transaction that
+-- changes a device's rows in device_applications, so the fleet's software is
+-- read from here instead of grouping every device's list. A name's devices
+-- have any version of it. A row whose count reaches 0 is removed.
+CREATE TABLE software_names (
+  name TEXT NOT NULL PRIMARY KEY,
+  devices INTEGER NOT NULL
+);
+
+-- The applications on the most devices first.
+CREATE INDEX idx_software_names_devices ON software_names (devices DESC, name);
+
+-- How many devices have each version of an application from each publisher,
+-- kept the same way. '' stands for no version or no publisher, which a
+-- snapshot never holds as text.
+CREATE TABLE software_versions (
+  name TEXT NOT NULL,
+  version TEXT NOT NULL,
+  publisher TEXT NOT NULL,
+  devices INTEGER NOT NULL,
+  PRIMARY KEY (name, version, publisher)
+);
 
 -- Applications installed, removed or updated between a device's snapshots.
 CREATE TABLE device_application_changes (
