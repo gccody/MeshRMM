@@ -847,3 +847,383 @@ async fn channels_email_users_and_roles_and_test_webhooks() {
         app.finish().await;
     }
 }
+
+/// Update and application rules, judged from what devices' scans found,
+/// which the engine keeps and reads again only for devices that reported.
+mod reported_scans {
+    use meshrmm_protocol_types::{ApplicationScan, UpdateScan};
+    use meshrmm_server::{applications, time::DAY_MS, updates};
+
+    use super::*;
+
+    fn security_rule() -> Value {
+        json!({ "name": "Old security updates", "severity": "warning", "condition": "updates_pending", "update_category": "security", "days": 7 })
+    }
+
+    fn restart_rule() -> Value {
+        json!({ "name": "Restart pending", "severity": "info", "condition": "reboot_pending", "days": 3 })
+    }
+
+    fn stale_apps_rule() -> Value {
+        json!({ "name": "Stale apps", "severity": "warning", "condition": "app_updates_pending", "days": 7 })
+    }
+
+    /// A scan finding `updates`, each an ID and a category.
+    fn update_scan(updates: &[(&str, &str)], reboot_pending: bool) -> UpdateScan {
+        let updates = updates
+            .iter()
+            .map(|(id, category)| json!({ "id": id, "title": format!("Update {id}"), "category": category }))
+            .collect::<Vec<_>>();
+        serde_json::from_value(json!({
+            "scanned_at_unix_ms": 1_700_000_000_000_i64,
+            "manager": "windows_update",
+            "updates": updates,
+            "reboot_pending": reboot_pending,
+        }))
+        .unwrap()
+    }
+
+    /// A winget scan finding `packages`, each an ID and whether a newer
+    /// version is offered.
+    fn application_scan(packages: &[(&str, bool)]) -> ApplicationScan {
+        let packages = packages
+            .iter()
+            .map(|(id, outdated)| {
+                let mut package =
+                    json!({ "source": "winget", "id": id, "name": id, "version": "1.0" });
+                if *outdated {
+                    package["available_version"] = "2.0".into();
+                }
+                package
+            })
+            .collect::<Vec<_>>();
+        serde_json::from_value(json!({
+            "scanned_at_unix_ms": 1_700_000_000_000_i64,
+            "managers": [{ "source": "winget" }],
+            "packages": packages,
+        }))
+        .unwrap()
+    }
+
+    /// Makes every device's pending updates look `days` old, without telling
+    /// the engine.
+    async fn age_updates(app: &App, days: i64) {
+        app.db()
+            .execute(
+                &sea_query::Query::update()
+                    .table(sea_query::Alias::new("device_pending_updates"))
+                    .value(
+                        sea_query::Alias::new("first_seen_at"),
+                        now_ms() - days * DAY_MS,
+                    )
+                    .to_owned(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Waits until the running engine has finished an evaluation.
+    async fn evaluated(app: &App) {
+        for _ in 0..200 {
+            if app.state.alerts.evaluations() > 0 {
+                // Waits for the evaluation in progress.
+                app.state.alerts.facts_kept().await;
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the engine never evaluated");
+    }
+
+    /// Waits until `count` alerts are open, for the running engine.
+    async fn open_until(admin: &mut Browser, count: usize) -> Vec<Value> {
+        let mut open = Vec::new();
+        for _ in 0..600 {
+            open = alerts_of(admin, "?state=open").await;
+            if open.len() >= count {
+                return open;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("{} of {count} alerts opened", open.len());
+    }
+
+    const BURST: usize = 50;
+
+    #[tokio::test]
+    async fn reports_in_a_burst_are_judged_together() {
+        for app in apps().await {
+            let name = app.name;
+            let mut admin = set_up(&app).await;
+            create_rule(&mut admin, security_rule()).await;
+            let mut devices = Vec::new();
+            for index in 0..BURST {
+                let device = app.enroll(&mut admin, &format!("DESK-{index}")).await;
+                updates::scan_reported(
+                    &app.state,
+                    &device.device_id,
+                    Vec::new(),
+                    update_scan(&[("KB1", "other")], false),
+                )
+                .await;
+                devices.push(device.device_id);
+            }
+            age_updates(&app, 8).await;
+            let engine = alerts::spawn(app.state.clone());
+            evaluated(&app).await;
+            assert!(
+                alerts_of(&mut admin, "?state=open").await.is_empty(),
+                "{name}"
+            );
+
+            // Each device's scan says the week-old update is a security one,
+            // one after another.
+            let before = app.state.alerts.evaluations();
+            for device in &devices {
+                updates::scan_reported(
+                    &app.state,
+                    device,
+                    Vec::new(),
+                    update_scan(&[("KB1", "security")], false),
+                )
+                .await;
+            }
+            let open = open_until(&mut admin, BURST).await;
+            let evaluations = app.state.alerts.evaluations() - before;
+            engine.abort();
+            assert_eq!(open.len(), BURST, "{name}");
+            assert!(
+                evaluations <= 10,
+                "{name}: {BURST} reports took {evaluations} evaluations"
+            );
+            app.finish().await;
+        }
+    }
+
+    /// Reports three pending updates (the latest of `round`), a restart, and
+    /// two outdated applications (one of `round`) of three.
+    async fn report(app: &App, device_id: &str, round: usize) {
+        let latest = format!("KB-{round}");
+        updates::scan_reported(
+            &app.state,
+            device_id,
+            Vec::new(),
+            update_scan(
+                &[("KB1", "security"), ("KB2", "other"), (&latest, "other")],
+                true,
+            ),
+        )
+        .await;
+        let tool = format!("Tool.{round}");
+        applications::scan_reported(
+            &app.state,
+            device_id,
+            Vec::new(),
+            application_scan(&[("Git.Git", true), (&tool, true), ("7zip.7zip", false)]),
+        )
+        .await;
+    }
+
+    /// What an evaluation reads: its statements, and the rows of devices'
+    /// scans.
+    async fn evaluation(app: &App) -> (u64, u64) {
+        let before = (app.db().counts(), app.state.alerts.fact_rows_read());
+        alerts::evaluate(&app.state, now_ms()).await.unwrap();
+        (
+            (app.db().counts() - before.0).statements,
+            app.state.alerts.fact_rows_read() - before.1,
+        )
+    }
+
+    /// The rows of one device's scans: three pending updates, its restart
+    /// and that it scanned; that it scanned applications, and two outdated.
+    const DEVICE_ROWS: u64 = 3 + 1 + 1 + 1 + 2;
+    /// The statements reading reported devices' scans: three for updates,
+    /// two for applications.
+    const REPORTED_STATEMENTS: u64 = 5;
+
+    #[tokio::test]
+    async fn an_evaluation_reads_only_the_scans_of_devices_that_reported() {
+        for app in apps().await {
+            let name = app.name;
+            let mut admin = set_up(&app).await;
+            for rule in [security_rule(), restart_rule(), stale_apps_rule()] {
+                create_rule(&mut admin, rule).await;
+            }
+            let mut devices = Vec::new();
+            for index in 0..12 {
+                let device = app.enroll(&mut admin, &format!("DESK-{index}")).await;
+                devices.push(device.device_id);
+            }
+            for device in &devices[..2] {
+                report(&app, device, 0).await;
+            }
+            // The engine just started: it reads every device's scans.
+            let (_, started) = evaluation(&app).await;
+            assert_eq!(started, 2 * DEVICE_ROWS, "{name}");
+            let (few_quiet, rows) = evaluation(&app).await;
+            assert_eq!(rows, 0, "{name}: nothing reported, nothing read");
+            report(&app, &devices[0], 1).await;
+            let few = evaluation(&app).await;
+            assert_eq!(few.1, DEVICE_ROWS, "{name}: the device that reported");
+            assert_eq!(few.0, few_quiet + REPORTED_STATEMENTS, "{name}");
+
+            // Ten more devices with as much pending change neither.
+            for device in &devices[2..] {
+                report(&app, device, 0).await;
+            }
+            assert_eq!(evaluation(&app).await.1, 10 * DEVICE_ROWS, "{name}");
+            let (many_quiet, rows) = evaluation(&app).await;
+            assert_eq!((many_quiet, rows), (few_quiet, 0), "{name}");
+            report(&app, &devices[0], 2).await;
+            let many = evaluation(&app).await;
+            assert_eq!(many, few, "{name}: one device reported");
+            assert!(
+                alerts_of(&mut admin, "?state=open").await.is_empty(),
+                "{name}: nothing is old yet"
+            );
+            assert_eq!(app.state.alerts.facts_kept().await, (12, 12), "{name}");
+            app.finish().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn kept_scans_raise_and_resolve_as_the_stored_ones_do() {
+        for app in apps().await {
+            let name = app.name;
+            let mut admin = set_up(&app).await;
+            let security = create_rule(&mut admin, security_rule()).await;
+            let desk = app.enroll(&mut admin, "Desk").await.device_id;
+            updates::scan_reported(
+                &app.state,
+                &desk,
+                Vec::new(),
+                update_scan(&[("KB1", "security")], true),
+            )
+            .await;
+            applications::scan_reported(
+                &app.state,
+                &desk,
+                Vec::new(),
+                application_scan(&[("Git.Git", true)]),
+            )
+            .await;
+            let now = now_ms();
+            alerts::evaluate(&app.state, now).await.unwrap();
+            assert!(
+                alerts_of(&mut admin, "?state=open").await.is_empty(),
+                "{name}"
+            );
+            assert_eq!(app.state.alerts.facts_kept().await, (1, 0), "{name}");
+
+            // A week passing raises it, with no report and nothing read.
+            let read = app.state.alerts.fact_rows_read();
+            alerts::evaluate(&app.state, now + 8 * DAY_MS)
+                .await
+                .unwrap();
+            let open = alerts_of(&mut admin, "?state=open").await;
+            assert_eq!(open.len(), 1, "{name}: {open:?}");
+            assert_eq!(open[0]["rule_id"], security);
+            assert_eq!(app.state.alerts.fact_rows_read(), read, "{name}");
+
+            // Rules saved later judge what was reported before.
+            let restart = create_rule(&mut admin, restart_rule()).await;
+            let stale = create_rule(&mut admin, stale_apps_rule()).await;
+            alerts::evaluate(&app.state, now + 8 * DAY_MS)
+                .await
+                .unwrap();
+            let open = alerts_of(&mut admin, "?state=open").await;
+            assert_eq!(open.len(), 3, "{name}: {open:?}");
+            assert_eq!(app.state.alerts.facts_kept().await, (1, 1), "{name}");
+
+            // Scans that report them gone resolve them.
+            updates::scan_reported(&app.state, &desk, Vec::new(), update_scan(&[], false)).await;
+            applications::scan_reported(
+                &app.state,
+                &desk,
+                Vec::new(),
+                application_scan(&[("Git.Git", false)]),
+            )
+            .await;
+            alerts::evaluate(&app.state, now + 8 * DAY_MS)
+                .await
+                .unwrap();
+            let open = alerts_of(&mut admin, "?state=open").await;
+            assert!(open.is_empty(), "{name}: {open:?}");
+
+            // Without update rules, the engine keeps no update scans.
+            for rule in [&security, &restart] {
+                let deleted = admin.delete(&format!("/v1/alert-rules/{rule}")).await;
+                assert_eq!(deleted.status, StatusCode::NO_CONTENT, "{name}");
+            }
+            alerts::evaluate(&app.state, now + 8 * DAY_MS)
+                .await
+                .unwrap();
+            assert_eq!(app.state.alerts.facts_kept().await, (0, 1), "{name}");
+
+            // A deleted device's alerts and scans go.
+            applications::scan_reported(
+                &app.state,
+                &desk,
+                Vec::new(),
+                application_scan(&[("Git.Git", true)]),
+            )
+            .await;
+            alerts::evaluate(&app.state, now + 16 * DAY_MS)
+                .await
+                .unwrap();
+            let open = alerts_of(&mut admin, "?state=open").await;
+            assert_eq!(open.len(), 1, "{name}: {open:?}");
+            assert_eq!(open[0]["rule_id"], stale);
+            let deleted = admin.delete(&format!("/v1/agents/{desk}")).await;
+            assert_eq!(deleted.status, StatusCode::NO_CONTENT, "{name}");
+            alerts::evaluate(&app.state, now + 16 * DAY_MS)
+                .await
+                .unwrap();
+            assert!(
+                alerts_of(&mut admin, "?state=all").await.is_empty(),
+                "{name}"
+            );
+            assert_eq!(app.state.alerts.facts_kept().await, (0, 0), "{name}");
+            app.finish().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_saved_rule_is_judged_at_once() {
+        for app in apps().await {
+            let name = app.name;
+            let mut admin = set_up(&app).await;
+            let desk = app.enroll(&mut admin, "Desk").await.device_id;
+            // Stored as a report would be, without telling the engine.
+            updates::store::store_scan(
+                &app.state.database,
+                &desk,
+                update_scan(&[("KB1", "security")], false),
+                now_ms(),
+            )
+            .await
+            .unwrap();
+            age_updates(&app, 8).await;
+            let engine = alerts::spawn(app.state.clone());
+            evaluated(&app).await;
+            let before = app.state.alerts.evaluations();
+
+            // The next evaluation would come after the interval; saving the
+            // rule starts one at once.
+            let saved = std::time::Instant::now();
+            create_rule(&mut admin, security_rule()).await;
+            let open = open_until(&mut admin, 1).await;
+            let waited = saved.elapsed();
+            let evaluations = app.state.alerts.evaluations() - before;
+            engine.abort();
+            assert_eq!(open.len(), 1, "{name}");
+            assert_eq!(evaluations, 1, "{name}");
+            assert!(
+                waited < alerts::EVALUATION_INTERVAL / 2,
+                "{name}: judged after {waited:?}"
+            );
+            app.finish().await;
+        }
+    }
+}

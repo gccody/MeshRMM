@@ -4,7 +4,9 @@
 //! alerts stay until a person resolves them. "Application updates pending"
 //! is judged with the device-state rules, from when each package was first
 //! found outdated.
-use std::collections::HashMap;
+use std::collections::HashSet;
+
+use meshrmm_protocol_types::PackageKey;
 
 use super::{
     announce,
@@ -14,40 +16,44 @@ use super::{
     store::{self, Raise},
 };
 use crate::{
-    applications::runs::{self, Action},
+    applications::{
+        runs::{self, Action},
+        store::OutdatedPackage,
+    },
     db::{self, Executor},
     http::AppState,
     time::{DAY_MS, now_ms},
 };
 
-/// Each scanned device's outdated packages, but those pinned library
-/// applications hold back, when an enabled rule watches them.
-pub async fn outdated(
-    executor: &mut impl Executor,
-    rules: &[Rule],
-) -> db::Result<HashMap<String, Vec<(String, i64)>>> {
-    if !rules
-        .iter()
-        .any(|rule| rule.enabled && rule.condition == Condition::AppUpdatesPending)
-    {
-        return Ok(HashMap::new());
-    }
+/// The packages of pinned library applications, which are held back on
+/// purpose. The library changes without any device reporting, so it is read
+/// for each evaluation rather than kept.
+pub async fn held(executor: &mut impl Executor) -> db::Result<HashSet<PackageKey>> {
     let library = crate::applications::library::load(executor, None).await?;
-    let held = crate::applications::store::Matches::new(&library).held_keys();
-    crate::applications::store::outdated_ages(executor, &held).await
+    Ok(crate::applications::store::Matches::new(&library)
+        .held_keys()
+        .into_iter()
+        .collect())
 }
 
 /// Judges an application updates rule for a device whose outdated packages
-/// (by name, with when each was first found outdated) are `outdated`;
-/// `None` for a device that never scanned.
-pub fn judge(rule: &Rule, outdated: Option<&Vec<(String, i64)>>, now: i64) -> Verdict {
+/// are `outdated`, but those `held` back; `None` for a device that never
+/// scanned.
+pub fn judge(
+    rule: &Rule,
+    outdated: Option<&[OutdatedPackage]>,
+    held: &HashSet<PackageKey>,
+    now: i64,
+) -> Verdict {
     let Some(packages) = outdated else {
         return Verdict::Unknown;
     };
     let days = rule.days.unwrap_or(1);
     let mut overdue = packages
         .iter()
-        .filter(|(_, since)| now - since >= days * DAY_MS)
+        .filter(|package| !package.key.as_ref().is_some_and(|key| held.contains(key)))
+        .filter(|package| now - package.since >= days * DAY_MS)
+        .map(|package| (&package.name, package.since))
         .collect::<Vec<_>>();
     overdue.sort_by_key(|(name, since)| (*since, name.to_lowercase()));
     let Some((oldest, since)) = overdue.first() else {
@@ -165,6 +171,8 @@ async fn check(state: &AppState, run_id: &str, now: i64) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use meshrmm_protocol_types::PackageSource;
+
     use super::*;
     use crate::{alerts::rules::Severity, targets::Target};
 
@@ -198,13 +206,22 @@ mod tests {
     #[test]
     fn application_updates_raise_once_pending_long_enough() {
         let now = 30 * DAY_MS;
+        let package = |source, id: &str, name: &str, days| OutdatedPackage {
+            key: Some(PackageKey {
+                source,
+                id: id.into(),
+            }),
+            name: name.into(),
+            since: now - days * DAY_MS,
+        };
         let packages = vec![
-            ("Firefox".to_owned(), now - 8 * DAY_MS),
-            ("Git".to_owned(), now - 10 * DAY_MS),
-            ("7-Zip".to_owned(), now - DAY_MS),
+            package(PackageSource::Winget, "Mozilla.Firefox", "Firefox", 8),
+            package(PackageSource::Winget, "Git.Git", "Git", 10),
+            package(PackageSource::Winget, "7zip.7zip", "7-Zip", 1),
         ];
-        assert_eq!(judge(&rule(7), None, now), Verdict::Unknown);
-        let Verdict::Known(breaches) = judge(&rule(7), Some(&packages), now) else {
+        let none = HashSet::new();
+        assert_eq!(judge(&rule(7), None, &none, now), Verdict::Unknown);
+        let Verdict::Known(breaches) = judge(&rule(7), Some(&packages), &none, now) else {
             panic!("a verdict");
         };
         assert_eq!(breaches.len(), 1);
@@ -217,8 +234,23 @@ mod tests {
             breaches[0].detail
         );
         assert_eq!(
-            judge(&rule(30), Some(&packages), now),
+            judge(&rule(30), Some(&packages), &none, now),
             Verdict::Known(Vec::new())
+        );
+        // A pinned application's package is held back, matched as its
+        // manager reads IDs.
+        let held = HashSet::from([PackageKey {
+            source: PackageSource::Winget,
+            id: "git.git".into(),
+        }]);
+        let Verdict::Known(breaches) = judge(&rule(7), Some(&packages), &held, now) else {
+            panic!("a verdict");
+        };
+        assert_eq!(breaches[0].value, 1.0);
+        assert!(
+            breaches[0].detail.contains("the oldest (Firefox)"),
+            "{}",
+            breaches[0].detail
         );
     }
 

@@ -524,56 +524,61 @@ pub async fn outdated(
     Ok(outdated)
 }
 
-/// Each scanned device's outdated packages, by name, with when each was
-/// first found outdated; for alert rules. Devices that never scanned are
-/// missing.
-pub async fn outdated_ages(
+/// A package a device's latest scan found outdated, for alert rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutdatedPackage {
+    /// `None` for a source this server doesn't know, which nothing holds
+    /// back.
+    pub key: Option<PackageKey>,
+    pub name: String,
+    /// When a scan first found it outdated.
+    pub since: i64,
+}
+
+/// Each scanned device's outdated packages, of the `only` devices or of
+/// every device; for alert rules. Devices that never scanned are missing.
+pub async fn outdated_packages(
     executor: &mut impl Executor,
-    held: &[PackageKey],
-) -> db::Result<HashMap<String, Vec<(String, i64)>>> {
-    let scanned: Vec<(String,)> = executor
-        .fetch_all(
-            &Query::select()
-                .column(DeviceApplicationStatus::DeviceId)
-                .from(DeviceApplicationStatus::Table)
-                .to_owned(),
-        )
-        .await?;
-    let mut ages = scanned
+    only: Option<&[String]>,
+) -> db::Result<HashMap<String, Vec<OutdatedPackage>>> {
+    let mut scanned = Query::select();
+    scanned
+        .column(DeviceApplicationStatus::DeviceId)
+        .from(DeviceApplicationStatus::Table);
+    let mut outdated = Query::select();
+    outdated
+        .columns([
+            DevicePackages::DeviceId,
+            DevicePackages::Source,
+            DevicePackages::PackageId,
+            DevicePackages::Name,
+            DevicePackages::OutdatedSince,
+        ])
+        .from(DevicePackages::Table)
+        .and_where(Expr::col(DevicePackages::OutdatedSince).is_not_null());
+    if let Some(ids) = only {
+        scanned.and_where(Expr::col(DeviceApplicationStatus::DeviceId).is_in(ids.iter().cloned()));
+        outdated.and_where(Expr::col(DevicePackages::DeviceId).is_in(ids.iter().cloned()));
+    }
+    let scanned: Vec<(String,)> = executor.fetch_all(&scanned).await?;
+    let mut packages = scanned
         .into_iter()
         .map(|(device_id,)| (device_id, Vec::new()))
         .collect::<HashMap<_, _>>();
-    let rows: Vec<(String, String, String, String, i64)> = executor
-        .fetch_all(
-            &Query::select()
-                .columns([
-                    DevicePackages::DeviceId,
-                    DevicePackages::Source,
-                    DevicePackages::PackageId,
-                    DevicePackages::Name,
-                    DevicePackages::OutdatedSince,
-                ])
-                .from(DevicePackages::Table)
-                .and_where(Expr::col(DevicePackages::OutdatedSince).is_not_null())
-                .to_owned(),
-        )
-        .await?;
+    let rows: Vec<(String, String, String, String, i64)> = executor.fetch_all(&outdated).await?;
     for (device_id, source, package_id, name, since) in rows {
-        // Pinned library applications are held back on purpose.
-        let is_held = PackageSource::parse(&source).is_some_and(|source| {
-            held.contains(&PackageKey {
-                source,
-                id: package_id,
-            })
-        });
-        if is_held {
-            continue;
-        }
-        if let Some(packages) = ages.get_mut(&device_id) {
-            packages.push((name, since));
+        if let Some(outdated) = packages.get_mut(&device_id) {
+            outdated.push(OutdatedPackage {
+                key: PackageSource::parse(&source).map(|source| PackageKey {
+                    source,
+                    id: package_id,
+                }),
+                name,
+                since,
+            });
         }
     }
-    Ok(ages)
+    Ok(packages)
 }
 
 /// The device was deleted: its scan goes with it.

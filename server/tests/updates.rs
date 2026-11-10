@@ -812,7 +812,21 @@ async fn alerts_of(browser: &mut Browser) -> Vec<Value> {
     response.body["alerts"].as_array().unwrap().clone()
 }
 
-/// Makes the device's pending updates and restart look `days` old.
+/// Evaluates until no alert is open: the server tells the alert engine of a
+/// scan just after storing it, so an evaluation may come between the two.
+async fn evaluate_until_clear(app: &App, admin: &mut Browser) {
+    for _ in 0..100 {
+        alerts::evaluate(&app.state, now_ms()).await.unwrap();
+        if alerts_of(admin).await.is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the alerts never cleared");
+}
+
+/// Makes the device's pending updates and restart look `days` old, and tells
+/// the alert engine, which reads them again only for devices that reported.
 async fn age(app: &App, device_id: &str, days: i64) {
     let then = now_ms() - days * DAY_MS;
     app.db()
@@ -835,6 +849,7 @@ async fn age(app: &App, device_id: &str, days: i64) {
         )
         .await
         .unwrap();
+    app.state.alerts.device_reported(device_id);
 }
 
 #[tokio::test]
@@ -931,8 +946,7 @@ async fn pending_updates_restarts_and_failed_installs_raise_alerts() {
             updates["status"]["reboot_pending"] == false
         })
         .await;
-        alerts::evaluate(&app.state, now_ms()).await.unwrap();
-        assert!(alerts_of(&mut admin).await.is_empty(), "{name}");
+        evaluate_until_clear(&app, &mut admin).await;
 
         // A failed install raises an alert that stays until resolved.
         let started = admin

@@ -98,12 +98,33 @@ the maintenance task deletes them.
 
 `server/src/alerts/` holds it all. The engine's task
 (`alerts::spawn`) takes in new resource readings every five seconds and
-judges the device-state rules every 15 seconds, and at once after a rule
-changes or a device reports an update or application scan, unless the scan
-found what the last one did (the same pending updates and restart pending,
-or the same packages): then there is nothing new to judge. Script failure rules are checked
+judges the device-state rules every 15 seconds (`EVALUATION_INTERVAL`), at
+once after a rule is saved, and soon after a device reports an update or
+application scan, unless the scan found what the last one did (the same
+pending updates and restart pending, or the same packages): then there is
+nothing new to judge. An evaluation covers the whole instance, so reports
+don't each start one: after an evaluation, reports wait at least 2 seconds
+(`MIN_REPORT_SPACING`) and at least five times as long as it took
+(`REPORT_SPACING_FACTOR`), at most until the next regular one, and every
+device that reported meanwhile is judged in the next. A small instance
+shows a scan's alert within a couple of seconds; a large one spends at most
+about a sixth of its time on evaluations that reports start. A finished
+self-healing attempt waits the same way; a saved rule doesn't, since
+someone is looking at it. Script failure rules are checked
 when an Agent reports a run, and when the engine finds a run lost; install
 failure rules when an install is reported failed or found lost.
+
+The engine keeps what devices' scans found that update and application
+rules judge (each pending update's category and when it was first seen,
+since when the device must restart, each outdated package and since when),
+while an enabled rule judges it, and reads it again only for the devices
+that reported since the last evaluation. Ages are counted from the
+evaluation's time, so an update that becomes old enough raises its alert
+with no new scan. It reads every device's again when it starts, after a rule
+that judges them is saved or deleted, and every 10 minutes
+(`alerts::FACTS_REFRESH_INTERVAL`), so a change it wasn't told of shows within
+that. Pins in the application library are read with each evaluation, since
+they change without any device reporting. A deleted device's are dropped.
 
 Unresolved alerts live in the database, keyed by a partial unique index
 (`idx_alerts_unresolved`), so a restart neither forgets an alert nor notifies
