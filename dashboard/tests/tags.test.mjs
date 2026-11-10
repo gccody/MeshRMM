@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { applyInventoryDelta, parseAgentEvent } from "../features/agents/model.ts";
-import { describeTagTarget, hasTags, tagChanges, tagCoverage, tagNameProblem, tagsOf } from "../features/tags/model.ts";
+import { describeTagTarget, hasTags, tagChanges, tagCoverage, tagLookup, tagNameProblem, tagsOf } from "../features/tags/model.ts";
 
 const tags = [
   { id: "l", name: "London", color: "green" },
@@ -28,6 +28,14 @@ test("devices match any or all of some tags", () => {
   assert.equal(hasTags({}, ["s"], "any"), false);
   assert.equal(hasTags({}, [], "all"), true, "no tags chosen matches every device");
   assert.deepEqual(tagsOf(["s", "gone", "l"], tags).map((tag) => tag.name), ["London", "Servers"]);
+});
+
+test("the wall's tag lookup finds what tagsOf does, in the same order", () => {
+  const lookup = tagLookup(tags);
+  for (const ids of [undefined, [], ["s"], ["s", "gone", "l"], ["l", "s", "l"], ["gone"], tags.map((tag) => tag.id).reverse()]) {
+    assert.deepEqual(lookup(ids), tagsOf(ids, tags), JSON.stringify(ids));
+  }
+  assert.deepEqual(tagLookup([])(["s"]), []);
 });
 
 test("tag names are unique ignoring case and fit on one line", () => {

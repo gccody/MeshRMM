@@ -47,11 +47,13 @@ origin as its API. Nothing runs on Node in production.
   xterm adds `<style>` elements, which the Content-Security-Policy refuses,
   so while a terminal is open they become inert elements whose rules go into
   constructed stylesheets.
-- **Large lists without inline styles.** The [file browser](../docs/files.md)
-  and the many-device picker draw only the rows on screen
-  (`lib/use-windowed-rows.ts`) and set their spacers' heights through the DOM,
+- **Large lists without inline styles.** The [file browser](../docs/files.md),
+  the many-device picker and the Devices wall draw only the rows on screen
+  (`lib/use-windowed-rows.ts`) and set the space of the rest through the DOM,
   which the Content-Security-Policy allows, rather than with `style`
-  attributes. Pickers that choose one device search the fleet and list the
+  attributes. The wall is a grid that scrolls with the page: it measures its
+  columns and its tiles, which are all one height, and pads itself for the
+  rows not drawn. Pickers that choose one device search the fleet and list the
   first matches (`features/device-picker/`), so neither puts every device in
   the page. Its uploads hash files with
   an incremental SHA-256 (`lib/sha256.ts`), since `crypto.subtle` needs a

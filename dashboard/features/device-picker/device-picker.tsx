@@ -25,7 +25,7 @@ export function DevicePicker({ agents, chosen, onChange, language }: {
   const above = useRef<HTMLDivElement>(null);
   const below = useRef<HTMLDivElement>(null);
   // A new search starts at the top.
-  const { first, last, onScroll } = useWindowedRows({ scroller, above, below }, shown.length, DEVICE_ROW_HEIGHT, search);
+  const { first, last, onScroll } = useWindowedRows({ scroller, above, below }, shown.length, DEVICE_ROW_HEIGHT, { listKey: search });
   const toggle = (id: string, checked: boolean) => onChange(checked ? [...chosen, id] : chosen.filter((candidate) => candidate !== id));
   const chooseShown = () => onChange([...new Set([...chosen, ...shown.map((agent) => agent.id)])]);
 
