@@ -72,7 +72,7 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
 
 /// Marks runs the Agent never reported as lost.
 pub async fn sweep(state: &AppState, now: i64) -> anyhow::Result<()> {
-    let lost = runs::sweep_lost(&mut &state.database, now).await?;
+    let lost = runs::sweep_lost(&state.database, now).await?;
     for (run_id, device_id, action) in &lost {
         tracing::info!(run_id, device_id, "an application run never reported");
         state.automation.device_changed(device_id);

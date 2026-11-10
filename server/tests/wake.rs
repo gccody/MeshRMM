@@ -597,6 +597,20 @@ async fn policies_wake_offline_devices_and_jobs_report_whether_they_came_online(
             )
             .await
             .unwrap();
+        // With the report deadline its device keeps.
+        app.db()
+            .execute(
+                &sea_query::Query::update()
+                    .table(sea_query::Alias::new("job_devices"))
+                    .value(sea_query::Alias::new("report_by"), now - MINUTE_MS)
+                    .and_where(
+                        sea_query::Expr::col(sea_query::Alias::new("job_id")).eq(job_id.as_str()),
+                    )
+                    .and_where(sea_query::Expr::col(sea_query::Alias::new("state")).eq("started"))
+                    .to_owned(),
+            )
+            .await
+            .unwrap();
         automation::pass(&app.state, now_ms()).await.unwrap();
         let job = admin.get(&format!("/v1/jobs/{job_id}")).await.body;
         let (outcome, detail) = outcome(&job, "ASLEEP");

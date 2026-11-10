@@ -588,9 +588,10 @@ async fn devices_that_cannot_start_yet_do_not_hold_up_later_jobs() {
     }
 }
 
-/// Moves a job's runs into the past.
+/// Moves a job's runs into the past, with the report deadlines its devices
+/// keep.
 async fn backdate_runs(app: &App, job_id: &str, by_ms: i64) {
-    use meshrmm_server::db::tables::ScriptRuns;
+    use meshrmm_server::db::tables::{JobDevices, ScriptRuns};
     use sea_query::{Expr, ExprTrait, Query};
     app.db()
         .execute(
@@ -601,6 +602,19 @@ async fn backdate_runs(app: &App, job_id: &str, by_ms: i64) {
                     Expr::col(ScriptRuns::CreatedAt).sub(by_ms),
                 )
                 .and_where(Expr::col(ScriptRuns::JobId).eq(job_id))
+                .to_owned(),
+        )
+        .await
+        .unwrap();
+    app.db()
+        .execute(
+            &Query::update()
+                .table(JobDevices::Table)
+                .value(
+                    JobDevices::ReportBy,
+                    Expr::col(JobDevices::ReportBy).sub(by_ms),
+                )
+                .and_where(Expr::col(JobDevices::JobId).eq(job_id))
                 .to_owned(),
         )
         .await
@@ -1809,6 +1823,88 @@ async fn job_rows(app: &App) -> i64 {
         .await
         .unwrap();
     count
+}
+
+/// Plans and writes an update scan on `target`, as the website starts one.
+async fn create_job(app: &App, target: automation::jobs::Target) -> String {
+    let plan = automation::jobs::plan(&mut app.db(), &app.state.agents, update_scan(target))
+        .await
+        .unwrap();
+    write_job(app, &plan).await.unwrap().id
+}
+
+#[tokio::test]
+async fn counts_and_the_next_batch_cost_the_same_however_large_the_job() {
+    use automation::jobs::{self, Target};
+    for app in apps().await {
+        let name = app.name;
+        let mut costs = Vec::new();
+        let mut connections = Vec::new();
+        for size in [20, 2_000] {
+            let devices = fleet(&app, &format!("FLEET{size}"), size).await;
+            connections.extend(devices.iter().map(|id| app.state.agents.connect(id)));
+            let id = create_job(&app, Target::Devices(devices)).await;
+            let before = app.db().counts();
+            let counts = jobs::counts(&mut app.db(), std::slice::from_ref(&id), now_ms())
+                .await
+                .unwrap();
+            let counting = app.db().counts() - before;
+            assert_eq!(counts[&id].queued, size as i64, "{name}");
+            let before = app.db().counts();
+            let batch = automation::dispatch::next_batch(&app.state, now_ms())
+                .await
+                .unwrap();
+            let batching = app.db().counts() - before;
+            assert_eq!(
+                batch.len() as u64,
+                (size as u64).min(automation::dispatch::MIN_BATCH * 4),
+                "{name}"
+            );
+            costs.push((counting.statements, batching.statements));
+            // The next size is measured alone.
+            jobs::cancel(&mut app.db(), &id, now_ms()).await.unwrap();
+        }
+        assert_eq!(costs[0], costs[1], "{name}: {costs:?}");
+        assert_eq!(costs[0].0, 1, "{name}: one grouped read counts a job");
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn a_large_job_s_queued_devices_do_not_starve_a_small_one() {
+    use automation::jobs::Target;
+    for app in apps().await {
+        let name = app.name;
+        let page = automation::dispatch::MIN_BATCH * 4;
+        // Far more queued than a pass reads, all before the small job's.
+        let mut large = fleet(&app, "LARGE", 3 * page as usize).await;
+        let small = fleet(&app, "SMALL", 1).await;
+        let _connections = large
+            .iter()
+            .chain(&small)
+            .map(|id| app.state.agents.connect(id))
+            .collect::<Vec<_>>();
+        let large_job = create_job(&app, Target::Devices(large.clone())).await;
+        let small_job = create_job(&app, Target::Devices(small.clone())).await;
+        let batch = automation::dispatch::next_batch(&app.state, now_ms())
+            .await
+            .unwrap();
+        assert_eq!(batch.len() as u64, page, "{name}");
+        assert_eq!(
+            (batch[0].job_id.as_str(), batch[0].device_id.as_str()),
+            (small_job.as_str(), small[0].as_str()),
+            "{name}: the job with fewer devices left goes first in the round"
+        );
+        large.sort();
+        assert!(
+            batch[1..]
+                .iter()
+                .zip(&large)
+                .all(|(row, device_id)| row.job_id == large_job && &row.device_id == device_id),
+            "{name}: then the large job's devices, by ID"
+        );
+        app.finish().await;
+    }
 }
 
 #[tokio::test]

@@ -38,6 +38,7 @@ use tokio::sync::broadcast;
 use self::relays::{Address, Candidate, Chosen};
 use crate::{
     audit::{self, Actor, Target as AuditTarget},
+    automation::jobs::{self, Changed, RunTable},
     db::{
         self, Executor,
         tables::{Agents, DeviceIpAddresses, DeviceSystemInfo, Users, WakeRelays, WakeRequests},
@@ -613,6 +614,11 @@ pub async fn start(
                     .to_owned(),
             )
             .await?;
+        if requester.job_id.is_some() {
+            // The job's device runs until the device comes online, or fails
+            // with no relay.
+            jobs::runs_changed(&mut transaction, RunTable::Wake, Changed::Id(&id), now).await?;
+        }
         for relay in &plan.relays {
             for (broadcast, prefix_length) in &relay.subnets {
                 transaction
@@ -829,6 +835,7 @@ async fn settle_status(executor: &mut impl Executor, wake_id: &str) -> db::Resul
                 .to_owned(),
         )
         .await?;
+    jobs::runs_changed(executor, RunTable::Wake, Changed::Id(wake_id), now_ms()).await?;
     Ok(())
 }
 
@@ -923,16 +930,31 @@ pub async fn device_connected(state: &AppState, device_id: &str) {
     let woken = match pending {
         Ok(None) => return,
         Ok(Some(_)) => {
-            state
-                .database
-                .execute(
-                    &Query::update()
-                        .table(WakeRequests::Table)
-                        .value(WakeRequests::OnlineAt, now)
-                        .cond_where(woken)
-                        .to_owned(),
-                )
-                .await
+            // The requests and their job devices' outcomes change together.
+            let online = async {
+                let mut transaction = state.database.begin().await?;
+                let woken = transaction
+                    .execute(
+                        &Query::update()
+                            .table(WakeRequests::Table)
+                            .value(WakeRequests::OnlineAt, now)
+                            .cond_where(woken)
+                            .to_owned(),
+                    )
+                    .await?;
+                if woken > 0 {
+                    jobs::runs_changed(
+                        &mut transaction,
+                        RunTable::Wake,
+                        Changed::Device(device_id),
+                        now,
+                    )
+                    .await?;
+                }
+                transaction.commit().await?;
+                db::Result::Ok(woken)
+            };
+            online.await
         }
         Err(error) => Err(error),
     };

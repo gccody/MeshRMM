@@ -13,7 +13,13 @@
 //! first in each round and the older first among equals. So a job on one
 //! device starts within a pass or two however large the jobs queued before
 //! it, and a job on a thousand devices still reaches them over a minute or
-//! so, its results trickling in rather than arriving together. A queued
+//! so, its results trickling in rather than arriving together. A pass reads
+//! the jobs that have devices that could start, then each one's first such
+//! devices by an index read limited to a page ([`next_parts`]), and puts
+//! them in that order itself: what it reads grows with the jobs, not with
+//! their queued devices. Jobs with more than a page left to start count as
+//! equals in each round, the older first, since a page is all a pass reads
+//! of each. A queued
 //! device that can't start yet, because it is at its limit, installing
 //! updates or busy with applications, is left out of the pass rather than
 //! holding up the devices queued after it, and starts on a pass after its
@@ -22,16 +28,17 @@
 //! offline ones: they are woken together, through the relays the wake
 //! requests pick, on the next pass however full the dispatcher is, since
 //! they hold no run.
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashMap;
 
 use meshrmm_protocol_types::{
     AgentCommand, FileDeliveryDestination, FileDeliveryRequest, RebootBehavior, RunAs,
     ScriptLanguage, ScriptRunRequest,
 };
-use sea_query::{Cond, Expr, ExprTrait, Order, Query};
+use sea_query::{Cond, Expr, ExprTrait, Order, Query, UnionType};
 
-use super::jobs::{DeviceState, Kind, Offline};
+use super::jobs::{self, DeviceState, Kind, Offline, Outcome, RunTable};
 use crate::{
+    applications::tables::ApplicationRuns,
     db::{
         self, Executor,
         tables::{
@@ -470,10 +477,11 @@ async fn in_flight(state: &AppState, now: i64) -> db::Result<InFlight> {
     Ok(in_flight)
 }
 
-#[derive(Debug, Clone, sqlx::FromRow)]
-struct QueuedRow {
-    job_id: String,
-    device_id: String,
+/// A queued device's part of a job, as a pass takes it.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct QueuedRow {
+    pub job_id: String,
+    pub device_id: String,
 }
 
 /// What the dispatcher needs of a job.
@@ -495,85 +503,291 @@ struct JobRow {
     expires_at: i64,
     requested_by_user_id: String,
     policy_name: Option<String>,
+    created_at: i64,
 }
 
-/// The SQL that is true of a queued device's part that could start now, as
-/// far as the database can tell before the pass starts anything: its job's
-/// class has room, and the device isn't at its limit and isn't running
-/// what the job's kind waits for. [`start`] checks the last two again.
-/// Wakes are started apart, by [`wake_queued`].
-fn startable(per_device: &HashMap<String, i64>, open: &[Class]) -> Cond {
-    let device = || Expr::col((JobDevices::Table, JobDevices::DeviceId));
-    let kind = || Expr::col((Jobs::Table, Jobs::Kind));
-    let at_limit = per_device
+/// The columns of [`JobRow`].
+const JOB_COLUMNS: [Jobs; 17] = [
+    Jobs::Id,
+    Jobs::Kind,
+    Jobs::ItemId,
+    Jobs::ItemName,
+    Jobs::Language,
+    Jobs::Body,
+    Jobs::TimeoutSeconds,
+    Jobs::RunAs,
+    Jobs::Destination,
+    Jobs::UpdateCategories,
+    Jobs::Reboot,
+    Jobs::RebootDelayMinutes,
+    Jobs::Offline,
+    Jobs::ExpiresAt,
+    Jobs::RequestedByUserId,
+    Jobs::PolicyName,
+    Jobs::CreatedAt,
+];
+
+/// Bound values one statement carries at most, well under what either
+/// database takes.
+const MAX_VALUES: usize = 30_000;
+/// Jobs one statement reads the next parts of.
+const JOBS_PER_READ: usize = 100;
+
+/// The devices the pass treats as at their limit: those with
+/// [`MAX_PER_DEVICE`] runs in flight. Each has that many of the runs in
+/// flight, so the list stays under half the ceilings together.
+fn at_limit(per_device: &HashMap<String, i64>) -> Vec<String> {
+    let mut at_limit = per_device
         .iter()
         .filter(|(_, count)| **count >= MAX_PER_DEVICE)
         .map(|(device_id, _)| device_id.clone())
         .collect::<Vec<_>>();
-    let open = open
-        .iter()
-        .flat_map(|class| class.kinds())
-        .map(|kind| kind.as_str());
-    let mut free = Cond::all()
-        .add(kind().is_in(open))
-        .add(
-            kind()
-                .ne(Kind::UpdateInstall.as_str())
-                .or(device().not_in_subquery(update_runs::pending_devices(UpdateKind::Install))),
-        )
-        .add(
-            kind()
-                .is_not_in(
-                    [Kind::AppInstall, Kind::AppUpdate, Kind::AppUninstall].map(Kind::as_str),
-                )
-                .or(device().not_in_subquery(crate::applications::busy_devices())),
-        );
-    // Each has MAX_PER_DEVICE of the runs in flight, so the list stays under
-    // half the ceilings together.
+    at_limit.sort();
+    at_limit
+}
+
+/// The job device's pending update install, or its pending application
+/// run: `busy`, narrowed to the device of the part it is evaluated for, so
+/// each part costs a lookup of its own device.
+fn on_the_part(mut busy: sea_query::SelectStatement, device: Expr) -> Expr {
+    busy.and_where(device.equals((JobDevices::Table, JobDevices::DeviceId)));
+    Expr::exists(busy)
+}
+
+/// The SQL that is true of a queued part that could start now, as far as
+/// the database can tell before the pass starts anything: the device isn't
+/// at its limit, and isn't running what the job's kind waits for (an update
+/// install for an install job, an application run for an application job).
+/// `kind` is the job's, or `None` for the kind of the job row the part is
+/// read beside. [`start`] checks the last two again. Wakes are started
+/// apart, by [`wake_queued`].
+fn startable(at_limit: &[String], kind: Option<Kind>) -> Cond {
+    let mut free = Cond::all();
     if !at_limit.is_empty() {
-        free = free.add(device().is_not_in(at_limit));
+        free = free.add(
+            Expr::col((JobDevices::Table, JobDevices::DeviceId))
+                .is_not_in(at_limit.iter().cloned()),
+        );
+    }
+    let waits = |kinds: &[Kind], busy: Expr| match kind {
+        Some(kind) if kinds.contains(&kind) => Some(busy.not()),
+        Some(_) => None,
+        None => Some(
+            Expr::col((Jobs::Table, Jobs::Kind))
+                .is_not_in(kinds.iter().map(|kind| kind.as_str()))
+                .or(busy.not()),
+        ),
+    };
+    let installing = on_the_part(
+        update_runs::pending_devices(UpdateKind::Install),
+        Expr::col((UpdateRuns::Table, UpdateRuns::DeviceId)),
+    );
+    let applications = on_the_part(
+        crate::applications::busy_devices(),
+        Expr::col((ApplicationRuns::Table, ApplicationRuns::DeviceId)),
+    );
+    for condition in [
+        waits(&[Kind::UpdateInstall], installing),
+        waits(
+            &[Kind::AppInstall, Kind::AppUpdate, Kind::AppUninstall],
+            applications,
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        free = free.add(condition);
     }
     free
 }
 
-/// The order a pass takes queued parts in: the jobs in turn, one device of
-/// each per round, and in each round the jobs with fewer parts left to
-/// start first, then the older. Within a job, devices go in the order they
-/// always have. So a small job isn't left behind a large one, even when
-/// one slot frees at a time.
-fn in_turn(select: &mut sea_query::SelectStatement) {
-    select
-        .order_by_expr(
-            Expr::cust(
-                "ROW_NUMBER() OVER (PARTITION BY job_devices.job_id ORDER BY job_devices.device_id)",
-            ),
-            Order::Asc,
+/// The unfinished jobs of `kinds` that have a queued part that could start
+/// while the devices of `at_limit` are at their limit, oldest first: few,
+/// each found by a lookup of its queued devices that stops at the first
+/// that could start.
+pub fn ready_jobs(kinds: &[Kind], at_limit: &[String]) -> sea_query::SelectStatement {
+    Query::select()
+        .columns(JOB_COLUMNS.map(|column| (Jobs::Table, column)))
+        .from(Jobs::Table)
+        .and_where(Expr::col((Jobs::Table, Jobs::FinishedAt)).is_null())
+        .and_where(
+            Expr::col((Jobs::Table, Jobs::Kind)).is_in(kinds.iter().map(|kind| kind.as_str())),
         )
-        .order_by_expr(
-            Expr::cust("COUNT(*) OVER (PARTITION BY job_devices.job_id)"),
-            Order::Asc,
+        // The first such device, by a lookup of the job's own devices: a
+        // limited subquery can't be turned into a join that reads every queued
+        // device of every job, as PostgreSQL does with EXISTS.
+        .and_where(
+            Expr::expr(
+                Query::select()
+                    .column((JobDevices::Table, JobDevices::DeviceId))
+                    .from(JobDevices::Table)
+                    .and_where(
+                        Expr::col((JobDevices::Table, JobDevices::JobId))
+                            .equals((Jobs::Table, Jobs::Id)),
+                    )
+                    .and_where(
+                        Expr::col((JobDevices::Table, JobDevices::State))
+                            .eq(DeviceState::Queued.as_str()),
+                    )
+                    .cond_where(startable(at_limit, None))
+                    .limit(1)
+                    .to_owned(),
+            )
+            .is_not_null(),
         )
         .order_by((Jobs::Table, Jobs::CreatedAt), Order::Asc)
-        .order_by((JobDevices::Table, JobDevices::JobId), Order::Asc)
-        .order_by((JobDevices::Table, JobDevices::DeviceId), Order::Asc);
+        .order_by((Jobs::Table, Jobs::Id), Order::Asc)
+        .to_owned()
 }
 
-/// The queued parts of jobs, joined to their job.
-fn queued_parts() -> sea_query::SelectStatement {
+/// The first `limit` queued parts of the job `job_id` of `kind` that could
+/// start, by device ID: a read of the job's queued devices in
+/// `idx_job_devices_job`'s order that passes over those that can't start,
+/// so they don't hold up the ones after them.
+pub fn next_parts(
+    job_id: &str,
+    kind: Kind,
+    at_limit: &[String],
+    limit: u64,
+) -> sea_query::SelectStatement {
     Query::select()
         .columns([
             (JobDevices::Table, JobDevices::JobId),
             (JobDevices::Table, JobDevices::DeviceId),
         ])
         .from(JobDevices::Table)
-        .inner_join(
-            Jobs::Table,
-            Expr::col((Jobs::Table, Jobs::Id)).equals((JobDevices::Table, JobDevices::JobId)),
-        )
+        .and_where(Expr::col((JobDevices::Table, JobDevices::JobId)).eq(job_id))
         .and_where(
             Expr::col((JobDevices::Table, JobDevices::State)).eq(DeviceState::Queued.as_str()),
         )
+        .cond_where(startable(at_limit, Some(kind)))
+        .order_by((JobDevices::Table, JobDevices::DeviceId), Order::Asc)
+        .limit(limit)
         .to_owned()
+}
+
+/// The next parts of each of `jobs`, `limit` of each at most, by device ID:
+/// one statement reads up to [`JOBS_PER_READ`] jobs' parts, each job's by
+/// its own limited read, as many as the bound values allow.
+async fn next_parts_of(
+    state: &AppState,
+    jobs: &[&JobRow],
+    at_limit: &[String],
+    limit: u64,
+) -> db::Result<HashMap<String, Vec<String>>> {
+    let per_read = (MAX_VALUES / (at_limit.len() + 8)).clamp(1, JOBS_PER_READ);
+    let mut parts: HashMap<String, Vec<String>> = HashMap::new();
+    if limit == 0 {
+        return Ok(parts);
+    }
+    for chunk in jobs.chunks(per_read) {
+        let mut reads = chunk.iter().filter_map(|job| {
+            let kind = Kind::parse(&job.kind)?;
+            // Each read keeps its own order and limit inside a union.
+            Some(
+                Query::select()
+                    .columns([JobDevices::JobId, JobDevices::DeviceId])
+                    .from_subquery(next_parts(&job.id, kind, at_limit, limit), "part")
+                    .to_owned(),
+            )
+        });
+        let Some(mut select) = reads.next() else {
+            continue;
+        };
+        select.unions(reads.map(|read| (UnionType::All, read)));
+        let rows: Vec<QueuedRow> = state.database.fetch_all(&select).await?;
+        for row in rows {
+            parts.entry(row.job_id).or_default().push(row.device_id);
+        }
+    }
+    // A union's rows come in no particular order.
+    for devices in parts.values_mut() {
+        devices.sort();
+    }
+    Ok(parts)
+}
+
+/// The queued parts a pass may start, at most `page`, in the order it
+/// takes them: the jobs in turn, one device of each per round, and in each
+/// round the jobs with fewer parts left to start first, then the older.
+/// Within a job, devices go by ID. So a small job isn't left behind a large
+/// one, even when one slot frees at a time. Only parts that could start are
+/// read, so those that can't don't keep the ones queued after them from
+/// being read. A pass reads the jobs with such parts, then each one's first
+/// parts by an index read limited to a page: never more of a job than a
+/// pass could take, however many devices it has. Jobs with more than a page
+/// left are equals in each round, the older first.
+async fn queued(
+    state: &AppState,
+    per_device: &HashMap<String, i64>,
+    open: &[Class],
+    page: u64,
+) -> db::Result<(Vec<QueuedRow>, HashMap<String, JobRow>)> {
+    let at_limit = at_limit(per_device);
+    let kinds = open
+        .iter()
+        .flat_map(|class| class.kinds())
+        .copied()
+        .collect::<Vec<_>>();
+    let jobs: Vec<JobRow> = state
+        .database
+        .fetch_all(&ready_jobs(&kinds, &at_limit))
+        .await?;
+    if jobs.is_empty() {
+        return Ok((Vec::new(), HashMap::new()));
+    }
+    // One past a page tells a job with more left than a pass takes from one
+    // with exactly a page.
+    let mut parts =
+        next_parts_of(state, &jobs.iter().collect::<Vec<_>>(), &at_limit, page + 1).await?;
+    let mut turns = jobs
+        .iter()
+        .filter_map(|job| Some((job, parts.remove(&job.id)?)))
+        .collect::<Vec<_>>();
+    turns.sort_by(|(job, left), (other, other_left)| {
+        left.len()
+            .cmp(&other_left.len())
+            .then(job.created_at.cmp(&other.created_at))
+            .then(job.id.cmp(&other.id))
+    });
+    let page = usize::try_from(page).unwrap_or(usize::MAX);
+    let mut queued = Vec::new();
+    'rounds: for round in 0..page {
+        let mut any = false;
+        for (job, devices) in &turns {
+            let Some(device_id) = devices.get(round) else {
+                continue;
+            };
+            any = true;
+            queued.push(QueuedRow {
+                job_id: job.id.clone(),
+                device_id: device_id.clone(),
+            });
+            if queued.len() >= page {
+                break 'rounds;
+            }
+        }
+        if !any {
+            break;
+        }
+    }
+    let jobs = jobs.into_iter().map(|job| (job.id.clone(), job)).collect();
+    Ok((queued, jobs))
+}
+
+/// The parts the next pass would start, in the order it would take them,
+/// within the limits for the Agents connected now; wakes aside. It starts
+/// nothing: tests measure what the read costs with it.
+pub async fn next_batch(state: &AppState, now: i64) -> db::Result<Vec<QueuedRow>> {
+    let limits = limits(state.agents.count());
+    let mut in_flight = in_flight(state, now).await?;
+    let open = in_flight.open(limits);
+    if open.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(queued(state, &in_flight.per_device, &open, limits.page())
+        .await?
+        .0)
 }
 
 /// Starts queued devices' runs and deliveries within the limits for the
@@ -584,7 +798,6 @@ fn queued_parts() -> sea_query::SelectStatement {
 /// devices start once its runs report, which wakes the engine. Nor are
 /// devices that can't start yet, for the same reason.
 pub async fn dispatch(state: &AppState, now: i64) -> anyhow::Result<bool> {
-    let database = &state.database;
     let limits = limits(state.agents.count());
     let more_wakes = wake_queued(state, limits.batch, now).await?;
     let mut in_flight = in_flight(state, now).await?;
@@ -592,18 +805,10 @@ pub async fn dispatch(state: &AppState, now: i64) -> anyhow::Result<bool> {
     if open.is_empty() {
         return Ok(more_wakes);
     }
-    // Only parts that could start, so those that can't don't keep the ones
-    // queued after them from being read.
-    let mut select = queued_parts();
-    select
-        .cond_where(startable(&in_flight.per_device, &open))
-        .limit(limits.page());
-    in_turn(&mut select);
-    let queued: Vec<QueuedRow> = database.fetch_all(&select).await?;
+    let (queued, jobs) = queued(state, &in_flight.per_device, &open, limits.page()).await?;
     if queued.is_empty() {
         return Ok(more_wakes);
     }
-    let jobs = jobs_of(state, &queued).await?;
     let mut started = 0;
     let mut stopped = false;
     for row in &queued {
@@ -644,71 +849,37 @@ pub async fn dispatch(state: &AppState, now: i64) -> anyhow::Result<bool> {
 }
 
 /// Wakes the devices of queued wake jobs, at most `batch`, oldest job
-/// first, whatever the other jobs hold: a wake holds no run. Returns
-/// whether more may be queued.
+/// first, whatever the other jobs hold: a wake holds no run. Reads the wake
+/// jobs with queued devices, then as many of each one's devices as the
+/// batch has room for, by device ID. Returns whether more may be queued.
 async fn wake_queued(state: &AppState, batch: u64, now: i64) -> anyhow::Result<bool> {
-    let mut select = queued_parts();
-    select
-        .and_where(Expr::col((Jobs::Table, Jobs::Kind)).eq(Kind::Wake.as_str()))
-        .order_by((Jobs::Table, Jobs::CreatedAt), Order::Asc)
-        .order_by((JobDevices::Table, JobDevices::JobId), Order::Asc)
-        .order_by((JobDevices::Table, JobDevices::DeviceId), Order::Asc)
-        .limit(batch);
-    let queued: Vec<QueuedRow> = state.database.fetch_all(&select).await?;
-    if queued.is_empty() {
-        return Ok(false);
-    }
-    let jobs = jobs_of(state, &queued).await?;
-    let mut wakes: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    for row in &queued {
-        wakes
-            .entry(&row.job_id)
-            .or_default()
-            .push(row.device_id.clone());
-    }
-    for (job_id, devices) in wakes {
-        if let Some(job) = jobs.get(job_id) {
-            state.automation.recount(job_id);
-            start_wakes(state, job, &devices, now).await?;
-        }
-    }
-    Ok(queued.len() as u64 >= batch)
-}
-
-/// The jobs of these queued parts.
-async fn jobs_of(state: &AppState, queued: &[QueuedRow]) -> db::Result<HashMap<String, JobRow>> {
-    let job_ids = queued
-        .iter()
-        .map(|row| row.job_id.clone())
-        .collect::<HashSet<_>>();
     let jobs: Vec<JobRow> = state
         .database
-        .fetch_all(
-            &Query::select()
-                .columns([
-                    Jobs::Id,
-                    Jobs::Kind,
-                    Jobs::ItemId,
-                    Jobs::ItemName,
-                    Jobs::Language,
-                    Jobs::Body,
-                    Jobs::TimeoutSeconds,
-                    Jobs::RunAs,
-                    Jobs::Destination,
-                    Jobs::UpdateCategories,
-                    Jobs::Reboot,
-                    Jobs::RebootDelayMinutes,
-                    Jobs::Offline,
-                    Jobs::ExpiresAt,
-                    Jobs::RequestedByUserId,
-                    Jobs::PolicyName,
-                ])
-                .from(Jobs::Table)
-                .and_where(Expr::col(Jobs::Id).is_in(job_ids))
-                .to_owned(),
-        )
+        .fetch_all(&ready_jobs(&[Kind::Wake], &[]))
         .await?;
-    Ok(jobs.into_iter().map(|job| (job.id.clone(), job)).collect())
+    let mut queued = 0;
+    for chunk in jobs.chunks(JOBS_PER_READ) {
+        let left = batch.saturating_sub(queued);
+        if left == 0 {
+            break;
+        }
+        let chunk = chunk.iter().collect::<Vec<_>>();
+        let parts = next_parts_of(state, &chunk, &[], left).await?;
+        for job in chunk {
+            let Some(devices) = parts.get(&job.id) else {
+                continue;
+            };
+            let room = usize::try_from(batch.saturating_sub(queued)).unwrap_or(usize::MAX);
+            let devices = &devices[..devices.len().min(room)];
+            if devices.is_empty() {
+                break;
+            }
+            queued += devices.len() as u64;
+            state.automation.recount(&job.id);
+            start_wakes(state, job, devices, now).await?;
+        }
+    }
+    Ok(queued >= batch)
 }
 
 /// Wakes a wake job's queued devices that are still offline, and skips
@@ -734,6 +905,13 @@ async fn start_wakes(
                     .table(JobDevices::Table)
                     .value(JobDevices::State, next.as_str())
                     .value(JobDevices::Detail, detail)
+                    // A woken device has no result until its wake request is
+                    // recorded, which writes how the request stands, and
+                    // keeps none if it never is.
+                    .value(
+                        JobDevices::Result,
+                        (!online).then_some(Outcome::NoResult.as_str()),
+                    )
                     .value(JobDevices::UpdatedAt, now)
                     .and_where(Expr::col(JobDevices::JobId).eq(job.id.as_str()))
                     .and_where(Expr::col(JobDevices::DeviceId).eq(device_id.as_str()))
@@ -966,19 +1144,16 @@ async fn start(state: &AppState, job: &JobRow, device_id: &str, now: i64) -> any
             }
         }
     };
-    let claimed = transaction
-        .execute(
-            &Query::update()
-                .table(JobDevices::Table)
-                .value(JobDevices::State, DeviceState::Started.as_str())
-                .value(JobDevices::UpdatedAt, now)
-                .and_where(Expr::col(JobDevices::JobId).eq(job.id.as_str()))
-                .and_where(Expr::col(JobDevices::DeviceId).eq(device_id))
-                .and_where(Expr::col(JobDevices::State).eq(DeviceState::Queued.as_str()))
-                .to_owned(),
-        )
-        .await?;
-    if claimed == 0 {
+    let claimed = jobs::claim(
+        &mut transaction,
+        &job.id,
+        device_id,
+        RunTable::of(kind),
+        &id,
+        now,
+    )
+    .await?;
+    if !claimed {
         // Cancelled meanwhile.
         transaction.rollback().await?;
         return Ok(false);
@@ -1053,6 +1228,9 @@ async fn unqueue(
                 .table(JobDevices::Table)
                 .value(JobDevices::State, next.as_str())
                 .value(JobDevices::Detail, detail)
+                // Its run never existed, so neither did its result.
+                .value(JobDevices::Result, Option::<&str>::None)
+                .value(JobDevices::ReportBy, Option::<i64>::None)
                 .value(JobDevices::UpdatedAt, now)
                 .and_where(Expr::col(JobDevices::JobId).eq(job.id.as_str()))
                 .and_where(Expr::col(JobDevices::DeviceId).eq(device_id))

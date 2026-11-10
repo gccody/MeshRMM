@@ -14,7 +14,7 @@ use meshrmm_server::{
 };
 use sea_query::{
     DeleteStatement, Expr, ExprTrait, PostgresQueryBuilder, Query, QueryBuilder, SelectStatement,
-    SqliteQueryBuilder,
+    SqliteQueryBuilder, UpdateStatement,
 };
 use sea_query_sqlx::{SqlxBinder, SqlxValues};
 use sqlx::{AssertSqlSafe, Connection, PgConnection, SqliteConnection};
@@ -24,6 +24,7 @@ const NOW: i64 = 1_800_000_000_000;
 enum Statement {
     Select(SelectStatement),
     Delete(DeleteStatement),
+    Update(UpdateStatement),
 }
 
 impl Statement {
@@ -31,6 +32,7 @@ impl Statement {
         match self {
             Self::Select(select) => select.build_sqlx(builder),
             Self::Delete(delete) => delete.build_sqlx(builder),
+            Self::Update(update) => update.build_sqlx(builder),
         }
     }
 }
@@ -539,6 +541,160 @@ async fn engine_queries_use_their_indexes() {
         for (query, statement, indexes) in statements() {
             let plan = postgres_plan(&mut connection, &statement).await;
             check(&mut misses, "PostgreSQL", query, indexes, &plan);
+        }
+        connection.close().await.unwrap();
+        postgres.drop_database().await;
+    }
+    assert!(misses.is_empty(), "{}", misses.join("\n\n"));
+}
+
+/// A statement, what runs it, the indexes it may use, and what its plan
+/// must not show.
+type Checked = (
+    &'static str,
+    Statement,
+    &'static [&'static str],
+    &'static [&'static str],
+);
+
+/// The statements that read or write a job's devices: a job's counts and
+/// the dispatcher's reads find one job's devices by its ID, never reading
+/// the run tables or the whole of `job_devices`, nor sorting them.
+fn job_statements() -> Vec<Checked> {
+    use meshrmm_server::automation::{
+        dispatch,
+        jobs::{self, Changed, Kind, RunTable},
+    };
+    const RUNS: &[&str] = &[
+        "script_runs",
+        "file_deliveries",
+        "update_runs",
+        "application_runs",
+        "wake_requests",
+        "SCAN job_devices",
+        "Seq Scan on job_devices",
+    ];
+    const SORTS: &[&str] = &[
+        "SCAN job_devices",
+        "Seq Scan on job_devices",
+        "TEMP B-TREE",
+        "Sort",
+    ];
+    let at_limit = ["busy-device".to_owned()];
+    vec![
+        (
+            "a job's counts",
+            Statement::Select(jobs::counts_query(&["job".to_owned()], NOW)),
+            &["idx_job_devices_job"],
+            RUNS,
+        ),
+        (
+            "the counts of a page of jobs",
+            Statement::Select(jobs::counts_query(
+                &(0..200)
+                    .map(|index| format!("job-{index}"))
+                    .collect::<Vec<_>>(),
+                NOW,
+            )),
+            &["idx_job_devices_job"],
+            RUNS,
+        ),
+        (
+            "the dispatcher's jobs with devices that could start",
+            Statement::Select(dispatch::ready_jobs(
+                &[Kind::Script, Kind::UpdateInstall, Kind::AppInstall],
+                &at_limit,
+            )),
+            &["idx_job_devices_job"],
+            &["SCAN job_devices", "Seq Scan on job_devices"],
+        ),
+        (
+            "the dispatcher's next devices of a script job",
+            Statement::Select(dispatch::next_parts("job", Kind::Script, &at_limit, 101)),
+            &["idx_job_devices_job"],
+            SORTS,
+        ),
+        (
+            "the dispatcher's next devices of an install job",
+            Statement::Select(dispatch::next_parts(
+                "job",
+                Kind::UpdateInstall,
+                &at_limit,
+                101,
+            )),
+            &["idx_job_devices_job"],
+            SORTS,
+        ),
+        (
+            "the dispatcher's next devices of an application job",
+            Statement::Select(dispatch::next_parts(
+                "job",
+                Kind::AppInstall,
+                &at_limit,
+                101,
+            )),
+            &["idx_job_devices_job"],
+            SORTS,
+        ),
+        (
+            "a run's report written into its job device",
+            Statement::Update(jobs::runs_changed_statement(
+                RunTable::Script,
+                Changed::Id("run"),
+                NOW,
+            )),
+            &[
+                "sqlite_autoindex_job_devices_1",
+                "job_devices_pkey",
+                "idx_job_devices_job",
+            ],
+            &["SCAN job_devices", "Seq Scan on job_devices"],
+        ),
+        (
+            "a woken device's job devices written when it came online",
+            Statement::Update(jobs::runs_changed_statement(
+                RunTable::Wake,
+                Changed::Device("device"),
+                NOW,
+            )),
+            &[
+                "idx_job_devices_state",
+                "job_devices_pkey",
+                "sqlite_autoindex_job_devices_1",
+                "idx_job_devices_job",
+            ],
+            &["SCAN job_devices", "Seq Scan on job_devices"],
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn job_queries_read_only_the_jobs_own_devices() {
+    let mut misses = Vec::new();
+    let mut check_all =
+        |backend: &str, query: &str, indexes: &[&str], forbidden: &[&str], plan: &str| {
+            check(&mut misses, backend, query, indexes, plan);
+            for shown in forbidden {
+                if plan.contains(shown) {
+                    misses.push(format!("on {backend}, {query} shows {shown}:\n{plan}"));
+                }
+            }
+        };
+    let sqlite = common::sqlite().await;
+    let mut connection = SqliteConnection::connect(&sqlite.url).await.unwrap();
+    for (query, statement, indexes, forbidden) in job_statements() {
+        let plan = sqlite_plan(&mut connection, &statement).await;
+        check_all("SQLite", query, indexes, forbidden, &plan);
+    }
+    connection.close().await.unwrap();
+    sqlite.drop_database().await;
+
+    if let Some(admin_url) = common::postgres_admin_url() {
+        let postgres = common::postgres(&admin_url).await;
+        let mut connection = PgConnection::connect(&postgres.url).await.unwrap();
+        for (query, statement, indexes, forbidden) in job_statements() {
+            let plan = postgres_plan(&mut connection, &statement).await;
+            check_all("PostgreSQL", query, indexes, forbidden, &plan);
         }
         connection.close().await.unwrap();
         postgres.drop_database().await;

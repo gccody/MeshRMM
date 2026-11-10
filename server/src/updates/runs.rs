@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::store;
 use crate::{
+    automation::jobs::{self, Changed, RunTable},
     db::{
         self, Database, Executor,
         tables::{Agents, UpdateRunItems, UpdateRuns, Users},
@@ -576,6 +577,7 @@ pub async fn finish_scans(
             )
             .await?;
         if updated == 1 {
+            changed(executor, run_id, now).await?;
             finished.push(run_id.clone());
         }
     }
@@ -644,6 +646,7 @@ pub async fn finish_install(
         ),
     )
     .await?;
+    changed(executor, run_id, now).await?;
     let mut seen = std::collections::HashSet::new();
     let items = result
         .items
@@ -677,9 +680,16 @@ pub async fn finish_install(
     Ok(true)
 }
 
-/// Marks runs the Agent never reported as lost, each lost install with its
-/// device's status row in one transaction. Returns them, with their devices
-/// and kinds.
+/// Writes how the run went into its job device's outcome, if it is a job's,
+/// in the transaction that changed its status.
+async fn changed(executor: &mut impl Executor, id: &str, now: i64) -> db::Result<()> {
+    jobs::runs_changed(executor, RunTable::Update, Changed::Id(id), now).await?;
+    Ok(())
+}
+
+/// Marks runs the Agent never reported as lost, each with its job device
+/// and, for an install, its device's status row in one transaction. Returns
+/// them, with their devices and kinds.
 pub async fn sweep_lost(database: &Database, now: i64) -> db::Result<Vec<(String, String, Kind)>> {
     let pending: Vec<(String, String, String, i64)> = database
         .fetch_all(
@@ -718,6 +728,9 @@ pub async fn sweep_lost(database: &Database, now: i64) -> db::Result<Vec<(String
                     .to_owned(),
             )
             .await?;
+        if updated == 1 {
+            changed(&mut transaction, &id, now).await?;
+        }
         if updated == 1 && kind == Kind::Install {
             store::install_ended(&mut transaction, &device_id, &id, "lost", now, (0, 0)).await?;
         }

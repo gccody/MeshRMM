@@ -827,11 +827,21 @@ CREATE TABLE job_devices (
   state TEXT NOT NULL CHECK (state IN ('queued', 'waiting', 'started', 'skipped', 'missed', 'cancelled')),
   -- Why it was skipped or missed.
   detail TEXT,
+  -- Once started: how its run, delivery, update run, application run or
+  -- wake ended, written in the same transaction as each change of the run's
+  -- status, or NULL while its report is due, by report_by; past that it has
+  -- no result. So a device's outcome and a job's counts are read from this
+  -- table alone.
+  result TEXT CHECK (result IS NULL OR result IN ('succeeded', 'failed', 'timed_out', 'no_result', 'skipped')),
+  report_by BIGINT,
   updated_at BIGINT NOT NULL,
   PRIMARY KEY (job_id, device_id)
 );
 
 CREATE INDEX idx_job_devices_state ON job_devices (state, device_id);
+-- A job's devices by state: its counts read this index alone, and the
+-- dispatcher takes a job's next queued devices from it in device ID order.
+CREATE INDEX idx_job_devices_job ON job_devices (job_id, state, device_id, result, report_by);
 
 -- Scripts and update scans and installs the server runs by itself: on a
 -- schedule, or on each device that enrolls. Each time it fires it starts a job.

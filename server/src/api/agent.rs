@@ -15,6 +15,7 @@ use sea_query::{Expr, ExprTrait, Query};
 
 use crate::{
     agents::{self, AuthenticatedAgent, parse_id},
+    automation::jobs::{self, Changed, RunTable},
     db::tables::{FileDeliveries, ScriptRuns},
     http::{ApiError, AppState, client_ip::ClientIp},
     realtime::coordinator,
@@ -200,8 +201,10 @@ pub async fn report_script_run(
         .chars()
         .take(MAX_RAN_AS_CHARS)
         .collect();
-    let updated = state
-        .database
+    let now = now_ms();
+    // The run and its job device's outcome change together.
+    let mut transaction = state.database.begin().await?;
+    let updated = transaction
         .execute(
             &Query::update()
                 .table(ScriptRuns::Table)
@@ -218,7 +221,7 @@ pub async fn report_script_run(
                     ScriptRuns::Error,
                     bounded(report.error, MAX_REPORTED_ERROR_CHARS),
                 )
-                .value(ScriptRuns::CompletedAt, now_ms())
+                .value(ScriptRuns::CompletedAt, now)
                 .and_where(Expr::col(ScriptRuns::Id).eq(run_id.as_str()))
                 .and_where(Expr::col(ScriptRuns::DeviceId).eq(agent.device_id.as_str()))
                 .and_where(Expr::col(ScriptRuns::Status).eq(ScriptRunStatus::Pending.as_str()))
@@ -228,6 +231,14 @@ pub async fn report_script_run(
     if updated == 0 {
         return Err(ApiError::not_found("no pending run has this ID"));
     }
+    jobs::runs_changed(
+        &mut transaction,
+        RunTable::Script,
+        Changed::Id(&run_id),
+        now,
+    )
+    .await?;
+    transaction.commit().await?;
     crate::alerts::script_run_finished(&state, &run_id).await;
     // A job's counts changed, and its device may take the next run.
     state.automation.device_changed(&agent.device_id);
@@ -318,8 +329,9 @@ pub async fn report_file_delivery(
     ) {
         return Err(ApiError::bad_request("a delivery reports how it finished"));
     }
-    let updated = state
-        .database
+    let now = now_ms();
+    let mut transaction = state.database.begin().await?;
+    let updated = transaction
         .execute(
             &Query::update()
                 .table(FileDeliveries::Table)
@@ -329,7 +341,7 @@ pub async fn report_file_delivery(
                     FileDeliveries::Error,
                     bounded(report.error, MAX_REPORTED_ERROR_CHARS),
                 )
-                .value(FileDeliveries::CompletedAt, now_ms())
+                .value(FileDeliveries::CompletedAt, now)
                 .and_where(Expr::col(FileDeliveries::Id).eq(delivery_id.as_str()))
                 .and_where(Expr::col(FileDeliveries::DeviceId).eq(agent.device_id.as_str()))
                 .and_where(
@@ -341,6 +353,14 @@ pub async fn report_file_delivery(
     if updated == 0 {
         return Err(ApiError::not_found("no pending delivery has this ID"));
     }
+    jobs::runs_changed(
+        &mut transaction,
+        RunTable::Delivery,
+        Changed::Id(&delivery_id),
+        now,
+    )
+    .await?;
+    transaction.commit().await?;
     state.automation.device_changed(&agent.device_id);
     Ok(StatusCode::NO_CONTENT)
 }

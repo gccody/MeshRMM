@@ -117,9 +117,13 @@ reports or has no result.
 Each second's batch takes devices from the queued jobs in turn: one from
 every job, then a second from every job, and so on, and in each round the
 jobs with fewer devices left to start go first, the older first among
-equals. So a job on a few devices starts within a second or two even
-behind a fleet-wide one, and gets the first slot its class frees; within a
-job, devices start in the same order as ever.
+equals (and among jobs with more devices left than a batch reads, which
+are all equals). So a job on a few devices starts within a second or two
+even behind a fleet-wide one, and gets the first slot its class frees;
+within a job, devices start in the same order as ever. A pass reads only
+what it can take: the jobs with devices that could start, and each one's
+next devices up to the batch's reading, however many devices the job has
+queued.
 
 A wake job's devices hold no run, so they don't count against either
 ceiling: a queued wake job's devices are woken on the next pass (up to a
@@ -143,7 +147,9 @@ looked up in one statement and, when any of them waits, queued in one more,
 so a fleet reconnecting after a server restart while a fleet-wide job waits
 doesn't make the server reread the job for each of them. A job's counts, shown on its page and pushed to the website, are
 recounted at most once a second, and only for the jobs whose devices
-changed: those queued or started, and those whose devices reported. A job
+changed: those queued or started, and those whose devices reported. Each
+device's outcome is stored with it, written together with every change of
+its run, so a recount reads only the job's own devices, from an index. A job
 is marked finished on the first recount after its last device reports, and
 its waiting devices are missed within a few seconds of it expiring. Once a
 minute, and when the server starts or a policy fires, the server also looks
@@ -394,9 +400,30 @@ should read the lists again.
   alongside everything else: 250 starts a second, each a transaction of a
   few statements, and their reports later, are about 500 small write
   transactions a second. A pass counts the runs in flight per class in the
-  same four queries as before (update runs grouped by kind too), and reads
-  the queued parts in the order above with `ROW_NUMBER()` and `COUNT(*)`
-  windows over each job's startable parts.
+  same four queries as before (update runs grouped by kind too), each
+  reading only pending runs. It then reads the unfinished jobs that have a
+  queued device that could start (`dispatch::ready_jobs`, with each job's
+  columns), and each one's first startable devices by device ID up to a
+  page past the batch (`dispatch::next_parts`, an index read of
+  `idx_job_devices_job`, a hundred jobs to a statement), and takes them in
+  the order above in memory. So its statements and the rows it reads grow
+  with the jobs it takes devices from, not with their queued devices.
+- Outcomes: `job_devices` keeps, once a device starts, how its run ended
+  (`result`: `succeeded`, `failed`, `timed_out`, `no_result` or `skipped`;
+  NULL while it awaits a report) and when its report is due (`report_by`).
+  A started device past `report_by` with no result reads as **No result**
+  by the clock, so nothing sweeps it. `jobs::runs_changed` writes them from
+  the run's row in the transaction of every change of a job run's status:
+  starting it (`jobs::claim`), an Agent's report of a script run, delivery,
+  update scan or install, or application run, runs marked lost (the
+  sweeps, and an Agent that restarted with application runs it no longer
+  has), a wake request recorded, its relays' reports, and a woken device
+  coming online. A run that never reached its Agent is removed and its
+  device waits again with neither. A job's counts (`jobs::counts`) are one
+  grouped read of `idx_job_devices_job` per 200 jobs, and its page
+  (`jobs::devices`) joins the runs only for what it shows of them. Runs are
+  kept at least as long as their jobs, so a device's run isn't deleted
+  before its job is; if it were, the device would keep its outcome.
 - `server/src/api/jobs.rs` and `server/src/api/automation.rs`.
 - Targets: `server/src/targets.rs` resolves every kind of target (chosen
   devices, companies, tags, every device) for jobs, policies and
@@ -404,7 +431,7 @@ should read the lists again.
   created, or against one device's company and tags when a policy or rule
   checks it.
 - Tables: `jobs` (what it sends, its target and expiry, who or which policy
-  started it), `job_devices` (each device's state), `automation_policies`
+  started it), `job_devices` (each device's state and outcome), `automation_policies`
   (with `tag_match`) and `automation_policy_companies`, `_devices`, `_tags`
   and `_channels`. Runs,
   deliveries and update runs carry `job_id`; a job's runs have the source
@@ -412,10 +439,11 @@ should read the lists again.
   `item_name` says what it does, and its `item_id` is empty. A wake job's
   kind is `wake`; its devices are woken together by the dispatcher, read
   apart from the other jobs' and outside their limits, and their outcomes
-  come from `wake_requests`. An application
+  are written from `wake_requests`. An application
   job's kind is `app_install`, `app_update` or `app_uninstall`; what it does
   is kept in `application_jobs`, a device's part waits while the device runs
-  another application run, and its outcome comes from `application_runs`.
+  another application run, and its outcome is written from
+  `application_runs`.
 - Each device's part is the same `run_script`, `deliver_file`,
   `scan_updates`, `install_updates` or `run_applications` command as one
   started by hand.
@@ -434,5 +462,17 @@ should read the lists again.
   enrollment policies, alerts and failure notifications, and retention;
   and that creating a job plans it without the writer and then only
   inserts, leaves out devices deleted in between, and starts nothing from a
-  policy changed between planning its firing and claiming it.
+  policy changed between planning its firing and claiming it. A job's
+  counts and the dispatcher's next batch cost the same statements for a
+  job of 20 devices and one of 2,000, and a large job's queued devices
+  don't keep a small job's from the front of the batch.
+- `cargo test -p meshrmm-server --test job_outcomes` keeps the old way of
+  working out each device's outcome, by joining it to its run, and checks
+  that the stored outcomes and the counts say the same for a job of each
+  kind through every change: starting, each kind of report, timeouts,
+  reports that never come (with the clock moved), lost runs, cancelling,
+  missed and skipped devices, deleted devices and purged history.
+- `cargo test -p meshrmm-server --test query_plans` checks that a job's
+  counts, the dispatcher's reads and the write of a report into its job
+  device find the job's devices by index, never the run tables.
 - `npm test` in `dashboard` covers the job and policy models.
