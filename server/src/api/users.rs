@@ -7,7 +7,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
 };
-use sea_query::{Expr, ExprTrait, Func, LockType, Order, Query};
+use sea_query::{Expr, ExprTrait, Func, Order, Query};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -21,13 +21,13 @@ use crate::{
     db::{
         self, Executor,
         tables::{
-            EffectiveUserRoles, OidcGroupRoles, ScimGroupMembers, ScimGroups,
-            Settings as SettingsTable, UserOidcGroups, UserPasskeys, UserRoles, UserTotp, Users,
+            OidcGroupRoles, ScimGroupMembers, ScimGroups, UserOidcGroups, UserPasskeys, UserRoles,
+            UserTotp, Users,
         },
     },
     http::{ApiError, AppState, JsonBody},
     mail::{self, Delivery},
-    rbac::{self, ADMINISTRATOR_ROLE_ID, Permission, Role},
+    rbac::{self, Permission, Role},
     settings,
     time::{HOUR_MS, now_ms},
     users::{self, User},
@@ -230,50 +230,19 @@ fn not_self(actor: &Authorized, user: &User) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Fails unless an enabled administrator would remain. Call inside the
-/// transaction that removes one, before committing.
+/// Fails unless an enabled administrator would remain; see
+/// [`rbac::administrator_remains`]. Call inside the transaction that may
+/// remove one, after the change and before committing.
 pub(crate) async fn ensure_administrator_remains(
     executor: &mut impl Executor,
 ) -> Result<(), ApiError> {
-    // Two transactions removing different administrators would each still
-    // count the other. Locking one shared row first makes the second wait
-    // and then count what the first committed. (SQLite's write lock already
-    // serializes them; sea-query leaves FOR UPDATE out there.)
-    let _: Option<(i64,)> = executor
-        .fetch_optional(
-            &Query::select()
-                .column(SettingsTable::Id)
-                .from(SettingsTable::Table)
-                .and_where(Expr::col(SettingsTable::Id).eq(1))
-                .lock(LockType::Update)
-                .to_owned(),
-        )
-        .await?;
-    let (count,): (i64,) = executor
-        .fetch_one(
-            &Query::select()
-                .expr(Func::count(Expr::col((Users::Table, Users::Id))))
-                .from(Users::Table)
-                .inner_join(
-                    EffectiveUserRoles::Table,
-                    Expr::col((EffectiveUserRoles::Table, EffectiveUserRoles::UserId))
-                        .equals((Users::Table, Users::Id)),
-                )
-                .and_where(
-                    Expr::col((EffectiveUserRoles::Table, EffectiveUserRoles::RoleId))
-                        .eq(ADMINISTRATOR_ROLE_ID),
-                )
-                .and_where(Expr::col((Users::Table, Users::Disabled)).eq(false))
-                .to_owned(),
-        )
-        .await?;
-    if count == 0 {
-        return Err(ApiError::conflict(
-            "at least one enabled user must keep the Administrator role",
-        )
-        .with_code("last_administrator"));
+    if rbac::administrator_remains(executor).await? {
+        return Ok(());
     }
-    Ok(())
+    Err(
+        ApiError::conflict("at least one enabled user must keep the Administrator role")
+            .with_code("last_administrator"),
+    )
 }
 
 #[derive(Debug, Deserialize)]

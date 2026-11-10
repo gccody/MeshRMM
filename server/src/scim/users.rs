@@ -10,13 +10,12 @@ use sea_query::{Expr, ExprTrait, LockType, Order, Query as Sql};
 use serde_json::{Map, Value, json};
 
 use super::{
-    ListQuery, Projection, ScimBody, ScimClient, ScimError, USER_SCHEMA, base_url, boolean, filter,
-    list_response, meta,
+    ListQuery, Projection, ScimBody, ScimClient, ScimError, USER_SCHEMA, base_url, boolean,
+    ensure_administrator_remains, filter, list_response, meta,
     patch::{Operation, PatchRequest},
     scim_json, text,
 };
 use crate::{
-    api::ensure_administrator_remains,
     audit::{self, Target},
     db::{
         Executor,

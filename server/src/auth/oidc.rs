@@ -3,7 +3,7 @@
 //!
 //! The provider's metadata and keys are fetched when a sign-in starts, so a
 //! key rotation at the provider needs nothing from the operator.
-use std::{sync::OnceLock, time::Duration};
+use std::{collections::BTreeSet, net::IpAddr, sync::OnceLock, time::Duration};
 
 use anyhow::{Context, anyhow, bail};
 use base64::Engine;
@@ -14,15 +14,18 @@ use openidconnect::{
     core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata},
 };
 use sea_query::{Expr, ExprTrait, Order, Query};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::{
+    audit::{self, Actor, Target},
     config::Config,
     db::{
         self, Executor,
-        tables::{OidcGroupRoles, OidcProvider},
+        tables::{OidcGroupRoles, OidcProvider, UserOidcGroups},
     },
+    rbac::{self, ADMINISTRATOR_ROLE_ID},
     secrets::{InstanceKey, new_token, token_hash},
+    users,
 };
 
 /// Where the provider sends the browser back to. Administrators register it
@@ -92,6 +95,91 @@ pub async fn group_roles(executor: &mut impl Executor) -> db::Result<Vec<(String
                 .to_owned(),
         )
         .await
+}
+
+/// Replaces the SSO groups `user_id` holds with `groups` as they sign in
+/// from `ip`. Groups granting the Administrator role that the user would
+/// lose stay if no enabled administrator would remain otherwise, with a
+/// warning and an audit record: the provider leaving everyone out of its
+/// administrators' group must not leave nobody able to administer MeshRMM.
+/// The sign-in goes ahead either way. Call inside the sign-in's transaction.
+pub async fn replace_user_groups(
+    executor: &mut impl Executor,
+    user_id: &str,
+    groups: &[String],
+    ip: IpAddr,
+) -> db::Result<()> {
+    let administrators = Query::select()
+        .column(OidcGroupRoles::GroupName)
+        .from(OidcGroupRoles::Table)
+        .and_where(Expr::col(OidcGroupRoles::RoleId).eq(ADMINISTRATOR_ROLE_ID))
+        .to_owned();
+    let held: Vec<(String,)> = executor
+        .fetch_all(
+            &Query::select()
+                .column(UserOidcGroups::GroupName)
+                .from(UserOidcGroups::Table)
+                .and_where(Expr::col(UserOidcGroups::UserId).eq(user_id))
+                .and_where(Expr::col(UserOidcGroups::GroupName).in_subquery(administrators))
+                .to_owned(),
+        )
+        .await?;
+    let groups = groups.iter().cloned().collect::<BTreeSet<_>>();
+    let lost = held
+        .into_iter()
+        .map(|(group,)| group)
+        .filter(|group| !groups.contains(group))
+        .collect::<Vec<_>>();
+    executor
+        .execute(
+            &Query::delete()
+                .from_table(UserOidcGroups::Table)
+                .and_where(Expr::col(UserOidcGroups::UserId).eq(user_id))
+                .to_owned(),
+        )
+        .await?;
+    insert_user_groups(executor, user_id, groups.iter()).await?;
+    if lost.is_empty() || rbac::administrator_remains(executor).await? {
+        return Ok(());
+    }
+    insert_user_groups(executor, user_id, lost.iter()).await?;
+    let email = users::by_id(executor, user_id)
+        .await?
+        .map(|user| user.email)
+        .unwrap_or_default();
+    tracing::warn!(
+        %email,
+        groups = ?lost,
+        "kept SSO groups the sign-in didn't report: they hold the last enabled administrator's role"
+    );
+    audit::record(
+        executor,
+        &Actor::user(user_id, &email, Some(ip)),
+        "user.sso_groups_kept",
+        Target::user(user_id),
+        json!({ "groups": lost, "reason": "last_administrator" }),
+    )
+    .await
+}
+
+async fn insert_user_groups<'a>(
+    executor: &mut impl Executor,
+    user_id: &str,
+    groups: impl IntoIterator<Item = &'a String>,
+) -> db::Result<()> {
+    let mut insert = Query::insert();
+    insert
+        .into_table(UserOidcGroups::Table)
+        .columns([UserOidcGroups::UserId, UserOidcGroups::GroupName]);
+    let mut any = false;
+    for group in groups {
+        insert.values_panic([user_id.into(), group.as_str().into()]);
+        any = true;
+    }
+    if any {
+        executor.execute(&insert).await?;
+    }
+    Ok(())
 }
 
 pub fn redirect_uri(config: &Config) -> String {

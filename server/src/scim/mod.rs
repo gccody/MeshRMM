@@ -26,8 +26,9 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use crate::{
     audit::Actor,
     auth::limits::ip_key,
-    db::tables::ScimTokens,
+    db::{Executor, tables::ScimTokens},
     http::{ApiError, AppState, client_ip::ClientIp},
+    rbac,
     secrets::token_hash,
     time::{MINUTE_MS, now_ms},
 };
@@ -127,6 +128,23 @@ impl ScimError {
     pub fn uniqueness(detail: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, Some("uniqueness"), detail)
     }
+}
+
+/// Fails unless an enabled administrator would remain; see
+/// [`rbac::administrator_remains`]. Call inside the transaction that may
+/// remove one, after the change and before committing.
+async fn ensure_administrator_remains(executor: &mut impl Executor) -> Result<(), ScimError> {
+    if rbac::administrator_remains(executor).await? {
+        return Ok(());
+    }
+    // The request is valid but MeshRMM's state refuses it, which RFC 7644
+    // calls `mutability` ("not compatible with ... current state"). The
+    // provider's administrator reads the detail in their sync log.
+    Err(ScimError::bad_request(
+        "mutability",
+        "this would leave MeshRMM without an enabled administrator; \
+         give another user the Administrator role in MeshRMM first",
+    ))
 }
 
 impl IntoResponse for ScimError {

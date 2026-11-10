@@ -11,9 +11,10 @@ use sea_query::{Expr, ExprTrait, Query};
 use crate::{
     api_tokens,
     audit::{Actor, TokenRef},
+    auth::oidc,
     db::{
         Executor,
-        tables::{UserOidcGroups, UserSessions, Users},
+        tables::{UserSessions, Users},
     },
     http::{ApiError, AppState, client_ip::ClientIp},
     rbac::{Permission, Permissions, Role},
@@ -113,14 +114,7 @@ pub async fn start(
         // them, so a sign-in it didn't see drops them until the next SSO
         // sign-in. Otherwise leaving a group at the provider would never
         // take effect for someone who signs in with a password or passkey.
-        executor
-            .execute(
-                &Query::delete()
-                    .from_table(UserOidcGroups::Table)
-                    .and_where(Expr::col(UserOidcGroups::UserId).eq(user_id))
-                    .to_owned(),
-            )
-            .await?;
+        oidc::replace_user_groups(executor, user_id, &[], client.ip).await?;
     }
     executor
         .execute(

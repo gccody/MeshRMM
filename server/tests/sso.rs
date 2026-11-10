@@ -4,7 +4,7 @@ mod common;
 
 use axum::http::{Method, StatusCode};
 use common::{
-    ADMIN_EMAIL, App, Browser, ORIGIN,
+    ADMIN_EMAIL, ADMIN_PASSWORD, App, Browser, ORIGIN,
     oidc_provider::{Authorization, CLIENT_ID, CLIENT_SECRET, MockProvider},
 };
 use serde_json::{Value, json};
@@ -306,6 +306,95 @@ async fn end_group_roles_on_password_sign_in(name: &str, app: &App, provider: &M
     );
     let account = sso_browser.get("/v1/account").await;
     assert_eq!(account.body["is_administrator"], false, "{name}");
+}
+
+#[tokio::test]
+async fn sign_ins_keep_the_last_administrators_sso_group() {
+    let provider = MockProvider::start().await;
+    for app in common::apps().await {
+        let name = app.name;
+        let mut admin = common::set_up(&app).await;
+        let admin_id = admin.get("/v1/account").await.body["user"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        admin
+            .put("/v1/settings/sso", settings(&provider, json!({})))
+            .await;
+        // Signing in through the provider links the account and makes the
+        // administrator one through rmm-admins too, so they may give up the
+        // role they hold directly.
+        let ada = json!({ "sub": "ada", "email": ADMIN_EMAIL, "email_verified": true });
+        let mut claims = ada.clone();
+        claims["groups"] = json!(["rmm-admins"]);
+        let (_, location) = sign_in(&app, &provider, claims).await;
+        assert_eq!(location, format!("{ORIGIN}/toolbox"), "{name}");
+        let stepped_down = admin
+            .patch(
+                &format!("/v1/users/{admin_id}"),
+                json!({ "role_ids": ["technician"] }),
+            )
+            .await;
+        assert_eq!(
+            stepped_down.status,
+            StatusCode::OK,
+            "{name}: {:?}",
+            stepped_down.body
+        );
+
+        // A sign-in whose claims leave the group out, or carry no groups,
+        // still signs in, but keeps the group that holds the last
+        // administrator's role.
+        let mut claims = ada.clone();
+        claims["groups"] = json!(["staff"]);
+        for claims in [claims, ada.clone()] {
+            let (mut browser, location) = sign_in(&app, &provider, claims).await;
+            assert_eq!(location, format!("{ORIGIN}/toolbox"), "{name}");
+            let account = browser.get("/v1/account").await;
+            assert_eq!(account.body["session"]["auth_method"], "oidc", "{name}");
+            assert_eq!(account.body["is_administrator"], true, "{name}");
+        }
+        // So does a sign-in the provider didn't see.
+        let mut password = app.browser();
+        let signed_in = password
+            .post(
+                "/v1/auth/sign-in",
+                json!({ "email": ADMIN_EMAIL, "password": ADMIN_PASSWORD }),
+            )
+            .await;
+        assert_eq!(signed_in.status, StatusCode::OK, "{name}");
+        let user = admin.get(&format!("/v1/users/{admin_id}")).await;
+        assert_eq!(
+            user.body["group_roles"],
+            json!([{ "id": "administrator", "name": "Administrator", "source": "sso", "group": "rmm-admins" }]),
+            "{name}"
+        );
+        let kept = common::audit_events(&app, "user.sso_groups_kept").await;
+        assert_eq!(kept.len(), 3, "{name}");
+        assert_eq!(kept[0].target_id, admin_id, "{name}");
+        assert_eq!(kept[0].actor_label, ADMIN_EMAIL, "{name}");
+        assert_eq!(
+            kept[0].metadata,
+            json!({ "groups": ["rmm-admins"], "reason": "last_administrator" }),
+            "{name}"
+        );
+
+        // With another administrator, the group goes as the claims say.
+        common::add_user(&app, &mut admin, "second@example.com", &["administrator"]).await;
+        let mut claims = ada.clone();
+        claims["groups"] = json!(["staff"]);
+        let (mut browser, _) = sign_in(&app, &provider, claims).await;
+        let account = browser.get("/v1/account").await;
+        assert_eq!(account.body["is_administrator"], false, "{name}");
+        assert_eq!(
+            common::audit_events(&app, "user.sso_groups_kept")
+                .await
+                .len(),
+            3,
+            "{name}"
+        );
+        app.finish().await;
+    }
 }
 
 #[tokio::test]
