@@ -228,6 +228,19 @@ impl Drop for TransferClaim {
     }
 }
 
+/// A request waiting for its Agent's answer. Dropping it forgets the
+/// request, as when the browser goes away while it waits.
+struct PendingRequest {
+    files: Files,
+    id: String,
+}
+
+impl Drop for PendingRequest {
+    fn drop(&mut self) {
+        self.files.lock().pending.remove(&self.id);
+    }
+}
+
 impl std::fmt::Debug for Files {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let state = self.lock();
@@ -294,8 +307,29 @@ impl Files {
         }
     }
 
-    fn forget_request(&self, request_id: &str) {
-        self.lock().pending.remove(request_id);
+    /// Waits for `device_id`'s answer to a new request: its ID, and where
+    /// the answer arrives. The request is forgotten when the guard drops,
+    /// however the wait for it ends.
+    fn expect_answer(&self, device_id: &str) -> (PendingRequest, oneshot::Receiver<FileReply>) {
+        let id = uuid::Uuid::new_v4().to_string();
+        let (reply, answer) = oneshot::channel();
+        self.lock().pending.insert(
+            id.clone(),
+            Pending {
+                device_id: device_id.to_owned(),
+                reply,
+            },
+        );
+        let guard = PendingRequest {
+            files: self.clone(),
+            id,
+        };
+        (guard, answer)
+    }
+
+    /// The requests waiting for an Agent's answer.
+    pub fn pending_requests(&self) -> usize {
+        self.lock().pending.len()
     }
 
     /// Reserves a transfer for `user_id` on `device_id`, unless either has
@@ -526,30 +560,21 @@ pub async fn ask(
         timeouts.request
     };
     let notification = notification(state, actor, device_id, run_as).await?;
-    let request_id = uuid::Uuid::new_v4().to_string();
-    let (reply, answer) = oneshot::channel();
-    state.files.lock().pending.insert(
-        request_id.clone(),
-        Pending {
-            device_id: device_id.to_owned(),
-            reply,
-        },
-    );
+    let (request, answer) = state.files.expect_answer(device_id);
     let name = operation.name();
     let command = AgentCommand::FileRequest {
         request: FileRequest {
-            request_id: request_id.clone(),
+            request_id: request.id.clone(),
             run_as,
             notification,
             operation,
         },
     };
     if !state.agents.send(device_id, command) {
-        state.files.forget_request(&request_id);
         return Err(device_offline());
     }
     let answer = tokio::time::timeout(wait, answer).await;
-    state.files.forget_request(&request_id);
+    drop(request);
     match answer {
         Ok(Ok(FileReply::Failed { error })) => Err(agent_error(error)),
         Ok(Ok(reply)) => Ok(reply),
@@ -685,6 +710,33 @@ mod tests {
             answer.try_recv(),
             Err(oneshot::error::TryRecvError::Closed)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_request_is_forgotten_however_its_wait_ends() {
+        let files = Files::default();
+        // The wait is dropped part way, as when the browser goes away.
+        let waiting = tokio::spawn({
+            let files = files.clone();
+            async move {
+                let (_request, answer) = files.expect_answer("device");
+                let _ = answer.await;
+            }
+        });
+        while files.pending_requests() == 0 {
+            tokio::task::yield_now().await;
+        }
+        waiting.abort();
+        assert!(waiting.await.unwrap_err().is_cancelled());
+        assert_eq!(files.pending_requests(), 0);
+
+        // And once it is answered.
+        let (request, mut answer) = files.expect_answer("device");
+        let id = request.id.clone();
+        files.answered("device", &id, FileReply::Upload { received: 1 });
+        assert!(answer.try_recv().is_ok());
+        drop(request);
+        assert_eq!(files.pending_requests(), 0);
     }
 
     #[test]

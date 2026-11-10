@@ -9,7 +9,11 @@
 //! checks it, and the byte count, against what the Agent says it sent; a
 //! mismatch, or the device going away, aborts the response, so the browser
 //! marks the download failed rather than saving a bad file. Files can be
-//! resumed with a `Range` request.
+//! resumed with a `Range` request. The Agent's sizes are checked against
+//! what was asked for before any is used. A browser that takes nothing for
+//! [`Timeouts::stall`](super::Timeouts), as one that keeps its connection
+//! open but stopped reading, has left: the transfer ends and its progress
+//! is failed. However an attempt ends, its progress ends done or failed.
 //!
 //! An upload's body goes to the Agent piece by piece, each sent only when
 //! the Agent's socket has taken the one before, so the browser waits on the
@@ -17,7 +21,13 @@
 //! A browser that sends nothing for [`Timeouts::stall`](super::Timeouts)
 //! has left, as one whose body breaks off has, and the Agent keeps its
 //! partial file for a resume.
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use axum::{
     body::Body,
@@ -33,9 +43,10 @@ use meshrmm_protocol_types::{
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use tokio::sync::mpsc;
 
 use super::{
-    Download, Progress, ProgressState, TransferClaim, Upload, agent_error, device_offline,
+    Download, Files, Progress, ProgressState, TransferClaim, Upload, agent_error, device_offline,
     transfer_limit,
 };
 use crate::{
@@ -231,13 +242,7 @@ pub async fn download(
         }),
         max_bytes,
     };
-    state.files.set_progress(&download.id, |progress| {
-        *progress = Progress {
-            state: ProgressState::Sending,
-            offset,
-            ..Progress::default()
-        }
-    });
+    let mut attempt = Attempt::start(&state.files, &download.id, offset);
     let started = connect_agent(
         state,
         &mut claim,
@@ -248,29 +253,20 @@ pub async fn download(
     .await;
     let mut socket = match started {
         Ok(socket) => socket,
-        Err(error) => {
-            fail_progress(state, &download.id, error.message());
-            return Err(error);
-        }
+        Err(error) => return Err(attempt.fail(error)),
     };
     let (size, modified) = match next_event(&mut socket, state.files.timeouts().stall).await {
         Some(FileStreamEvent::Begin { size, modified }) => (size, modified),
-        Some(FileStreamEvent::Failed { error }) => {
-            let error = agent_error(error);
-            fail_progress(state, &download.id, error.message());
-            return Err(error);
-        }
-        _ => {
-            fail_progress(state, &download.id, "the device disconnected");
-            return Err(disconnected());
-        }
+        Some(FileStreamEvent::Failed { error }) => return Err(attempt.fail(agent_error(error))),
+        _ => return Err(attempt.fail(disconnected())),
     };
-    if file && size.is_none() {
-        return Err(disconnected());
-    }
-    state
-        .files
-        .set_progress(&download.id, |progress| progress.size = size);
+    // A resumed part is exactly what was asked for, within the file.
+    let part = range.map(|range| length.unwrap_or(download.info.size - range.start));
+    let size = match checked_size(file, size, part, max_bytes) {
+        Ok(size) => size,
+        Err(error) => return Err(attempt.fail(error)),
+    };
+    attempt.update(|progress| progress.size = size);
 
     let name = match download.info.kind {
         FileDownloadKind::File => download.info.name.clone(),
@@ -301,6 +297,7 @@ pub async fn download(
         }
         if range.is_some() {
             status = StatusCode::PARTIAL_CONTENT;
+            // `checked_size` keeps the part within the file's `total`.
             let last = (offset + size).saturating_sub(1);
             response_headers.insert(
                 header::CONTENT_RANGE,
@@ -320,21 +317,116 @@ pub async fn download(
         socket,
         claim,
         download,
+        attempt,
         offset,
         expected: size,
         hasher: Sha256::new(),
         bytes: 0,
         finished: false,
     };
-    let body = Body::from_stream(futures_util::stream::unfold(sending, Sending::next));
-    Ok((status, response_headers, body).into_response())
+    // One piece waits for the browser at a time.
+    let (pieces, taken) = mpsc::channel(1);
+    let completed = Arc::new(AtomicBool::new(false));
+    tokio::spawn(sending.run(pieces, completed.clone()));
+    let body = futures_util::stream::unfold(Some(taken), move |taken| {
+        let completed = completed.clone();
+        async move {
+            let mut taken = taken?;
+            match taken.recv().await {
+                Some(piece) => Some((piece, Some(taken))),
+                None if completed.load(Ordering::Acquire) => None,
+                // The relay gave up without the browser hearing why, as
+                // when it stalled: the body must not end as if complete.
+                None => Some((Err(std::io::Error::other("the download was stopped")), None)),
+            }
+        }
+    });
+    Ok((status, response_headers, Body::from_stream(body)).into_response())
 }
 
-fn fail_progress(state: &AppState, id: &str, error: &str) {
-    state.files.set_progress(id, |progress| {
-        progress.state = ProgressState::Failed;
-        progress.error = Some(error.to_owned());
-    });
+/// The size a download's begin says follows, checked: the Agent is a less
+/// trusted peer, so a file must have a size, a resumed part exactly the
+/// `part` asked for, and nothing more than the transfer limit.
+fn checked_size(
+    file: bool,
+    size: Option<u64>,
+    part: Option<u64>,
+    max_bytes: u64,
+) -> Result<Option<u64>, ApiError> {
+    let wrong = |message: &str| {
+        ApiError::new(StatusCode::BAD_GATEWAY, message.to_owned()).with_code("bad_device_reply")
+    };
+    match size {
+        None if file => Err(wrong("the device didn't say how big the file is")),
+        Some(size) if size > max_bytes => Err(wrong(
+            "the device offered more than this server's transfer limit",
+        )),
+        Some(size) if part.is_some_and(|part| part != size) => Err(wrong(
+            "the device offered a different part of the file than was asked for",
+        )),
+        size => Ok(size),
+    }
+}
+
+/// A download attempt's progress. However the attempt ends, it ends done or
+/// failed: dropped before then, as when the browser goes away while the
+/// Agent starts, it is failed.
+struct Attempt {
+    files: Files,
+    id: String,
+    ended: bool,
+}
+
+impl Attempt {
+    fn start(files: &Files, id: &str, offset: u64) -> Self {
+        files.set_progress(id, |progress| {
+            *progress = Progress {
+                state: ProgressState::Sending,
+                offset,
+                ..Progress::default()
+            }
+        });
+        Self {
+            files: files.clone(),
+            id: id.to_owned(),
+            ended: false,
+        }
+    }
+
+    fn update(&self, change: impl FnOnce(&mut Progress)) {
+        self.files.set_progress(&self.id, change);
+    }
+
+    /// Ends the attempt failed with `error`, and returns it.
+    fn fail(&mut self, error: ApiError) -> ApiError {
+        self.failed(error.message());
+        error
+    }
+
+    fn failed(&mut self, error: &str) {
+        self.ended = true;
+        self.update(|progress| {
+            progress.state = ProgressState::Failed;
+            progress.error = Some(error.to_owned());
+        });
+    }
+
+    fn done(&mut self, bytes: u64, sha256: String) {
+        self.ended = true;
+        self.update(|progress| {
+            progress.state = ProgressState::Done;
+            progress.bytes = bytes;
+            progress.sha256 = Some(sha256);
+        });
+    }
+}
+
+impl Drop for Attempt {
+    fn drop(&mut self) {
+        if !self.ended {
+            self.failed("the download was stopped");
+        }
+    }
 }
 
 /// A download's body as it streams. Dropped before the end, as when the
@@ -344,6 +436,7 @@ struct Sending {
     socket: WebSocket,
     claim: TransferClaim,
     download: Download,
+    attempt: Attempt,
     offset: u64,
     expected: Option<u64>,
     hasher: Sha256,
@@ -354,7 +447,43 @@ struct Sending {
 type Piece = Result<Bytes, std::io::Error>;
 
 impl Sending {
-    async fn next(mut self) -> Option<(Piece, Self)> {
+    /// Hands the Agent's pieces to the response's body, each once the
+    /// browser has taken the one before. A browser that takes nothing for
+    /// [`Timeouts::stall`](super::Timeouts), like one that keeps its
+    /// connection open but stopped reading, has left: the transfer ends,
+    /// freeing its place and the Agent's socket.
+    async fn run(mut self, body: mpsc::Sender<Piece>, completed: Arc<AtomicBool>) {
+        let stall = self.state.files.timeouts().stall;
+        loop {
+            let piece = tokio::select! {
+                piece = self.next() => piece,
+                // The browser went away; dropping records it.
+                () = body.closed() => return,
+            };
+            let Some(piece) = piece else {
+                completed.store(true, Ordering::Release);
+                return;
+            };
+            if piece.is_err() {
+                // Ended: free the transfer before the browser hears why.
+                drop(self);
+                let _ = tokio::time::timeout(stall, body.send(piece)).await;
+                return;
+            }
+            match tokio::time::timeout(stall, body.send(piece)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return,
+                Err(_) => {
+                    // The browser isn't reading, so it can't hear why.
+                    let _ = self.fail("the browser stopped taking the download");
+                    return;
+                }
+            }
+        }
+    }
+
+    /// The next piece for the browser; `None` once the download is done.
+    async fn next(&mut self) -> Option<Piece> {
         if self.finished {
             return None;
         }
@@ -363,20 +492,20 @@ impl Sending {
             let stall = self.state.files.timeouts().stall;
             let frame = tokio::select! {
                 frame = tokio::time::timeout(stall, self.socket.recv()) => frame,
-                () = offline.cancelled() => return self.fail("the device went offline"),
+                () = offline.cancelled() => return Some(self.fail("the device went offline")),
             };
             match frame {
                 Ok(Some(Ok(Message::Binary(bytes)))) => {
-                    let total = self.bytes + bytes.len() as u64;
+                    let Some(total) = self.bytes.checked_add(bytes.len() as u64) else {
+                        return Some(self.fail("the device sent too much"));
+                    };
                     if self.expected.is_some_and(|expected| total > expected) {
-                        return self.fail("the device sent more than the file holds");
+                        return Some(self.fail("the device sent more than the file holds"));
                     }
                     self.hasher.update(&bytes);
                     self.bytes = total;
-                    self.state
-                        .files
-                        .set_progress(&self.download.id, |progress| progress.bytes = total);
-                    return Some((Ok(bytes), self));
+                    self.attempt.update(|progress| progress.bytes = total);
+                    return Some(Ok(bytes));
                 }
                 Ok(Some(Ok(Message::Text(text)))) => {
                     return match serde_json::from_str::<FileStreamEvent>(&text) {
@@ -385,45 +514,37 @@ impl Sending {
                             if bytes != self.bytes
                                 || self.expected.is_some_and(|expected| expected != self.bytes)
                             {
-                                self.fail("the device sent a different amount than it said")
+                                Some(self.fail("the device sent a different amount than it said"))
                             } else if sha256.as_deref() != Some(relayed.as_str()) {
-                                self.fail("what arrived didn't match the device's SHA-256")
+                                Some(self.fail("what arrived didn't match the device's SHA-256"))
                             } else {
                                 self.complete(relayed);
                                 None
                             }
                         }
                         Ok(FileStreamEvent::Failed { error }) => {
-                            self.fail(&error.sanitized().message)
+                            Some(self.fail(&error.sanitized().message))
                         }
-                        _ => self.fail("the device sent something unexpected"),
+                        _ => Some(self.fail("the device sent something unexpected")),
                     };
                 }
                 Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {}
-                _ => return self.fail("the device disconnected"),
+                _ => return Some(self.fail("the device disconnected")),
             }
         }
     }
 
-    /// Ends the body with an error, which aborts the response.
-    fn fail(mut self, error: &str) -> Option<(Piece, Self)> {
+    /// Ends the download failed, with the error that aborts the response.
+    fn fail(&mut self, error: &str) -> Piece {
         self.finished = true;
-        fail_progress(&self.state, &self.download.id, error);
+        self.attempt.failed(error);
         self.record("failed", None, Some(error));
-        Some((Err(std::io::Error::other(error.to_owned())), self))
+        Err(std::io::Error::other(error.to_owned()))
     }
 
     fn complete(&mut self, sha256: String) {
         self.finished = true;
-        let bytes = self.bytes;
-        let digest = sha256.clone();
-        self.state
-            .files
-            .set_progress(&self.download.id, |progress| {
-                progress.state = ProgressState::Done;
-                progress.bytes = bytes;
-                progress.sha256 = Some(digest);
-            });
+        self.attempt.done(self.bytes, sha256.clone());
         self.record("completed", Some(sha256), None);
     }
 
@@ -471,7 +592,7 @@ impl Drop for Sending {
     fn drop(&mut self) {
         if !self.finished {
             self.finished = true;
-            fail_progress(&self.state, &self.download.id, "the download was stopped");
+            // Its attempt, dropped next, records the progress failed.
             self.record("cancelled", None, Some("the download was stopped"));
         }
     }
@@ -546,8 +667,8 @@ pub async fn upload(
     let (mut agent_tx, mut agent_rx) = socket.split();
     let mut body = body.into_data_stream();
     let room = upload.size - offset;
+    let mut sent = 0u64;
     let pump = async {
-        let mut sent = 0u64;
         // A browser that vanished without closing its connection sends
         // nothing more, and is gone like one whose body broke off.
         while let Some(frame) = tokio::time::timeout(stall, body.next())
@@ -638,6 +759,14 @@ pub async fn upload(
     })
     .await;
     match finished {
+        // The partial file can't hold more than it had and was sent.
+        Ok(Some(FileStreamEvent::Done { bytes, .. })) if bytes > offset + sent => {
+            Err(ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "the device says it has more of the upload than was sent",
+            )
+            .with_code("bad_device_reply"))
+        }
         Ok(Some(FileStreamEvent::Done { bytes, .. })) => Ok(bytes),
         Ok(Some(FileStreamEvent::Failed { error })) => Err(agent_error(error)),
         _ => Err(disconnected()),
