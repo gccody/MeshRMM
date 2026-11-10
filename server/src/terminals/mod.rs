@@ -25,12 +25,13 @@ use axum::extract::ws::WebSocket;
 use meshrmm_protocol_types::{RunAs, TerminalShell};
 use tokio::sync::oneshot;
 
-use crate::{audit::Actor, rbac::Permission};
+use crate::{audit::Actor, rbac::Permission, realtime::LIVENESS};
 
 pub const MAX_TERMINALS_PER_DEVICE: usize = 5;
 pub const MAX_TERMINALS_PER_USER: usize = 10;
 
-/// How long each step of opening a terminal may take.
+/// How long each step of opening a terminal may take, and how long an open
+/// one waits on a side that has gone quiet.
 #[derive(Debug, Clone, Copy)]
 pub struct Timeouts {
     /// From the request until the browser's socket connects.
@@ -39,6 +40,14 @@ pub struct Timeouts {
     pub agent_connect: Duration,
     /// Replaces the company's idle time, for tests.
     pub idle: Option<Duration>,
+    /// How often both sockets are pinged, which keeps proxies from closing
+    /// a quiet terminal and finds peers that went away without closing.
+    pub ping: Duration,
+    /// How long after the browser was last heard from, a pong included, it
+    /// counts as gone.
+    pub browser_silence: Duration,
+    /// The same for the Agent.
+    pub agent_silence: Duration,
 }
 
 impl Default for Timeouts {
@@ -47,6 +56,11 @@ impl Default for Timeouts {
             browser_connect: Duration::from_secs(30),
             agent_connect: Duration::from_secs(20),
             idle: None,
+            ping: Duration::from_secs(20),
+            // Three unanswered pings.
+            browser_silence: Duration::from_secs(75),
+            // Like the Agent's control connection.
+            agent_silence: LIVENESS,
         }
     }
 }

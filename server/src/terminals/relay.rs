@@ -19,7 +19,7 @@
 //! | 4003 | The user lost the permission the terminal needs |
 //! | 4004 | The device is offline or didn't open the terminal in time |
 //! | 4008 | Nobody typed for the company's idle time |
-//! | 4009 | The device's socket ended |
+//! | 4009 | The device's socket ended, or the device stopped answering |
 //!
 //! [`TERMINAL_WINDOW_BYTES`]: meshrmm_protocol_types::TERMINAL_WINDOW_BYTES
 use std::{
@@ -45,15 +45,10 @@ use crate::{
     audit::{self, Target},
     auth::{Authorized, accounts::ACCESS_RECHECK, session},
     http::AppState,
-    realtime::{LIVENESS, SEND_TIMEOUT},
+    realtime::SEND_TIMEOUT,
     settings,
+    terminals::Timeouts,
 };
-
-/// Pings keep proxies from closing a quiet terminal and find dead peers.
-const PING_INTERVAL: Duration = Duration::from_secs(20);
-/// A browser that hasn't answered three pings is gone. The Agent gets
-/// [`LIVENESS`], like its control connection.
-const BROWSER_SILENCE: Duration = Duration::from_secs(75);
 
 /// How a terminal ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,12 +59,16 @@ enum End {
     Failed,
     /// The browser closed the terminal or went away.
     BrowserLeft,
+    /// Nothing came from the browser, not even a pong, for its silence limit.
+    BrowserQuiet,
     /// The browser sent something a terminal doesn't take.
     BrowserProtocol,
     DeviceOffline,
     DeviceTimeout,
     /// The Agent's socket ended, stalled or sent something unexpected.
     DeviceDisconnected,
+    /// Nothing came from the Agent, not even a pong, for its silence limit.
+    DeviceQuiet,
     Idle(Duration),
     SignedOut,
     PermissionRemoved,
@@ -82,10 +81,12 @@ impl End {
             Self::Exited => "exited",
             Self::Failed => "failed",
             Self::BrowserLeft => "closed",
+            Self::BrowserQuiet => "browser_quiet",
             Self::BrowserProtocol => "protocol_error",
             Self::DeviceOffline => "device_offline",
             Self::DeviceTimeout => "device_timeout",
             Self::DeviceDisconnected => "device_disconnected",
+            Self::DeviceQuiet => "device_quiet",
             Self::Idle(_) => "idle",
             Self::SignedOut => "signed_out",
             Self::PermissionRemoved => "permission_removed",
@@ -97,11 +98,13 @@ impl End {
         Some(match self {
             Self::Exited => (1000, "the shell exited".into()),
             Self::Failed => (1000, "the shell couldn't start".into()),
-            Self::BrowserLeft => return None,
+            // Nobody is there to read why.
+            Self::BrowserLeft | Self::BrowserQuiet => return None,
             Self::BrowserProtocol => (1003, "unsupported terminal message".into()),
             Self::DeviceOffline => (4004, "the device is offline".into()),
             Self::DeviceTimeout => (4004, "the device didn't open the terminal".into()),
             Self::DeviceDisconnected => (4009, "the device disconnected".into()),
+            Self::DeviceQuiet => (4009, "the device stopped answering".into()),
             Self::Idle(idle) => (
                 4008,
                 format!("closed after {} without input", describe(*idle)),
@@ -338,9 +341,10 @@ async fn relay(
         {
             return End::DeviceDisconnected;
         }
+        let timeouts = state.terminals.timeouts();
         tokio::select! {
-            end = upstream(&mut browser_rx, &mut agent_tx, &shared) => end,
-            end = downstream(&mut agent_rx, &mut browser_tx, &shared, outcome) => end,
+            end = upstream(&mut browser_rx, &mut agent_tx, &shared, timeouts) => end,
+            end = downstream(&mut agent_rx, &mut browser_tx, &shared, outcome, timeouts) => end,
             end = idle_timer(&shared, idle) => end,
             end = access(state, token, ip, requested, &shared) => end,
         }
@@ -362,7 +366,8 @@ async fn relay(
             let _ = tokio::time::timeout(SEND_TIMEOUT, browser_tx.close()).await;
         }
     }
-    if end != End::DeviceDisconnected {
+    let agent_told = end != End::DeviceDisconnected;
+    if agent_told {
         // The Agent ends the shell and everything it started.
         let _ = tokio::time::timeout(
             SEND_TIMEOUT,
@@ -373,22 +378,51 @@ async fn relay(
         )
         .await;
     }
+    // Apart, so a side slow to answer doesn't hold up recording the close
+    // or freeing the terminal. A side given up on has nothing left to read.
+    let browser_listening = end != End::BrowserQuiet;
+    let agent_listening = agent_told && end != End::DeviceQuiet;
+    tokio::spawn(async move {
+        tokio::join!(
+            finish_closing(browser_rx, browser_listening),
+            finish_closing(agent_rx, agent_listening),
+        )
+    });
     end
 }
 
-/// Browser to Agent: input, resizes and acknowledgements.
+/// Reads what `socket` still sends until it answers the close frame just
+/// sent, within [`SEND_TIMEOUT`], unless it isn't `listening`. Dropping a
+/// socket with input unread resets the connection, and a peer still sending,
+/// such as a user typing, could lose the close frame and its reason with it.
+async fn finish_closing(mut socket: SplitStream<WebSocket>, listening: bool) {
+    if listening {
+        let _ = tokio::time::timeout(SEND_TIMEOUT, async {
+            while let Some(Ok(_)) = socket.next().await {}
+        })
+        .await;
+    }
+}
+
+/// Browser to Agent: input, resizes and acknowledgements. Pings the Agent,
+/// and gives up on a browser that has sent nothing, not even a pong to the
+/// pings [`downstream`] sends it, for [`Timeouts::browser_silence`].
 async fn upstream(
     browser: &mut SplitStream<WebSocket>,
     agent: &mut SplitSink<WebSocket, Message>,
     shared: &Shared,
+    timeouts: Timeouts,
 ) -> End {
-    let mut ping = tokio::time::interval(PING_INTERVAL);
+    let mut ping = tokio::time::interval(timeouts.ping);
     ping.tick().await;
     let mut acknowledged = 0;
+    // Judged from the browser's own frames alone, so the pings sent here
+    // and the Agent's traffic don't keep a vanished browser open.
+    let mut last_heard = Instant::now();
     loop {
         tokio::select! {
-            frame = tokio::time::timeout(BROWSER_SILENCE, browser.next()) => {
-                let Ok(frame) = frame else { return End::BrowserLeft };
+            frame = browser.next() => {
+                last_heard = Instant::now();
                 match frame {
                     Some(Ok(Message::Binary(bytes))) => {
                         if bytes.len() > MAX_TERMINAL_MESSAGE_BYTES {
@@ -427,23 +461,31 @@ async fn upstream(
                     return End::DeviceDisconnected;
                 }
             }
+            () = tokio::time::sleep_until((last_heard + timeouts.browser_silence).into()) => {
+                return End::BrowserQuiet;
+            }
         }
     }
 }
 
-/// Agent to browser: output and what happens to the shell.
+/// Agent to browser: output and what happens to the shell. Pings the
+/// browser, and gives up on an Agent that has sent nothing, not even a pong
+/// to the pings [`upstream`] sends it, for [`Timeouts::agent_silence`].
 async fn downstream(
     agent: &mut SplitStream<WebSocket>,
     browser: &mut SplitSink<WebSocket, Message>,
     shared: &Shared,
     outcome: &mut Outcome,
+    timeouts: Timeouts,
 ) -> End {
-    let mut ping = tokio::time::interval(PING_INTERVAL);
+    let mut ping = tokio::time::interval(timeouts.ping);
     ping.tick().await;
+    // Judged from the Agent's own frames alone, as in `upstream`.
+    let mut last_heard = Instant::now();
     loop {
         tokio::select! {
-            frame = tokio::time::timeout(LIVENESS, agent.next()) => {
-                let Ok(frame) = frame else { return End::DeviceDisconnected };
+            frame = agent.next() => {
+                last_heard = Instant::now();
                 match frame {
                     Some(Ok(Message::Binary(bytes))) => {
                         // Counted before sending, so an acknowledgement can't
@@ -488,6 +530,9 @@ async fn downstream(
                 if !forward(browser, Message::Ping(Default::default())).await {
                     return End::BrowserLeft;
                 }
+            }
+            () = tokio::time::sleep_until((last_heard + timeouts.agent_silence).into()) => {
+                return End::DeviceQuiet;
             }
         }
     }
@@ -593,6 +638,7 @@ mod tests {
             End::DeviceOffline,
             End::DeviceTimeout,
             End::DeviceDisconnected,
+            End::DeviceQuiet,
             End::Idle(Duration::from_secs(1800)),
             End::SignedOut,
             End::PermissionRemoved,
@@ -603,6 +649,7 @@ mod tests {
             assert!(reason.len() <= 123, "{reason}");
         }
         assert_eq!(End::BrowserLeft.browser_close(), None);
+        assert_eq!(End::BrowserQuiet.browser_close(), None);
         assert_eq!(
             End::Idle(Duration::from_secs(1800))
                 .browser_close()

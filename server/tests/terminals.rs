@@ -22,6 +22,22 @@ fn quick(state: &mut meshrmm_server::http::AppState) {
     });
 }
 
+/// Short silence limits, pings well within them, and an idle time that
+/// doesn't get in the way.
+const PING: Duration = Duration::from_millis(100);
+const BROWSER_SILENCE: Duration = Duration::from_millis(1000);
+const AGENT_SILENCE: Duration = Duration::from_millis(800);
+
+fn listening(state: &mut meshrmm_server::http::AppState) {
+    state.terminals = Terminals::new(Timeouts {
+        idle: Some(Duration::from_secs(600)),
+        ping: PING,
+        browser_silence: BROWSER_SILENCE,
+        agent_silence: AGENT_SILENCE,
+        ..Timeouts::default()
+    });
+}
+
 fn request(shell: &str, run_as: &str) -> Value {
     json!({ "shell": shell, "run_as": run_as, "columns": 100, "rows": 30 })
 }
@@ -220,15 +236,7 @@ async fn terminals_relay_both_ways_and_record_their_life() {
         assert_eq!(close["account"], "root");
         assert_eq!(close["program"], "/bin/bash");
         assert!(close["duration_ms"].is_u64());
-        // The relay forgets the terminal just after recording that it closed.
-        let deadline = tokio::time::Instant::now() + SOCKET_WAIT;
-        while app.state.terminals.count_on(&agent.device_id) != 0 {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "{name}: the closed terminal is still counted"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        forgotten(&app, &agent).await;
 
         // Closing the browser's socket tells the Agent to end the shell.
         let mut terminal = start(
@@ -273,6 +281,188 @@ async fn terminals_relay_both_ways_and_record_their_life() {
         let closes = wait_for_audit(&app, "terminal.close", 4).await;
         assert_eq!(closes[0].metadata["reason"], "failed");
         assert_eq!(closes[0].metadata["error"], "Nobody is signed in.");
+        app.finish().await;
+    }
+}
+
+/// The reason terminal `id` was recorded as closed with, once it is. Found
+/// by its id, since the log's order follows the clock.
+async fn reason_closed(app: &App, id: &str) -> Value {
+    let deadline = tokio::time::Instant::now() + SOCKET_WAIT;
+    loop {
+        let closes = audit_events(app, "terminal.close").await;
+        if let Some(close) = closes
+            .iter()
+            .find(|event| event.metadata["terminal_id"] == id)
+        {
+            return close.metadata["reason"].clone();
+        }
+        let reasons: Vec<_> = closes.iter().map(|event| &event.metadata).collect();
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{}: terminal {id} wasn't recorded as closed: {reasons:?}",
+            app.name
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Waits for `agent`'s device to have no terminals counted. The relay
+/// forgets a terminal just after recording that it closed.
+async fn forgotten(app: &App, agent: &Agent) {
+    let deadline = tokio::time::Instant::now() + SOCKET_WAIT;
+    while app.state.terminals.count_on(&agent.device_id) != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{}: the closed terminal is still counted",
+            app.name
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Sends `message` on `socket` every [`PING`], reading (and so answering
+/// pings) all the while, until the server closes it. Returns the close code
+/// and reason, and when it came.
+async fn keep_talking(socket: &mut Ws, message: Message) -> ((u16, String), tokio::time::Instant) {
+    let deadline = tokio::time::Instant::now() + SOCKET_WAIT;
+    let mut every = tokio::time::interval(PING);
+    loop {
+        tokio::select! {
+            frame = socket.next() => match frame {
+                Some(Ok(Message::Close(Some(frame)))) => {
+                    return ((u16::from(frame.code), frame.reason.to_string()), tokio::time::Instant::now());
+                }
+                Some(Ok(Message::Close(None)) | Err(_)) | None => {
+                    return ((1005, String::new()), tokio::time::Instant::now());
+                }
+                Some(Ok(_)) => {}
+            },
+            // The server may close between two sends.
+            _ = every.tick() => drop(socket.send(message.clone()).await),
+            () = tokio::time::sleep_until(deadline) => panic!("the terminal stayed open"),
+        }
+    }
+}
+
+/// Reads `socket` for `wait`, which answers the server's pings, and returns
+/// how many came. Anything else fails.
+async fn only_pings(socket: &mut Ws, wait: Duration) -> usize {
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut pings = 0;
+    loop {
+        match tokio::time::timeout_at(deadline, socket.next()).await {
+            Err(_) => return pings,
+            Ok(Some(Ok(Message::Ping(_)))) => pings += 1,
+            Ok(Some(Ok(Message::Pong(_)))) => {}
+            Ok(other) => panic!("the terminal didn't stay quiet: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn terminals_end_when_a_side_goes_quiet() {
+    for app in apps_with(listening).await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let (agent, mut control) = enrolled(&app, &mut admin, &server, "linux").await;
+
+        // The browser vanishes without closing its socket while the shell
+        // keeps writing: pings to it and the Agent's output don't keep it.
+        let mut terminal = start(
+            &server,
+            &mut admin,
+            &agent,
+            &mut control,
+            request("bash", "system"),
+        )
+        .await;
+        // The server hears this after `quiet_from`, and nothing more.
+        let quiet_from = tokio::time::Instant::now();
+        let resize = json!({ "type": "resize", "columns": 90, "rows": 20 });
+        send(
+            &mut terminal.browser,
+            Message::Text(resize.to_string().into()),
+        )
+        .await;
+        let (close, at) = keep_talking(
+            &mut terminal.agent,
+            Message::Binary(b"tick\r\n".to_vec().into()),
+        )
+        .await;
+        assert_eq!(close, (1000, "browser_quiet".into()), "{name}");
+        let after = at - quiet_from;
+        assert!(after >= BROWSER_SILENCE, "{name}: given up after {after:?}");
+        assert_eq!(
+            reason_closed(&app, &terminal.id).await,
+            "browser_quiet",
+            "{name}"
+        );
+        forgotten(&app, &agent).await;
+
+        // The Agent vanishes while the user keeps typing.
+        let mut terminal = start(
+            &server,
+            &mut admin,
+            &agent,
+            &mut control,
+            request("bash", "system"),
+        )
+        .await;
+        let quiet_from = tokio::time::Instant::now();
+        send(&mut terminal.agent, Message::Binary(b"$ ".to_vec().into())).await;
+        let (close, at) =
+            keep_talking(&mut terminal.browser, Message::Binary(b"l".to_vec().into())).await;
+        assert_eq!(
+            close,
+            (4009, "the device stopped answering".into()),
+            "{name}"
+        );
+        let after = at - quiet_from;
+        assert!(after >= AGENT_SILENCE, "{name}: given up after {after:?}");
+        assert_eq!(
+            reason_closed(&app, &terminal.id).await,
+            "device_quiet",
+            "{name}"
+        );
+        forgotten(&app, &agent).await;
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn answering_pings_keeps_a_quiet_terminal_open() {
+    for app in apps_with(listening).await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let (agent, mut control) = enrolled(&app, &mut admin, &server, "linux").await;
+        let mut terminal = start(
+            &server,
+            &mut admin,
+            &agent,
+            &mut control,
+            request("bash", "system"),
+        )
+        .await;
+
+        // Neither side sends anything but pongs, for well past both limits.
+        let wait = BROWSER_SILENCE * 3;
+        let (browser_pings, agent_pings) = tokio::join!(
+            only_pings(&mut terminal.browser, wait),
+            only_pings(&mut terminal.agent, wait),
+        );
+        assert!(browser_pings >= 3, "{name}: {browser_pings} pings");
+        assert!(agent_pings >= 3, "{name}: {agent_pings} pings");
+        assert_eq!(app.state.terminals.count_on(&agent.device_id), 1);
+        assert!(audit_events(&app, "terminal.close").await.is_empty());
+
+        terminal.browser.close(None).await.unwrap();
+        assert_eq!(closed(&mut terminal.agent).await, (1000, "closed".into()));
+        let closes = wait_for_audit(&app, "terminal.close", 1).await;
+        assert_eq!(closes[0].metadata["reason"], "closed", "{name}");
+        forgotten(&app, &agent).await;
         app.finish().await;
     }
 }
