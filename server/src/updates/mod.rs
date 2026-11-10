@@ -17,7 +17,7 @@
 pub mod runs;
 pub mod store;
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{collections::HashSet, time::Duration};
 
 use meshrmm_protocol_types::{
     AgentCommand, LastUpdateScan, UpdateInstallResult, UpdateInstallStatus, UpdateScan,
@@ -30,6 +30,7 @@ use self::{runs::Run, store::DeviceSummary};
 use crate::{
     db,
     http::AppState,
+    realtime::{Serializations, Shared},
     time::{DAY_MS, now_ms},
 };
 
@@ -51,25 +52,35 @@ pub enum UpdatesEvent {
 
 #[derive(Debug, Clone)]
 pub struct Engine {
-    events: broadcast::Sender<Arc<UpdatesEvent>>,
+    events: broadcast::Sender<Shared<UpdatesEvent>>,
+    /// The JSON made of its events, once each for every event socket.
+    serializations: Serializations,
 }
 
 impl Default for Engine {
     fn default() -> Self {
         Self {
             events: broadcast::channel(EVENT_BACKLOG).0,
+            serializations: Serializations::default(),
         }
     }
 }
 
 impl Engine {
-    pub fn subscribe(&self) -> broadcast::Receiver<Arc<UpdatesEvent>> {
+    /// Update events from now on, each serialised once for every event
+    /// socket that sends it.
+    pub fn subscribe(&self) -> broadcast::Receiver<Shared<UpdatesEvent>> {
         self.events.subscribe()
+    }
+
+    /// How many update events had their JSON made.
+    pub fn serializations(&self) -> u64 {
+        self.serializations.count()
     }
 
     fn publish(&self, event: UpdatesEvent) {
         // Nobody listening is fine.
-        let _ = self.events.send(Arc::new(event));
+        let _ = self.events.send(Shared::new(event, &self.serializations));
     }
 
     /// Whether an event published now would reach anyone: when not, there

@@ -17,6 +17,13 @@
 //! `devices.view` permission again every half minute, and at once after a
 //! change that can take access away (to users, roles, sessions or sign-in
 //! settings), and closes with 4001 when either is gone.
+//!
+//! What every socket sends alike is serialised once for all of them: each
+//! presence change and snapshot, alert event and update event is
+//! [`Shared`](crate::realtime::Shared), and resource usage comes from one
+//! feed that scans and serialises each tick once
+//! ([`Metrics::subscribe`](crate::realtime::Metrics::subscribe)). Only job
+//! events, shaped for each viewer, and the alert counts are made per socket.
 use std::{
     net::IpAddr,
     time::{Duration, Instant},
@@ -39,7 +46,7 @@ use crate::{
     automation::jobs::Viewer,
     http::{ApiError, AppState, client_ip::ClientIp},
     rbac::Permission,
-    realtime::{close_frame, metrics::MetricsEvent, presence::PresenceEvent, send},
+    realtime::{close_frame, metrics::Subscription, send},
 };
 
 /// Browsers don't ping; this keeps proxies from closing a quiet socket and
@@ -51,9 +58,6 @@ const SILENCE_LIMIT: Duration = Duration::from_secs(75);
 /// 128 KiB). The website sends only `refresh` and pongs, and the socket
 /// takes no message over 1 KiB.
 const READ_BUFFER_BYTES: usize = 1024;
-/// How often new resource usage readings are sent, as often as Agents report.
-const METRICS_INTERVAL: Duration =
-    Duration::from_secs(meshrmm_protocol_types::METRICS_INTERVAL_SECONDS);
 
 pub async fn subscribe(
     State(state): State<AppState>,
@@ -98,12 +102,13 @@ async fn serve(
         mut jobs,
         mut updates,
     } = allowed;
-    let mut events = state.presence.subscribe();
+    let mut events = state.presence.frames();
     let mut alert_events = state.alerts.subscribe();
     let mut job_events = state.automation.subscribe();
     let mut update_events = state.updates.subscribe();
     let mut access = state.presence.access_changes();
-    let Some(mut revision) = send_snapshot(&state, &mut socket, alerts).await else {
+    let mut usage = state.metrics.subscribe();
+    let Some(mut revision) = send_snapshot(&state, &mut socket, alerts, &mut usage).await else {
         return;
     };
     let mut recheck = tokio::time::interval(ACCESS_RECHECK);
@@ -111,27 +116,19 @@ async fn serve(
     // Both fire at once; the socket was just authorized.
     recheck.tick().await;
     ping.tick().await;
-    // Fires at once, sending every online device's usage.
-    let mut metrics = tokio::time::interval(METRICS_INTERVAL);
-    metrics.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut metrics_sent = 0;
     let mut last_heard = Instant::now();
     loop {
         tokio::select! {
             event = events.recv() => match event {
                 Ok(event) if event.revision() > revision => {
                     revision = event.revision();
-                    if !send_event(&mut socket, &event).await {
+                    if !send(&mut socket, event.message()).await {
                         return;
                     }
                 }
                 Ok(_) => {}
-                Err(RecvError::Lagged(_)) => match send_snapshot(&state, &mut socket, alerts).await {
-                    Some(sent) => {
-                        revision = sent;
-                        metrics_sent = 0;
-                        metrics.reset_immediately();
-                    }
+                Err(RecvError::Lagged(_)) => match send_snapshot(&state, &mut socket, alerts, &mut usage).await {
+                    Some(sent) => revision = sent,
                     None => return,
                 },
                 Err(RecvError::Closed) => return,
@@ -140,12 +137,8 @@ async fn serve(
                 last_heard = Instant::now();
                 match frame {
                 Some(Ok(Message::Text(text))) if text.as_str() == "refresh" => {
-                    match send_snapshot(&state, &mut socket, alerts).await {
-                        Some(sent) => {
-                            revision = sent;
-                            metrics_sent = 0;
-                            metrics.reset_immediately();
-                        }
+                    match send_snapshot(&state, &mut socket, alerts, &mut usage).await {
+                        Some(sent) => revision = sent,
                         None => return,
                     }
                 }
@@ -159,7 +152,7 @@ async fn serve(
             },
             event = alert_events.recv(), if alerts => {
                 let sent = match event {
-                    Ok(event) => send_json(&mut socket, &*event).await,
+                    Ok(event) => send(&mut socket, event.message()).await,
                     Err(RecvError::Lagged(_)) => send_alert_counts(&state, &mut socket).await,
                     Err(RecvError::Closed) => return,
                 };
@@ -183,7 +176,7 @@ async fn serve(
             }
             event = update_events.recv(), if updates => {
                 let sent = match event {
-                    Ok(event) => send_json(&mut socket, &*event).await,
+                    Ok(event) => send(&mut socket, event.message()).await,
                     Err(RecvError::Lagged(_)) => send_json(&mut socket, &json!({ "type": "updates_resync" })).await,
                     Err(RecvError::Closed) => return,
                 };
@@ -217,15 +210,9 @@ async fn serve(
                 jobs = allowed.jobs;
                 updates = allowed.updates;
             }
-            _ = metrics.tick() => {
-                let (readings, sequence) = state.metrics.since(metrics_sent);
-                metrics_sent = sequence;
-                if !readings.is_empty() {
-                    let json = serde_json::to_string(&MetricsEvent::Metrics { readings })
-                        .expect("metrics events serialize");
-                    if !send(&mut socket, Message::Text(json.into())).await {
-                        return;
-                    }
+            json = usage.next() => {
+                if !send(&mut socket, Message::Text(json)).await {
+                    return;
                 }
             }
             _ = ping.tick() => {
@@ -295,9 +282,15 @@ async fn send_json(socket: &mut WebSocket, event: &impl serde::Serialize) -> boo
     send(socket, Message::Text(json.into())).await
 }
 
-/// Sends a snapshot, and the alert counts if `alerts`, and returns the
-/// snapshot's revision, or `None` if the socket or the database failed.
-async fn send_snapshot(state: &AppState, socket: &mut WebSocket, alerts: bool) -> Option<u64> {
+/// Sends a snapshot, the alert counts if `alerts`, and every online
+/// device's latest reading, and returns the snapshot's revision, or `None`
+/// if the socket or the database failed.
+async fn send_snapshot(
+    state: &AppState,
+    socket: &mut WebSocket,
+    alerts: bool,
+    usage: &mut Subscription,
+) -> Option<u64> {
     let snapshot = match state.presence.snapshot().await {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -306,14 +299,12 @@ async fn send_snapshot(state: &AppState, socket: &mut WebSocket, alerts: bool) -
             return None;
         }
     };
-    send_event(socket, &snapshot).await.then_some(())?;
+    send(socket, snapshot.message()).await.then_some(())?;
     if alerts {
         send_alert_counts(state, socket).await.then_some(())?;
     }
+    if let Some(readings) = usage.restart() {
+        send(socket, Message::Text(readings)).await.then_some(())?;
+    }
     Some(snapshot.revision())
-}
-
-async fn send_event(socket: &mut WebSocket, event: &PresenceEvent) -> bool {
-    let json = serde_json::to_string(event).expect("presence events serialize");
-    send(socket, Message::Text(json.into())).await
 }

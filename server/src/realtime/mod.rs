@@ -6,6 +6,7 @@ mod hub;
 pub mod metrics;
 pub mod presence;
 pub mod sessions;
+pub mod shared;
 
 use std::time::Duration;
 
@@ -16,6 +17,7 @@ pub use self::{
     metrics::Metrics,
     presence::Presence,
     sessions::Sessions,
+    shared::{Serializations, Shared},
 };
 
 /// Agents and viewers ping every 20 seconds and give up on a socket after a
