@@ -165,6 +165,28 @@ pub fn releases_on_session_change(event: u32) -> bool {
     )
 }
 
+/// The virtual key Windows has down for a number-pad digit or its decimal
+/// point while Num Lock is on. Their scan codes map to the keys they are
+/// with Num Lock off (Home for 7, and so on), so a held one is down under
+/// either.
+#[cfg(any(windows, test))]
+pub fn num_lock_virtual_key(scan_code: u16, extended: bool) -> Option<u32> {
+    const VK_NUMPAD0: u32 = 0x60;
+    const VK_DECIMAL: u32 = 0x6e;
+    if extended {
+        return None;
+    }
+    let digit = match scan_code {
+        0x52 => 0,
+        0x4f..=0x51 => u32::from(scan_code - 0x4f) + 1,
+        0x4b..=0x4d => u32::from(scan_code - 0x4b) + 4,
+        0x47..=0x49 => u32::from(scan_code - 0x47) + 7,
+        0x53 => return Some(VK_DECIMAL),
+        _ => return None,
+    };
+    Some(VK_NUMPAD0 + digit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,6 +415,19 @@ mod tests {
                 key_up(CTRL, false),
             ]
         );
+    }
+
+    #[test]
+    fn number_pad_digits_have_a_second_virtual_key_under_num_lock() {
+        assert_eq!(num_lock_virtual_key(0x47, false), Some(0x67));
+        assert_eq!(num_lock_virtual_key(0x4c, false), Some(0x65));
+        assert_eq!(num_lock_virtual_key(0x4f, false), Some(0x61));
+        assert_eq!(num_lock_virtual_key(0x52, false), Some(0x60));
+        assert_eq!(num_lock_virtual_key(0x53, false), Some(0x6e));
+        // Home itself, and minus and plus between the digits, have only one.
+        assert_eq!(num_lock_virtual_key(0x47, true), None);
+        assert_eq!(num_lock_virtual_key(0x4a, false), None);
+        assert_eq!(num_lock_virtual_key(0x4e, false), None);
     }
 
     #[test]

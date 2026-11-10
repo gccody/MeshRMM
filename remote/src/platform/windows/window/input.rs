@@ -207,12 +207,16 @@ impl WindowContext {
                 };
                 let scan = u32::from(scan_code) | if extended { 0xe000 } else { 0 };
                 let virtual_key = unsafe { MapVirtualKeyW(scan, MAPVK_VSC_TO_VK_EX) };
+                // Not down, too, while another desktop takes the input.
+                let down = |key: u32| unsafe { GetAsyncKeyState(key as i32) } < 0;
                 // A key without a virtual key cannot be checked; its own
                 // key-up or the next focus loss releases it.
                 virtual_key == 0
                     || keyboard_hook::holds(virtual_key)
-                    // Zero, too, while another desktop takes the input.
-                    || unsafe { GetAsyncKeyState(virtual_key as i32) } < 0
+                    || down(virtual_key)
+                    // With Num Lock on, a number-pad digit is down as the
+                    // digit, not as the key its scan code maps to.
+                    || crate::input::num_lock_virtual_key(scan_code, extended).is_some_and(down)
             },
         );
         for input in released {
