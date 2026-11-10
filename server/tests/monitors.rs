@@ -462,6 +462,159 @@ async fn monitors_follow_their_targets_and_platforms() {
     }
 }
 
+/// The IDs of the next monitors sent to the stand-in Agent, sorted, if any
+/// arrive within `within`.
+async fn monitors_sent(connection: &mut AgentConnection, within: Duration) -> Option<Vec<String>> {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let command = tokio::time::timeout_at(deadline, common::next_command(connection))
+            .await
+            .ok()?
+            .expect("the connection was replaced");
+        if let AgentCommand::SetMonitors { monitors } = command {
+            let mut ids = monitors
+                .into_iter()
+                .map(|monitor| monitor.id)
+                .collect::<Vec<_>>();
+            ids.sort();
+            return Some(ids);
+        }
+    }
+}
+
+fn sorted(ids: &[&str]) -> Option<Vec<String>> {
+    let mut ids = ids.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>();
+    ids.sort();
+    Some(ids)
+}
+
+/// Reads the stand-in Agent's monitor updates until one is `expected`.
+async fn monitors_until(connection: &mut AgentConnection, expected: &[&str]) {
+    let expected = sorted(expected);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let sent = monitors_sent(connection, deadline - tokio::time::Instant::now()).await;
+        assert!(sent.is_some(), "expected {expected:?}");
+        if sent == expected {
+            return;
+        }
+    }
+}
+
+#[tokio::test]
+async fn presence_changes_resync_only_the_devices_they_name() {
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let mut tags = Vec::new();
+        for tag in ["web", "prod"] {
+            let created = admin
+                .post("/v1/tags", json!({ "name": tag, "color": "blue" }))
+                .await;
+            assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+            tags.push(created.body["id"].as_str().unwrap().to_owned());
+        }
+        let [web, prod] = &tags[..] else {
+            unreachable!()
+        };
+        let everywhere = create_rule(&mut admin, service_rule("Nginx", json!({}))).await;
+        let everywhere = everywhere["id"].as_str().unwrap();
+        let tagged = create_rule(
+            &mut admin,
+            service_rule(
+                "Web in production",
+                json!({ "target": "tags", "tag_ids": [web, prod], "tag_match": "all" }),
+            ),
+        )
+        .await;
+        let tagged = tagged["id"].as_str().unwrap();
+        let mut ids = Vec::new();
+        let mut connections = Vec::new();
+        for device in ["One", "Two", "Three"] {
+            let agent = app.enroll_on(&mut admin, device, "linux").await;
+            connections.push(app.state.agents.connect(&agent.device_id));
+            ids.push(agent.device_id);
+        }
+        let late = app.enroll_on(&mut admin, "Late", "linux").await;
+        let engine = monitors::spawn(app.state.clone());
+        for connection in &mut connections {
+            assert_eq!(
+                monitors_sent(connection, Duration::from_secs(10)).await,
+                sorted(&[everywhere]),
+                "{name}"
+            );
+        }
+        let passes = app.state.monitors.full_passes();
+        let quiet = Duration::from_millis(600);
+        let mut add_tags = async |device: &str, add: &[&String]| {
+            let changed = admin
+                .post(
+                    "/v1/device-tags",
+                    json!({ "device_ids": [device], "add": add }),
+                )
+                .await;
+            assert_eq!(changed.status, StatusCode::OK, "{:?}", changed.body);
+        };
+
+        // Tagging one device sends it alone its new monitors, read for that
+        // device only.
+        add_tags(&ids[0], &[web, prod]).await;
+        assert_eq!(
+            monitors_sent(&mut connections[0], Duration::from_secs(10)).await,
+            sorted(&[everywhere, tagged]),
+            "{name}"
+        );
+        assert_eq!(monitors_sent(&mut connections[1], quiet).await, None);
+        assert_eq!(monitors_sent(&mut connections[2], quiet).await, None);
+        // A device whose monitors stay the same isn't sent them again.
+        add_tags(&ids[1], &[prod]).await;
+        assert_eq!(monitors_sent(&mut connections[1], quiet).await, None);
+        // An Agent that connects gets its monitors.
+        connections.push(app.state.agents.connect(&late.device_id));
+        app.state.presence.connected(&late.device_id).await;
+        assert_eq!(
+            monitors_sent(&mut connections[3], Duration::from_secs(10)).await,
+            sorted(&[everywhere]),
+            "{name}"
+        );
+        assert_eq!(app.state.monitors.full_passes(), passes, "{name}");
+
+        // Deleting a tag takes it out of the rule, which then covers the
+        // device with the other tag, though no presence change names it.
+        let deleted = admin.delete(&format!("/v1/tags/{web}")).await;
+        assert_eq!(deleted.status, StatusCode::NO_CONTENT, "{name}");
+        assert_eq!(
+            monitors_sent(&mut connections[1], Duration::from_secs(10)).await,
+            sorted(&[everywhere, tagged]),
+            "{name}"
+        );
+        assert!(app.state.monitors.full_passes() > passes, "{name}");
+        assert_eq!(monitors_sent(&mut connections[2], quiet).await, None);
+
+        // A rule change reaches every device it applies to.
+        let disabled = admin
+            .put(
+                &format!("/v1/alert-rules/{everywhere}"),
+                service_rule("Nginx", json!({ "enabled": false })),
+            )
+            .await;
+        assert_eq!(
+            disabled.status,
+            StatusCode::OK,
+            "{name}: {:?}",
+            disabled.body
+        );
+        // The first device lost a tag too, and may have been sent a set in
+        // between.
+        monitors_until(&mut connections[0], &[tagged]).await;
+        monitors_until(&mut connections[1], &[tagged]).await;
+        monitors_until(&mut connections[2], &[]).await;
+        monitors_until(&mut connections[3], &[]).await;
+        engine.abort();
+        app.finish().await;
+    }
+}
+
 #[tokio::test]
 async fn self_healing_restarts_services_and_resolves_alerts_as_remediated() {
     for app in apps().await {

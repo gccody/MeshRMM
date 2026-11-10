@@ -186,8 +186,9 @@ task.
   resolves alerts, and broadcasts them; event sockets of users who may see
   alerts pass them on. See [alerts](alerts.md).
 - **Monitors**: the engine's task sends each connected Agent its monitors
-  when they change, comparing what each was last sent on presence changes,
-  rule changes and every minute. The Agent's results are judged as they
+  when they change, comparing what each was last sent: for the devices a
+  presence change names, and for every connected device on rule changes,
+  deleted tags and every minute, at most once per 5 seconds. The Agent's results are judged as they
   arrive; self-healing attempts are made on the alert engine's passes. See
   [monitors](monitors.md).
 - **Automation**: the engine's task fires due policies, starts jobs' runs on
