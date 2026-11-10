@@ -18,7 +18,7 @@ use std::{
     time::Duration,
 };
 
-use meshrmm_protocol_types::SystemMetrics;
+use meshrmm_protocol_types::{METRICS_INTERVAL_SECONDS, SystemMetrics};
 use sea_query::{Expr, ExprTrait, InsertStatement, OnConflict, Order, Query};
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +29,10 @@ use crate::{
 
 /// How far back the live view reaches.
 pub const LIVE_WINDOW_MS: i64 = 15 * MINUTE_MS;
+/// Points a live window has room for before it has to grow: one per
+/// reporting interval, and a few more for jitter.
+const LIVE_ROOM: usize =
+    (LIVE_WINDOW_MS / (METRICS_INTERVAL_SECONDS as i64 * SECOND_MS)) as usize + 4;
 /// How long per-minute history is kept.
 pub const HISTORY_MS: i64 = 7 * DAY_MS;
 /// Readings closer together than this are dropped, which bounds what an
@@ -180,10 +184,7 @@ impl Range {
     /// How long each point covers: a few hundred points at most.
     pub fn step_ms(self) -> i64 {
         match self {
-            Self::Live => {
-                i64::try_from(meshrmm_protocol_types::METRICS_INTERVAL_SECONDS).unwrap_or(5)
-                    * SECOND_MS
-            }
+            Self::Live => i64::try_from(METRICS_INTERVAL_SECONDS).unwrap_or(5) * SECOND_MS,
             Self::Hour => MINUTE_MS,
             Self::Day => 5 * MINUTE_MS,
             Self::Week => 30 * MINUTE_MS,
@@ -191,10 +192,154 @@ impl Range {
     }
 }
 
+/// A reading in the live window, in 40 bytes where a [`Point`] takes 72: an
+/// offset for its time, the load as the Agent's `f32`, the amounts unsigned
+/// as reported, and capacities kept apart, as they rarely change.
+#[derive(Debug, Clone, Copy)]
+struct LivePoint {
+    /// Milliseconds after its window's [`LiveWindow::base`].
+    offset: u32,
+    cpu_percent: f32,
+    memory_used_bytes: u64,
+    network_received_bytes_per_second: u64,
+    network_sent_bytes_per_second: u64,
+    storage_used_bytes: u64,
+}
+
+/// The capacities of the points from the one at `from` on.
+#[derive(Debug, Clone, Copy)]
+struct Capacities {
+    from: u32,
+    memory_total_bytes: u64,
+    storage_total_bytes: u64,
+}
+
+/// A device's readings of the last [`LIVE_WINDOW_MS`], oldest first, which
+/// make the same [`Point`]s as the readings themselves.
+#[derive(Debug, Default)]
+struct LiveWindow {
+    /// The Unix milliseconds that offsets count from.
+    base: i64,
+    points: VecDeque<LivePoint>,
+    /// Oldest first; the first applies to the first point.
+    capacities: VecDeque<Capacities>,
+}
+
+impl LiveWindow {
+    fn at(&self, point: &LivePoint) -> i64 {
+        self.base + i64::from(point.offset)
+    }
+
+    /// Adds a reading taken at `at`, after the others, and drops those that
+    /// leave the window.
+    fn push(&mut self, at: i64, metrics: &SystemMetrics) {
+        while let Some(oldest) = self.points.front().map(|point| self.at(point))
+            && oldest <= at - LIVE_WINDOW_MS
+        {
+            self.points.pop_front();
+        }
+        match self.points.front().map(|point| point.offset) {
+            None => {
+                self.base = at;
+                self.capacities.clear();
+                if self.points.capacity() == 0 {
+                    self.points.reserve_exact(LIVE_ROOM);
+                    self.capacities.reserve_exact(1);
+                }
+            }
+            Some(first) => {
+                while self
+                    .capacities
+                    .get(1)
+                    .is_some_and(|next| next.from <= first)
+                {
+                    self.capacities.pop_front();
+                }
+                if u32::try_from(at - self.base).is_err() {
+                    // After 49 days of one connection: count from the oldest
+                    // point, which is within the window.
+                    for point in &mut self.points {
+                        point.offset -= first;
+                    }
+                    for capacities in &mut self.capacities {
+                        capacities.from = capacities.from.saturating_sub(first);
+                    }
+                    self.base += i64::from(first);
+                }
+            }
+        }
+        let offset = u32::try_from(at - self.base).unwrap_or(u32::MAX);
+        let (storage_used, storage_total) = metrics.storage();
+        if !self.capacities.back().is_some_and(|last| {
+            (last.memory_total_bytes, last.storage_total_bytes)
+                == (metrics.memory_total_bytes, storage_total)
+        }) {
+            self.capacities.push_back(Capacities {
+                from: offset,
+                memory_total_bytes: metrics.memory_total_bytes,
+                storage_total_bytes: storage_total,
+            });
+        }
+        self.points.push_back(LivePoint {
+            offset,
+            cpu_percent: metrics.cpu_percent,
+            memory_used_bytes: metrics.memory_used_bytes,
+            network_received_bytes_per_second: metrics.network_received_bytes_per_second,
+            network_sent_bytes_per_second: metrics.network_sent_bytes_per_second,
+            storage_used_bytes: storage_used,
+        });
+    }
+
+    /// The points taken after `after`, oldest first.
+    fn points(&self, after: i64) -> Vec<Point> {
+        let mut changes = self.capacities.iter().peekable();
+        let mut current = changes.next().copied();
+        let mut points = Vec::with_capacity(self.points.len());
+        for point in &self.points {
+            while let Some(next) = changes.next_if(|next| next.from <= point.offset) {
+                current = Some(*next);
+            }
+            let at = self.at(point);
+            let Some(capacities) = current.filter(|_| at > after) else {
+                continue;
+            };
+            points.push(Point {
+                at,
+                cpu_percent: f64::from(point.cpu_percent),
+                cpu_percent_max: f64::from(point.cpu_percent),
+                memory_used_bytes: signed(point.memory_used_bytes),
+                memory_total_bytes: signed(capacities.memory_total_bytes),
+                network_received_bytes_per_second: signed(point.network_received_bytes_per_second),
+                network_sent_bytes_per_second: signed(point.network_sent_bytes_per_second),
+                storage_used_bytes: signed(point.storage_used_bytes),
+                storage_total_bytes: signed(capacities.storage_total_bytes),
+            });
+        }
+        points
+    }
+
+    fn held(&self) -> Held {
+        Held {
+            points: self.points.len(),
+            bytes: size_of::<Self>()
+                + self.points.capacity() * size_of::<LivePoint>()
+                + self.capacities.capacity() * size_of::<Capacities>(),
+        }
+    }
+}
+
+/// What the live view holds for a device.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Held {
+    pub points: usize,
+    /// The bytes its window takes with its room for more.
+    pub bytes: usize,
+}
+
 #[derive(Debug, Default)]
 struct Device {
     latest: Option<Reading>,
-    recent: VecDeque<Point>,
+    live: LiveWindow,
     minute: Option<Totals>,
 }
 
@@ -339,7 +484,12 @@ impl Metrics {
         let mut state = self.state();
         state.sequence += 1;
         let sequence = state.sequence;
-        let device = state.devices.entry(device_id.to_owned()).or_default();
+        if !state.devices.contains_key(device_id) {
+            state
+                .devices
+                .insert(device_id.to_owned(), Device::default());
+        }
+        let device = state.devices.get_mut(device_id)?;
         if device
             .latest
             .as_ref()
@@ -348,20 +498,18 @@ impl Metrics {
             return None;
         }
         let point = Point::of(at, &metrics);
+        device.live.push(at, &metrics);
+        // The previous reading's copy of the id is reused.
+        let device_id = device
+            .latest
+            .take()
+            .map_or_else(|| device_id.to_owned(), |latest| latest.device_id);
         device.latest = Some(Reading {
-            device_id: device_id.to_owned(),
+            device_id,
             at,
             metrics,
             sequence,
         });
-        device.recent.push_back(point);
-        while device
-            .recent
-            .front()
-            .is_some_and(|oldest| oldest.at <= at - LIVE_WINDOW_MS)
-        {
-            device.recent.pop_front();
-        }
         let start = at - at.rem_euclid(MINUTE_MS);
         match &mut device.minute {
             Some(minute) if minute.start == start => {
@@ -413,6 +561,20 @@ impl Metrics {
         (readings, state.sequence)
     }
 
+    /// The sequence to ask [`Metrics::since`] from to get only readings
+    /// recorded after now.
+    pub fn sequence(&self) -> u64 {
+        self.state().sequence
+    }
+
+    /// What the live view holds for the device, while its Agent is online.
+    pub fn held(&self, device_id: &str) -> Option<Held> {
+        self.state()
+            .devices
+            .get(device_id)
+            .map(|device| device.live.held())
+    }
+
     /// The device's latest reading, while its Agent is online.
     pub fn latest(&self, device_id: &str) -> Option<Reading> {
         self.state()
@@ -429,14 +591,7 @@ impl Metrics {
                 .state()
                 .devices
                 .get(device_id)
-                .map(|device| {
-                    device
-                        .recent
-                        .iter()
-                        .filter(|point| point.at > now - LIVE_WINDOW_MS)
-                        .copied()
-                        .collect()
-                })
+                .map(|device| device.live.points(now - LIVE_WINDOW_MS))
                 .unwrap_or_default());
         }
         let step = range.step_ms();
@@ -809,7 +964,7 @@ mod tests {
 
         let state = metrics.state();
         let device = &state.devices["a"];
-        assert_eq!(device.recent.len(), 3);
+        assert_eq!(device.live.points.len(), 3);
         assert_eq!(device.latest.as_ref().unwrap().metrics.cpu_percent, 50.0);
     }
 
@@ -820,13 +975,132 @@ mod tests {
             metrics.record_at("a", sample(1.0, 1), second * SECOND_MS);
         }
         let state = metrics.state();
-        let recent = &state.devices["a"].recent;
+        let points = state.devices["a"].live.points(i64::MIN);
         assert_eq!(
-            recent.len() as i64,
+            points.len() as i64,
             LIVE_WINDOW_MS / (5 * SECOND_MS),
             "readings older than the window are gone"
         );
-        assert!(recent.back().unwrap().at - recent.front().unwrap().at < LIVE_WINDOW_MS);
+        assert!(points.last().unwrap().at - points[0].at < LIVE_WINDOW_MS);
+    }
+
+    /// A small deterministic generator, so failures repeat.
+    struct Random(u64);
+
+    impl Random {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next() % bound
+        }
+    }
+
+    fn random_reading(random: &mut Random) -> SystemMetrics {
+        let mut volumes = vec![VolumeUsage {
+            name: "C:".into(),
+            total_bytes: 512 << 30,
+            free_bytes: random.below(512 << 30),
+        }];
+        // Now and then a drive comes or goes, or memory changes.
+        if random.below(20) == 0 {
+            volumes.push(VolumeUsage {
+                name: "D:".into(),
+                total_bytes: random.next(),
+                free_bytes: random.next(),
+            });
+        }
+        SystemMetrics {
+            cpu_percent: f32::from_bits(random.next() as u32 & 0x3fff_ffff).min(100.0),
+            memory_used_bytes: random.next() >> random.below(64),
+            memory_total_bytes: if random.below(30) == 0 {
+                random.next()
+            } else {
+                16 << 30
+            },
+            network_received_bytes_per_second: random.next() >> random.below(64),
+            network_sent_bytes_per_second: u64::MAX - random.below(3),
+            uptime_seconds: 60,
+            volumes,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_live_window_gives_back_the_points_of_its_readings() {
+        let metrics = store().await;
+        let mut random = Random(7);
+        let mut at = 1_000 * MINUTE_MS;
+        let mut expected = VecDeque::new();
+        for _ in 0..2_000 {
+            at += [2, 5, 5, 5, 6, 20, 400, 1_000][random.below(8) as usize] * SECOND_MS;
+            let reading = random_reading(&mut random);
+            expected.push_back(Point::of(at, &reading));
+            while expected
+                .front()
+                .is_some_and(|point: &Point| point.at <= at - LIVE_WINDOW_MS)
+            {
+                expected.pop_front();
+            }
+            metrics.record_at("a", reading, at);
+            let state = metrics.state();
+            let live = &state.devices["a"].live;
+            assert_eq!(live.points(i64::MIN), Vec::from(expected.clone()));
+            let after = at - random.below(LIVE_WINDOW_MS as u64) as i64;
+            assert_eq!(
+                live.points(after),
+                expected
+                    .iter()
+                    .filter(|point| point.at > after)
+                    .copied()
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn the_live_window_outlasts_its_offsets() {
+        let mut live = LiveWindow::default();
+        let mut expected = VecDeque::new();
+        let start = 1_000 * MINUTE_MS;
+        let mut at = start;
+        // Past the 49 days a `u32` of milliseconds counts.
+        while at < start + i64::from(u32::MAX) + 2 * LIVE_WINDOW_MS {
+            let reading = sample((at / SECOND_MS % 100) as f32, (at / SECOND_MS) as u64 % 997);
+            expected.push_back(Point::of(at, &reading));
+            if expected.len() > 30 {
+                expected.pop_front();
+            }
+            live.push(at, &reading);
+            at += 30 * SECOND_MS;
+        }
+        assert!(live.base > start, "offsets count from a later time");
+        assert_eq!(live.points(i64::MIN), Vec::from(expected));
+    }
+
+    #[tokio::test]
+    async fn a_live_window_holds_its_points_in_40_bytes_each() {
+        assert_eq!(size_of::<LivePoint>(), 40);
+        let metrics = store().await;
+        for second in (0..=2 * LIVE_WINDOW_MS / SECOND_MS).step_by(5) {
+            metrics.record_at("a", sample(1.0, 1), second * SECOND_MS);
+        }
+        let held = metrics.held("a").unwrap();
+        assert_eq!(held.points, 180);
+        // The room for 184 points and one set of capacities, which it never
+        // outgrew.
+        assert_eq!(LIVE_ROOM, 184);
+        assert_eq!(
+            held.bytes,
+            size_of::<LiveWindow>() + 184 * 40 + size_of::<Capacities>()
+        );
+        assert_eq!(held.bytes, 7_456);
+        metrics.disconnected("a");
+        assert_eq!(metrics.held("a"), None);
     }
 
     #[tokio::test]

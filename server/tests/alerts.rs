@@ -286,6 +286,77 @@ async fn device_state_rules_raise_and_resolve_alerts_and_notify() {
 }
 
 #[tokio::test]
+async fn the_engine_keeps_readings_only_as_far_back_as_load_rules_look() {
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let desk = app.enroll(&mut admin, "Desk").await;
+        let device = desk.device_id.as_str();
+        let _connection = app.state.agents.connect(device);
+        let start = now_ms() - 4 * 60 * MINUTE_MS;
+
+        // No rule reads loads: nothing is kept, however long it reports.
+        create_rule(
+            &mut admin,
+            json!({ "name": "Gone", "severity": "warning", "condition": "device_offline", "duration_minutes": 15 }),
+        )
+        .await;
+        let mut at = start + 60 * MINUTE_MS;
+        observe(&app, device, at, 3_600, 95.0);
+        alerts::evaluate(&app.state, at).await.unwrap();
+        assert_eq!(
+            app.state.alerts.held(device),
+            alerts::Held::default(),
+            "{name}"
+        );
+
+        // A rule at the website's default window keeps ten minutes, as soon as
+        // it is saved.
+        let mut rule = json!({
+            "name": "Busy CPU", "severity": "warning", "condition": "cpu",
+            "threshold": 80, "duration_minutes": 10,
+        });
+        let rule_id = create_rule(&mut admin, rule.clone()).await;
+        at += 60 * MINUTE_MS;
+        observe(&app, device, at, 3_595, 95.0);
+        assert_eq!(app.state.alerts.held(device).readings, 123, "{name}");
+        alerts::evaluate(&app.state, at).await.unwrap();
+        let open = alerts_of(&mut admin, "").await;
+        assert_eq!(open.len(), 1, "{name}: {open:?}");
+        assert_eq!(open[0]["detail"], "CPU averaged 95% over 10 minutes");
+
+        // Lengthened to an hour, it waits for an hour of readings to judge:
+        // until then the alert stays, though the load dropped.
+        rule["duration_minutes"] = json!(60);
+        let updated = admin
+            .put(&format!("/v1/alert-rules/{rule_id}"), rule.clone())
+            .await;
+        assert_eq!(updated.status, StatusCode::OK, "{:?}", updated.body);
+        at += 40 * MINUTE_MS;
+        observe(&app, device, at, 2_395, 5.0);
+        alerts::evaluate(&app.state, at).await.unwrap();
+        assert_eq!(alerts_of(&mut admin, "").await.len(), 1, "{name}");
+        at += 20 * MINUTE_MS;
+        observe(&app, device, at, 1_195, 5.0);
+        alerts::evaluate(&app.state, at).await.unwrap();
+        assert!(alerts_of(&mut admin, "").await.is_empty(), "{name}");
+        assert_eq!(app.state.alerts.held(device).readings, 723, "{name}");
+
+        // Turned off, nothing is kept again.
+        rule["enabled"] = json!(false);
+        let updated = admin.put(&format!("/v1/alert-rules/{rule_id}"), rule).await;
+        assert_eq!(updated.status, StatusCode::OK, "{:?}", updated.body);
+        alerts::evaluate(&app.state, at).await.unwrap();
+        assert_eq!(
+            app.state.alerts.held(device),
+            alerts::Held::default(),
+            "{name}"
+        );
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
 async fn offline_alerts_count_from_the_disconnect_or_the_server_start() {
     for app in apps().await {
         let name = app.name;

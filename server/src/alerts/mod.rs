@@ -16,7 +16,10 @@
 //! nor notifies again. What the engine keeps in memory starts over: a device
 //! counts as offline from the first evaluation after a start, so a restart
 //! delays offline alerts instead of raising one for every device, and loads
-//! need a full window of new readings.
+//! need a full window of new readings. The engine keeps devices' readings
+//! only as far back as the longest window of the enabled CPU and memory
+//! rules, and none while there is no such rule, so a rule that starts
+//! looking further back waits for its window to fill too.
 pub mod applications;
 mod evaluate;
 pub mod rules;
@@ -34,6 +37,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use tokio::sync::{Notify, broadcast};
 
+pub use self::evaluate::Held;
 use self::{
     evaluate::{DeviceState, Tracker, UpdateFacts, Verdict, judge},
     rules::{Condition, Rule},
@@ -115,9 +119,21 @@ impl Engine {
         self.inner.wake.notify_one();
     }
 
+    /// Takes in a rule just saved: keeps the readings it needs from now on,
+    /// and judges the rules soon.
+    pub fn rule_saved(&self, rule: &Rule) {
+        self.tracker().keep_also_for(rule);
+        self.wake();
+    }
+
     /// Takes in a reading the device's Agent reported at `at`.
     pub fn observe(&self, device_id: &str, at: i64, metrics: &SystemMetrics) {
         self.tracker().observe(device_id, at, metrics);
+    }
+
+    /// What the engine holds of the device's readings.
+    pub fn held(&self, device_id: &str) -> Held {
+        self.tracker().held(device_id)
     }
 
     fn tracker(&self) -> std::sync::MutexGuard<'_, Tracker> {
@@ -131,6 +147,9 @@ impl Engine {
     /// Takes in the readings reported after `sequence`, and returns the
     /// sequence to ask from next.
     fn feed(&self, metrics: &Metrics, sequence: u64) -> u64 {
+        if !self.tracker().wants_readings() {
+            return metrics.sequence();
+        }
         let (readings, next) = metrics.since(sequence);
         let mut tracker = self.tracker();
         for reading in readings {
@@ -216,6 +235,7 @@ pub async fn evaluate(state: &AppState, now: i64) -> anyhow::Result<()> {
     let mut wanted = Vec::new();
     {
         let mut tracker = state.alerts.tracker();
+        tracker.keep_for(&rules);
         let ids = devices
             .iter()
             .map(|device| device.id.clone())

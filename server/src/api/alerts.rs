@@ -344,7 +344,7 @@ pub async fn create_rule(
     )
     .await?;
     transaction.commit().await?;
-    state.alerts.wake();
+    state.alerts.rule_saved(&rule);
     state.monitors.wake();
     let view = RuleView::new(&mut &state.database, rule).await?;
     Ok((StatusCode::CREATED, Json(view)))
@@ -404,7 +404,7 @@ pub async fn update_rule(
     )
     .await?;
     transaction.commit().await?;
-    state.alerts.wake();
+    state.alerts.rule_saved(&rule);
     crate::monitors::rule_changed(&state, &previous, &rule).await;
     if let Err(error) = crate::monitors::remediation::rule_saved(&state, &rule).await {
         tracing::warn!(
