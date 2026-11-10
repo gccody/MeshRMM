@@ -15,11 +15,18 @@ use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSImageCompressionF
 use objc2_core_foundation::CFRetained;
 use objc2_core_graphics::CGImage;
 use objc2_core_media::{CMSampleBuffer, CMTime};
-use objc2_core_video::{CVPixelBuffer, kCVPixelFormatType_32BGRA};
+use objc2_core_video::{
+    CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow,
+    CVPixelBufferGetDataSize, CVPixelBufferGetHeight, CVPixelBufferGetWidth,
+    CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
+    kCVPixelFormatType_32BGRA,
+};
 use objc2_foundation::{NSDictionary, NSError, NSNumber, NSObject, NSObjectProtocol};
 use objc2_screen_capture_kit::{
     SCStream, SCStreamConfiguration, SCStreamOutput, SCStreamOutputType,
 };
+
+use crate::remote::thumbnail::{Capture, Layout, Pixels, Signature, encode_if_changed};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 const JPEG_QUALITY: f64 = 0.7;
@@ -63,14 +70,39 @@ impl SnapshotOutput {
     }
 }
 
-/// The main display, scaled to fit the thumbnail box, as a JPEG.
-pub(crate) fn main_display_jpeg() -> anyhow::Result<Vec<u8>> {
+/// The main display, scaled to fit the thumbnail box, as a JPEG unless it
+/// looks like `previous`.
+pub(crate) fn main_display(previous: Option<&Signature>) -> anyhow::Result<Capture> {
     let displays = super::display::enumerate()?;
     let display = super::display::choose(&displays, None)?;
     let (width, height) = super::display::pixel_size(&display);
     let (width, height) = crate::remote::thumbnail::scaled_size(width, height);
     let frame = capture_frame(display.id.0, width, height)?;
-    encode_jpeg(&frame)
+    encode_if_changed(signature(&frame)?, previous, || encode_jpeg(&frame))
+}
+
+/// What the BGRA frame looks like, read while its pixels are locked.
+fn signature(frame: &CVPixelBuffer) -> anyhow::Result<Signature> {
+    // SAFETY: the frame is locked for reading while its bytes are borrowed,
+    // and the slice covers no more than the buffer holds.
+    unsafe {
+        if CVPixelBufferLockBaseAddress(frame, CVPixelBufferLockFlags::ReadOnly) != 0 {
+            bail!("Core Video could not lock the thumbnail frame");
+        }
+        let base = CVPixelBufferGetBaseAddress(frame).cast::<u8>();
+        let (width, height) = (CVPixelBufferGetWidth(frame), CVPixelBufferGetHeight(frame));
+        let stride = CVPixelBufferGetBytesPerRow(frame);
+        let signature = if base.is_null() {
+            Err(anyhow::anyhow!("the thumbnail frame has no pixels"))
+        } else {
+            let length = CVPixelBufferGetDataSize(frame).min(stride.saturating_mul(height));
+            let data = std::slice::from_raw_parts(base, length);
+            Pixels::new(data, width, height, stride, Layout::BGRX)
+                .map(|pixels| Signature::of(&pixels))
+        };
+        CVPixelBufferUnlockBaseAddress(frame, CVPixelBufferLockFlags::ReadOnly);
+        signature
+    }
 }
 
 fn capture_frame(
@@ -163,13 +195,7 @@ fn encode_jpeg(frame: &CVPixelBuffer) -> anyhow::Result<Vec<u8>> {
         representation.representationUsingType_properties(NSBitmapImageFileType::JPEG, &properties)
     }
     .context("AppKit could not encode the thumbnail")?;
-    let jpeg = data.to_vec();
-    anyhow::ensure!(
-        jpeg.len() <= crate::remote::thumbnail::MAX_BYTES,
-        "the thumbnail is {} bytes, more than the server accepts",
-        jpeg.len()
-    );
-    Ok(jpeg)
+    Ok(data.to_vec())
 }
 
 #[cfg(test)]
@@ -179,7 +205,9 @@ mod tests {
     #[test]
     #[ignore = "needs a display and Screen Recording permission"]
     fn captures_the_main_display_as_a_small_jpeg() {
-        let jpeg = main_display_jpeg().unwrap();
+        let Capture::Changed { jpeg, .. } = main_display(None).unwrap() else {
+            panic!("a capture without an image to compare with was not encoded");
+        };
         assert!(jpeg.starts_with(&[0xff, 0xd8]), "a JPEG");
         assert!(jpeg.len() > 1000);
         std::fs::write(std::env::temp_dir().join("meshrmm-thumbnail.jpg"), &jpeg).unwrap();

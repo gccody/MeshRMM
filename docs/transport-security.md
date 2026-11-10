@@ -21,7 +21,9 @@ client trusts the operating system's root certificates, loaded once per
 process into one configuration whose session cache lets a reconnect resume
 its TLS session, and the Agent's ureq
 and the viewer's reqwest clients verify certificates through the operating
-system. There is no certificate pinning. Handshake tests against local
+system. The Agent's screen thumbnail uploads also keep one ureq client, and
+so one session cache, for the life of the process, and close each connection
+after its upload. There is no certificate pinning. Handshake tests against local
 TLS 1.2-only servers cover each client.
 
 ## The peer connection

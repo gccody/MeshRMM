@@ -31,6 +31,7 @@ use super::protocol::{
 };
 use crate::remote::connection_approval::{ApprovalPrompt, Decision};
 use crate::remote::platform::ScreenInput;
+use crate::remote::thumbnail::{Capture, Signature};
 
 /// How long a helper may take to answer a request. Starting capture is the
 /// slowest, when ScreenCaptureKit first lists the displays.
@@ -175,10 +176,14 @@ impl Registry {
             .with_context(|| format!("no session helper is running for user {uid}"))
     }
 
-    /// A JPEG of the console's main display, from its session helper.
-    pub(crate) fn thumbnail(&self) -> anyhow::Result<Vec<u8>> {
-        match self.console_helper()?.call(Request::Thumbnail)? {
-            Reply::Thumbnail(jpeg) => Ok(jpeg),
+    /// A JPEG of the console's main display, unless it looks like
+    /// `previous`, from its session helper.
+    pub(crate) fn thumbnail(&self, previous: Option<&Signature>) -> anyhow::Result<Capture> {
+        match self
+            .console_helper()?
+            .call(Request::Thumbnail(previous.cloned()))?
+        {
+            Reply::Thumbnail(capture) => Ok(capture),
             reply => bail!("the session helper answered a thumbnail with {reply:?}"),
         }
     }

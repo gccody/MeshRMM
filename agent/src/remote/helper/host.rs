@@ -159,7 +159,7 @@ fn serve(stream: UnixStream, input: &Arc<LocalInput>, login_window: bool) -> any
             sequence: Arc::clone(&sequence),
             events: events.clone(),
         };
-        if matches!(call.request, Request::Thumbnail) {
+        if matches!(call.request, Request::Thumbnail(_)) {
             // A capture takes a moment; a session's requests keep flowing.
             let spawned = std::thread::Builder::new()
                 .name("meshrmm-thumbnail".into())
@@ -308,10 +308,10 @@ fn handle(request: Request, served: &Served) -> anyhow::Result<Reply> {
         Request::LockScreen => super::platform::session_close::lock_here()?,
         Request::LogOut => super::platform::session_close::log_out_here()?,
         Request::ShowTerminalNotice(text) => crate::remote::terminal::show_notice_here(text)?,
-        Request::Thumbnail => {
-            return Ok(Reply::Thumbnail(
-                super::platform::snapshot::main_display_jpeg()?,
-            ));
+        Request::Thumbnail(previous) => {
+            return Ok(Reply::Thumbnail(super::platform::snapshot::main_display(
+                previous.as_ref(),
+            )?));
         }
         Request::CancelApproval => approval
             .lock()
