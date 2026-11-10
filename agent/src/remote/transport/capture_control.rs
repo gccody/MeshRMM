@@ -37,6 +37,83 @@ pub(super) fn profile_candidates(
     candidates
 }
 
+/// What the session asks of the video: the profiles the viewer can decode,
+/// the chroma and quality the person chose, and the profiles the viewer
+/// could not present. A rejection lasts until the person asks for another
+/// chroma or the viewer connects again; the same choice sent again changes
+/// nothing, so it cannot bring a rejected profile back.
+pub(super) struct ProfileSelection {
+    viewer_profiles: Vec<VideoProfile>,
+    chroma: ChromaMode,
+    /// None until the viewer has sent its capabilities.
+    quality: Option<QualityPreset>,
+    rejected: Vec<VideoProfile>,
+}
+
+impl ProfileSelection {
+    /// The bootstrap profile the stream starts with, before the viewer
+    /// has said what it can decode.
+    pub(super) fn new(bootstrap: VideoProfile) -> Self {
+        Self {
+            viewer_profiles: vec![bootstrap],
+            chroma: ChromaMode::Yuv420,
+            quality: None,
+            rejected: Vec::new(),
+        }
+    }
+
+    /// A viewer's capabilities on connect, which start the choice over.
+    pub(super) fn negotiate(
+        &mut self,
+        profiles: Vec<VideoProfile>,
+        quality: QualityPreset,
+        chroma: ChromaMode,
+    ) {
+        self.viewer_profiles = profiles;
+        self.chroma = chroma;
+        self.quality = Some(quality);
+        self.rejected.clear();
+    }
+
+    /// The person chose `chroma`. False when it is the chroma already asked
+    /// for: then nothing changes.
+    pub(super) fn choose_chroma(&mut self, chroma: ChromaMode) -> bool {
+        if chroma == self.chroma {
+            return false;
+        }
+        self.chroma = chroma;
+        self.rejected.clear();
+        true
+    }
+
+    /// The person chose `quality`. False when it is the quality already
+    /// asked for: then nothing changes. A rejection stays: the quality
+    /// changes the bitrate, not which profiles the viewer can present.
+    pub(super) fn choose_quality(&mut self, quality: QualityPreset) -> bool {
+        if self.quality == Some(quality) {
+            return false;
+        }
+        self.quality = Some(quality);
+        true
+    }
+
+    /// The viewer could not present `profile`.
+    pub(super) fn reject(&mut self, profile: VideoProfile) {
+        if !self.rejected.contains(&profile) {
+            self.rejected.push(profile);
+        }
+    }
+
+    pub(super) fn chroma(&self) -> ChromaMode {
+        self.chroma
+    }
+
+    /// The profiles to try, best first.
+    pub(super) fn candidates(&self) -> Vec<VideoProfile> {
+        profile_candidates(&self.viewer_profiles, self.chroma, &self.rejected)
+    }
+}
+
 fn start_first_profile(
     streamer: &Arc<Mutex<Box<dyn ScreenStreamer>>>,
     display_id: DisplayId,
@@ -105,12 +182,10 @@ pub(super) async fn run_capture_control(
         format,
         configured_maximum_bitrate,
         active_profile,
-        viewer_profiles: vec![active_profile],
-        requested_chroma: ChromaMode::Yuv420,
+        selection: ProfileSelection::new(active_profile),
         capture_cursor: true,
         recording: false,
         viewer_controls_input: false,
-        rejected_profiles: Vec::new(),
         capture_running: true,
         capture_unavailable_since: None,
         capture_retry_after: std::time::Instant::now(),
@@ -152,12 +227,10 @@ struct CaptureControl {
     format: VideoFormat,
     configured_maximum_bitrate: u32,
     active_profile: VideoProfile,
-    viewer_profiles: Vec<VideoProfile>,
-    requested_chroma: ChromaMode,
+    selection: ProfileSelection,
     capture_cursor: bool,
     recording: bool,
     viewer_controls_input: bool,
-    rejected_profiles: Vec<VideoProfile>,
     capture_running: bool,
     capture_unavailable_since: Option<std::time::Instant>,
     capture_retry_after: std::time::Instant,
@@ -173,16 +246,20 @@ impl CaptureControl {
             }
             ControlCommand::Bitrate(value) => self.set_adaptive_bitrate(value)?,
             ControlCommand::RestartBitrate(value) => self.restart_at_bitrate(value).await?,
-            ControlCommand::Quality(quality) => self.apply_quality(quality, None).await?,
+            ControlCommand::Quality(quality) => {
+                if self.selection.choose_quality(quality) {
+                    self.apply_quality(quality, None).await?;
+                } else {
+                    tracing::info!(?quality, "video quality selection is already in force");
+                }
+            }
             ControlCommand::ViewerCapabilities {
                 profiles,
                 quality,
                 chroma,
                 headless_resolution,
             } => {
-                self.viewer_profiles = profiles;
-                self.requested_chroma = chroma;
-                self.rejected_profiles.clear();
+                self.selection.negotiate(profiles, quality, chroma);
                 self.apply_quality(quality, Some(headless_resolution))
                     .await?;
             }
@@ -225,11 +302,7 @@ impl CaptureControl {
     }
 
     fn candidates(&self) -> Vec<VideoProfile> {
-        profile_candidates(
-            &self.viewer_profiles,
-            self.requested_chroma,
-            &self.rejected_profiles,
-        )
+        self.selection.candidates()
     }
 
     fn start(
@@ -369,7 +442,7 @@ impl CaptureControl {
             tracing::info!(
                 active_profile = ?self.active_profile,
                 ?quality,
-                requested_chroma = ?self.requested_chroma,
+                requested_chroma = ?self.selection.chroma(),
                 "video quality/profile selection retained active configuration"
             );
             return Ok(());
@@ -439,13 +512,15 @@ impl CaptureControl {
     }
 
     async fn apply_chroma(&mut self, chroma: ChromaMode) -> anyhow::Result<()> {
-        self.requested_chroma = chroma;
-        self.rejected_profiles.clear();
+        if !self.selection.choose_chroma(chroma) {
+            tracing::info!(?chroma, "chroma selection is already in force");
+            return Ok(());
+        }
         let candidates = self.candidates();
         if candidates.first() == Some(&self.active_profile) {
             tracing::info!(
                 active_profile = ?self.active_profile,
-                requested_chroma = ?self.requested_chroma,
+                requested_chroma = ?self.selection.chroma(),
                 "chroma selection retained active profile"
             );
             return Ok(());
@@ -455,7 +530,7 @@ impl CaptureControl {
         self.resume(started).await?;
         tracing::info!(
             active_profile = ?self.active_profile,
-            requested_chroma = ?self.requested_chroma,
+            requested_chroma = ?self.selection.chroma(),
             "viewer chroma selection applied"
         );
         Ok(())
@@ -474,7 +549,7 @@ impl CaptureControl {
             );
             return Ok(());
         }
-        self.rejected_profiles.push(profile);
+        self.selection.reject(profile);
         tracing::warn!(
             ?profile,
             reason,

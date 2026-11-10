@@ -193,9 +193,8 @@ impl ControlSink {
 
     /// Sends a message the viewer generates by itself although a person's
     /// action usually sends its type: releasing the keys and buttons still
-    /// held when the window loses focus or changes display, or re-applying
-    /// the session's quality to a new window. It never restarts the idle
-    /// time.
+    /// held when the window loses focus or changes display. It never
+    /// restarts the idle time.
     pub fn send_automatic(&self, message: meshrmm_protocol::SessionMessage) {
         self.deliver(message);
     }
