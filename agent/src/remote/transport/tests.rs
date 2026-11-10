@@ -111,8 +111,9 @@ fn a_different_chroma_lets_a_rejected_profile_be_tried_again() {
 }
 
 #[test]
-fn a_different_quality_lets_a_rejected_profile_be_tried_again() {
+fn a_different_quality_is_applied_and_keeps_a_rejection() {
     let mut selection = fallen_back_to_h264();
+    // The viewer still cannot present the profile at another bitrate.
     assert!(selection.choose_quality(QualityPreset::BestQuality));
-    assert_eq!(selection.candidates(), vec![H265_420, H264_420]);
+    assert_eq!(selection.candidates(), vec![H264_420]);
 }

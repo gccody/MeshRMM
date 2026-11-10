@@ -39,9 +39,9 @@ pub(super) fn profile_candidates(
 
 /// What the session asks of the video: the profiles the viewer can decode,
 /// the chroma and quality the person chose, and the profiles the viewer
-/// could not present. A rejection lasts until the person asks for something
-/// else; the same choice sent again changes nothing, so it cannot bring a
-/// rejected profile back.
+/// could not present. A rejection lasts until the person asks for another
+/// chroma or the viewer connects again; the same choice sent again changes
+/// nothing, so it cannot bring a rejected profile back.
 pub(super) struct ProfileSelection {
     viewer_profiles: Vec<VideoProfile>,
     chroma: ChromaMode,
@@ -87,13 +87,13 @@ impl ProfileSelection {
     }
 
     /// The person chose `quality`. False when it is the quality already
-    /// asked for: then nothing changes.
+    /// asked for: then nothing changes. A rejection stays: the quality
+    /// changes the bitrate, not which profiles the viewer can present.
     pub(super) fn choose_quality(&mut self, quality: QualityPreset) -> bool {
         if self.quality == Some(quality) {
             return false;
         }
         self.quality = Some(quality);
-        self.rejected.clear();
         true
     }
 
