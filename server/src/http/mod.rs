@@ -46,6 +46,8 @@ pub struct AppState {
     pub database: Database,
     /// The settings row, for readers that needn't read it in a transaction.
     pub settings: Arc<crate::settings::Cache>,
+    /// What authentication knows about recently active users.
+    pub accounts: Arc<crate::auth::accounts::Accounts>,
     pub instance_key: InstanceKey,
     pub auth: Arc<AuthState>,
     pub storage: Storage,

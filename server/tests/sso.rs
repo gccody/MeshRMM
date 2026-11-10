@@ -571,3 +571,42 @@ async fn losing_roles_from_sso_groups_closes_sockets_at_once() {
         app.finish().await;
     }
 }
+
+#[tokio::test]
+async fn losing_roles_from_sso_groups_applies_to_the_next_request() {
+    let provider = MockProvider::start().await;
+    for app in common::apps().await {
+        let name = app.name;
+        let mut admin = common::set_up(&app).await;
+        let grouped = settings(&provider, json!({ "default_role_id": null }));
+        let saved = admin.put("/v1/settings/sso", grouped).await;
+        assert_eq!(saved.status, StatusCode::OK, "{name}: {:?}", saved.body);
+        let (mut browser, _) = sign_in(
+            &app,
+            &provider,
+            json!({ "sub": "ada", "email": "ada@example.com", "email_verified": true, "groups": ["rmm-admins"] }),
+        )
+        .await;
+        for _ in 0..2 {
+            let account = browser.get("/v1/account").await;
+            assert_eq!(account.body["is_administrator"], true, "{name}");
+        }
+
+        // The group no longer grants a role.
+        let ungrouped = settings(
+            &provider,
+            json!({ "default_role_id": null, "group_roles": [] }),
+        );
+        let saved = admin.put("/v1/settings/sso", ungrouped).await;
+        assert_eq!(saved.status, StatusCode::OK, "{name}: {:?}", saved.body);
+        let account = browser.get("/v1/account").await;
+        assert_eq!(account.body["is_administrator"], false, "{name}");
+        assert_eq!(account.body["roles"], json!([]), "{name}");
+        assert_eq!(
+            browser.get("/v1/users").await.status,
+            StatusCode::FORBIDDEN,
+            "{name}"
+        );
+        app.finish().await;
+    }
+}

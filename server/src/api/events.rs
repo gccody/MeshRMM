@@ -35,14 +35,13 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::{
     alerts::{AlertEvent, store},
-    auth::{Authorized, SignedIn, session},
+    auth::{Authorized, SignedIn, accounts::ACCESS_RECHECK, session},
     automation::jobs::Viewer,
     http::{ApiError, AppState, client_ip::ClientIp},
     rbac::Permission,
     realtime::{close_frame, metrics::MetricsEvent, presence::PresenceEvent, send},
 };
 
-const RECHECK_INTERVAL: Duration = Duration::from_secs(30);
 /// Browsers don't ping; this keeps proxies from closing a quiet socket and
 /// finds dead ones.
 const PING_INTERVAL: Duration = Duration::from_secs(30);
@@ -107,7 +106,7 @@ async fn serve(
     let Some(mut revision) = send_snapshot(&state, &mut socket, alerts).await else {
         return;
     };
-    let mut recheck = tokio::time::interval(RECHECK_INTERVAL);
+    let mut recheck = tokio::time::interval(ACCESS_RECHECK);
     let mut ping = tokio::time::interval(PING_INTERVAL);
     // Both fire at once; the socket was just authorized.
     recheck.tick().await;

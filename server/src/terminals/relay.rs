@@ -43,7 +43,7 @@ use tokio::sync::oneshot;
 use super::{Claim, Requested, permission};
 use crate::{
     audit::{self, Target},
-    auth::{Authorized, session},
+    auth::{Authorized, accounts::ACCESS_RECHECK, session},
     http::AppState,
     realtime::{LIVENESS, SEND_TIMEOUT},
     settings,
@@ -54,9 +54,6 @@ const PING_INTERVAL: Duration = Duration::from_secs(20);
 /// A browser that hasn't answered three pings is gone. The Agent gets
 /// [`LIVENESS`], like its control connection.
 const BROWSER_SILENCE: Duration = Duration::from_secs(75);
-/// How often the user's sign-in and permissions are checked again, besides
-/// whenever a signed-in user changes something.
-const ACCESS_RECHECK: Duration = Duration::from_secs(30);
 
 /// How a terminal ended.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -273,6 +273,20 @@ CSRF check, since a browser can't attach the header cross-site. `SignedIn`
 `server/src/api/mod.rs` refuses tokens on account security, credential and
 sign-in settings, and the website's sockets.
 
+Authenticating a request reads the session's row (or the token's) every
+time, so an ended session or a revoked token stops working on the next
+request. The settings come from `settings::Cache`, and the user, their roles
+with permissions and their second factors from `auth::accounts::Accounts`
+on `AppState`, so a warm request runs that one statement (plus the
+`last_seen_at` or `last_used_at` write at most once a minute), where it ran
+eight. An account is kept only for the access generation it was loaded in
+(see below): every change that can alter it bumps the generation before
+its response is sent, so the next request reads the database again, and a
+load that raced a change isn't kept. Entries also last at most 30 seconds,
+for changes made outside the server; past 1,000 users the oldest go.
+`server/tests/request_authentication.rs` holds a warm request to one
+statement.
+
 Roles are built from these permissions (`server/src/rbac.rs`):
 
 `devices.view`, `devices.edit`, `devices.enroll`, `devices.delete`,
@@ -301,30 +315,35 @@ Open event sockets, terminals and remote sessions keep checking that their
 user may still use them, and close when the user is signed out, disabled or
 loses the permission they need. Each checks when presence's access
 generation is bumped (`Presence::recheck_access`), and event sockets and
-terminals also every 30 seconds.
+terminals also every 30 seconds (`auth::accounts::ACCESS_RECHECK`). The
+same generation is what keeps the accounts authentication holds valid, so
+the bump that wakes a socket has already made its check read the user
+afresh.
 
-The generation is bumped only by changes that can take access away, after
-they are committed:
+The generation is bumped by changes to a user, their roles or their second
+factors, and by anything else that can take access away, after they are
+committed:
 
 - any successful write to the routes `server/src/api/mod.rs` groups as
   changing access: signing in and out, setup, accepting an invitation and
-  completing a password reset; the account's own security (password, second
-  factors, passkeys, sessions); API tokens; and administration (users,
-  invitations, roles, instance, sign-in, SMTP, SCIM and SSO settings). A new
-  route in those groups signals by default. A write there that changed
-  nothing, such as signing out a browser without a session, says so with
-  `AccessUnchanged`;
+  completing a password reset; the account's own security (profile,
+  password, second factors, passkeys, sessions); API tokens; and
+  administration (users, invitations, roles, instance, sign-in, SMTP, SCIM
+  and SSO settings). A new route in those groups signals by default. A write
+  there that changed nothing, such as signing out a browser without a
+  session, says so with `AccessUnchanged`;
 - an SSO sign-in (`GET /v1/auth/sso/callback`), which reads the user's
   groups again;
-- SCIM requests that disable or delete a user, or change the members of, or
+- SCIM requests that change or delete a user, or change the members of, or
   delete, a group that grants a role.
 
 Everything else (devices, tags, notes, companies, scripts, files, alerts,
 automation, applications) changes no one's access and doesn't signal, so a
 busy server doesn't make every open socket check its access for nothing.
 Deleting a device ends its remote session directly. A change made outside
-the server process, such as `meshrmm-server admin`, is caught by the
-30-second check.
+the server process, such as `meshrmm-server admin`, can't signal: it applies
+within 30 seconds, when the cached account expires and the sockets' periodic
+check runs.
 
 ## The Windows Agent
 
