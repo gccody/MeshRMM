@@ -296,12 +296,6 @@ export function sortAlerts(alerts: readonly Alert[]) {
   return [...alerts].sort(compareAlerts);
 }
 
-// Applies a changed alert to a list with these filters.
-export function applyAlertChange(alerts: readonly Alert[], changed: Alert, filters: AlertFilters) {
-  const others = alerts.filter((alert) => alert.id !== changed.id);
-  return sortAlerts(matchesAlertFilters(changed, filters) ? [...others, changed] : others);
-}
-
 // How many alerts the Alerts page asks for, and so the most it holds.
 export const ALERT_PAGE_LIMIT = 200;
 
@@ -339,6 +333,21 @@ export function applyAlertChanges<L extends BoundedAlerts>(list: L, changes: Ite
 // Whether a truncated list holds fewer alerts than the server would send,
 // after alerts left it, so it should be read again.
 export const needsRefill = (list: BoundedAlerts, limit: number) => list.truncated && list.alerts.length < limit;
+
+// What an alert event means for a list with these filters: the changed
+// alert to merge into it, if any, and whether the list must be read again.
+// The socket's counts stand for changes it didn't send one by one (a rule's
+// alerts deleted with it, changes missed while the socket was closed or fell
+// behind) and name no device, so they always ask for a read. An alert never
+// moves to another device, so in one device's list another device's alert
+// isn't there, can't enter, and can't be in a read on its way: it's ignored.
+export type AlertEventEffect = { change: Alert | null; read: boolean };
+
+export function alertEventEffect(event: AlertEvent, filters: AlertFilters): AlertEventEffect {
+  if (event.type === "alert_counts") return { change: null, read: true };
+  if (event.type !== "alert_upsert" || (filters.device && event.alert.device_id !== filters.device)) return { change: null, read: false };
+  return { change: event.alert, read: false };
+}
 
 // "Resolved by ada@example.com", "Resolved: the condition passed".
 export function resolutionLabel(alert: Pick<Alert, "resolution" | "resolved_by">) {
