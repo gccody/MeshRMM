@@ -594,6 +594,9 @@ CREATE INDEX idx_script_runs_device ON script_runs (device_id, created_at);
 CREATE INDEX idx_script_runs_requester ON script_runs (requested_by_user_id, created_at);
 CREATE INDEX idx_script_runs_created ON script_runs (created_at);
 CREATE INDEX idx_script_runs_job ON script_runs (job_id, device_id);
+-- The dispatcher counts each device's pending runs and the alert engine
+-- looks for lost ones, every pass.
+CREATE INDEX idx_script_runs_status ON script_runs (status, device_id);
 
 CREATE TABLE file_deliveries (
   id TEXT NOT NULL PRIMARY KEY,
@@ -615,6 +618,8 @@ CREATE TABLE file_deliveries (
 CREATE INDEX idx_file_deliveries_device ON file_deliveries (device_id, created_at);
 CREATE INDEX idx_file_deliveries_created ON file_deliveries (created_at);
 CREATE INDEX idx_file_deliveries_job ON file_deliveries (job_id, device_id);
+-- The dispatcher counts each device's pending deliveries every pass.
+CREATE INDEX idx_file_deliveries_status ON file_deliveries (status, device_id);
 
 -- Where notifications go: email to chosen users and everyone holding chosen
 -- roles, or a webhook. Alert rules name the channels they notify.
@@ -759,6 +764,8 @@ CREATE UNIQUE INDEX idx_alerts_unresolved ON alerts (rule_id, device_id, subject
 CREATE INDEX idx_alerts_device ON alerts (device_id, raised_at);
 CREATE INDEX idx_alerts_raised ON alerts (raised_at);
 CREATE INDEX idx_alerts_resolved ON alerts (resolved_at);
+-- Self-healing looks for alerts whose next attempt is due every evaluation.
+CREATE INDEX idx_alerts_remediation ON alerts (remediation_state, next_remediation_at);
 
 -- A script run or file delivery on many devices at once. The job keeps what
 -- it sends, so every device gets the same script even if the library
@@ -972,7 +979,7 @@ CREATE TABLE update_runs (
 CREATE INDEX idx_update_runs_device ON update_runs (device_id, created_at);
 CREATE INDEX idx_update_runs_created ON update_runs (created_at);
 CREATE INDEX idx_update_runs_job ON update_runs (job_id, device_id);
-CREATE INDEX idx_update_runs_status ON update_runs (status);
+CREATE INDEX idx_update_runs_status ON update_runs (status, device_id);
 
 -- How each update of an install went.
 CREATE TABLE update_run_items (
@@ -1119,7 +1126,8 @@ CREATE TABLE application_runs (
 CREATE INDEX idx_application_runs_device ON application_runs (device_id, created_at);
 CREATE INDEX idx_application_runs_created ON application_runs (created_at);
 CREATE INDEX idx_application_runs_job ON application_runs (job_id, device_id);
-CREATE INDEX idx_application_runs_status ON application_runs (status);
+CREATE INDEX idx_application_runs_status ON application_runs (status, device_id);
+CREATE INDEX idx_application_runs_completed ON application_runs (completed_at);
 -- A device does one scan and one install, update or uninstall at a time; two
 -- requests at once can't both start one.
 CREATE UNIQUE INDEX idx_application_runs_one_pending ON application_runs (device_id, (action = 'scan')) WHERE status = 'pending';
@@ -1198,3 +1206,6 @@ CREATE TABLE alert_remediations (
 
 CREATE INDEX idx_alert_remediations_alert ON alert_remediations (alert_id, attempt);
 CREATE INDEX idx_alert_remediations_run ON alert_remediations (script_run_id);
+-- Self-healing looks for running attempts, with and without a script run,
+-- every evaluation.
+CREATE INDEX idx_alert_remediations_status ON alert_remediations (status, script_run_id);
