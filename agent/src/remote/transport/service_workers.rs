@@ -515,7 +515,9 @@ impl InputStatus {
         {
             self.state = Some(next);
         }
-        if self.typing.unwrap_or(false) != typing
+        // Said once at the start too: a viewer that reconnected while the
+        // previous connection's text was being typed still shows it as typing.
+        if self.typing != Some(typing)
             && updates
                 .try_send(SessionMessage::Typing { active: typing })
                 .is_ok()
