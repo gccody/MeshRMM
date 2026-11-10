@@ -1,6 +1,8 @@
 mod transform;
 mod upload;
 
+use super::frame_schedule::{Decoded, VideoPipeline};
+use super::renderer::PresentKind;
 use super::*;
 use crate::stream_reset::ResetPlan;
 use transform::{
@@ -180,86 +182,117 @@ impl WorkerPipeline {
         self.decoder.wants_input()
     }
 
-    pub(super) unsafe fn poll(&mut self, presenter_frames_dropped: u64) -> anyhow::Result<()> {
-        let frames = unsafe { self.decoder.poll()? };
-        unsafe { self.present_decoded(frames, presenter_frames_dropped) }
+    /// Waits up to `timeout_ms` for the swap chain to take another frame,
+    /// or for `wake`.
+    pub(super) unsafe fn wait_until_ready_to_present(
+        &mut self,
+        wake: Option<HANDLE>,
+        timeout_ms: u32,
+    ) {
+        unsafe {
+            self.presentation
+                .renderer
+                .wait_until_ready_to_present(wake, timeout_ms)
+        };
     }
 
-    pub(super) unsafe fn process(
-        &mut self,
-        queued: QueuedFrame,
-        presenter_frames_dropped: u64,
-    ) -> anyhow::Result<Option<QueuedFrame>> {
-        let decoded = unsafe { self.decoder.decode(&queued)? };
-        let accepted = decoded.accepted;
-        unsafe { self.present_decoded(decoded.frames, presenter_frames_dropped)? };
-        Ok((!accepted).then_some(queued))
-    }
-
-    unsafe fn present_decoded(
-        &mut self,
-        frames: Vec<DecodedFrame>,
-        presenter_frames_dropped: u64,
-    ) -> anyhow::Result<()> {
+    fn count_decoded(&mut self, frames: &[DecodedFrame]) {
         self.decoded += frames.len() as u64;
         self.interval_decoded += frames.len() as u64;
-        self.decoded_frames_dropped = self
-            .decoded_frames_dropped
-            .saturating_add(frames.len().saturating_sub(1) as u64);
-        // The decoder may release more than one surface at once. Present only
-        // the newest one so decoder scheduling cannot create a display queue.
-        if let Some(frame) = frames.into_iter().last() {
-            let receive_to_decode_start_us =
-                frame.decode_start_us.saturating_sub(frame.received_at_us);
-            let render_start = monotonic_timestamp_us();
-            unsafe {
-                self.presentation
-                    .renderer
-                    .present(&frame.texture, frame.subresource)?
-            };
-            let presentation_us = monotonic_timestamp_us();
-            self.first_presented.get_or_init(std::time::Instant::now);
-            self.presented += 1;
-            self.interval_presented += 1;
-            tracing::debug!(
-                frame_id = frame.frame_id,
-                receive_to_decode_start_us,
-                decode_us = frame
-                    .decode_complete_us
-                    .saturating_sub(frame.decode_start_us),
-                render_present_us = presentation_us.saturating_sub(render_start),
-                frames_decoded = self.decoded,
-                frames_presented = self.presented,
-                "video frame presented"
-            );
-        }
+    }
+
+    /// Publishes the decode and present rates every two seconds.
+    pub(super) fn update_statistics(&mut self, presenter_frames_dropped: u64) {
         let now_us = monotonic_timestamp_us();
         let elapsed_us = now_us.saturating_sub(self.stats_started_us);
-        if elapsed_us >= 2_000_000 {
-            let elapsed_seconds = elapsed_us as f64 / 1_000_000.0;
-            let decode_fps = self.interval_decoded as f64 / elapsed_seconds;
-            let present_fps = self.interval_presented as f64 / elapsed_seconds;
-            self.debug.update_presentation(
-                Some(decode_fps),
-                present_fps,
-                self.presented,
-                Some(presenter_frames_dropped),
-                self.decoded_frames_dropped,
-            );
-            if self.statistics_log.due() {
-                tracing::info!(
-                    decode_fps,
-                    present_fps,
-                    frames_decoded = self.decoded,
-                    frames_presented = self.presented,
-                    decoded_frames_dropped = self.decoded_frames_dropped,
-                    "decoder/presentation statistics"
-                );
-            }
-            self.interval_decoded = 0;
-            self.interval_presented = 0;
-            self.stats_started_us = now_us;
+        if elapsed_us < 2_000_000 {
+            return;
         }
+        // Pictures decoded but replaced by a newer one before the display
+        // took them.
+        self.decoded_frames_dropped = self.decoded.saturating_sub(self.presented);
+        let elapsed_seconds = elapsed_us as f64 / 1_000_000.0;
+        let decode_fps = self.interval_decoded as f64 / elapsed_seconds;
+        let present_fps = self.interval_presented as f64 / elapsed_seconds;
+        self.debug.update_presentation(
+            Some(decode_fps),
+            present_fps,
+            self.presented,
+            Some(presenter_frames_dropped),
+            self.decoded_frames_dropped,
+        );
+        if self.statistics_log.due() {
+            tracing::info!(
+                decode_fps,
+                present_fps,
+                frames_decoded = self.decoded,
+                frames_presented = self.presented,
+                decoded_frames_dropped = self.decoded_frames_dropped,
+                "decoder/presentation statistics"
+            );
+        }
+        self.interval_decoded = 0;
+        self.interval_presented = 0;
+        self.stats_started_us = now_us;
+    }
+}
+
+impl VideoPipeline for WorkerPipeline {
+    type Picture = DecodedFrame;
+
+    unsafe fn poll(&mut self) -> anyhow::Result<Vec<DecodedFrame>> {
+        let frames = unsafe { self.decoder.poll()? };
+        self.count_decoded(&frames);
+        Ok(frames)
+    }
+
+    fn wants_input(&self) -> bool {
+        self.decoder.wants_input()
+    }
+
+    unsafe fn decode(&mut self, frame: &QueuedFrame) -> anyhow::Result<Decoded<DecodedFrame>> {
+        let decoded = unsafe { self.decoder.decode(frame)? };
+        self.count_decoded(&decoded.frames);
+        Ok(Decoded {
+            accepted: decoded.accepted,
+            pictures: decoded.frames,
+        })
+    }
+
+    unsafe fn ready_to_present(&mut self) -> bool {
+        unsafe { self.presentation.renderer.ready_to_present() }
+    }
+
+    unsafe fn present(&mut self, frame: DecodedFrame, overdue: bool) -> anyhow::Result<()> {
+        let receive_to_decode_start_us = frame.decode_start_us.saturating_sub(frame.received_at_us);
+        let render_start = monotonic_timestamp_us();
+        unsafe {
+            self.presentation.renderer.present(
+                &frame.texture,
+                frame.subresource,
+                if overdue {
+                    PresentKind::Overdue
+                } else {
+                    PresentKind::Normal
+                },
+            )?
+        };
+        let presentation_us = monotonic_timestamp_us();
+        self.first_presented.get_or_init(std::time::Instant::now);
+        self.presented += 1;
+        self.interval_presented += 1;
+        tracing::debug!(
+            frame_id = frame.frame_id,
+            receive_to_decode_start_us,
+            decode_us = frame
+                .decode_complete_us
+                .saturating_sub(frame.decode_start_us),
+            receive_to_present_us = presentation_us.saturating_sub(frame.received_at_us),
+            render_present_us = presentation_us.saturating_sub(render_start),
+            frames_decoded = self.decoded,
+            frames_presented = self.presented,
+            "video frame presented"
+        );
         Ok(())
     }
 }
@@ -412,7 +445,10 @@ struct PendingMetadata {
     decode_start_us: u64,
 }
 
-struct DecodedFrame {
+pub(super) struct DecodedFrame {
+    /// Holds the decoder's surface out of its pool until the picture is
+    /// presented; the decoder would otherwise decode into it again.
+    _sample: Option<IMFSample>,
     texture: ID3D11Texture2D,
     subresource: u32,
     frame_id: u64,
@@ -695,8 +731,13 @@ impl Decoder {
         Ok(())
     }
 
+    /// Whether the decoder takes another frame. The worker offers it every
+    /// queued frame at once, so this also stops at
+    /// [`MAX_DECODER_PENDING_FRAMES`] without a picture out: frames wait in
+    /// the presenter's queue instead.
     fn wants_input(&self) -> bool {
-        !self.asynchronous || self.need_input > 0
+        (!self.asynchronous || self.need_input > 0)
+            && self.pending.len() < MAX_DECODER_PENDING_FRAMES
     }
 
     unsafe fn poll(&mut self) -> anyhow::Result<Vec<DecodedFrame>> {
@@ -721,11 +762,6 @@ impl Decoder {
                 accepted: false,
                 frames: decoded,
             });
-        }
-        if self.pending.len() >= MAX_DECODER_PENDING_FRAMES {
-            bail!(
-                "video decoder buffered more than {MAX_DECODER_PENDING_FRAMES} frames; stopping instead of accumulating latency"
-            );
         }
         let decode_start_us = monotonic_timestamp_us();
         if !self.first_input_logged {
@@ -849,7 +885,7 @@ impl Decoder {
         let sample = sample.context("video decoder returned no sample")?;
         let buffer = unsafe { sample.GetBufferByIndex(0) }
             .context("decoded sample has no surface buffer")?;
-        let (texture, subresource) = match buffer.cast::<IMFDXGIBuffer>() {
+        let (texture, subresource, sample) = match buffer.cast::<IMFDXGIBuffer>() {
             Ok(dxgi) => {
                 let mut raw: *mut c_void = ptr::null_mut();
                 unsafe { dxgi.GetResource(&ID3D11Texture2D::IID, &mut raw) }
@@ -860,16 +896,22 @@ impl Decoder {
                 let texture = unsafe { ID3D11Texture2D::from_raw(raw) };
                 let subresource = unsafe { dxgi.GetSubresourceIndex() }
                     .context("decoded texture subresource unavailable")?;
-                (texture, subresource)
+                (texture, subresource, Some(sample))
             }
-            // A software decoder's picture is in system memory.
-            Err(_) => (unsafe { self.upload.upload(&buffer, self.output_size)? }, 0),
+            // A software decoder's picture is in system memory; the
+            // upload copies it.
+            Err(_) => (
+                unsafe { self.upload.upload(&buffer, self.output_size)? },
+                0,
+                None,
+            ),
         };
         let metadata = self
             .pending
             .pop_front()
             .context("decoder output had no input metadata")?;
         Ok(Some(DecodedFrame {
+            _sample: sample,
             texture,
             subresource,
             frame_id: metadata.frame_id,

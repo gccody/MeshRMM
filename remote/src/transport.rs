@@ -14,6 +14,7 @@ use crate::reconnect::{AttemptProgress, ReconnectPhase, ReconnectStatus};
 
 mod control;
 mod failure;
+mod keyframe;
 mod receiver;
 mod services;
 mod video;
