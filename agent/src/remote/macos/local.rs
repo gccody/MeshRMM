@@ -322,6 +322,8 @@ impl LocalInput {
     }
 
     pub(crate) fn input_state(&self) -> InputState {
+        // Read before the controller is locked; see `blacked_out`.
+        let blacked_out = self.blacked_out();
         self.controller().map_or_else(
             |_| InputState::default(),
             |input| InputState {
@@ -329,12 +331,15 @@ impl LocalInput {
                 viewer_controls_input: input.viewer_controls_input(),
                 agent_pointer_display: input.agent_pointer_display(),
                 agent_input_blocked: input.blocked(),
-                blacked_out: self.blacked_out(),
+                blacked_out,
             },
         )
     }
 
-    /// Undoes everything a session changed, for a helper the session left.
+    /// Whether the screens are blacked out. It takes the blackout lock, which
+    /// `set_blackout` holds while it waits for the controller, so nothing may
+    /// call it with the controller locked: the two would wait for each other
+    /// for good, with the Mac's user still locked out.
     fn blacked_out(&self) -> bool {
         self.blackout
             .lock()
@@ -342,6 +347,7 @@ impl LocalInput {
             .is_some()
     }
 
+    /// Undoes everything a session changed, for a helper the session left.
     pub(crate) fn end_session(&self) {
         let _ = self.set_blackout(false);
         let _ = self.set_agent_input_blocked(false);
@@ -404,21 +410,30 @@ impl ScreenInput for LocalInput {
                 }
             }
         } else if !enabled && blackout.take().is_some() {
-            self.excluded.set("blackout", Vec::new())?;
+            // Input first, so nothing that fails after it leaves the Mac's
+            // user locked out with the screens back.
             self.controller()?
                 .set_blocked(self.manually_blocked.load(Ordering::SeqCst))?;
+            self.excluded.set("blackout", Vec::new())?;
         }
         Ok(())
     }
     fn maintenance_state(&self) -> Option<meshrmm_protocol::SessionMessage> {
+        // Read before the controller is locked; see `blacked_out`.
+        let blacked_out = self.blacked_out();
+        let agent_input_blocked = self.controller().ok()?.blocked();
         Some(meshrmm_protocol::SessionMessage::MaintenanceState {
-            agent_input_blocked: self.controller().ok()?.blocked(),
-            blacked_out: self.blacked_out(),
+            agent_input_blocked,
+            blacked_out,
         })
     }
     fn set_agent_input_blocked(&self, blocked: bool) -> anyhow::Result<()> {
+        // The blackout lock before the controller, as `set_blackout` takes
+        // them, and held until the choice is recorded, so a blackout that
+        // ends meanwhile restores what was asked for here.
+        let blackout = self.blackout.lock().unwrap_or_else(|e| e.into_inner());
         self.controller()?
-            .set_blocked(blocked || self.blacked_out())?;
+            .set_blocked(blocked || blackout.is_some())?;
         self.manually_blocked.store(blocked, Ordering::SeqCst);
         Ok(())
     }
