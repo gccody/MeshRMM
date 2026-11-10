@@ -48,6 +48,10 @@ const RECHECK_INTERVAL: Duration = Duration::from_secs(30);
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// A browser that hasn't answered two pings is gone.
 const SILENCE_LIMIT: Duration = Duration::from_secs(75);
+/// The read buffer each open tab's socket holds (tungstenite's default is
+/// 128 KiB). The website sends only `refresh` and pongs, and the socket
+/// takes no message over 1 KiB.
+const READ_BUFFER_BYTES: usize = 1024;
 /// How often new resource usage readings are sent, as often as Agents report.
 const METRICS_INTERVAL: Duration =
     Duration::from_secs(meshrmm_protocol_types::METRICS_INTERVAL_SECONDS);
@@ -79,6 +83,7 @@ pub async fn subscribe(
     let token = session::token(&headers).expect("an authorized request has a session cookie");
     Ok(upgrade
         .max_message_size(1024)
+        .read_buffer_size(READ_BUFFER_BYTES)
         .on_upgrade(move |socket| serve(state, token, ip, allowed, socket)))
 }
 

@@ -352,6 +352,59 @@ async fn agents_send_system_information_the_website_shows_and_searches() {
 }
 
 #[tokio::test]
+async fn a_snapshot_far_larger_than_the_read_buffer_arrives_whole() {
+    for app in apps().await {
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let desk = app.enroll(&mut admin, "Desk").await;
+        let mut events = admin.events(&server).await.unwrap();
+        receive_json(&mut events).await;
+        let mut control = desk.connect(&server).await.unwrap();
+        receive_json(&mut events).await;
+
+        // Hundreds of KiB, many times the control connection's read buffer
+        // (and tungstenite's default one).
+        let padding = "x".repeat(200);
+        let applications: Vec<_> = (0..2_000)
+            .map(|index| application(&format!("App {index:04} {padding}"), Some("1.0")))
+            .collect();
+        let large = snapshot("SER-1", "10.1.2.3", applications);
+        assert!(large.to_string().len() > 512 * 1024);
+        send_json(&mut control, large).await;
+        receive_json(&mut events).await;
+        let path = format!("/v1/agents/{}/system-info", desk.device_id);
+        let stored = admin.get(&path).await;
+        assert_eq!(stored.status, 200, "{:?}", stored.body);
+        assert_eq!(stored.body["application_count"], 2_000, "{}", app.name);
+        let listed = admin
+            .get(&format!("/v1/agents/{}/applications", desk.device_id))
+            .await;
+        let stored_applications = listed.body["applications"].as_array().unwrap();
+        assert_eq!(stored_applications.len(), 2_000, "{}", app.name);
+        assert_eq!(
+            stored_applications[1_999]["name"],
+            format!("App 1999 {padding}")
+        );
+
+        // A small message after it is still read.
+        send_json(
+            &mut control,
+            snapshot("SER-2", "10.1.2.3", vec![application("7-Zip", None)]),
+        )
+        .await;
+        let event = receive_json(&mut events).await;
+        assert_eq!(
+            device(&event, &desk.device_id)["system"]["serial_number"],
+            "SER-2",
+            "{}",
+            app.name
+        );
+        drop(control);
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
 async fn seeing_system_information_needs_devices_view() {
     for app in apps().await {
         let mut admin = set_up(&app).await;
