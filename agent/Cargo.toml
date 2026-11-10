@@ -137,3 +137,4 @@ zbus = "5"
 [dev-dependencies]
 meshrmm-session-transport = { path = "../crates/session-transport", features = ["test-support"] }
 meshrmm-signaling-client = { workspace = true, features = ["test-support"] }
+tokio = { workspace = true, features = ["test-util"] }

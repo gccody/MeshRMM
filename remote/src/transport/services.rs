@@ -90,8 +90,11 @@ pub(super) fn start_viewer_services(
     for label in SERVICE_CHANNELS {
         let route = Arc::new(ServiceRoute::default());
         routes.insert(label, route.clone());
+        // The writer waits while its channel has no room. The clipboard worker keeps the rest
+        // of its latest copy itself, where a newer copy replaces it, so only one chunk of an
+        // outdated copy can wait here.
         let (outgoing, pending) =
-            mpsc::channel::<SessionMessage>(if label == CLIPBOARD_CHANNEL { 1024 } else { 64 });
+            mpsc::channel::<SessionMessage>(if label == CLIPBOARD_CHANNEL { 1 } else { 64 });
         viewer
             .service_senders
             .lock()
@@ -124,6 +127,11 @@ pub(super) fn start_viewer_services(
     ))
 }
 
+/// A control or input write webrtc-sctp has not taken after this fails the presentation.
+/// Unlike the services, which wait as long as their channel is open, input this late is no
+/// use to the person.
+const CONTROL_WRITE_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Writes queued control messages once the control channel is open.
 fn spawn_control_writer(
     control: tokio::sync::watch::Sender<Option<ServiceChannel>>,
@@ -135,7 +143,14 @@ fn spawn_control_writer(
             let Ok(channel) = wait_control_channel(&control).await else {
                 break;
             };
-            if let Err(error) = meshrmm_session_transport::send(&channel, message).await {
+            let sent = tokio::time::timeout(
+                CONTROL_WRITE_LIMIT,
+                meshrmm_session_transport::send(&channel, message),
+            )
+            .await
+            .context("timed out")
+            .and_then(|sent| sent);
+            if let Err(error) = sent {
                 let _ = errors.send(format!("input/control send failed: {error:#}"));
                 break;
             }
@@ -276,5 +291,49 @@ impl ServiceWorker {
         if label == CHAT_CHANNEL {
             viewer.chat.set_available(false);
         }
+    }
+}
+
+#[cfg(test)]
+mod stall_tests {
+    use super::*;
+    use meshrmm_protocol::FileMessage;
+    use meshrmm_session_transport::test_link::TestLink;
+
+    fn chunk(id: u64, index: u8) -> SessionMessage {
+        SessionMessage::FileTransfer(FileMessage::Chunk {
+            id,
+            data: vec![index; 16 * 1024],
+        })
+    }
+
+    /// The writer waits out a channel without room for longer than the five seconds that used
+    /// to end it, then sends what it held and what comes after.
+    #[tokio::test(start_paused = true)]
+    async fn a_service_writer_carries_on_after_its_channel_has_no_room_for_ten_seconds() {
+        let (mut link, channels) = TestLink::connect(&[FILE_CHANNEL]).await;
+        let route = Arc::new(ServiceRoute::default());
+        route.attach(channels[0].clone());
+        route.peer_ready();
+        let (control, _) = tokio::sync::watch::channel(Some(channels[0].clone()));
+        let (outgoing, pending) = mpsc::channel(64);
+        let writer = spawn_service_writer(FILE_CHANNEL, route, control, pending);
+        link.cut();
+        for index in 0..32 {
+            outgoing.try_send(chunk(1, index)).unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        assert!(!writer.is_finished());
+        link.restore();
+        for index in 0..32 {
+            assert_eq!(
+                link.next().await,
+                (FILE_CHANNEL.to_owned(), chunk(1, index))
+            );
+        }
+        outgoing.try_send(chunk(2, 0)).unwrap();
+        assert_eq!(link.next().await, (FILE_CHANNEL.to_owned(), chunk(2, 0)));
+        writer.abort();
+        link.close().await;
     }
 }

@@ -3,6 +3,8 @@ pub mod identity;
 pub mod queue;
 #[cfg(any(test, feature = "test-support"))]
 pub mod simulated_link;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_link;
 use anyhow::Context;
 use meshrmm_protocol::SessionMessage;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -110,38 +112,57 @@ impl ServiceChannel {
         }
     }
 
-    pub async fn writable(&self) -> anyhow::Result<()> {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let changed = self.changed.notified();
-                tokio::pin!(changed);
-                // Register before inspecting state/capacity to avoid a lost wake.
-                changed.as_mut().enable();
-                use webrtc::data_channel::data_channel_state::RTCDataChannelState;
-                anyhow::ensure!(
-                    self.ready_state() == RTCDataChannelState::Open,
-                    "session channel is not open"
-                );
-                self.wake_when_buffer_drains().await;
-                let (buffered, backlog) = self.channel.backlog().await;
-                if backlog < SEND_QUEUE_LIMIT {
-                    return Ok(());
-                }
-                // Wake once acknowledgements bring the backlog under the limit, at the rate
-                // measured now. A slower rate only wakes this later, never past the buffer
-                // falling under the limit.
-                let threshold = buffered - (backlog - SEND_QUEUE_LIMIT) - 1;
-                self.channel
-                    .set_buffered_amount_low_threshold(threshold)
-                    .await;
-                if self.channel.buffered_amount().await <= threshold {
-                    continue;
-                }
-                changed.await;
+    /// Resolves once the channel is closing or closed. A channel that has not opened yet is
+    /// not closed.
+    pub async fn closed(&self) {
+        use webrtc::data_channel::data_channel_state::RTCDataChannelState;
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if matches!(
+                self.ready_state(),
+                RTCDataChannelState::Closing | RTCDataChannelState::Closed
+            ) {
+                return;
             }
-        })
-        .await
-        .context("session channel buffer remained full for five seconds")?
+            changed.await;
+        }
+    }
+
+    /// Waits for room for as long as the channel stays open, and fails only once it is not
+    /// open. The channel is reliable and ordered, so nothing is lost by waiting. A connection
+    /// that stops carrying anything is ended by the session's own checks (its peer connection
+    /// failing, or staying disconnected past the session's grace period), which close every
+    /// channel and so wake this.
+    pub async fn writable(&self) -> anyhow::Result<()> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            // Register before inspecting state/capacity to avoid a lost wake.
+            changed.as_mut().enable();
+            use webrtc::data_channel::data_channel_state::RTCDataChannelState;
+            anyhow::ensure!(
+                self.ready_state() == RTCDataChannelState::Open,
+                "session channel is not open"
+            );
+            self.wake_when_buffer_drains().await;
+            let (buffered, backlog) = self.channel.backlog().await;
+            if backlog < SEND_QUEUE_LIMIT {
+                return Ok(());
+            }
+            // Wake once acknowledgements bring the backlog under the limit, at the rate
+            // measured now. A slower rate only wakes this later, never past the buffer
+            // falling under the limit.
+            let threshold = buffered - (backlog - SEND_QUEUE_LIMIT) - 1;
+            self.channel
+                .set_buffered_amount_low_threshold(threshold)
+                .await;
+            if self.channel.buffered_amount().await <= threshold {
+                continue;
+            }
+            changed.await;
+        }
     }
 }
 
@@ -204,12 +225,17 @@ impl ServiceRoute {
     }
 }
 
+/// Sends `message`, waiting for webrtc-sctp to take it for as long as the channel stays
+/// open: its send blocks while the connection's pending queue is full. Fails once the channel
+/// closes, as a connection that is gone closes it.
 pub async fn send(channel: &ServiceChannel, message: SessionMessage) -> anyhow::Result<()> {
     let bytes = bytes::Bytes::from(message.encode().context("invalid session message")?);
-    tokio::time::timeout(Duration::from_secs(5), channel.send(&bytes))
-        .await
-        .context("session channel write timed out")?
-        .context("session channel write failed")?;
+    tokio::select! {
+        sent = channel.send(&bytes) => {
+            sent.context("session channel write failed")?;
+        }
+        () = channel.closed() => anyhow::bail!("session channel closed"),
+    }
     Ok(())
 }
 
@@ -567,5 +593,100 @@ mod network_tests {
         .unwrap();
         a.close().await.unwrap();
         b.close().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod stall_tests {
+    use super::*;
+    use crate::test_link::TestLink;
+
+    const MESSAGES: u8 = 32;
+
+    /// The `index`th of a burst, 16 KiB long, so a few fill the channel's queue limit.
+    fn message(index: u8) -> SessionMessage {
+        SessionMessage::FileTransfer(meshrmm_protocol::FileMessage::Chunk {
+            id: 1,
+            data: vec![index; 16 * 1024],
+        })
+    }
+
+    async fn assert_burst_arrives(link: &mut TestLink) {
+        for index in 0..MESSAGES {
+            let (label, received) = link.next().await;
+            assert_eq!(label, FILE_CHANNEL);
+            assert_eq!(received, message(index));
+        }
+    }
+
+    /// While the link carries nothing the channel has no room, past the five seconds that used
+    /// to end its writers; once it carries again every message arrives, in order.
+    #[tokio::test(start_paused = true)]
+    async fn a_writer_waits_out_a_link_that_carries_nothing_for_ten_seconds() {
+        let (mut link, channels) = TestLink::connect(&[FILE_CHANNEL]).await;
+        let channel = channels[0].clone();
+        link.cut();
+        let writer = tokio::spawn(async move {
+            for index in 0..MESSAGES {
+                channel.writable().await?;
+                send(&channel, message(index)).await?;
+            }
+            anyhow::Ok(())
+        });
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(!writer.is_finished(), "{:?}", writer.await);
+        link.restore();
+        assert_burst_arrives(&mut link).await;
+        writer.await.unwrap().unwrap();
+        link.close().await;
+    }
+
+    /// A send that finds webrtc-sctp's pending queue full waits for it as long as the channel
+    /// is open.
+    #[tokio::test(start_paused = true)]
+    async fn a_send_waits_for_a_full_pending_queue_while_the_link_carries_nothing() {
+        let (mut link, channels) = TestLink::connect(&[FILE_CHANNEL]).await;
+        let channel = channels[0].clone();
+        link.cut();
+        let writer = tokio::spawn(async move {
+            for index in 0..MESSAGES {
+                send(&channel, message(index)).await?;
+            }
+            anyhow::Ok(())
+        });
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(!writer.is_finished(), "{:?}", writer.await);
+        link.restore();
+        assert_burst_arrives(&mut link).await;
+        writer.await.unwrap().unwrap();
+        link.close().await;
+    }
+
+    /// Closing the connection ends a writer waiting for room, and one blocked in a send.
+    #[tokio::test(start_paused = true)]
+    async fn closing_the_connection_ends_writers_waiting_on_it() {
+        let (link, channels) = TestLink::connect(&[FILE_CHANNEL]).await;
+        let channel = channels[0].clone();
+        link.cut();
+        let waiting = channel.clone();
+        let room = tokio::spawn(async move {
+            for index in 0..MESSAGES {
+                waiting.writable().await?;
+                send(&waiting, message(index)).await?;
+            }
+            anyhow::Ok(())
+        });
+        let blocked = tokio::spawn(async move {
+            for index in 0..MESSAGES {
+                send(&channel, message(index)).await?;
+            }
+            anyhow::Ok(())
+        });
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(!room.is_finished() && !blocked.is_finished());
+        link.sender.close().await.unwrap();
+        assert!(room.await.unwrap().is_err());
+        assert!(blocked.await.unwrap().is_err());
+        link.receiver.close().await.unwrap();
     }
 }
