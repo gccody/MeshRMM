@@ -45,6 +45,35 @@ struct ViewerInputState {
     pending_pointer: Option<SessionMessage>,
 }
 
+/// Asks the device for a keyframe of `stream_id` unless one was just asked
+/// for: every request the viewer makes comes through here.
+fn request_keyframe(
+    keyframes: &Mutex<KeyframeRequests>,
+    outgoing: &mpsc::UnboundedSender<SessionMessage>,
+    stream_id: VideoStreamId,
+    now_us: u64,
+) {
+    let due = keyframes
+        .lock()
+        .is_ok_and(|mut requests| requests.request(stream_id, now_us));
+    if due {
+        send_keyframe_request(outgoing, stream_id);
+    } else {
+        tracing::trace!(
+            stream_id = stream_id.0,
+            "a keyframe was asked for recently; waiting for it"
+        );
+    }
+}
+
+fn send_keyframe_request(
+    outgoing: &mpsc::UnboundedSender<SessionMessage>,
+    stream_id: VideoStreamId,
+) {
+    tracing::info!(stream_id = stream_id.0, "requesting a video keyframe");
+    let _ = outgoing.send(SessionMessage::RequestKeyframe { stream_id });
+}
+
 impl ViewerControlQueue {
     pub(super) fn new(
         outgoing: mpsc::UnboundedSender<SessionMessage>,
@@ -54,6 +83,26 @@ impl ViewerControlQueue {
             .recording_outgoing
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(outgoing.clone());
+        let keyframes: Arc<Mutex<KeyframeRequests>> = Default::default();
+        {
+            // A recording that fell behind asks for its keyframe through the
+            // same limiter, on the newest connection. A weak sender, so the
+            // recorder never keeps a closed connection's queue open.
+            let keyframes = Arc::clone(&keyframes);
+            let outgoing = outgoing.downgrade();
+            resume_state
+                .recording
+                .set_keyframe_request(move |stream_id| {
+                    if let Some(outgoing) = outgoing.upgrade() {
+                        request_keyframe(
+                            &keyframes,
+                            &outgoing,
+                            stream_id,
+                            monotonic_timestamp_us(),
+                        );
+                    }
+                });
+        }
         Self {
             recording: resume_state.recording.clone(),
             maintenance: Arc::new(Mutex::new(crate::platform::MaintenanceState::default())),
@@ -69,7 +118,7 @@ impl ViewerControlQueue {
                 pending_pointer: None,
             })),
             pointer_changed: Arc::new(Notify::new()),
-            keyframes: Default::default(),
+            keyframes,
             resume_state,
         }
     }
@@ -137,21 +186,8 @@ impl ViewerControlQueue {
         }
     }
 
-    /// Asks the device for a keyframe of `stream_id` unless one was just
-    /// asked for: every request the viewer makes comes through here.
     fn request_keyframe(&self, stream_id: VideoStreamId, now_us: u64) {
-        let due = self
-            .keyframes
-            .lock()
-            .is_ok_and(|mut requests| requests.request(stream_id, now_us));
-        if due {
-            self.send_keyframe_request(stream_id);
-        } else {
-            tracing::trace!(
-                stream_id = stream_id.0,
-                "a keyframe was asked for recently; waiting for it"
-            );
-        }
+        request_keyframe(&self.keyframes, &self.outgoing, stream_id, now_us);
     }
 
     /// Sends a keyframe request that had to wait, or one that went
@@ -175,10 +211,7 @@ impl ViewerControlQueue {
     }
 
     fn send_keyframe_request(&self, stream_id: VideoStreamId) {
-        tracing::info!(stream_id = stream_id.0, "requesting a video keyframe");
-        let _ = self
-            .outgoing
-            .send(SessionMessage::RequestKeyframe { stream_id });
+        send_keyframe_request(&self.outgoing, stream_id);
     }
 
     /// What the viewer window and its presenter send through. Only the
@@ -1192,6 +1225,25 @@ mod tests {
             SessionMessage::SetRecording { enabled: true }
         );
         assert!(first_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_recording_asks_for_keyframes_on_the_newest_connection_through_its_limiter() {
+        let state = ViewerResumeState::default();
+        let (first_tx, mut first_rx) = mpsc::unbounded_channel();
+        let _first = ViewerControlQueue::new(first_tx, state.clone());
+        let (second_tx, mut second_rx) = mpsc::unbounded_channel();
+        let second = ViewerControlQueue::new(second_tx, state.clone());
+        let stream_id = VideoStreamId(4);
+        state.recording.request_keyframe(stream_id);
+        assert_eq!(
+            second_rx.try_recv().unwrap(),
+            SessionMessage::RequestKeyframe { stream_id }
+        );
+        assert!(first_rx.try_recv().is_err());
+        // The window's own request just after waits, as for any other.
+        second.send(SessionMessage::RequestKeyframe { stream_id });
+        assert!(second_rx.try_recv().is_err());
     }
 
     const IDLE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
