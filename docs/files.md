@@ -279,7 +279,11 @@ queue of four pieces, which waits on the socket. An upload's next piece is
 read from the browser's request only when the Agent's socket has taken the
 last, and the Agent's writer takes from a queue of four. The server holds
 one piece at a time either way, so a slow browser or a slow disk slows the
-transfer instead of filling memory.
+transfer instead of filling memory. The Agent, or a browser sending an
+upload, that sends nothing for ten minutes is taken to be gone: an upload
+whose browser has gone quiet ends as `upload_interrupted` and frees its
+place among the transfers, and the device keeps the partial file to resume
+from.
 
 The API, all of it open to API tokens:
 

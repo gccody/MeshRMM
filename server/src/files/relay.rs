@@ -14,6 +14,9 @@
 //! An upload's body goes to the Agent piece by piece, each sent only when
 //! the Agent's socket has taken the one before, so the browser waits on the
 //! device's disk. The Agent says how much its partial file holds at the end.
+//! A browser that sends nothing for [`Timeouts::stall`](super::Timeouts)
+//! has left, as one whose body breaks off has, and the Agent keeps its
+//! partial file for a resume.
 use std::time::Duration;
 
 use axum::{
@@ -40,9 +43,6 @@ use crate::{
     http::{ApiError, AppState},
 };
 
-/// A peer that takes this long to send or take a piece is gone. Long,
-/// since a browser may pause a download.
-const STALL: Duration = Duration::from_secs(10 * 60);
 /// How long the Agent gets to save an upload's last pieces.
 const FINISH_WAIT: Duration = Duration::from_secs(120);
 /// At most this many paths go in an audit event.
@@ -98,10 +98,11 @@ fn entity_tag(size: u64, modified: Option<i64>) -> String {
     format!("\"{size}-{}\"", modified.unwrap_or_default())
 }
 
-/// The next JSON event on the Agent's socket; `None` when it closed.
-async fn next_event(socket: &mut WebSocket) -> Option<FileStreamEvent> {
+/// The next JSON event on the Agent's socket; `None` when it closed or
+/// sent nothing for `stall`.
+async fn next_event(socket: &mut WebSocket, stall: Duration) -> Option<FileStreamEvent> {
     loop {
-        match tokio::time::timeout(STALL, socket.recv()).await {
+        match tokio::time::timeout(stall, socket.recv()).await {
             Ok(Some(Ok(Message::Text(text)))) => return serde_json::from_str(&text).ok(),
             Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {}
             _ => return None,
@@ -252,7 +253,7 @@ pub async fn download(
             return Err(error);
         }
     };
-    let (size, modified) = match next_event(&mut socket).await {
+    let (size, modified) = match next_event(&mut socket, state.files.timeouts().stall).await {
         Some(FileStreamEvent::Begin { size, modified }) => (size, modified),
         Some(FileStreamEvent::Failed { error }) => {
             let error = agent_error(error);
@@ -359,8 +360,9 @@ impl Sending {
         }
         loop {
             let offline = self.claim.offline.clone();
+            let stall = self.state.files.timeouts().stall;
             let frame = tokio::select! {
-                frame = tokio::time::timeout(STALL, self.socket.recv()) => frame,
+                frame = tokio::time::timeout(stall, self.socket.recv()) => frame,
                 () = offline.cancelled() => return self.fail("the device went offline"),
             };
             match frame {
@@ -529,7 +531,8 @@ pub async fn upload(
     )
     .await?;
     let mut socket = socket;
-    match next_event(&mut socket).await {
+    let stall = state.files.timeouts().stall;
+    match next_event(&mut socket, stall).await {
         Some(FileStreamEvent::Ready { received }) if received == offset => {}
         Some(FileStreamEvent::Failed { error }) => return Err(agent_error(error)),
         Some(FileStreamEvent::Ready { received }) => {
@@ -545,7 +548,12 @@ pub async fn upload(
     let room = upload.size - offset;
     let pump = async {
         let mut sent = 0u64;
-        while let Some(frame) = body.next().await {
+        // A browser that vanished without closing its connection sends
+        // nothing more, and is gone like one whose body broke off.
+        while let Some(frame) = tokio::time::timeout(stall, body.next())
+            .await
+            .map_err(|_| Pumped::BrowserLeft)?
+        {
             let Ok(bytes) = frame else {
                 return Err(Pumped::BrowserLeft);
             };
@@ -558,7 +566,7 @@ pub async fn upload(
                 }
                 let piece = Message::Binary(bytes.slice(start..end));
                 if !matches!(
-                    tokio::time::timeout(STALL, agent_tx.send(piece)).await,
+                    tokio::time::timeout(stall, agent_tx.send(piece)).await,
                     Ok(Ok(()))
                 ) {
                     return Err(Pumped::AgentLeft);
@@ -567,7 +575,7 @@ pub async fn upload(
             }
         }
         let end = serde_json::to_string(&FileStreamControl::End).expect("serializes");
-        match tokio::time::timeout(STALL, agent_tx.send(Message::Text(end.into()))).await {
+        match tokio::time::timeout(stall, agent_tx.send(Message::Text(end.into()))).await {
             Ok(Ok(())) => Ok(()),
             _ => Err(Pumped::AgentLeft),
         }

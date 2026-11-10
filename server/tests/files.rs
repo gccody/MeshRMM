@@ -30,6 +30,19 @@ fn quick(state: &mut meshrmm_server::http::AppState) {
     });
 }
 
+/// How long a transfer's peer may send nothing with [`stalls_quickly`].
+const STALL: Duration = Duration::from_millis(1500);
+
+/// [`quick`], and a peer gone quiet for [`STALL`] has left.
+fn stalls_quickly(state: &mut meshrmm_server::http::AppState) {
+    state.files = Files::new(Timeouts {
+        request: Duration::from_secs(5),
+        agent_connect: Duration::from_millis(1500),
+        stall: STALL,
+        ..Timeouts::default()
+    });
+}
+
 fn hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -135,6 +148,48 @@ async fn wait_for_audit(
             events.len()
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Starts an upload of `size` bytes to `path` on `device_id`, and returns
+/// its URL.
+async fn new_upload(
+    admin: &Browser,
+    control: &mut Ws,
+    device_id: &str,
+    path: &str,
+    size: usize,
+) -> String {
+    let call = post(
+        admin,
+        format!("/v1/agents/{device_id}/files/uploads"),
+        json!({ "path": path, "size": size }),
+    );
+    answer(control, json!({ "reply": "upload", "received": 0 })).await;
+    let id = call.await.unwrap().body["id"].as_str().unwrap().to_owned();
+    format!("/v1/file-uploads/{id}")
+}
+
+/// The bytes an upload's transfer socket carries, and whether the server
+/// ended them with `end` rather than closing the socket.
+async fn uploaded(socket: &mut Ws) -> (Vec<u8>, bool) {
+    let mut got = Vec::new();
+    loop {
+        match tokio::time::timeout(common::SOCKET_WAIT, socket.next())
+            .await
+            .expect("the server neither sent more nor closed the socket")
+        {
+            Some(Ok(Message::Binary(bytes))) => got.extend_from_slice(&bytes),
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+            Some(Ok(Message::Text(text))) => {
+                assert_eq!(
+                    serde_json::from_str::<Value>(&text).unwrap(),
+                    json!({ "type": "end" })
+                );
+                return (got, true);
+            }
+            _ => return (got, false),
+        }
     }
 }
 
@@ -984,6 +1039,144 @@ async fn uploads_resume_and_land_only_when_verified() {
             *app.state.presence.access_changes().borrow(),
             access,
             "{name}"
+        );
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn uploads_whose_browser_goes_quiet_end_and_resume() {
+    for app in apps_with(stalls_quickly).await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let (agent, mut control) = enrolled(&app, &mut admin, &server).await;
+        let content: Vec<u8> = (0..300_000u32).map(|index| (index % 251) as u8).collect();
+        let url = new_upload(
+            &admin,
+            &mut control,
+            &agent.device_id,
+            "/srv/in/quiet.bin",
+            content.len(),
+        )
+        .await;
+
+        // The browser sends a part and then nothing, neither more bytes nor
+        // an end, as one that vanished without closing its connection.
+        let first = content[..100_000].to_vec();
+        let body =
+            futures_util::stream::iter([Ok::<_, std::io::Error>(Bytes::from(first.clone()))])
+                .chain(futures_util::stream::pending());
+        let request = admin
+            .request(Method::PUT, &format!("{url}?offset=0"))
+            .body(Body::from_stream(body))
+            .unwrap();
+        let sending = {
+            let mut browser = admin.clone();
+            tokio::spawn(async move { browser.raw(request).await })
+        };
+        let (_, mut socket) = next_transfer(&server, &agent, &mut control).await;
+        event(&mut socket, json!({ "type": "ready", "received": 0 })).await;
+        assert_eq!(
+            uploaded(&mut socket).await,
+            (first, false),
+            "{name}: the Agent's socket closes without an end"
+        );
+        let broken = tokio::time::timeout(common::SOCKET_WAIT, sending)
+            .await
+            .expect("the upload ends")
+            .unwrap();
+        assert_eq!(broken.status, 400, "{name}: {:?}", broken.body);
+        assert_eq!(broken.code(), "upload_interrupted", "{name}");
+        assert_eq!(
+            app.state.files.transfers_on(&agent.device_id),
+            0,
+            "{name}: the transfer's place is free"
+        );
+
+        // The same user goes on, on the same device, from what it has.
+        let request = admin
+            .request(Method::PUT, &format!("{url}?offset=100000"))
+            .body(Body::from(content[100_000..].to_vec()))
+            .unwrap();
+        let sending = {
+            let mut browser = admin.clone();
+            tokio::spawn(async move { browser.raw(request).await })
+        };
+        let (transfer, mut socket) = next_transfer(&server, &agent, &mut control).await;
+        assert_eq!(transfer["transfer"]["offset"], 100_000, "{name}");
+        event(&mut socket, json!({ "type": "ready", "received": 100_000 })).await;
+        assert_eq!(
+            uploaded(&mut socket).await,
+            (content[100_000..].to_vec(), true),
+            "{name}"
+        );
+        event(
+            &mut socket,
+            json!({ "type": "done", "bytes": content.len() }),
+        )
+        .await;
+        let sent = sending.await.unwrap();
+        assert_eq!(sent.status, 200, "{name}: {:?}", sent.body);
+        assert_eq!(sent.body["received"], content.len(), "{name}");
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn uploads_go_on_through_pauses_shorter_than_the_stall_limit() {
+    for app in apps_with(stalls_quickly).await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let (agent, mut control) = enrolled(&app, &mut admin, &server).await;
+        let content: Vec<u8> = (0..80_000u32).map(|index| (index % 251) as u8).collect();
+        let url = new_upload(
+            &admin,
+            &mut control,
+            &agent.device_id,
+            "/srv/in/slow.bin",
+            content.len(),
+        )
+        .await;
+
+        // Ten pieces, each after a pause a fifth of the limit: the whole
+        // body takes twice the limit.
+        let pieces = content
+            .chunks(8_000)
+            .map(|piece| Bytes::from(piece.to_vec()))
+            .collect::<Vec<_>>();
+        let body = futures_util::stream::iter(pieces).then(|piece| async move {
+            tokio::time::sleep(STALL / 5).await;
+            Ok::<_, std::io::Error>(piece)
+        });
+        let request = admin
+            .request(Method::PUT, &format!("{url}?offset=0"))
+            .body(Body::from_stream(body))
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let sending = {
+            let mut browser = admin.clone();
+            tokio::spawn(async move { browser.raw(request).await })
+        };
+        let (_, mut socket) = next_transfer(&server, &agent, &mut control).await;
+        event(&mut socket, json!({ "type": "ready", "received": 0 })).await;
+        assert_eq!(
+            uploaded(&mut socket).await,
+            (content.clone(), true),
+            "{name}"
+        );
+        event(
+            &mut socket,
+            json!({ "type": "done", "bytes": content.len() }),
+        )
+        .await;
+        let sent = sending.await.unwrap();
+        assert_eq!(sent.status, 200, "{name}: {:?}", sent.body);
+        assert_eq!(sent.body["received"], content.len(), "{name}");
+        assert!(
+            started.elapsed() > STALL,
+            "{name}: the body outlasted the limit"
         );
         app.finish().await;
     }
