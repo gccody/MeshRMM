@@ -83,7 +83,7 @@ pub async fn serve(
                         }
                         Ok(AgentStatusMessage::Metrics { metrics }) => {
                             if state.agents.is_current(&device_id, connection.id) {
-                                state.metrics.record(&device_id, metrics).await;
+                                state.metrics.record(&device_id, metrics);
                             }
                         }
                         Ok(AgentStatusMessage::SystemInfo { system }) => {
@@ -157,7 +157,7 @@ pub async fn serve(
     drop(connection);
     // A newer connection from the device keeps reporting.
     if !state.agents.is_connected(&device_id) {
-        state.metrics.disconnected(&device_id).await;
+        state.metrics.disconnected(&device_id);
         // Requests sent on this connection won't be answered.
         state.files.device_disconnected(&device_id);
     }

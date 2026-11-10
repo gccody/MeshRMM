@@ -181,7 +181,9 @@ task.
   Disabling a user or removing their `devices.view` permission closes their
   sockets.
 - **Metrics**: the latest resource readings of each Agent, held in memory.
-  See [devices](devices.md#resource-monitoring).
+  Its writer task stores the finished minutes of every device together
+  every 5 seconds, in one transaction. See
+  [devices](devices.md#resource-monitoring).
 - **Alerts**: the engine's task reads presence and the metrics, raises and
   resolves alerts, and broadcasts them; event sockets of users who may see
   alerts pass them on. See [alerts](alerts.md).

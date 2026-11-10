@@ -153,6 +153,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let automating = automation::spawn(state.clone());
     let updating = updates::spawn(state.clone());
     let applying = applications::spawn(state.clone());
+    let storing_metrics = state.metrics.spawn_writer();
     let handle = Handle::<serve::Endpoint>::new();
     tokio::spawn({
         let handle = handle.clone();
@@ -169,6 +170,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     automating.abort();
     updating.abort();
     applying.abort();
+    // Before the database closes, so the finished minutes waiting are kept.
+    storing_metrics.stop().await;
     state.turn.stop().await;
     state.database.close().await;
     served

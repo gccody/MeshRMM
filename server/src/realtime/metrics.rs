@@ -7,13 +7,19 @@
 //! next minute's first reading arrives or the Agent disconnects, and rows are
 //! kept for [`HISTORY_MS`]. Readings are stamped with the server's clock, so
 //! an Agent's wrong clock can't misplace them.
+//!
+//! Finished minutes wait in memory and the writer task stores them every
+//! [`FLUSH_INTERVAL`], all in one transaction, so a minute reaches the history
+//! within that long. Writing each on its own would be one statement per
+//! device per minute: 167 a second for 10,000 Agents.
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque, btree_map::Entry},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use meshrmm_protocol_types::SystemMetrics;
-use sea_query::{Expr, ExprTrait, OnConflict, Order, Query};
+use sea_query::{Expr, ExprTrait, InsertStatement, OnConflict, Order, Query};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -28,6 +34,24 @@ pub const HISTORY_MS: i64 = 7 * DAY_MS;
 /// Readings closer together than this are dropped, which bounds what an
 /// Agent that reports too often can make the server keep.
 const MIN_SPACING_MS: i64 = 2 * SECOND_MS;
+/// How often the writer task stores the finished minutes.
+pub const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+/// The most finished minutes kept waiting while the database can't take
+/// them: 2 minutes of 100,000 Agents, or 20 of 10,000, in about 50 MB. The
+/// oldest go first.
+const MAX_PENDING_MINUTES: usize = 250_000;
+/// Rows per insert statement. Each binds [`ROW_COLUMNS`] (11) parameters, so
+/// 2,000 rows bind 22,000: under SQLite's limit of 32,766 and PostgreSQL's of
+/// 65,535.
+const ROWS_PER_STATEMENT: usize = 2_000;
+/// When a batch is refused, minutes are tried one at a time; if this many in
+/// a row are refused with none stored, it is the database, not the minutes,
+/// and the rest wait for the next flush. Without it a database refusing
+/// everything would take one statement per waiting minute, every flush. The
+/// trade-off: if this many genuinely bad minutes sort first (by minute, so
+/// one minute's devices), the good ones behind them wait too, until the bad
+/// ones age out of the bound.
+const REFUSALS_BEFORE_GIVING_UP: usize = 1_000;
 
 /// A device's latest report.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -180,17 +204,111 @@ struct State {
     sequence: u64,
 }
 
+/// Finished minutes waiting for the writer, at most one per device and
+/// minute: PostgreSQL refuses an upsert that names a row twice.
+#[derive(Debug)]
+struct Pending {
+    /// By minute first, so the oldest are dropped first.
+    minutes: BTreeMap<(i64, String), Totals>,
+    limit: usize,
+    /// Minutes dropped for room since the last stored batch.
+    dropped: u64,
+}
+
+impl Pending {
+    fn new(limit: usize) -> Self {
+        Self {
+            minutes: BTreeMap::new(),
+            limit,
+            dropped: 0,
+        }
+    }
+
+    /// Queues a minute, merging it into one already waiting for the device,
+    /// as the upsert merges it into a stored one.
+    fn insert(&mut self, device_id: &str, minute: Totals) {
+        match self.minutes.entry((minute.start, device_id.to_owned())) {
+            Entry::Occupied(mut waiting) => {
+                waiting.get_mut().add(&minute.point(), minute.samples);
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(minute);
+                self.trim();
+            }
+        }
+    }
+
+    fn trim(&mut self) {
+        while self.minutes.len() > self.limit {
+            self.minutes.pop_first();
+            if self.dropped == 0 {
+                tracing::warn!(
+                    limit = self.limit,
+                    "the database is not keeping up with resource usage history; dropping the oldest minutes"
+                );
+            }
+            self.dropped += 1;
+        }
+    }
+
+    fn take(&mut self) -> Vec<Queued> {
+        std::mem::take(&mut self.minutes).into_iter().collect()
+    }
+
+    /// Queues again minutes a failed write took, under the ones queued since.
+    fn restore(&mut self, minutes: Vec<Queued>) {
+        let newer = std::mem::replace(&mut self.minutes, minutes.into_iter().collect());
+        for ((_, device_id), minute) in newer {
+            self.insert(&device_id, minute);
+        }
+        self.trim();
+    }
+
+    /// Dropped minutes since the last call, once the database caught up.
+    fn caught_up(&mut self) -> u64 {
+        std::mem::take(&mut self.dropped)
+    }
+}
+
+/// What one flush stored.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Flushed {
+    /// Device minutes written.
+    pub minutes: usize,
+    pub statements: usize,
+    /// Minutes the database refused on their own while others were stored.
+    pub refused: usize,
+}
+
+#[derive(Debug, Default)]
+struct Writer {
+    /// Whether the last flush failed, so an outage is logged once.
+    failing: bool,
+    /// Statements tried for a single minute after a refused batch.
+    tried_alone: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct Metrics {
     database: Database,
     state: Arc<Mutex<State>>,
+    pending: Arc<Mutex<Pending>>,
+    /// Held while writing, so a device's history isn't deleted between a
+    /// flush taking its minutes and storing them.
+    writer: Arc<tokio::sync::Mutex<Writer>>,
 }
 
 impl Metrics {
     pub fn new(database: Database) -> Self {
+        Self::with_limit(database, MAX_PENDING_MINUTES)
+    }
+
+    fn with_limit(database: Database, limit: usize) -> Self {
         Self {
             database,
             state: Arc::default(),
+            pending: Arc::new(Mutex::new(Pending::new(limit))),
+            writer: Arc::default(),
         }
     }
 
@@ -201,12 +319,19 @@ impl Metrics {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Records a reading from the device's connected Agent, and stores the
-    /// previous minute when this one starts the next.
-    pub async fn record(&self, device_id: &str, metrics: SystemMetrics) {
+    fn pending(&self) -> std::sync::MutexGuard<'_, Pending> {
+        // As for `state`.
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Records a reading from the device's connected Agent, and queues the
+    /// previous minute for storing when this one starts the next.
+    pub fn record(&self, device_id: &str, metrics: SystemMetrics) {
         let finished = self.record_at(device_id, metrics.sanitized(), now_ms());
         if let Some(finished) = finished {
-            self.store(device_id, &finished).await;
+            self.pending().insert(device_id, finished);
         }
     }
 
@@ -248,17 +373,21 @@ impl Metrics {
     }
 
     /// The device's Agent is offline: its live readings are dropped and its
-    /// unfinished minute is stored.
-    pub async fn disconnected(&self, device_id: &str) {
+    /// unfinished minute is queued for storing.
+    pub fn disconnected(&self, device_id: &str) {
         let device = self.state().devices.remove(device_id);
         if let Some(minute) = device.and_then(|device| device.minute) {
-            self.store(device_id, &minute).await;
+            self.pending().insert(device_id, minute);
         }
     }
 
     /// The device was deleted: its readings and history are dropped.
     pub async fn forget(&self, device_id: &str) -> db::Result<()> {
         self.state().devices.remove(device_id);
+        let _writing = self.writer.lock().await;
+        self.pending()
+            .minutes
+            .retain(|(_, waiting), _| waiting != device_id);
         self.database
             .execute(
                 &Query::delete()
@@ -327,73 +456,236 @@ impl Metrics {
         Ok(buckets(rows, step))
     }
 
-    async fn store(&self, device_id: &str, minute: &Totals) {
-        let point = minute.point();
-        // A reconnect within the minute stores it again; the two merge.
-        let weighted = |column: &str| {
-            Expr::cust(format!(
-                "(device_metrics.{column} * device_metrics.samples + excluded.{column} * excluded.samples) \
-                 / (device_metrics.samples + excluded.samples)"
-            ))
-        };
-        let stored = self
-            .database
-            .execute(
-                &Query::insert()
-                    .into_table(DeviceMetrics::Table)
-                    .columns(ROW_COLUMNS)
-                    .values_panic([
-                        device_id.into(),
-                        minute.start.into(),
-                        minute.samples.into(),
-                        point.cpu_percent.into(),
-                        point.cpu_percent_max.into(),
-                        point.memory_used_bytes.into(),
-                        point.memory_total_bytes.into(),
-                        point.network_received_bytes_per_second.into(),
-                        point.network_sent_bytes_per_second.into(),
-                        point.storage_used_bytes.into(),
-                        point.storage_total_bytes.into(),
-                    ])
-                    .on_conflict(
-                        OnConflict::columns([DeviceMetrics::DeviceId, DeviceMetrics::Minute])
-                            .values([
-                                (DeviceMetrics::CpuPercent, weighted("cpu_percent")),
-                                (DeviceMetrics::MemoryUsedBytes, weighted("memory_used_bytes")),
-                                (
-                                    DeviceMetrics::NetworkReceivedBytesPerSecond,
-                                    weighted("network_received_bytes_per_second"),
-                                ),
-                                (
-                                    DeviceMetrics::NetworkSentBytesPerSecond,
-                                    weighted("network_sent_bytes_per_second"),
-                                ),
-                                (
-                                    DeviceMetrics::CpuPercentMax,
-                                    Expr::cust(
-                                        "CASE WHEN excluded.cpu_percent_max > device_metrics.cpu_percent_max \
-                                         THEN excluded.cpu_percent_max ELSE device_metrics.cpu_percent_max END",
-                                    ),
-                                ),
-                                (
-                                    DeviceMetrics::Samples,
-                                    Expr::cust("device_metrics.samples + excluded.samples"),
-                                ),
-                            ])
-                            .update_columns([
-                                DeviceMetrics::MemoryTotalBytes,
-                                DeviceMetrics::StorageUsedBytes,
-                                DeviceMetrics::StorageTotalBytes,
-                            ])
-                            .to_owned(),
-                    )
-                    .to_owned(),
-            )
-            .await;
-        if let Err(error) = stored {
-            tracing::warn!(device_id, %error, "could not store a minute of the device's resource usage");
+    /// Starts the task that stores the finished minutes every
+    /// [`FLUSH_INTERVAL`].
+    pub fn spawn_writer(&self) -> HistoryWriter {
+        let metrics = self.clone();
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(FLUSH_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        // A failure is logged, and its minutes wait for the next.
+                        let _ = metrics.flush().await;
+                    }
+                    _ = &mut stopped => break,
+                }
+            }
+            let _ = metrics.flush().await;
+        });
+        HistoryWriter { stop, task }
+    }
+
+    /// Stores every finished minute waiting, in one transaction. The minutes
+    /// of a failed flush wait for the next.
+    pub async fn flush(&self) -> db::Result<Flushed> {
+        let mut writer = self.writer.lock().await;
+        let minutes = self.pending().take();
+        if minutes.is_empty() {
+            return Ok(Flushed::default());
+        }
+        match self.write(&mut writer, minutes).await {
+            Ok(flushed) => {
+                if std::mem::take(&mut writer.failing) {
+                    tracing::info!("storing resource usage history again");
+                }
+                let dropped = self.pending().caught_up();
+                if dropped > 0 {
+                    tracing::warn!(
+                        dropped,
+                        "minutes of resource usage history were dropped while the database was behind"
+                    );
+                }
+                Ok(flushed)
+            }
+            Err((error, unwritten)) => {
+                self.pending().restore(unwritten);
+                if std::mem::replace(&mut writer.failing, true) {
+                    tracing::debug!(%error, "still could not store resource usage history");
+                } else {
+                    tracing::warn!(%error, "could not store resource usage history; retrying");
+                }
+                Err(error)
+            }
         }
     }
+
+    /// Writes the minutes, or fails with those not written.
+    async fn write(
+        &self,
+        writer: &mut Writer,
+        minutes: Vec<Queued>,
+    ) -> Result<Flushed, (sqlx::Error, Vec<Queued>)> {
+        match self.write_together(&minutes).await {
+            Ok(statements) => {
+                return Ok(Flushed {
+                    minutes: minutes.len(),
+                    statements,
+                    refused: 0,
+                });
+            }
+            Err(Failed::Statement(sqlx::Error::Database(_))) => {}
+            Err(Failed::Statement(error) | Failed::Transaction(error)) => {
+                return Err((error, minutes));
+            }
+        }
+        // The database refused a statement, which rolled back the rest: store
+        // each minute on its own, so a minute it refuses loses only itself.
+        let mut flushed = Flushed::default();
+        let mut refused = Vec::new();
+        let mut refusal = None;
+        let mut rest = minutes.into_iter();
+        while let Some(minute) = rest.next() {
+            writer.tried_alone += 1;
+            match self
+                .database
+                .execute(&upsert(std::slice::from_ref(&minute)))
+                .await
+            {
+                Ok(_) => {
+                    flushed.minutes += 1;
+                    flushed.statements += 1;
+                }
+                Err(error @ sqlx::Error::Database(_)) => {
+                    refused.push(minute);
+                    if flushed.minutes == 0 && refused.len() == REFUSALS_BEFORE_GIVING_UP {
+                        refused.extend(rest);
+                        return Err((refusal.unwrap_or(error), refused));
+                    }
+                    refusal.get_or_insert(error);
+                }
+                Err(error) => {
+                    refused.push(minute);
+                    refused.extend(rest);
+                    return Err((error, refused));
+                }
+            }
+        }
+        match refusal {
+            // Refusing every minute is about the database, not the minutes:
+            // they wait, as a failed flush's do.
+            Some(error) if flushed.minutes == 0 => Err((error, refused)),
+            Some(error) => {
+                tracing::warn!(
+                    refused = refused.len(),
+                    %error,
+                    "the database refused minutes of resource usage history; they are dropped"
+                );
+                flushed.refused = refused.len();
+                Ok(flushed)
+            }
+            None => Ok(flushed),
+        }
+    }
+
+    /// Writes the minutes in one transaction, a chunk per statement, and
+    /// returns how many statements that took.
+    async fn write_together(&self, minutes: &[Queued]) -> Result<usize, Failed> {
+        let mut transaction = self.database.begin().await.map_err(Failed::Transaction)?;
+        let mut statements = 0;
+        for chunk in minutes.chunks(ROWS_PER_STATEMENT) {
+            transaction
+                .execute(&upsert(chunk))
+                .await
+                .map_err(Failed::Statement)?;
+            statements += 1;
+        }
+        transaction.commit().await.map_err(Failed::Transaction)?;
+        Ok(statements)
+    }
+}
+
+/// A finished minute waiting for the writer, by its start and device.
+type Queued = ((i64, String), Totals);
+
+enum Failed {
+    /// An insert failed.
+    Statement(sqlx::Error),
+    /// Beginning or committing the transaction failed.
+    Transaction(sqlx::Error),
+}
+
+/// The task storing finished minutes.
+pub struct HistoryWriter {
+    stop: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl HistoryWriter {
+    /// Stores the minutes waiting, then ends the task.
+    pub async fn stop(self) {
+        let _ = self.stop.send(());
+        let _ = self.task.await;
+    }
+}
+
+/// Inserts the minutes, merging each into one already stored for its device
+/// and minute, as when a reconnect within the minute stores it again.
+fn upsert(minutes: &[Queued]) -> InsertStatement {
+    let weighted = |column: &str| {
+        Expr::cust(format!(
+            "(device_metrics.{column} * device_metrics.samples + excluded.{column} * excluded.samples) \
+             / (device_metrics.samples + excluded.samples)"
+        ))
+    };
+    let mut statement = Query::insert()
+        .into_table(DeviceMetrics::Table)
+        .columns(ROW_COLUMNS)
+        .to_owned();
+    for ((start, device_id), minute) in minutes {
+        let point = minute.point();
+        statement.values_panic([
+            device_id.as_str().into(),
+            (*start).into(),
+            minute.samples.into(),
+            point.cpu_percent.into(),
+            point.cpu_percent_max.into(),
+            point.memory_used_bytes.into(),
+            point.memory_total_bytes.into(),
+            point.network_received_bytes_per_second.into(),
+            point.network_sent_bytes_per_second.into(),
+            point.storage_used_bytes.into(),
+            point.storage_total_bytes.into(),
+        ]);
+    }
+    statement.on_conflict(
+        OnConflict::columns([DeviceMetrics::DeviceId, DeviceMetrics::Minute])
+            .values([
+                (DeviceMetrics::CpuPercent, weighted("cpu_percent")),
+                (
+                    DeviceMetrics::MemoryUsedBytes,
+                    weighted("memory_used_bytes"),
+                ),
+                (
+                    DeviceMetrics::NetworkReceivedBytesPerSecond,
+                    weighted("network_received_bytes_per_second"),
+                ),
+                (
+                    DeviceMetrics::NetworkSentBytesPerSecond,
+                    weighted("network_sent_bytes_per_second"),
+                ),
+                (
+                    DeviceMetrics::CpuPercentMax,
+                    Expr::cust(
+                        "CASE WHEN excluded.cpu_percent_max > device_metrics.cpu_percent_max \
+                         THEN excluded.cpu_percent_max ELSE device_metrics.cpu_percent_max END",
+                    ),
+                ),
+                (
+                    DeviceMetrics::Samples,
+                    Expr::cust("device_metrics.samples + excluded.samples"),
+                ),
+            ])
+            .update_columns([
+                DeviceMetrics::MemoryTotalBytes,
+                DeviceMetrics::StorageUsedBytes,
+                DeviceMetrics::StorageTotalBytes,
+            ])
+            .to_owned(),
+    );
+    statement
 }
 
 const ROW_COLUMNS: [DeviceMetrics; 11] = [
@@ -555,6 +847,131 @@ mod tests {
         assert_eq!(json["cpu_percent"], 3.0);
         assert_eq!(json["at"], 10 * SECOND_MS);
         assert!(json.get("sequence").is_none());
+    }
+
+    async fn stored_samples(metrics: &Metrics) -> Vec<i64> {
+        let rows: Vec<(i64,)> = metrics
+            .database
+            .fetch_all(
+                &Query::select()
+                    .column(DeviceMetrics::Samples)
+                    .from(DeviceMetrics::Table)
+                    .to_owned(),
+            )
+            .await
+            .unwrap();
+        rows.into_iter().map(|(samples,)| samples).collect()
+    }
+
+    fn minute(start: i64, cpu: f64) -> Totals {
+        Totals::new(start * MINUTE_MS, &Point::of(0, &sample(cpu as f32, 10)), 1)
+    }
+
+    #[test]
+    fn waiting_minutes_merge_per_device_and_minute() {
+        let mut pending = Pending::new(10);
+        pending.insert("a", minute(1, 10.0));
+        pending.insert("a", minute(1, 30.0));
+        pending.insert("b", minute(1, 50.0));
+        let waiting = pending.take();
+        assert_eq!(waiting.len(), 2);
+        let ((start, device_id), merged) = &waiting[0];
+        assert_eq!((*start, device_id.as_str()), (MINUTE_MS, "a"));
+        assert_eq!(merged.samples, 2);
+        assert_eq!(merged.point().cpu_percent, 20.0);
+        assert_eq!(merged.point().cpu_percent_max, 30.0);
+        assert!(pending.take().is_empty());
+    }
+
+    #[test]
+    fn the_wait_is_bounded_by_dropping_the_oldest_minutes() {
+        let mut pending = Pending::new(3);
+        for start in 0..5 {
+            pending.insert("a", minute(start, 1.0));
+        }
+        assert_eq!(pending.caught_up(), 2);
+        assert_eq!(pending.caught_up(), 0, "counted once per incident");
+        let starts = |pending: &mut Pending| -> Vec<i64> {
+            let waiting = pending.take();
+            let starts = waiting
+                .iter()
+                .map(|((start, _), _)| start / MINUTE_MS)
+                .collect();
+            pending.restore(waiting);
+            starts
+        };
+        assert_eq!(starts(&mut pending), [2, 3, 4]);
+
+        // A failed flush's minutes come back under the newer ones and the
+        // bound, merging with any queued since.
+        let failed = pending.take();
+        pending.insert("a", minute(4, 1.0));
+        pending.insert("a", minute(5, 1.0));
+        pending.restore(failed);
+        assert_eq!(pending.caught_up(), 1);
+        let waiting = pending.take();
+        assert_eq!(waiting.len(), 3);
+        assert_eq!(waiting[0].0.0, 3 * MINUTE_MS);
+        assert_eq!(waiting[1].1.samples, 2, "minute 4 merged");
+    }
+
+    #[tokio::test]
+    async fn a_failed_flush_keeps_its_minutes_for_the_next() {
+        // No tables yet, so storing fails.
+        let metrics = store().await;
+        metrics.record_at("a", sample(10.0, 10), 1_000 * MINUTE_MS);
+        metrics.disconnected("a");
+        assert!(metrics.flush().await.is_err());
+        assert!(metrics.writer.lock().await.failing);
+        assert_eq!(metrics.pending().minutes.len(), 1);
+
+        metrics.database.migrate().await.unwrap();
+        let flushed = metrics.flush().await.unwrap();
+        assert_eq!(
+            flushed,
+            Flushed {
+                minutes: 1,
+                statements: 1,
+                refused: 0
+            }
+        );
+        assert!(!metrics.writer.lock().await.failing);
+        assert_eq!(stored_samples(&metrics).await, [1]);
+    }
+
+    #[tokio::test]
+    async fn a_database_refusing_everything_is_tried_alone_only_so_often() {
+        // No tables yet, so every statement is refused.
+        let metrics = store().await;
+        let waiting = REFUSALS_BEFORE_GIVING_UP + 500;
+        for device in 0..waiting {
+            let device_id = format!("device-{device}");
+            metrics.record_at(&device_id, sample(10.0, 10), 1_000 * MINUTE_MS);
+            metrics.disconnected(&device_id);
+        }
+        assert!(metrics.flush().await.is_err());
+        assert_eq!(
+            metrics.writer.lock().await.tried_alone,
+            REFUSALS_BEFORE_GIVING_UP as u64
+        );
+        assert_eq!(metrics.pending().minutes.len(), waiting, "all of them wait");
+
+        metrics.database.migrate().await.unwrap();
+        let flushed = metrics.flush().await.unwrap();
+        assert_eq!((flushed.minutes, flushed.statements), (waiting, 1));
+        assert_eq!(stored_samples(&metrics).await.len(), waiting);
+    }
+
+    #[tokio::test]
+    async fn the_writer_stores_what_waits_when_it_stops() {
+        let metrics = store().await;
+        metrics.database.migrate().await.unwrap();
+        let writer = metrics.spawn_writer();
+        metrics.record_at("a", sample(10.0, 10), 1_000 * MINUTE_MS);
+        metrics.disconnected("a");
+        writer.stop().await;
+        assert!(metrics.pending().minutes.is_empty());
+        assert_eq!(stored_samples(&metrics).await, [1]);
     }
 
     #[test]

@@ -396,17 +396,19 @@ async fn agents_report_resource_usage_to_the_website_and_history() {
         assert_eq!(point["storage_used_bytes"], 750);
         assert_eq!(point["storage_total_bytes"], 1_000);
 
-        // Going offline stores the unfinished minute and ends the live view.
+        // Going offline queues the unfinished minute for the history writer,
+        // and ends the live view.
         drop(control);
         receive_json(&mut events).await;
-        let mut stored = Vec::new();
-        for _ in 0..50 {
-            stored = stored_minutes(&app, &agent.device_id).await;
-            if !stored.is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        assert!(stored_minutes(&app, &agent.device_id).await.is_empty());
+        let flushed = app.state.metrics.flush().await.unwrap();
+        assert_eq!(
+            (flushed.minutes, flushed.statements),
+            (1, 1),
+            "{}",
+            app.name
+        );
+        let stored = stored_minutes(&app, &agent.device_id).await;
         assert_eq!(stored, [(1, 20.0, 20.0)], "{}", app.name);
         assert!(admin.get(&path).await.body["latest"].is_null());
 
@@ -417,13 +419,8 @@ async fn agents_report_resource_usage_to_the_website_and_history() {
         assert_eq!(receive_json(&mut events).await["type"], "metrics");
         drop(control);
         receive_json(&mut events).await;
-        for _ in 0..50 {
-            stored = stored_minutes(&app, &agent.device_id).await;
-            if stored.iter().map(|minute| minute.0).sum::<i64>() == 2 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        app.state.metrics.flush().await.unwrap();
+        let stored = stored_minutes(&app, &agent.device_id).await;
         // Unless the minute turned between the two readings.
         if stored.len() == 1 {
             assert_eq!(stored, [(2, 40.0, 60.0)], "{}", app.name);
@@ -438,13 +435,153 @@ async fn agents_report_resource_usage_to_the_website_and_history() {
         assert_eq!(points.last().unwrap()["cpu_percent_max"], 60.0);
         assert_eq!(admin.get(&format!("{path}?range=year")).await.status, 400);
 
-        // Deleting the device removes its history.
+        // Deleting the device removes its history, and the minute still
+        // waiting to be stored.
+        let mut control = agent.connect(&server).await.unwrap();
+        receive_json(&mut events).await;
+        send_json(&mut control, metrics_report(80.0, 8_000)).await;
+        assert_eq!(receive_json(&mut events).await["type"], "metrics");
+        drop(control);
+        receive_json(&mut events).await;
         let deleted = admin
             .delete(&format!("/v1/agents/{}", agent.device_id))
             .await;
         assert_eq!(deleted.status, 204, "{:?}", deleted.body);
+        assert_eq!(app.state.metrics.flush().await.unwrap().minutes, 0);
         assert!(stored_minutes(&app, &agent.device_id).await.is_empty());
         assert_eq!(admin.get(&path).await.status, 404);
+        app.finish().await;
+    }
+}
+
+fn usage(cpu: f32, received: u64) -> meshrmm_protocol_types::SystemMetrics {
+    meshrmm_protocol_types::SystemMetrics {
+        cpu_percent: cpu,
+        memory_used_bytes: 4_000,
+        memory_total_bytes: 16_000,
+        network_received_bytes_per_second: received,
+        network_sent_bytes_per_second: 500,
+        uptime_seconds: 3_600,
+        volumes: Vec::new(),
+    }
+}
+
+/// Queues a minute of one reading for the device, as when its Agent reports
+/// once and goes offline.
+fn report_once(app: &App, device_id: &str, cpu: f32) {
+    app.state.metrics.record(device_id, usage(cpu, 2_000));
+    app.state.metrics.disconnected(device_id);
+}
+
+#[tokio::test]
+async fn finished_minutes_reach_the_history_in_few_statements() {
+    for app in apps().await {
+        let devices: Vec<String> = (0..2_500).map(|n| format!("device-{n}")).collect();
+        for device_id in &devices {
+            report_once(&app, device_id, 10.0);
+        }
+        // A reconnect within the minute queues it twice; the two merge, which
+        // PostgreSQL needs of a statement that names a row once.
+        report_once(&app, &devices[0], 30.0);
+
+        let flushed = app.state.metrics.flush().await.unwrap();
+        let first = stored_minutes(&app, &devices[0]).await;
+        // Unless the minute turned between the two reports.
+        let expected = if first.len() == 1 {
+            assert_eq!(first, [(2, 20.0, 30.0)], "{}", app.name);
+            2_500
+        } else {
+            2_501
+        };
+        assert_eq!(flushed.minutes, expected, "{}", app.name);
+        assert_eq!(flushed.statements, 2, "2,000 rows a statement");
+        assert_eq!(flushed.refused, 0);
+        assert_eq!(
+            stored_minutes(&app, &devices[2_499]).await,
+            [(1, 10.0, 10.0)]
+        );
+        assert_eq!(app.state.metrics.flush().await.unwrap().statements, 0);
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn a_deleted_devices_waiting_minutes_are_dropped_and_the_rest_stored() {
+    for app in apps().await {
+        report_once(&app, "kept", 10.0);
+        report_once(&app, "deleted", 20.0);
+        app.state.metrics.forget("deleted").await.unwrap();
+        let flushed = app.state.metrics.flush().await.unwrap();
+        assert_eq!(flushed.minutes, 1, "{}", app.name);
+        assert_eq!(stored_minutes(&app, "kept").await, [(1, 10.0, 10.0)]);
+        assert!(stored_minutes(&app, "deleted").await.is_empty());
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn a_minute_the_database_refuses_loses_only_itself() {
+    use sea_query::Query;
+    for app in apps().await {
+        // Merging into this stored minute overflows PostgreSQL's integers;
+        // SQLite turns them into reals instead. Stored for this minute and
+        // the next, in case it turns.
+        let now = meshrmm_server::time::now_ms();
+        let minute = now - now % 60_000;
+        for start in [minute, minute + 60_000] {
+            app.db()
+                .execute(
+                    &Query::insert()
+                        .into_table("device_metrics")
+                        .columns([
+                            "device_id",
+                            "minute",
+                            "samples",
+                            "cpu_percent",
+                            "cpu_percent_max",
+                            "memory_used_bytes",
+                            "memory_total_bytes",
+                            "network_received_bytes_per_second",
+                            "network_sent_bytes_per_second",
+                            "storage_used_bytes",
+                            "storage_total_bytes",
+                        ])
+                        .values_panic([
+                            "huge".into(),
+                            start.into(),
+                            1_i64.into(),
+                            1.0_f64.into(),
+                            1.0_f64.into(),
+                            0_i64.into(),
+                            0_i64.into(),
+                            i64::MAX.into(),
+                            0_i64.into(),
+                            0_i64.into(),
+                            0_i64.into(),
+                        ])
+                        .to_owned(),
+                )
+                .await
+                .unwrap();
+        }
+        report_once(&app, "before", 10.0);
+        app.state.metrics.record("huge", usage(10.0, u64::MAX));
+        app.state.metrics.disconnected("huge");
+        report_once(&app, "after", 30.0);
+
+        let flushed = app.state.metrics.flush().await.unwrap();
+        assert_eq!(
+            stored_minutes(&app, "before").await,
+            [(1, 10.0, 10.0)],
+            "{}",
+            app.name
+        );
+        assert_eq!(stored_minutes(&app, "after").await, [(1, 30.0, 30.0)]);
+        if app.name == "postgres" {
+            assert_eq!((flushed.minutes, flushed.refused), (2, 1));
+        }
+        // A refused minute isn't tried again.
+        assert_eq!(app.state.metrics.flush().await.unwrap().statements, 0);
         app.finish().await;
     }
 }
