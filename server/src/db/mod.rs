@@ -4,9 +4,10 @@
 //! backend's dialect, so every query runs on both. Row types decode from
 //! either backend when their integers are `i64` (PostgreSQL columns are all
 //! `BIGINT`) and their booleans are `bool`.
+mod counts;
 pub mod tables;
 
-use std::{str::FromStr, time::Duration};
+use std::{str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::{Context, bail};
 use sea_query::{
@@ -22,7 +23,8 @@ use sqlx::{
     },
 };
 
-use self::tables::SqlxMigrations;
+pub use self::counts::Counts;
+use self::{counts::Counters, tables::SqlxMigrations};
 
 static SQLITE_MIGRATIONS: Migrator = sqlx::migrate!("./migrations/sqlite");
 static POSTGRES_MIGRATIONS: Migrator = sqlx::migrate!("./migrations/postgres");
@@ -69,6 +71,7 @@ enum Pool {
 #[derive(Debug, Clone)]
 pub struct Database {
     pool: Pool,
+    counters: Arc<Counters>,
 }
 
 /// Runs the same body against whichever pool or transaction is connected,
@@ -119,7 +122,15 @@ impl Database {
         } else {
             bail!("database.url must start with sqlite:// or postgres://");
         };
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            counters: Arc::default(),
+        })
+    }
+
+    /// What the pool has run since it opened.
+    pub fn counts(&self) -> Counts {
+        self.counters.counts()
     }
 
     pub fn backend(&self) -> Backend {
@@ -159,6 +170,7 @@ impl Database {
         &self,
         statement: &S,
     ) -> Result<u64> {
+        self.counters.write();
         dispatch!(&self.pool, pool, builder => {
             let (sql, values) = render(statement, builder);
             Ok(sqlx::query_with(sql, values).execute(pool).await?.rows_affected())
@@ -169,6 +181,7 @@ impl Database {
         &self,
         statement: &S,
     ) -> Result<Vec<T>> {
+        self.counters.read();
         dispatch!(&self.pool, pool, builder => {
             let (sql, values) = render(statement, builder);
             sqlx::query_as_with(sql, values).fetch_all(pool).await
@@ -179,6 +192,7 @@ impl Database {
         &self,
         statement: &S,
     ) -> Result<Option<T>> {
+        self.counters.read();
         dispatch!(&self.pool, pool, builder => {
             let (sql, values) = render(statement, builder);
             sqlx::query_as_with(sql, values).fetch_optional(pool).await
@@ -189,6 +203,7 @@ impl Database {
         &self,
         statement: &S,
     ) -> Result<T> {
+        self.counters.read();
         dispatch!(&self.pool, pool, builder => {
             let (sql, values) = render(statement, builder);
             sqlx::query_as_with(sql, values).fetch_one(pool).await
@@ -202,7 +217,9 @@ impl Database {
     /// transaction that reads and then writes would otherwise fail at once,
     /// without waiting, when another connection wrote in between.
     pub async fn begin(&self) -> Result<Transaction> {
+        self.counters.transaction();
         Ok(Transaction {
+            counters: Arc::clone(&self.counters),
             inner: match &self.pool {
                 Pool::Sqlite(pool) => {
                     TransactionInner::Sqlite(pool.begin_with("BEGIN IMMEDIATE").await?)
@@ -255,6 +272,7 @@ enum TransactionInner {
 /// [`Database`].
 pub struct Transaction {
     inner: TransactionInner,
+    counters: Arc<Counters>,
 }
 
 macro_rules! dispatch_transaction {
@@ -277,6 +295,7 @@ impl Transaction {
         &mut self,
         statement: &S,
     ) -> Result<u64> {
+        self.counters.write();
         dispatch_transaction!(&mut self.inner, connection, builder => {
             let (sql, values) = render(statement, builder);
             Ok(sqlx::query_with(sql, values).execute(&mut **connection).await?.rows_affected())
@@ -287,6 +306,7 @@ impl Transaction {
         &mut self,
         statement: &S,
     ) -> Result<Vec<T>> {
+        self.counters.read();
         dispatch_transaction!(&mut self.inner, connection, builder => {
             let (sql, values) = render(statement, builder);
             sqlx::query_as_with(sql, values).fetch_all(&mut **connection).await
@@ -297,6 +317,7 @@ impl Transaction {
         &mut self,
         statement: &S,
     ) -> Result<Option<T>> {
+        self.counters.read();
         dispatch_transaction!(&mut self.inner, connection, builder => {
             let (sql, values) = render(statement, builder);
             sqlx::query_as_with(sql, values).fetch_optional(&mut **connection).await
@@ -307,6 +328,7 @@ impl Transaction {
         &mut self,
         statement: &S,
     ) -> Result<T> {
+        self.counters.read();
         dispatch_transaction!(&mut self.inner, connection, builder => {
             let (sql, values) = render(statement, builder);
             sqlx::query_as_with(sql, values).fetch_one(&mut **connection).await

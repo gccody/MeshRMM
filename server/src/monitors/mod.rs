@@ -421,6 +421,15 @@ impl Catalog {
     async fn load(state: &AppState, device_id: Option<&str>) -> db::Result<Self> {
         let executor = &mut &state.database;
         let rules = state.monitors.rules(executor).await?;
+        // Without rules no device has monitors, whatever it is, so most
+        // instances' connects read nothing here.
+        if rules.rules.is_empty() {
+            return Ok(Self {
+                rules,
+                devices: HashMap::new(),
+                platforms: HashMap::new(),
+            });
+        }
         let devices = targets::devices(executor, device_id)
             .await?
             .into_iter()

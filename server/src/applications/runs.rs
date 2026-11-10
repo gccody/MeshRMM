@@ -743,6 +743,23 @@ pub async fn interrupted(
     connected_at: i64,
     now: i64,
 ) -> db::Result<Vec<(String, Action)>> {
+    let mut lost = Vec::new();
+    for (id, action) in unknown(executor, device_id, known, connected_at).await? {
+        if mark_lost(executor, &id, INTERRUPTED, now).await? {
+            lost.push((id, action));
+        }
+    }
+    Ok(lost)
+}
+
+/// The runs [`interrupted`] would mark as lost now. Only these can be, since
+/// no run recorded from here on is recorded before `connected_at`.
+pub async fn unknown(
+    executor: &mut impl Executor,
+    device_id: &str,
+    known: &[String],
+    connected_at: i64,
+) -> db::Result<Vec<(String, Action)>> {
     let pending: Vec<(String, String)> = executor
         .fetch_all(
             &Query::select()
@@ -754,19 +771,11 @@ pub async fn interrupted(
                 .to_owned(),
         )
         .await?;
-    let mut lost = Vec::new();
-    for (id, action) in pending {
-        let Some(action) = Action::parse(&action) else {
-            continue;
-        };
-        if known.contains(&id) {
-            continue;
-        }
-        if mark_lost(executor, &id, INTERRUPTED, now).await? {
-            lost.push((id, action));
-        }
-    }
-    Ok(lost)
+    Ok(pending
+        .into_iter()
+        .filter(|(id, _)| !known.contains(id))
+        .filter_map(|(id, action)| Some((id, Action::parse(&action)?)))
+        .collect())
 }
 
 /// How many of each device's job runs await a report at `now`.

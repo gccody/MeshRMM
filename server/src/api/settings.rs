@@ -62,6 +62,7 @@ async fn save(
     }
     let settings = settings::load(&mut transaction).await?;
     transaction.commit().await?;
+    state.settings.forget();
     Ok(settings)
 }
 

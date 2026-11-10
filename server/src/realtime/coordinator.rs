@@ -38,11 +38,20 @@ pub async fn serve(
     // Before presence, so a page that sees the device come online reads it
     // as woken.
     wake::device_connected(&state, &device_id).await;
+    // Before presence too, so the one refresh that shows the device online
+    // shows the address it connected from.
+    let collect_system_info = match system_info::connected(&state.database, &device_id, ip).await {
+        Ok(stale) => stale,
+        Err(error) => {
+            tracing::warn!(device_id, %error, "could not record the device's address");
+            false
+        }
+    };
     state.presence.connected(&device_id).await;
     // Jobs waiting for the device start now.
     state.automation.device_connected(&device_id);
     tracing::info!(device_id, "Agent connected");
-    if let Ok(replayed) = greet(&state, &device_id, ip, &mut socket).await {
+    if let Ok(replayed) = greet(&state, &device_id, collect_system_info, &mut socket).await {
         let mut last_session = replayed;
         let mut last_heard = Instant::now();
         loop {
@@ -187,13 +196,13 @@ async fn record_system_info(
 
 /// What a newly connected Agent is owed: the session it should be in, a
 /// rotated credential it hasn't used yet, a request for a system
-/// information snapshot if the server's is missing or old, and one for an
-/// update scan if the last is old or the device had to restart. Returns the
-/// session it replayed.
+/// information snapshot if the server's is missing or old
+/// (`collect_system_info`), and one for an update scan if the last is old or
+/// the device had to restart. Returns the session it replayed.
 async fn greet(
     state: &AppState,
     device_id: &str,
-    ip: IpAddr,
+    collect_system_info: bool,
     socket: &mut WebSocket,
 ) -> Result<Option<AgentSessionRequest>, ()> {
     let replayed = state.sessions.replay(state, device_id).await;
@@ -227,23 +236,12 @@ async fn greet(
             "could not read the Agent's rotated credential"
         ),
     }
-    match system_info::connected(&state.database, device_id, ip).await {
-        Ok(stale) => {
-            // The device list shows the address.
-            state.presence.refresh(device_id).await;
-            if stale {
-                let message = ToAgent::Command(AgentCommand::CollectSystemInfo).to_json();
-                socket
-                    .send(Message::Text(message.into()))
-                    .await
-                    .map_err(drop)?;
-            }
-        }
-        Err(error) => tracing::warn!(
-            device_id,
-            %error,
-            "could not record the device's address"
-        ),
+    if collect_system_info {
+        let message = ToAgent::Command(AgentCommand::CollectSystemInfo).to_json();
+        socket
+            .send(Message::Text(message.into()))
+            .await
+            .map_err(drop)?;
     }
     match updates::connected(state, device_id).await {
         Ok(true) => {

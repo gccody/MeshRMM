@@ -96,6 +96,7 @@ pub async fn prepare(config: Config) -> anyhow::Result<AppState> {
         files: files::Files::default(),
         turn: Turn::new(&instance_key),
         database,
+        settings: Arc::default(),
         instance_key,
         auth: Arc::new(AuthState::default()),
         storage,

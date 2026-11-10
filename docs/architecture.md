@@ -232,6 +232,17 @@ the device's credential; the Agent keeps asking, in case the device is
 restored, from every 2 minutes growing to once an hour
 (`agent/src/remote/signaling.rs`).
 
+On the server, connecting a device with nothing pending only reads: a dozen
+statements about that device, none of them a write, so a fleet reconnecting
+after a restart doesn't queue for SQLite's write lock. Each step that may
+record something (the device was woken, it connects from a new address, its
+update scan is old, an application run was interrupted) looks first and
+writes only then. The instance settings are kept in memory until they are
+saved (`settings::Cache` on `AppState`), the monitor rules for 15 seconds,
+and a device's update status is read only while a website listens for it.
+`Database::counts` counts statements, writes and transactions, which
+`server/tests/realtime.rs` holds the connect to.
+
 ### Sign-in and permissions
 
 The website and the API share one origin, so the website uses an HttpOnly

@@ -125,6 +125,7 @@ pub async fn complete(
         )
         .await?;
         transaction.commit().await?;
+        state.settings.forget();
         Ok(cookie)
     }
     .await;

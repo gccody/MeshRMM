@@ -41,6 +41,8 @@ use crate::{
 pub struct AppState {
     pub config: Arc<Config>,
     pub database: Database,
+    /// The settings row, for readers that needn't read it in a transaction.
+    pub settings: Arc<crate::settings::Cache>,
     pub instance_key: InstanceKey,
     pub auth: Arc<AuthState>,
     pub storage: Storage,

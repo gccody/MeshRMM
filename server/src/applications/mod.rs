@@ -95,6 +95,15 @@ pub async fn activity_reported(
 ) {
     // One transaction, so nobody sees some of them settled and not others.
     let settle = async {
+        // Most Agents have none to settle: looking first keeps their connect
+        // from taking SQLite's write lock. The transaction looks again, for
+        // runs that finished meanwhile.
+        if runs::unknown(&mut &state.database, device_id, run_ids, connected_at)
+            .await?
+            .is_empty()
+        {
+            return anyhow::Ok(Vec::new());
+        }
         let mut transaction = state.database.begin().await?;
         let lost =
             runs::interrupted(&mut transaction, device_id, run_ids, connected_at, now_ms()).await?;

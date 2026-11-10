@@ -370,25 +370,33 @@ pub async fn connected(
     device_id: &str,
     public_ip: IpAddr,
 ) -> db::Result<bool> {
-    database
-        .execute(
-            &Query::update()
-                .table(DeviceSystemInfo::Table)
-                .value(DeviceSystemInfo::PublicIp, public_ip.to_string())
-                .and_where(Expr::col(DeviceSystemInfo::DeviceId).eq(device_id))
-                .to_owned(),
-        )
-        .await?;
-    let received: Option<(i64,)> = database
+    let public_ip = public_ip.to_string();
+    let stored: Option<(i64, Option<String>)> = database
         .fetch_optional(
             &Query::select()
-                .column(DeviceSystemInfo::ReceivedAt)
+                .columns([DeviceSystemInfo::ReceivedAt, DeviceSystemInfo::PublicIp])
                 .from(DeviceSystemInfo::Table)
                 .and_where(Expr::col(DeviceSystemInfo::DeviceId).eq(device_id))
                 .to_owned(),
         )
         .await?;
-    Ok(received.is_none_or(|(received,)| now_ms() - received > STALE_AFTER_MS))
+    // Agents mostly reconnect from where they were, and writing only a
+    // change keeps their connect from taking SQLite's write lock. A snapshot
+    // stored meanwhile records the address itself.
+    if let Some((_, stored_ip)) = &stored
+        && stored_ip.as_deref() != Some(public_ip.as_str())
+    {
+        database
+            .execute(
+                &Query::update()
+                    .table(DeviceSystemInfo::Table)
+                    .value(DeviceSystemInfo::PublicIp, public_ip)
+                    .and_where(Expr::col(DeviceSystemInfo::DeviceId).eq(device_id))
+                    .to_owned(),
+            )
+            .await?;
+    }
+    Ok(stored.is_none_or(|(received, _)| now_ms() - received > STALE_AFTER_MS))
 }
 
 /// Removes a deleted device's snapshot and history.
