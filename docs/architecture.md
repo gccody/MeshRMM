@@ -292,7 +292,8 @@ intersected with its user's roles at each request, and its requests skip the
 CSRF check, since a browser can't attach the header cross-site. `SignedIn`
 (account routes) takes sessions only, and `website_only` in
 `server/src/api/mod.rs` refuses tokens on account security, credential and
-sign-in settings, and the website's sockets.
+sign-in settings, invitations, email settings and SSO links, and the
+website's sockets.
 
 Authenticating a request reads the session's row (or the token's) every
 time, so an ended session or a revoked token stops working on the next
