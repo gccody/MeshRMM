@@ -69,8 +69,7 @@ impl IdleDisconnect {
 /// requests, bitrate feedback, statistics, clipboard synchronisation, file
 /// transfer traffic, negotiation) is not activity, and neither is anything
 /// only the Agent sends. When the viewer sends one of the person's message
-/// types on its own, such as releasing held keys or re-applying the quality
-/// to a new window, it does so through
+/// types on its own, such as releasing held keys, it does so through
 /// [`ControlSink::send_automatic`](crate::platform::ControlSink::send_automatic).
 pub fn is_activity(message: &SessionMessage) -> bool {
     match message {

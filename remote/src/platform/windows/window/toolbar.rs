@@ -72,18 +72,12 @@ impl WindowContext {
         self.show_chroma(self.control.chroma_mode());
     }
 
-    /// Applies the session's quality and chroma to a new window. The viewer
-    /// does this by itself, so it is not activity.
-    pub(super) fn reapply_quality(&self) {
-        let preset = self.control.quality_preset();
-        self.control
-            .send_automatic(SessionMessage::SetQuality { preset });
-        self.show_quality(preset);
-        let mode = self.control.chroma_mode();
-        if self.control.supports_chroma(mode) {
-            self.control
-                .send_automatic(SessionMessage::SetChroma { mode });
-        }
+    /// Shows the session's quality and chroma in a new window without
+    /// sending them: the Agent has had them since the viewer's capabilities
+    /// on connect, and sending them again with every window would undo a
+    /// codec fallback the new window was opened for.
+    pub(super) fn show_session_choices(&self) {
+        self.show_quality(self.control.quality_preset());
         self.show_chroma(self.control.chroma_mode());
     }
 

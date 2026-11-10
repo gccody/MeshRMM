@@ -74,7 +74,7 @@ pub(in crate::platform::windows) unsafe fn create_window(
         let _ = unsafe { EnableWindow(controls.chroma_buttons[1].0, false) };
     }
     context.layout_toolbar(window);
-    context.reapply_quality();
+    context.show_session_choices();
     let _ = unsafe { ShowWindow(window, SW_SHOW) };
     close_launch_status();
     Ok(window)
@@ -293,5 +293,87 @@ pub(super) unsafe fn remember_placement(window: HWND) {
         *LAST_PLACEMENT
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(placement);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use meshrmm_protocol::{DesktopSession, DisplayId, PixelFormat};
+    use windows::Win32::UI::Controls::BST_CHECKED;
+
+    use super::*;
+
+    #[test]
+    fn a_new_window_shows_the_session_choices_without_sending_them() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let control = crate::platform::windows::test_sink(
+            Arc::clone(&sent),
+            meshrmm_chat::ChatSession::default(),
+        );
+        // The session's choices, sent once from the settings.
+        control.send(SessionMessage::SetQuality {
+            preset: QualityPreset::BestQuality,
+        });
+        control.send(SessionMessage::SetChroma {
+            mode: ChromaMode::Yuv444,
+        });
+        sent.lock().unwrap().clear();
+        let display = Display {
+            session: DesktopSession::Console,
+            id: DisplayId(1),
+            name: r"\.\DISPLAY1".into(),
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 720,
+            primary: true,
+        };
+        let format = VideoFormat {
+            width: 1280,
+            height: 720,
+            frames_per_second: 60,
+            codec: Codec::H264,
+            pixel_format: PixelFormat::Nv12,
+            bitrate_bits_per_second: 12_000_000,
+        };
+
+        let window = unsafe {
+            create_window(
+                format,
+                display.clone(),
+                vec![display],
+                control,
+                DebugInfo::new("window-creation-test"),
+            )
+        }
+        .expect("the viewer window");
+
+        // A replacement window for a codec fallback must not ask the Agent
+        // again for what it already has: a repeated choice used to clear
+        // the rejected profile and bring it straight back.
+        let resent = sent.lock().unwrap().clone();
+        assert!(
+            !resent.iter().any(|message| matches!(
+                message,
+                SessionMessage::SetQuality { .. } | SessionMessage::SetChroma { .. }
+            )),
+            "{resent:?}"
+        );
+        let context = unsafe { window_context(window) }.expect("the window's context");
+        let state = context.toolbar_state();
+        assert_eq!(state.quality, QualityPreset::BestQuality);
+        assert!(matches!(state.chroma, Some((ChromaMode::Yuv444, _))));
+        let checked = |button: HWND| {
+            unsafe { SendMessageW(button, BM_GETCHECK, None, None) }.0 == BST_CHECKED.0 as isize
+        };
+        let controls = context.controls();
+        for (button, preset) in controls.quality_buttons {
+            assert_eq!(checked(button), preset == QualityPreset::BestQuality);
+        }
+        for (button, mode) in controls.chroma_buttons {
+            assert_eq!(checked(button), mode == ChromaMode::Yuv444);
+        }
+        drop(context);
+        unsafe { DestroyWindow(window) }.unwrap();
     }
 }
