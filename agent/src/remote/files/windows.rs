@@ -45,6 +45,13 @@ pub(super) struct User {
     logon: UserLogon,
 }
 
+impl User {
+    /// The user's SID.
+    pub(super) fn id(&self) -> String {
+        self.logon.sid().to_owned()
+    }
+}
+
 // SAFETY: the token is only read, by impersonation, while the thread acting
 // as the user runs; the Account that owns it outlives that thread.
 unsafe impl Sync for User {}

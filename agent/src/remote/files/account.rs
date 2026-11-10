@@ -38,12 +38,21 @@ impl Account {
         self.user.is_some()
     }
 
+    /// The signed-in user operations act as, as the Agent remembers them:
+    /// their SID on Windows, their user ID on macOS and Linux.
+    pub(super) fn user_id(&self) -> Option<String> {
+        self.user.as_ref().map(platform::User::id)
+    }
+
     /// Runs `work` as the account.
     pub(super) fn run<T: Send>(
         &self,
         work: impl FnOnce() -> Result<T, FileError> + Send,
     ) -> Result<T, FileError> {
         let Some(user) = &self.user else {
+            #[cfg(test)]
+            return working::within(work);
+            #[cfg(not(test))]
             return work();
         };
         let failed = |message: &str| FileError::new(FileErrorCode::Failed, message);
@@ -71,6 +80,30 @@ pub(super) fn nobody_signed_in() -> FileError {
         FileErrorCode::NoUser,
         "Nobody is signed in to this computer, so there is no user to act as. Use SYSTEM or root instead.",
     )
+}
+
+/// Tests can't take on a user's identity, so there an account's work runs
+/// on the calling thread with this mark, for what must never happen as the
+/// user to check it.
+#[cfg(test)]
+pub(super) mod working {
+    use std::cell::Cell;
+
+    thread_local! {
+        static WORKING: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn within<T>(work: impl FnOnce() -> T) -> T {
+        let before = WORKING.replace(true);
+        let result = work();
+        WORKING.set(before);
+        result
+    }
+
+    /// Whether this thread is doing an account's work.
+    pub(in super::super) fn now() -> bool {
+        WORKING.get()
+    }
 }
 
 #[cfg(test)]

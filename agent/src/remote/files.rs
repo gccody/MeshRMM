@@ -9,7 +9,7 @@
 //! go over a socket of the transfer's own ([`transfer`]), never the control
 //! connection.
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use meshrmm_protocol::{FileError, FileErrorCode, FileOperation, FileReply, FileRequest};
@@ -51,6 +51,12 @@ pub(super) struct Files {
     running: Arc<Semaphore>,
     listings: Arc<listing::Cache>,
     sweep: tokio::time::Interval,
+    /// The Agent's mode, from its first request, for the sweep to find the
+    /// signed-in user.
+    mode: OnceLock<ExecutionMode>,
+    /// The sweep running, if one is: one at a time, however long a slow
+    /// drive holds one up.
+    sweeping: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Files {
@@ -64,11 +70,14 @@ impl Files {
             running: Arc::new(Semaphore::new(CONCURRENT_OPERATIONS)),
             listings: Arc::new(listing::Cache::default()),
             sweep,
+            mode: OnceLock::new(),
+            sweeping: None,
         }
     }
 
     /// Runs `request` in the background; its answer comes from [`Self::next`].
     pub(super) fn request(&self, mode: ExecutionMode, request: FileRequest) {
+        self.mode.get_or_init(|| mode);
         let replies = self.replies_tx.clone();
         let running = Arc::clone(&self.running);
         let listings = Arc::clone(&self.listings);
@@ -105,7 +114,10 @@ impl Files {
                     }
                 }
                 _ = self.sweep.tick() => {
-                    tokio::task::spawn_blocking(uploads::sweep);
+                    if self.sweeping.as_ref().is_none_or(|sweep| sweep.is_finished()) {
+                        let mode = self.mode.get().copied();
+                        self.sweeping = Some(tokio::task::spawn_blocking(move || uploads::sweep(mode)));
+                    }
                 }
             }
         }
