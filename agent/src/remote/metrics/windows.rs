@@ -1,6 +1,5 @@
 //! Resource usage from the Win32 system information and IP helper APIs.
 use anyhow::Context;
-use meshrmm_protocol::VolumeUsage;
 use windows::Win32::Foundation::FILETIME;
 use windows::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_ROW2};
 use windows::Win32::Storage::FileSystem::{
@@ -109,7 +108,7 @@ pub(super) fn uptime_seconds() -> anyhow::Result<u64> {
 
 /// The fixed drives with a letter, named like `C:`. Removable, network and
 /// optical drives are left out.
-pub(super) fn volumes() -> anyhow::Result<Vec<VolumeUsage>> {
+pub(super) fn volume_mounts() -> anyhow::Result<Vec<String>> {
     let length = unsafe { GetLogicalDriveStringsW(None) };
     anyhow::ensure!(
         length > 0,
@@ -124,32 +123,31 @@ pub(super) fn volumes() -> anyhow::Result<Vec<VolumeUsage>> {
         "GetLogicalDriveStringsW failed: {}",
         std::io::Error::last_os_error()
     );
-    let mut volumes = Vec::new();
-    for root in buffer[..written].split(|&unit| unit == 0) {
-        if root.is_empty() {
-            continue;
-        }
-        let path: Vec<u16> = root.iter().copied().chain(Some(0)).collect();
-        let path = PCWSTR(path.as_ptr());
-        if unsafe { GetDriveTypeW(path) } != DRIVE_FIXED {
-            continue;
-        }
-        let name = drive_name(root);
-        let (mut free, mut total) = (0u64, 0u64);
-        if let Err(error) =
-            unsafe { GetDiskFreeSpaceExW(path, Some(&mut free), Some(&mut total), None) }
-        {
-            // Such as a BitLocker drive that is still locked.
-            tracing::debug!(volume = %name, %error, "could not read a volume's capacity");
-            continue;
-        }
-        volumes.push(VolumeUsage {
-            name,
-            total_bytes: total,
-            free_bytes: free,
-        });
+    Ok(buffer[..written]
+        .split(|&unit| unit == 0)
+        .filter(|root| {
+            let path: Vec<u16> = root.iter().copied().chain(Some(0)).collect();
+            !root.is_empty() && unsafe { GetDriveTypeW(PCWSTR(path.as_ptr())) } == DRIVE_FIXED
+        })
+        .map(drive_name)
+        .collect())
+}
+
+/// A drive's size and free space, in bytes. A BitLocker drive that is still
+/// locked has none to read.
+pub(super) fn volume_usage(drive: &str) -> anyhow::Result<(u64, u64)> {
+    let root: Vec<u16> = format!("{drive}\\").encode_utf16().chain(Some(0)).collect();
+    let (mut free, mut total) = (0u64, 0u64);
+    unsafe {
+        GetDiskFreeSpaceExW(
+            PCWSTR(root.as_ptr()),
+            Some(&mut free),
+            Some(&mut total),
+            None,
+        )
     }
-    Ok(volumes)
+    .with_context(|| drive.to_owned())?;
+    Ok((total, free))
 }
 
 /// `C:\` as `C:`.

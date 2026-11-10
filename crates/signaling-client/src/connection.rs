@@ -17,7 +17,8 @@ use crate::progress::Progress;
 
 type Outgoing = (Message, oneshot::Sender<anyhow::Result<()>>);
 
-/// How often the connection pings the server.
+/// How long the connection may go without writing, or without reading,
+/// before it pings the server (see [`next_ping`]).
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 /// How long the server may go unheard before the connection is dead.
 const LIVENESS: Duration = Duration::from_secs(60);
@@ -69,11 +70,24 @@ impl SignalingConnection {
             let (mut sink, mut stream) = socket.split();
             let ping = Notify::new();
             let read = async {
-                let mut heartbeat = tokio::time::interval(limits.ping_interval);
-                heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                heartbeat.tick().await;
                 let mut last_read = Instant::now();
+                let mut pinged = last_read;
+                // While a large message goes out, what the server sends, its
+                // pongs too, may wait behind it, but the server taking the
+                // message in shows it is there.
+                let heard = |last_read: Instant| {
+                    progress
+                        .drained_at()
+                        .map_or(last_read, |drained| drained.max(last_read))
+                };
                 loop {
+                    let ping_at = next_ping(
+                        last_read,
+                        progress.written_at(),
+                        pinged,
+                        limits.ping_interval,
+                    );
+                    let dead_at = heard(last_read) + limits.liveness;
                     tokio::select! {
                         message = stream.next() => {
                             let message = message.context("signaling connection closed")??;
@@ -87,16 +101,17 @@ impl SignalingConnection {
                                     .map_err(|_| anyhow::anyhow!("signaling command queue full or closed"))?,
                             }
                         }
-                        _ = heartbeat.tick() => {
-                            // While a large message goes out, what the server
-                            // sends, its pongs too, may wait behind it, but the
-                            // server taking the message in shows it is there.
-                            let heard = progress
-                                .drained_at()
-                                .map_or(last_read, |drained| drained.max(last_read));
-                            anyhow::ensure!(heard.elapsed() < limits.liveness, "signaling liveness timeout");
-                            // Written once the write going on, if any, ends.
-                            ping.notify_one();
+                        () = tokio::time::sleep_until(ping_at.min(dead_at)) => {
+                            anyhow::ensure!(
+                                heard(last_read).elapsed() < limits.liveness,
+                                "signaling liveness timeout"
+                            );
+                            let now = Instant::now();
+                            if next_ping(last_read, progress.written_at(), pinged, limits.ping_interval) <= now {
+                                pinged = now;
+                                // Written once the write going on, if any, ends.
+                                ping.notify_one();
+                            }
                         }
                     }
                 }
@@ -188,6 +203,20 @@ impl SignalingConnection {
             .try_send((message, done))
             .map_err(|_| anyhow::anyhow!("signaling writer full or closed"))
     }
+}
+
+/// When to ping: once the connection has gone `interval` without writing,
+/// since the server gives up on a client it hasn't heard a frame from for
+/// its liveness limit, or without reading, since the pong is then all the
+/// client would hear. A connection busy both ways needs no ping. A ping
+/// waiting behind a long write is not asked for again within `interval`.
+fn next_ping(
+    last_read: Instant,
+    last_written: Instant,
+    pinged: Instant,
+    interval: Duration,
+) -> Instant {
+    last_read.min(last_written).max(pinged) + interval
 }
 
 /// Writes `message`, failing once the socket has taken nothing for `stall`.
@@ -411,6 +440,21 @@ mod tests {
             server.next().await.unwrap().unwrap(),
             Message::Text("ack".into())
         );
+    }
+
+    #[test]
+    fn pings_only_once_a_direction_has_been_quiet_for_the_interval() {
+        let interval = Duration::from_secs(20);
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        // Traffic both ways 5 seconds ago: no ping for another 15.
+        assert_eq!(next_ping(at(95), at(95), at(0), interval), at(115));
+        // Writing but hearing nothing since 70: the pong is due.
+        assert_eq!(next_ping(at(70), at(99), at(0), interval), at(90));
+        // Hearing but writing nothing since 70: the server needs a frame.
+        assert_eq!(next_ping(at(99), at(70), at(0), interval), at(90));
+        // A ping still waiting behind a long write isn't asked for again.
+        assert_eq!(next_ping(at(0), at(99), at(95), interval), at(115));
     }
 
     #[tokio::test]

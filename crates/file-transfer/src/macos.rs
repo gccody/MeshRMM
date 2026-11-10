@@ -116,11 +116,15 @@ pub fn rename_no_replace(from: &std::path::Path, to: &std::path::Path) -> std::i
     let (from, to) = (c_path(from)?, c_path(to)?);
     // SAFETY: both arguments are NUL-terminated paths that outlive the call.
     if unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
+        return Ok(());
     }
+    let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    Err(crate::rename::macos_exclusive_rename_error(code))
 }
+const _: () = assert!(
+    crate::rename::macos_errno::EINVAL == libc::EINVAL
+        && crate::rename::macos_errno::ENOTSUP == libc::ENOTSUP
+);
 
 /// Quarantines a received file or folder as a download from MeshRMM, so
 /// Gatekeeper checks it before it first opens, as it does for browser

@@ -6,7 +6,8 @@ use std::{
     io,
 };
 
-use super::receive::{move_unique, rename_no_replace};
+use super::receive::move_unique;
+use super::rename::{macos_errno, macos_exclusive_rename_error};
 use super::send::send_file;
 use super::sweep::{sweep_batches, sweep_partials};
 use super::*;
@@ -320,6 +321,23 @@ fn rename_never_replaces_an_existing_file_or_folder() {
     assert_eq!(moved, sandbox.0.join("fallback.txt"));
     assert_eq!(fs::read_to_string(moved).unwrap(), "new");
     assert_eq!(fs::read_to_string(&to).unwrap(), "original");
+}
+#[test]
+fn macos_volumes_without_an_exclusive_rename_take_the_fallback() {
+    for code in [macos_errno::ENOTSUP, macos_errno::EINVAL] {
+        assert_eq!(
+            macos_exclusive_rename_error(code).kind(),
+            io::ErrorKind::Unsupported,
+            "{code}"
+        );
+    }
+    // EEXIST, EACCES and ENOENT keep their meaning.
+    for code in [17, 13, 2] {
+        assert_eq!(
+            macos_exclusive_rename_error(code).raw_os_error(),
+            Some(code)
+        );
+    }
 }
 #[test]
 fn sweeps_only_stale_partials_and_unused_cache_batches() {

@@ -7,9 +7,10 @@
 //! systemd service. Readings come
 //! straight from the operating system. CPU load and network rates are averages
 //! since the previous sample. Volumes can sit on slow disks, so they are read
-//! at most every [`VOLUME_REFRESH`] and the last list is reported in between.
+//! at most every [`VOLUME_REFRESH`] and the last list is reported in between,
+//! and one that does not answer is left out (see [`VolumeReader`]).
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use meshrmm_protocol::{METRICS_INTERVAL_SECONDS, SystemMetrics, VolumeUsage};
@@ -34,6 +35,9 @@ use self::windows as platform;
 pub const INTERVAL: Duration = Duration::from_secs(METRICS_INTERVAL_SECONDS);
 /// How long a volume list is reused before the disks are asked again.
 const VOLUME_REFRESH: Duration = Duration::from_secs(60);
+/// How long one volume may take to give its size and free space. A healthy
+/// disk answers at once, from what the kernel already holds.
+const VOLUME_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// When the computer started, in Unix milliseconds by its clock at `now`,
 /// from how long it has been up. `None` when the uptime can't be read.
@@ -108,6 +112,76 @@ fn order_volumes(volumes: &mut [VolumeUsage]) {
     });
 }
 
+/// A volume's size and free space, in bytes.
+type Usage = anyhow::Result<(u64, u64)>;
+
+/// Asks each volume for its usage on a thread of its own, waiting at most
+/// [`VOLUME_TIMEOUT`]. A disk that never answers, such as one that is
+/// failing or an iSCSI disk whose target went away, blocks the call that
+/// asks it, and would otherwise stop every later sample. It is left out,
+/// and not asked again until its stuck call returns, so at most one thread
+/// waits on each.
+struct VolumeReader {
+    usage: Arc<dyn Fn(&str) -> Usage + Send + Sync>,
+    timeout: Duration,
+    /// The volumes whose call has not returned, with where it will answer.
+    hanging: HashMap<String, mpsc::Receiver<Usage>>,
+}
+
+impl VolumeReader {
+    fn new(timeout: Duration, usage: impl Fn(&str) -> Usage + Send + Sync + 'static) -> Self {
+        Self {
+            usage: Arc::new(usage),
+            timeout,
+            hanging: HashMap::new(),
+        }
+    }
+
+    /// The usage of each of `mounts` that answers in time and has space.
+    fn read(&mut self, mounts: Vec<String>) -> Vec<VolumeUsage> {
+        // A call that returned at last frees its volume to be asked again.
+        self.hanging
+            .retain(|_, answer| matches!(answer.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        let mut volumes = Vec::new();
+        for name in mounts {
+            if self.hanging.contains_key(&name) {
+                continue;
+            }
+            let (answer, answered) = mpsc::sync_channel(1);
+            let (usage, mount) = (Arc::clone(&self.usage), name.clone());
+            let asked = std::thread::Builder::new()
+                .name("meshrmm-volume-usage".into())
+                .spawn(move || {
+                    let _ = answer.send(usage(&mount));
+                });
+            if let Err(error) = asked {
+                tracing::debug!(volume = %name, %error, "could not ask a volume for its usage");
+                continue;
+            }
+            match answered.recv_timeout(self.timeout) {
+                Ok(Ok((total_bytes, free_bytes))) if total_bytes > 0 => {
+                    volumes.push(VolumeUsage {
+                        name,
+                        total_bytes,
+                        free_bytes,
+                    });
+                }
+                Ok(Ok(_)) => {}
+                // Such as a BitLocker drive that is still locked.
+                Ok(Err(error)) => {
+                    tracing::debug!(volume = %name, error = ?error, "could not read a volume's usage");
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    tracing::warn!(volume = %name, timeout = ?self.timeout, "a volume did not give its usage in time; it is left out until it answers");
+                    self.hanging.insert(name, answered);
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {}
+            }
+        }
+        volumes
+    }
+}
+
 /// Physical memory in use and installed, in bytes.
 struct Memory {
     used: u64,
@@ -122,6 +196,7 @@ pub struct Sampler {
     network: Option<(Instant, Vec<Interface>)>,
     volumes: Vec<VolumeUsage>,
     volumes_read: Option<Instant>,
+    volume_reader: VolumeReader,
     /// The parts whose last reading failed. A failure is logged as a warning
     /// once, not every few seconds.
     failing: HashSet<&'static str>,
@@ -135,6 +210,7 @@ impl Sampler {
             network: None,
             volumes: Vec::new(),
             volumes_read: None,
+            volume_reader: VolumeReader::new(VOLUME_TIMEOUT, platform::volume_usage),
             failing: HashSet::new(),
         };
         sampler.cpu = sampler.read("cpu", platform::cpu_ticks());
@@ -193,7 +269,8 @@ impl Sampler {
             .is_none_or(|read| read.elapsed() >= VOLUME_REFRESH)
         {
             self.volumes_read = Some(Instant::now());
-            if let Some(mut volumes) = self.read("volumes", platform::volumes()) {
+            if let Some(mounts) = self.read("volumes", platform::volume_mounts()) {
+                let mut volumes = self.volume_reader.read(mounts);
                 order_volumes(&mut volumes);
                 self.volumes = volumes;
             }
@@ -336,6 +413,43 @@ mod tests {
         order_volumes(&mut volumes);
         let names: Vec<_> = volumes.iter().map(|volume| volume.name.as_str()).collect();
         assert_eq!(names, ["/Volumes/Backup", "C:", "/", "D:"]);
+    }
+
+    #[test]
+    fn a_volume_that_does_not_answer_is_left_out_until_it_does() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (release, gate) = mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&asked);
+        let mut reader = VolumeReader::new(Duration::from_secs(1), move |mount| {
+            if mount == "/hung" {
+                counted.fetch_add(1, Ordering::SeqCst);
+                // Blocks until the test lets it go, like a dead disk.
+                let _ = gate.lock().unwrap().recv();
+            }
+            Ok((100, 40))
+        });
+        let mounts = || vec!["/".to_owned(), "/hung".to_owned()];
+        let names = |volumes: Vec<VolumeUsage>| {
+            volumes
+                .into_iter()
+                .map(|volume| volume.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(reader.read(mounts())), ["/"]);
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        // Still stuck, so not asked again: no second thread waits on it.
+        assert_eq!(names(reader.read(mounts())), ["/"]);
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        drop(release);
+        // Waits for the stuck call to answer and its thread to end.
+        for answer in reader.hanging.values() {
+            while answer.recv().is_ok() {}
+        }
+        assert_eq!(names(reader.read(mounts())), ["/", "/hung"]);
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
     }
 
     #[test]

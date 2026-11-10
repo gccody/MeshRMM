@@ -20,8 +20,9 @@ pub use self::{
     shared::{Serializations, Shared},
 };
 
-/// Agents and viewers ping every 20 seconds and give up on a socket after a
-/// minute without a frame; the server does the same.
+/// Agents and viewers ping once they have gone 20 seconds without writing or
+/// without reading a frame, and give up on a socket after a minute without
+/// one; the server does the same.
 pub const LIVENESS: Duration = Duration::from_secs(60);
 
 /// A peer that takes longer than this to accept a message has stopped

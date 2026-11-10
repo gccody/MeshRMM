@@ -3,7 +3,6 @@ use std::ffi::CStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail, ensure};
-use meshrmm_protocol::VolumeUsage;
 
 use super::{CpuTime, Interface, Memory};
 
@@ -178,7 +177,7 @@ pub(super) fn uptime_seconds() -> anyhow::Result<u64> {
 /// startup disk and writable disks under `/Volumes`. APFS system volumes
 /// share the startup disk's space and are hidden from browsing, and
 /// read-only ones are mostly disk images, so neither is listed.
-pub(super) fn volumes() -> anyhow::Result<Vec<VolumeUsage>> {
+pub(super) fn volume_mounts() -> anyhow::Result<Vec<String>> {
     // MNT_NOWAIT lists mounts without asking each file system for fresh
     // numbers, which a network volume can take long to answer.
     // SAFETY: a null buffer asks for the count.
@@ -206,29 +205,31 @@ pub(super) fn volumes() -> anyhow::Result<Vec<VolumeUsage>> {
         std::io::Error::last_os_error()
     );
     mounts.truncate(count as usize);
-    let mut volumes = Vec::new();
-    for mount in &mounts {
-        // SAFETY: the kernel NUL-terminates the mount point.
-        let path = unsafe { CStr::from_ptr(mount.f_mntonname.as_ptr()) };
-        if !listed(mount.f_flags, path.to_bytes()) {
-            continue;
-        }
-        // Fresh numbers for the volumes that are listed.
-        // SAFETY: the structure is plain integers and characters.
-        let mut current: libc::statfs = unsafe { std::mem::zeroed() };
-        // SAFETY: the path is NUL-terminated and `current` is a statfs.
-        if unsafe { libc::statfs(path.as_ptr(), &mut current) } != 0 {
-            tracing::debug!(path = ?path, error = %std::io::Error::last_os_error(), "could not read a volume's capacity");
-            continue;
-        }
-        let block = u64::from(current.f_bsize);
-        volumes.push(VolumeUsage {
-            name: path.to_string_lossy().into_owned(),
-            total_bytes: current.f_blocks.saturating_mul(block),
-            free_bytes: current.f_bavail.saturating_mul(block),
-        });
+    Ok(mounts
+        .iter()
+        .filter_map(|mount| {
+            // SAFETY: the kernel NUL-terminates the mount point.
+            let path = unsafe { CStr::from_ptr(mount.f_mntonname.as_ptr()) };
+            listed(mount.f_flags, path.to_bytes()).then(|| path.to_string_lossy().into_owned())
+        })
+        .collect())
+}
+
+/// Fresh numbers for a listed volume: its size and the space free to the
+/// Agent's user, in bytes.
+pub(super) fn volume_usage(path: &str) -> anyhow::Result<(u64, u64)> {
+    let text = std::ffi::CString::new(path)?;
+    // SAFETY: the structure is plain integers and characters.
+    let mut current: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: the path is NUL-terminated and `current` is a statfs.
+    if unsafe { libc::statfs(text.as_ptr(), &mut current) } != 0 {
+        return Err(std::io::Error::last_os_error()).context(path.to_owned());
     }
-    Ok(volumes)
+    let block = u64::from(current.f_bsize);
+    Ok((
+        current.f_blocks.saturating_mul(block),
+        current.f_bavail.saturating_mul(block),
+    ))
 }
 
 /// Whether a volume mounted with `flags` at `path` is reported.

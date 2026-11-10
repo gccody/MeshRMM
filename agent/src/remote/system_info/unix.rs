@@ -287,8 +287,16 @@ pub(super) fn find_tool(name: &str) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
+/// The most standard output a tool may write: rpm's list of ten thousand
+/// packages is under 2 MiB.
+#[cfg(target_os = "linux")]
+const MOST_OUTPUT: u64 = 16 * 1024 * 1024;
+/// The most error output kept, for the message when a tool fails.
+#[cfg(target_os = "linux")]
+const MOST_ERRORS: u64 = 64 * 1024;
+
 /// Runs a tool and returns its standard output, failing if it runs longer
-/// than `timeout` or exits with an error.
+/// than `timeout`, exits with an error or writes more than [`MOST_OUTPUT`].
 #[cfg(target_os = "linux")]
 pub(super) fn run_tool(
     path: &Path,
@@ -299,7 +307,16 @@ pub(super) fn run_tool(
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    use anyhow::bail;
+    use anyhow::{bail, ensure};
+
+    /// At most `most` bytes of `stream`, and whether it had more. The rest
+    /// is read and dropped, so the tool isn't left blocked writing it.
+    fn read_at_most(mut stream: impl Read, most: u64) -> std::io::Result<(Vec<u8>, bool)> {
+        let mut kept = Vec::new();
+        (&mut stream).take(most).read_to_end(&mut kept)?;
+        let more = std::io::copy(&mut stream, &mut std::io::sink())? > 0;
+        Ok((kept, more))
+    }
 
     let mut child = Command::new(path)
         .args(args)
@@ -309,17 +326,14 @@ pub(super) fn run_tool(
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("could not run {}", path.display()))?;
-    let mut stdout = child.stdout.take().context("no standard output")?;
-    let mut stderr = child.stderr.take().context("no standard error")?;
+    let stdout = child.stdout.take().context("no standard output")?;
+    let stderr = child.stderr.take().context("no standard error")?;
     // Reading on other threads keeps a full pipe from stalling the tool.
-    let output = std::thread::spawn(move || {
-        let mut text = Vec::new();
-        stdout.read_to_end(&mut text).map(|_| text)
-    });
+    let output = std::thread::spawn(move || read_at_most(stdout, MOST_OUTPUT));
     let errors = std::thread::spawn(move || {
-        let mut text = Vec::new();
-        let _ = stderr.read_to_end(&mut text);
-        text
+        read_at_most(stderr, MOST_ERRORS)
+            .map(|(text, _)| text)
+            .unwrap_or_default()
     });
     let started = Instant::now();
     let status = loop {
@@ -333,7 +347,7 @@ pub(super) fn run_tool(
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    let output = output
+    let (output, more) = output
         .join()
         .map_err(|_| anyhow::anyhow!("reading the output failed"))??;
     let errors = errors.join().unwrap_or_default();
@@ -344,6 +358,12 @@ pub(super) fn run_tool(
             String::from_utf8_lossy(&errors).trim()
         );
     }
+    ensure!(
+        !more,
+        "{} wrote more than {} MiB",
+        path.display(),
+        MOST_OUTPUT >> 20
+    );
     Ok(String::from_utf8_lossy(&output).into_owned())
 }
 
@@ -398,6 +418,22 @@ mod tests {
         .to_string();
         assert!(failed.contains("bad"), "{failed}");
         assert!(run_tool(shell, &["-c", "sleep 5"], Duration::from_millis(100)).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_tool_that_writes_too_much_fails_instead_of_filling_memory() {
+        use std::time::Duration;
+
+        let shell = Path::new("/bin/sh");
+        let just_enough = format!("head -c {MOST_OUTPUT} /dev/zero");
+        let output = run_tool(shell, &["-c", &just_enough], Duration::from_secs(60)).unwrap();
+        assert_eq!(output.len() as u64, MOST_OUTPUT);
+        let too_much = format!("head -c {} /dev/zero", MOST_OUTPUT + 1);
+        let error = run_tool(shell, &["-c", &too_much], Duration::from_secs(60))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("wrote more than 16 MiB"), "{error}");
     }
 
     #[test]
