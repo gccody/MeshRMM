@@ -73,6 +73,8 @@ pub trait VideoEncoder {
     fn set_bitrate(&self, bits_per_second: u32) -> Result<(), Error>;
 }
 
+/// One `MFStartup` of the Media Foundation platform, ended by `MFShutdown`
+/// on drop. Objects of the platform go before it: see [`OnPlatform`].
 pub(crate) struct MediaFoundationRuntime;
 
 impl MediaFoundationRuntime {
@@ -93,13 +95,117 @@ impl Drop for MediaFoundationRuntime {
     }
 }
 
-pub struct MediaFoundationVideoEncoder {
-    _runtime: MediaFoundationRuntime,
-    transform: IMFTransform,
+/// Media Foundation objects and the guards of the platform they belong to.
+/// Rust drops a struct's fields in declaration order, after its `Drop`
+/// body, so `objects`, with the `Drop` that ends its transform, is always
+/// released before `platform`: no object outlives the `MFShutdown` of its
+/// platform. A tuple of guards drops front to back, so a COM apartment last
+/// in it is left after Media Foundation shuts down.
+pub(crate) struct OnPlatform<T, P> {
+    objects: T,
+    _platform: P,
+}
+
+impl<T, P> OnPlatform<T, P> {
+    /// `platform` must already be up while `objects` are created.
+    pub(crate) fn hold(platform: P, objects: T) -> Self {
+        Self {
+            objects,
+            _platform: platform,
+        }
+    }
+}
+
+impl<T, P> std::ops::Deref for OnPlatform<T, P> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.objects
+    }
+}
+
+impl<T, P> std::ops::DerefMut for OnPlatform<T, P> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.objects
+    }
+}
+
+impl<T: VideoEncoder, P> VideoEncoder for OnPlatform<T, P> {
+    fn poll(&mut self) -> Result<Vec<EncodedAccessUnit>, Error> {
+        self.objects.poll()
+    }
+
+    fn wants_input(&self) -> bool {
+        self.objects.wants_input()
+    }
+
+    fn submit(
+        &mut self,
+        texture: &ID3D11Texture2D,
+        capture_timestamp_us: u64,
+    ) -> Result<Vec<EncodedAccessUnit>, Error> {
+        self.objects.submit(texture, capture_timestamp_us)
+    }
+
+    fn request_keyframe(&self) -> Result<(), Error> {
+        self.objects.request_keyframe()
+    }
+
+    fn set_bitrate(&self, bits_per_second: u32) -> Result<(), Error> {
+        self.objects.set_bitrate(bits_per_second)
+    }
+}
+
+/// The owner's transform, ended when it drops, whether it got as far as
+/// streaming or failed in configuration: it discards what it still holds,
+/// ends its stream, and an asynchronous (hardware) transform is shut down
+/// through `IMFShutdown`, which ends its worker threads, its event queue and
+/// its GPU session. A synchronous transform needs no shutdown and mostly
+/// has no `IMFShutdown`. Interfaces cast from it may be released after it.
+pub(crate) struct Transform(IMFTransform);
+
+impl Transform {
+    pub(crate) fn new(transform: IMFTransform) -> Self {
+        Self(transform)
+    }
+}
+
+impl std::ops::Deref for Transform {
+    type Target = IMFTransform;
+
+    fn deref(&self) -> &IMFTransform {
+        &self.0
+    }
+}
+
+impl Drop for Transform {
+    fn drop(&mut self) {
+        // Safety: this owns the transform, and nothing calls it after this.
+        unsafe {
+            let _ = self.0.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+            let _ = self.0.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+            let _ = self.0.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+            if let Ok(shutdown) = self.0.cast::<IMFShutdown>()
+                && let Err(error) = shutdown.Shutdown()
+            {
+                tracing::warn!(%error, "Media Foundation encoder shutdown failed");
+            }
+        }
+    }
+}
+
+/// A GPU vendor's asynchronous encoder, on the Media Foundation platform
+/// it needs.
+pub(crate) type MediaFoundationVideoEncoder = OnPlatform<HardwareEncoder, MediaFoundationRuntime>;
+
+/// Fields drop in declaration order: the transform is ended first.
+pub(crate) struct HardwareEncoder {
+    transform: Transform,
     event_generator: IMFMediaEventGenerator,
     codec_api: ICodecAPI,
     output_info: MFT_OUTPUT_STREAM_INFO,
-    device_manager: IMFDXGIDeviceManager,
+    /// Kept for the transform, which uses its device.
+    _device_manager: IMFDXGIDeviceManager,
     frame_duration_100ns: i64,
     need_input: u32,
     have_output: u32,
@@ -224,7 +330,7 @@ impl OutputFramer {
 }
 
 impl MediaFoundationVideoEncoder {
-    pub fn new(
+    pub(crate) fn new(
         device: &ID3D11Device,
         width: u32,
         height: u32,
@@ -234,6 +340,29 @@ impl MediaFoundationVideoEncoder {
         pixel_format: VideoPixelFormat,
     ) -> Result<Self, Error> {
         let runtime = MediaFoundationRuntime::start()?;
+        let encoder = HardwareEncoder::new(
+            device,
+            width,
+            height,
+            frames_per_second,
+            bitrate_bits_per_second,
+            codec,
+            pixel_format,
+        )?;
+        Ok(OnPlatform::hold(runtime, encoder))
+    }
+}
+
+impl HardwareEncoder {
+    fn new(
+        device: &ID3D11Device,
+        width: u32,
+        height: u32,
+        frames_per_second: u32,
+        bitrate_bits_per_second: u32,
+        codec: VideoCodec,
+        pixel_format: VideoPixelFormat,
+    ) -> Result<Self, Error> {
         // Capture/conversion and the asynchronous hardware MFT share the
         // immediate context. D3D11 does not serialize that access by default.
         // Enable protection before handing the device to Media Foundation.
@@ -242,7 +371,7 @@ impl MediaFoundationVideoEncoder {
             let multithread: ID3D11Multithread = context.cast().map_err(Error::Configuration)?;
             let _ = multithread.SetMultithreadProtected(true);
         }
-        let transform = activate_hardware_transform(codec, pixel_format)?;
+        let transform = Transform::new(activate_hardware_transform(codec, pixel_format)?);
         unsafe {
             let attributes = transform.GetAttributes().map_err(Error::Configuration)?;
             if attributes.GetUINT32(&MF_TRANSFORM_ASYNC).unwrap_or(0) != 0 {
@@ -276,12 +405,11 @@ impl MediaFoundationVideoEncoder {
                 .map_err(Error::Configuration)?;
             let output = OutputFramer::new(&transform, codec);
             let mut encoder = Self {
-                _runtime: runtime,
                 transform,
                 event_generator,
                 codec_api,
                 output_info,
-                device_manager,
+                _device_manager: device_manager,
                 frame_duration_100ns: 10_000_000_i64 / i64::from(frames_per_second.max(1)),
                 need_input: 0,
                 have_output: 0,
@@ -329,7 +457,7 @@ impl MediaFoundationVideoEncoder {
     }
 }
 
-impl VideoEncoder for MediaFoundationVideoEncoder {
+impl VideoEncoder for HardwareEncoder {
     fn poll(&mut self) -> Result<Vec<EncodedAccessUnit>, Error> {
         self.pump_events(false)?;
         self.take_available_outputs()
@@ -390,7 +518,7 @@ impl VideoEncoder for MediaFoundationVideoEncoder {
     }
 }
 
-impl MediaFoundationVideoEncoder {
+impl HardwareEncoder {
     fn take_available_outputs(&mut self) -> Result<Vec<EncodedAccessUnit>, Error> {
         let mut outputs = Vec::with_capacity(self.have_output as usize);
         while self.have_output > 0 {
@@ -403,21 +531,46 @@ impl MediaFoundationVideoEncoder {
         }
         Ok(outputs)
     }
+
+    /// Waits, for at most [`SETTLE_TIMEOUT`], until the transform has no
+    /// frame in flight and asks for input again, discarding the output
+    /// still to come. NVIDIA's HEVC encoder leaves work items on Media
+    /// Foundation's work queues that touch it after its last release
+    /// otherwise, and crashes the Agent.
+    fn settle(&mut self) {
+        let deadline = std::time::Instant::now() + SETTLE_TIMEOUT;
+        loop {
+            if let Err(error) = self
+                .pump_events(false)
+                .and_then(|()| self.take_available_outputs())
+            {
+                tracing::warn!(%error, "hardware encoder failed while finishing its frames");
+                return;
+            }
+            if self.output.pending() == 0 && self.need_input > 0 {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    frames_in_flight = self.output.pending(),
+                    "hardware encoder did not finish its frames before it was released"
+                );
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
 }
 
-impl Drop for MediaFoundationVideoEncoder {
+/// How long a hardware encoder may take to finish its frames in flight
+/// when it is replaced: far longer than a frame takes.
+const SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+impl Drop for HardwareEncoder {
     fn drop(&mut self) {
-        // Safety: these messages terminate the transform owned by this object.
-        unsafe {
-            let _ = self
-                .transform
-                .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-            let _ = self
-                .transform
-                .ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
-            let _ = self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
-        }
-        let _keep_manager_alive = &self.device_manager;
+        self.settle();
+        // The fields drop next: `transform` first, which ends the transform
+        // and shuts it down.
     }
 }
 
@@ -885,6 +1038,173 @@ mod tests {
                     "{codec:?} frame {index}"
                 );
             }
+        }
+    }
+
+    /// Records when it is dropped.
+    struct DropWitness(
+        &'static str,
+        std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+    );
+
+    impl Drop for DropWitness {
+        fn drop(&mut self) {
+            self.1.borrow_mut().push(self.0);
+        }
+    }
+
+    /// Both encoders rely on this order to release their transform before
+    /// `MFShutdown`, and to leave COM after Media Foundation.
+    #[test]
+    fn objects_drop_before_their_platform_guards_in_order() {
+        use super::OnPlatform;
+
+        let dropped = std::rc::Rc::default();
+        let witness = |name| DropWitness(name, std::rc::Rc::clone(&dropped));
+        let platform = (witness("media foundation"), witness("com"));
+        drop(OnPlatform::hold(platform, witness("transform")));
+        assert_eq!(*dropped.borrow(), ["transform", "media foundation", "com"]);
+    }
+
+    /// A 256x256 converted desktop-like frame on `device`, and its converter.
+    fn hardware_test_input(
+        device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+        context: &windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+    ) -> (
+        crate::converter::BgraToYuvConverter,
+        windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+    ) {
+        use crate::VideoPixelFormat;
+        use windows::Win32::Graphics::Direct3D11::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: 256,
+            Height: 256,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            ..Default::default()
+        };
+        let pixels: Vec<u32> = (0..256 * 256)
+            .map(|i| {
+                if (i / 256 + i % 256) % 8 < 4 {
+                    0xffffffff
+                } else {
+                    0xff101010
+                }
+            })
+            .collect();
+        let data = D3D11_SUBRESOURCE_DATA {
+            pSysMem: pixels.as_ptr().cast(),
+            SysMemPitch: 256 * 4,
+            ..Default::default()
+        };
+        let mut texture = None;
+        unsafe { device.CreateTexture2D(&desc, Some(&data), Some(&mut texture)) }.unwrap();
+        let mut converter = crate::converter::BgraToYuvConverter::new(
+            device,
+            context,
+            256,
+            256,
+            60,
+            VideoPixelFormat::Yuv420,
+            false,
+        )
+        .unwrap();
+        let input = converter.convert(&texture.unwrap()).unwrap().clone();
+        (converter, input)
+    }
+
+    /// Encodes `input` once, waiting on the transform's events instead of
+    /// polling.
+    fn encode_one(
+        encoder: &mut super::MediaFoundationVideoEncoder,
+        input: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+        capture_timestamp_us: u64,
+    ) -> crate::EncodedAccessUnit {
+        use super::VideoEncoder;
+
+        while !encoder.wants_input() {
+            encoder.pump_events(true).unwrap();
+            assert!(encoder.take_available_outputs().unwrap().is_empty());
+        }
+        let mut output = encoder.submit(input, capture_timestamp_us).unwrap();
+        while output.is_empty() {
+            encoder.pump_events(true).unwrap();
+            output.extend(encoder.take_available_outputs().unwrap());
+        }
+        assert_eq!(output.len(), 1);
+        output.pop().unwrap()
+    }
+
+    /// Dropping the encoder shuts its asynchronous transform down: the
+    /// transform's event queue, which a copy of its event generator still
+    /// reaches, is closed.
+    #[test]
+    #[ignore = "requires a Windows hardware H.264 encoder"]
+    fn dropping_the_hardware_encoder_shuts_its_transform_down() {
+        use super::*;
+
+        // Keeps the platform up for `events`, which outlives the encoder.
+        let _platform = MediaFoundationRuntime::start().unwrap();
+        let (device, context) = windows_capture::d3d11::create_d3d_device().unwrap();
+        let (_converter, input) = hardware_test_input(&device, &context);
+        let mut encoder = MediaFoundationVideoEncoder::new(
+            &device,
+            256,
+            256,
+            60,
+            6_000_000,
+            VideoCodec::H264,
+            VideoPixelFormat::Yuv420,
+        )
+        .unwrap();
+        assert!(encode_one(&mut encoder, &input, 1).keyframe);
+        let events = encoder.event_generator.clone();
+        drop(encoder);
+        let error = unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) }.unwrap_err();
+        assert_eq!(error.code(), MF_E_SHUTDOWN);
+    }
+
+    /// Replaces the encoder again and again, as bitrate steps, display
+    /// changes and codec fallbacks do, each time with a frame still in
+    /// flight and no other Media Foundation user keeping the platform up.
+    /// Without [`HardwareEncoder::settle`], NVIDIA's HEVC encoder crashes
+    /// this within a few dozen restarts.
+    #[test]
+    #[ignore = "requires Windows hardware H.264 and HEVC encoders; runs for about 15 seconds"]
+    fn hardware_encoder_restarts_many_times_in_a_row() {
+        use super::*;
+
+        let (device, context) = windows_capture::d3d11::create_d3d_device().unwrap();
+        let (_converter, input) = hardware_test_input(&device, &context);
+        for restart in 0..200_u32 {
+            let codec = [VideoCodec::H264, VideoCodec::H265][restart as usize % 2];
+            let mut encoder = MediaFoundationVideoEncoder::new(
+                &device,
+                256,
+                256,
+                60,
+                2_000_000 * (1 + restart % 4),
+                codec,
+                VideoPixelFormat::Yuv420,
+            )
+            .unwrap();
+            for frame in 0..3_u64 {
+                let unit = encode_one(&mut encoder, &input, frame * 16_667 + 1);
+                assert_eq!(unit.keyframe, frame == 0, "{codec:?} restart {restart}");
+            }
+            while !encoder.wants_input() {
+                encoder.pump_events(true).unwrap();
+            }
+            let _ = encoder.submit(&input, 3 * 16_667 + 1).unwrap();
         }
     }
 

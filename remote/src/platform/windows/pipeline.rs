@@ -6,7 +6,7 @@ use super::renderer::PresentKind;
 use super::*;
 use crate::stream_reset::ResetPlan;
 use transform::{
-    attach_device, codec_subtype, decoded_subtype, output_size, provides_samples,
+    Transform, attach_device, codec_subtype, decoded_subtype, output_size, provides_samples,
     select_output_type, video_type,
 };
 use upload::CpuUpload;
@@ -477,7 +477,8 @@ enum DecoderKind {
 }
 
 pub(super) struct Decoder {
-    transform: IMFTransform,
+    /// Ended first: fields drop in declaration order.
+    transform: Transform,
     events: Option<IMFMediaEventGenerator>,
     asynchronous: bool,
     _device_manager: Option<IMFDXGIDeviceManager>,
@@ -571,8 +572,10 @@ impl Decoder {
         }
         unsafe { CoTaskMemFree(Some(activations_ptr.cast())) };
         let activation = activation.context("hardware decoder activation was empty")?;
-        let transform: IMFTransform = unsafe { activation.ActivateObject() }
-            .with_context(|| format!("hardware {:?} decoder activation failed", format.codec))?;
+        let transform =
+            Transform::new(unsafe { activation.ActivateObject() }.with_context(|| {
+                format!("hardware {:?} decoder activation failed", format.codec)
+            })?);
         let attributes =
             unsafe { transform.GetAttributes() }.context("decoder attributes unavailable")?;
         let asynchronous = unsafe { attributes.GetUINT32(&MF_TRANSFORM_ASYNC) }.unwrap_or(0) != 0;
@@ -620,9 +623,10 @@ impl Decoder {
         format: VideoFormat,
         gpu: bool,
     ) -> anyhow::Result<Self> {
-        let transform: IMFTransform =
+        let transform = Transform::new(
             unsafe { CoCreateInstance(&CLSID_MSH264DecoderMFT, None, CLSCTX_INPROC_SERVER) }
-                .context("Microsoft's H.264 decoder is not installed")?;
+                .context("Microsoft's H.264 decoder is not installed")?,
+        );
         let attributes =
             unsafe { transform.GetAttributes() }.context("decoder attributes unavailable")?;
         // Without it, the decoder holds frames back for reordering.
@@ -650,7 +654,7 @@ impl Decoder {
     }
 
     unsafe fn start(
-        transform: IMFTransform,
+        transform: Transform,
         device_manager: Option<IMFDXGIDeviceManager>,
         kind: DecoderKind,
         asynchronous: bool,
@@ -919,20 +923,6 @@ impl Decoder {
             decode_start_us: metadata.decode_start_us,
             decode_complete_us: monotonic_timestamp_us(),
         }))
-    }
-}
-
-impl Drop for Decoder {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = self
-                .transform
-                .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-            let _ = self
-                .transform
-                .ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
-            let _ = self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
-        }
     }
 }
 

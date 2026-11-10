@@ -272,3 +272,114 @@ fn the_viewer_device_decodes_h264() {
         decoder.kind
     );
 }
+
+fn fixture_frame(frame_id: u64) -> QueuedFrame {
+    QueuedFrame {
+        frame: EncodedFrame {
+            stream_id: meshrmm_protocol::VideoStreamId(1),
+            frame_id,
+            capture_timestamp_us: 0,
+            encode_complete_timestamp_us: 0,
+            send_timestamp_us: 0,
+            keyframe: true,
+            data: FIXTURE.to_vec(),
+        },
+        received_at_us: 0,
+    }
+}
+
+/// Replaces the decoder again and again, as every stream reset does: each
+/// time it probes the other profiles, as `supported_video_profiles` does,
+/// and keeps the old decoder's last picture past its replacement, as the
+/// frame schedule can.
+#[test]
+#[ignore = "requires Windows Media Foundation"]
+fn the_decoder_is_replaced_many_times_in_a_row() {
+    let _com = unsafe { ComRuntime::start() }.unwrap();
+    let _mf = unsafe { MediaFoundationRuntime::start() }.unwrap();
+    let (device, _context) = unsafe { create_device() }.unwrap();
+    let format = fixture_format();
+    let mut decoder = unsafe { Decoder::new(&device, format) }.unwrap();
+    let mut held = None;
+    for reset in 0..200_u64 {
+        let decoded = unsafe { decoder.decode(&fixture_frame(reset + 1)) }.unwrap();
+        assert!(decoded.accepted, "reset {reset}");
+        // An asynchronous decoder can finish the picture later.
+        if !decoder.asynchronous {
+            assert!(!decoded.frames.is_empty(), "reset {reset}: no picture");
+        }
+        let picture = decoded.frames.into_iter().last();
+        for codec in [Codec::H264, Codec::H265] {
+            for pixel_format in [
+                meshrmm_protocol::PixelFormat::Nv12,
+                meshrmm_protocol::PixelFormat::Ayuv,
+            ] {
+                let mut candidate = format;
+                candidate.codec = codec;
+                candidate.pixel_format = pixel_format;
+                let _ = unsafe { Decoder::new(&device, candidate) };
+            }
+        }
+        decoder = unsafe { Decoder::new(&device, format) }.unwrap();
+        // The previous decoder's picture goes after the decoder.
+        held = picture;
+    }
+    drop(decoder);
+    drop(held);
+}
+
+/// The first hardware MFT this machine has: a decoder if there is one, else
+/// an encoder. Both are asynchronous.
+unsafe fn hardware_transform() -> IMFTransform {
+    for category in [MFT_CATEGORY_VIDEO_DECODER, MFT_CATEGORY_VIDEO_ENCODER] {
+        let mut activations_ptr: *mut Option<IMFActivate> = ptr::null_mut();
+        let mut count = 0;
+        unsafe {
+            MFTEnumEx(
+                category,
+                MFT_ENUM_FLAG(MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0),
+                None,
+                None,
+                &mut activations_ptr,
+                &mut count,
+            )
+        }
+        .unwrap();
+        if activations_ptr.is_null() {
+            continue;
+        }
+        let activations =
+            unsafe { std::slice::from_raw_parts_mut(activations_ptr, count as usize) };
+        let activation = activations.iter().find_map(Clone::clone);
+        for item in activations.iter_mut() {
+            let _ = item.take();
+        }
+        unsafe { CoTaskMemFree(Some(activations_ptr.cast())) };
+        if let Some(activation) = activation {
+            return unsafe { activation.ActivateObject() }.unwrap();
+        }
+    }
+    panic!("this machine has no hardware video MFT");
+}
+
+/// Dropping the decoder's transform shuts an asynchronous one down: its
+/// event queue, which a copy of its event generator still reaches, is
+/// closed. Microsoft's H.264 decoder is synchronous, so this takes a
+/// hardware MFT, an encoder where the GPU registers no decoder.
+#[test]
+#[ignore = "requires a hardware Media Foundation video decoder or encoder"]
+fn dropping_the_transform_shuts_an_asynchronous_one_down() {
+    let _com = unsafe { ComRuntime::start() }.unwrap();
+    let _mf = unsafe { MediaFoundationRuntime::start() }.unwrap();
+    let transform = unsafe { hardware_transform() };
+    let attributes = unsafe { transform.GetAttributes() }.unwrap();
+    assert_ne!(
+        unsafe { attributes.GetUINT32(&MF_TRANSFORM_ASYNC) }.unwrap_or(0),
+        0
+    );
+    unsafe { attributes.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1) }.unwrap();
+    let events: IMFMediaEventGenerator = transform.cast().unwrap();
+    drop(transform::Transform::new(transform));
+    let error = unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) }.unwrap_err();
+    assert_eq!(error.code(), MF_E_SHUTDOWN);
+}

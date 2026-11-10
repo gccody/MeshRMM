@@ -1,5 +1,44 @@
 use super::*;
 
+/// The decoder's transform, ended when it drops, whether it got as far as
+/// streaming or failed in configuration: it discards what it still holds,
+/// ends its stream, and an asynchronous (hardware) transform is shut down
+/// through `IMFShutdown`, which ends its worker threads, its event queue
+/// and its GPU session. Nothing waits on its events after that. A
+/// synchronous transform needs no shutdown and mostly has no `IMFShutdown`.
+/// Interfaces cast from it may be released after it.
+pub(super) struct Transform(IMFTransform);
+
+impl Transform {
+    pub(super) fn new(transform: IMFTransform) -> Self {
+        Self(transform)
+    }
+}
+
+impl std::ops::Deref for Transform {
+    type Target = IMFTransform;
+
+    fn deref(&self) -> &IMFTransform {
+        &self.0
+    }
+}
+
+impl Drop for Transform {
+    fn drop(&mut self) {
+        // Safety: this owns the transform, and nothing calls it after this.
+        unsafe {
+            let _ = self.0.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+            let _ = self.0.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+            let _ = self.0.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+            if let Ok(shutdown) = self.0.cast::<IMFShutdown>()
+                && let Err(error) = shutdown.Shutdown()
+            {
+                tracing::warn!(%error, "video decoder shutdown failed");
+            }
+        }
+    }
+}
+
 pub(super) fn codec_subtype(codec: Codec) -> windows::core::GUID {
     match codec {
         Codec::H264 => MFVideoFormat_H264,
