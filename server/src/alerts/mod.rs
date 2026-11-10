@@ -2,15 +2,17 @@
 //! docs/alerts.md.
 //!
 //! The engine's task judges the rules about a device's state (offline, disk
-//! space, CPU and memory) every [`EVALUATION_INTERVAL`], and at once when
-//! rules change, from which Agents are connected and the resource usage they
-//! report. It raises an alert when a rule's condition holds for a device the
-//! rule has no unresolved alert about, and resolves the alert when the
-//! condition passes, or when the rule is turned off or stops covering the
-//! device. Script failure rules are checked when a run finishes
-//! ([`script_run_finished`]) or is found lost; their alerts stay until a
-//! person resolves them. Raising an alert notifies the rule's channels, and
-//! so does resolving one if the rule asks.
+//! space, CPU and memory, updates and applications) every
+//! [`EVALUATION_INTERVAL`], from which Agents are connected, the resource
+//! usage they report and what their scans found. A saved rule is judged at
+//! once; a device's report is judged soon, with other reports, at most as
+//! often as [`report_spacing`] allows. It raises an alert when a rule's
+//! condition holds for a device the rule has no unresolved alert about, and
+//! resolves the alert when the condition passes, or when the rule is turned
+//! off or stops covering the device. Script failure rules are checked when
+//! a run finishes ([`script_run_finished`]) or is found lost; their alerts
+//! stay until a person resolves them. Raising an alert notifies the rule's
+//! channels, and so does resolving one if the rule asks.
 //!
 //! Unresolved alerts live in the database, so a restart neither forgets them
 //! nor notifies again. What the engine keeps in memory starts over: a device
@@ -19,27 +21,37 @@
 //! need a full window of new readings. The engine keeps devices' readings
 //! only as far back as the longest window of the enabled CPU and memory
 //! rules, and none while there is no such rule, so a rule that starts
-//! looking further back waits for its window to fill too.
+//! looking further back waits for its window to fill too. It keeps what
+//! devices' scans found while update or application rules judge it, and
+//! reads it again only for devices that reported (see [`facts`]).
 pub mod applications;
 mod evaluate;
+mod facts;
 pub mod rules;
 pub mod store;
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 
 use meshrmm_protocol_types::{ScriptRunStatus, SystemMetrics};
 use sea_query::{Expr, ExprTrait, Query};
 use serde::Serialize;
 use serde_json::{Map, Value};
-use tokio::sync::{Notify, broadcast};
+use tokio::{
+    sync::{Notify, broadcast},
+    time::Instant,
+};
 
 pub use self::evaluate::Held;
 use self::{
-    evaluate::{DeviceState, Tracker, UpdateFacts, Verdict, judge},
+    evaluate::{DeviceState, Tracker, Verdict, judge},
+    facts::{Changes, Facts},
     rules::{Condition, Rule},
     store::{Alert, Counts, Raise, Resolution},
 };
@@ -56,6 +68,20 @@ use crate::{
 
 /// How often device-state rules are judged.
 pub const EVALUATION_INTERVAL: Duration = Duration::from_secs(15);
+/// The least time from one evaluation to the next that devices' reports
+/// start: soon enough that a scan's alert shows within a couple of seconds
+/// on a small instance, while reports that arrive together are judged
+/// together.
+pub const MIN_REPORT_SPACING: Duration = Duration::from_secs(2);
+/// How many times as long as the last evaluation took the engine waits
+/// after it before reports start the next: an evaluation reads the whole
+/// instance, however few devices reported, so on a large instance reports
+/// keep it busy at most a sixth of the time instead of all of it.
+pub const REPORT_SPACING_FACTOR: u32 = 5;
+/// How often an evaluation reads every device's update and application
+/// scans again, whatever the engine was told: a change it wasn't told of
+/// shows within this long.
+pub const FACTS_REFRESH_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// How often the engine takes in new resource usage readings: as often as
 /// Agents report.
 const FEED_INTERVAL: Duration =
@@ -64,6 +90,14 @@ const FEED_INTERVAL: Duration =
 pub const RESOLVED_RETENTION_MS: i64 = 90 * DAY_MS;
 /// Changes a subscriber may fall behind by before it gets the counts again.
 const EVENT_BACKLOG: usize = 256;
+
+/// How long after an evaluation that took `took` reports may start the next:
+/// [`REPORT_SPACING_FACTOR`] times as long, at least [`MIN_REPORT_SPACING`]
+/// and at most [`EVALUATION_INTERVAL`], when the engine evaluates anyway.
+pub fn report_spacing(took: Duration) -> Duration {
+    took.saturating_mul(REPORT_SPACING_FACTOR)
+        .clamp(MIN_REPORT_SPACING, EVALUATION_INTERVAL)
+}
 
 /// What the website's event socket sends about alerts, to users who may see
 /// them.
@@ -91,9 +125,15 @@ pub struct Engine {
 struct Inner {
     tracker: Mutex<Tracker>,
     events: broadcast::Sender<Arc<AlertEvent>>,
-    wake: Notify,
-    /// One evaluation at a time.
-    evaluating: tokio::sync::Mutex<()>,
+    /// Judges the rules at once.
+    now: Notify,
+    /// Judges the rules soon, spaced after the last evaluation.
+    soon: Notify,
+    changes: Mutex<Changes>,
+    evaluations: AtomicU64,
+    fact_rows: AtomicU64,
+    /// One evaluation at a time, and the facts it keeps.
+    evaluating: tokio::sync::Mutex<Facts>,
 }
 
 impl Default for Engine {
@@ -102,8 +142,12 @@ impl Default for Engine {
             inner: Arc::new(Inner {
                 tracker: Mutex::default(),
                 events: broadcast::channel(EVENT_BACKLOG).0,
-                wake: Notify::new(),
-                evaluating: tokio::sync::Mutex::new(()),
+                now: Notify::new(),
+                soon: Notify::new(),
+                changes: Mutex::default(),
+                evaluations: AtomicU64::new(0),
+                fact_rows: AtomicU64::new(0),
+                evaluating: tokio::sync::Mutex::default(),
             }),
         }
     }
@@ -114,16 +158,42 @@ impl Engine {
         self.inner.events.subscribe()
     }
 
-    /// Judges the rules soon, such as after they changed.
+    /// Judges the rules soon, with whatever else is waiting, such as after a
+    /// self-healing attempt finished.
     pub fn wake(&self) {
-        self.inner.wake.notify_one();
+        self.inner.soon.notify_one();
     }
 
-    /// Takes in a rule just saved: keeps the readings it needs from now on,
-    /// and judges the rules soon.
+    /// The device's Agent reported something update or application rules
+    /// judge, already stored: its scans are read again, and the rules judged
+    /// soon, with other devices' reports.
+    pub fn device_reported(&self, device_id: &str) {
+        self.changes().devices.insert(device_id.to_owned());
+        self.wake();
+    }
+
+    /// Takes in a rule just saved: keeps the readings and scans it needs
+    /// from now on, and judges the rules at once, since the person who
+    /// saved it is waiting to see what it raises.
     pub fn rule_saved(&self, rule: &Rule) {
         self.tracker().keep_also_for(rule);
-        self.wake();
+        self.rules_changed(rule);
+        self.inner.now.notify_one();
+    }
+
+    /// Takes in a rule just deleted, with its alerts.
+    pub fn rule_deleted(&self, rule: &Rule) {
+        self.rules_changed(rule);
+    }
+
+    /// Every device's scans are read again for the kind of rule that changed.
+    fn rules_changed(&self, rule: &Rule) {
+        let mut changes = self.changes();
+        match rule.condition {
+            Condition::UpdatesPending | Condition::RebootPending => changes.update_rules = true,
+            Condition::AppUpdatesPending => changes.application_rules = true,
+            _ => {}
+        }
     }
 
     /// Takes in a reading the device's Agent reported at `at`.
@@ -136,10 +206,35 @@ impl Engine {
         self.tracker().held(device_id)
     }
 
+    /// How many evaluations the engine has made.
+    pub fn evaluations(&self) -> u64 {
+        self.inner.evaluations.load(Ordering::Relaxed)
+    }
+
+    /// How many rows of devices' update and application scans evaluations
+    /// have read.
+    pub fn fact_rows_read(&self) -> u64 {
+        self.inner.fact_rows.load(Ordering::Relaxed)
+    }
+
+    /// For how many devices the engine keeps what update scans and what
+    /// application scans found. It waits for an evaluation in progress.
+    pub async fn facts_kept(&self) -> (usize, usize) {
+        self.inner.evaluating.lock().await.kept()
+    }
+
     fn tracker(&self) -> std::sync::MutexGuard<'_, Tracker> {
         // Nothing panics while holding the lock, so a poisoned one is whole.
         self.inner
             .tracker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn changes(&self) -> std::sync::MutexGuard<'_, Changes> {
+        // Nothing panics while holding the lock, so a poisoned one is whole.
+        self.inner
+            .changes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -164,28 +259,54 @@ impl Engine {
     }
 }
 
-/// Runs the engine until the returned task is aborted.
+/// Runs the engine until the returned task is aborted: it evaluates every
+/// [`EVALUATION_INTERVAL`], at once when a rule is saved, and after
+/// [`report_spacing`] when devices reported.
 pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let engine = &state.alerts.inner;
         let mut feed = tokio::time::interval(FEED_INTERVAL);
         feed.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut sequence = 0;
-        let mut evaluated: Option<Instant> = None;
+        // When the last evaluation finished, and when reports may start the
+        // next.
+        let mut last: Option<(Instant, Instant)> = None;
+        let mut reported = false;
         loop {
-            let woken = tokio::select! {
+            let spaced = last.map(|(_, spaced)| spaced);
+            let at_once = tokio::select! {
                 _ = feed.tick() => false,
-                () = state.alerts.inner.wake.notified() => true,
+                () = engine.now.notified() => true,
+                () = engine.soon.notified(), if !reported => {
+                    reported = true;
+                    false
+                }
+                () = tokio::time::sleep_until(spaced.unwrap_or_else(Instant::now)),
+                    if reported && spaced.is_some() => false,
             };
             sequence = state.alerts.feed(&state.metrics, sequence);
-            if woken || evaluated.is_none_or(|at| at.elapsed() >= EVALUATION_INTERVAL) {
-                if let Err(error) = evaluate(&state, now_ms()).await {
-                    tracing::warn!(
-                        error = format!("{error:#}"),
-                        "could not evaluate alert rules"
-                    );
+            let due = match last {
+                None => true,
+                Some((finished, spaced)) => {
+                    at_once
+                        || finished.elapsed() >= EVALUATION_INTERVAL
+                        || (reported && Instant::now() >= spaced)
                 }
-                evaluated = Some(Instant::now());
+            };
+            if !due {
+                continue;
             }
+            // What reported until now is in this evaluation.
+            reported = false;
+            let started = Instant::now();
+            if let Err(error) = evaluate(&state, now_ms()).await {
+                tracing::warn!(
+                    error = format!("{error:#}"),
+                    "could not evaluate alert rules"
+                );
+            }
+            let finished = Instant::now();
+            last = Some((finished, finished + report_spacing(finished - started)));
         }
     })
 }
@@ -194,7 +315,12 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
 /// raising and resolving alerts, and marks runs the Agent never reported
 /// as lost.
 pub async fn evaluate(state: &AppState, now: i64) -> anyhow::Result<()> {
-    let _one_at_a_time = state.alerts.inner.evaluating.lock().await;
+    let mut facts = state.alerts.inner.evaluating.lock().await;
+    state
+        .alerts
+        .inner
+        .evaluations
+        .fetch_add(1, Ordering::Relaxed);
     sweep_lost_runs(state, now).await?;
     crate::monitors::remediation::tick(state, now).await?;
     let mut database = &state.database;
@@ -212,23 +338,47 @@ pub async fn evaluate(state: &AppState, now: i64) -> anyhow::Result<()> {
                 .map(|reading| (id.clone(), reading))
         })
         .collect::<HashMap<_, _>>();
-    let watches_updates = rules.iter().any(|rule| {
-        rule.enabled
-            && matches!(
-                rule.condition,
-                Condition::UpdatesPending | Condition::RebootPending
-            )
-    });
-    let (pending_updates, reboots, scanned) = if watches_updates {
-        (
-            crate::updates::store::pending_ages(&mut database).await?,
-            crate::updates::store::reboots_pending(&mut database).await?,
-            crate::updates::store::scanned_devices(&mut database).await?,
-        )
-    } else {
-        Default::default()
+    let judges = |conditions: &[Condition]| {
+        rules
+            .iter()
+            .any(|rule| rule.enabled && conditions.contains(&rule.condition))
     };
-    let outdated_packages = applications::outdated(&mut database, &rules).await?;
+    let judges_updates = judges(&[Condition::UpdatesPending, Condition::RebootPending]);
+    let judges_applications = judges(&[Condition::AppUpdatesPending]);
+    let active = devices
+        .iter()
+        .map(|device| device.id.as_str())
+        .collect::<HashSet<_>>();
+    // What devices reported before this point is read now; what they report
+    // after is left for the next evaluation.
+    let changes = std::mem::take(&mut *state.alerts.changes());
+    let refreshed = facts
+        .refresh(
+            &mut database,
+            &changes,
+            &active,
+            judges_updates,
+            judges_applications,
+        )
+        .await;
+    let rows = match refreshed {
+        Ok(rows) => rows,
+        Err(error) => {
+            // Read them all next time rather than miss a device's change.
+            *facts = Facts::default();
+            return Err(error.into());
+        }
+    };
+    state
+        .alerts
+        .inner
+        .fact_rows
+        .fetch_add(rows, Ordering::Relaxed);
+    let held = if judges_applications {
+        applications::held(&mut database).await?
+    } else {
+        HashSet::new()
+    };
 
     // Which rule and device pairs have a verdict, and the alerts it wants.
     let mut judged = HashSet::new();
@@ -255,13 +405,10 @@ pub async fn evaluate(state: &AppState, now: i64) -> anyhow::Result<()> {
                     connected: connected.contains(device_id),
                     updating: updating.contains(device_id),
                     latest: latest.get(device_id).map(|reading| &reading.metrics),
-                    updates: scanned.contains(device_id).then(|| UpdateFacts {
-                        pending: pending_updates.get(device_id).map_or(&[], Vec::as_slice),
-                        reboot_pending_since: reboots.get(device_id).copied(),
-                    }),
+                    updates: facts.updates(device_id),
                 };
                 let verdict = if rule.condition == Condition::AppUpdatesPending {
-                    applications::judge(rule, outdated_packages.get(device_id), now)
+                    applications::judge(rule, facts.applications(device_id), &held, now)
                 } else {
                     judge(rule, device, &tracker, now)
                 };
@@ -514,6 +661,8 @@ pub async fn changed(state: &AppState, id: &str) -> anyhow::Result<()> {
 /// The device was deleted: its alerts go with it.
 pub async fn device_removed(state: &AppState, device_id: &str) {
     state.alerts.tracker().forget(device_id);
+    // The next evaluation drops what its scans found.
+    state.alerts.changes().removed.insert(device_id.to_owned());
     if let Err(error) =
         crate::monitors::store::delete_for_device(&mut &state.database, device_id).await
     {
@@ -906,6 +1055,14 @@ mod tests {
             exit_code,
             error: error.map(str::to_owned),
         }
+    }
+
+    #[test]
+    fn reports_wait_longer_after_longer_evaluations() {
+        let millis = Duration::from_millis;
+        assert_eq!(report_spacing(millis(5)), MIN_REPORT_SPACING);
+        assert_eq!(report_spacing(millis(1_000)), millis(5_000));
+        assert_eq!(report_spacing(millis(10_000)), EVALUATION_INTERVAL);
     }
 
     #[test]

@@ -941,7 +941,8 @@ async fn application_jobs_and_policies_run_on_each_device() {
     }
 }
 
-/// Makes the device's outdated packages look `days` old.
+/// Makes the device's outdated packages look `days` old, and tells the alert
+/// engine, which reads them again only for devices that reported.
 async fn age(app: &App, device_id: &str, days: i64) {
     app.db()
         .execute(
@@ -959,12 +960,26 @@ async fn age(app: &App, device_id: &str, days: i64) {
         )
         .await
         .unwrap();
+    app.state.alerts.device_reported(device_id);
 }
 
 async fn alerts_of(browser: &mut Browser) -> Vec<Value> {
     let response = browser.get("/v1/alerts?state=open").await;
     assert_eq!(response.status, StatusCode::OK, "{:?}", response.body);
     response.body["alerts"].as_array().unwrap().clone()
+}
+
+/// Evaluates until no alert is open: the server tells the alert engine of a
+/// scan just after storing it, so an evaluation may come between the two.
+async fn evaluate_until_clear(app: &App, admin: &mut Browser) {
+    for _ in 0..100 {
+        alerts::evaluate(&app.state, now_ms()).await.unwrap();
+        if alerts_of(admin).await.is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the alerts never cleared");
 }
 
 #[tokio::test]
@@ -1057,8 +1072,7 @@ async fn outdated_and_failed_applications_raise_alerts() {
             body["packages"][0]["available_version"].is_null()
         })
         .await;
-        alerts::evaluate(&app.state, now_ms()).await.unwrap();
-        assert!(alerts_of(&mut admin).await.is_empty(), "{name}");
+        evaluate_until_clear(&app, &mut admin).await;
 
         // Each application that fails to install raises its own alert.
         let started = admin

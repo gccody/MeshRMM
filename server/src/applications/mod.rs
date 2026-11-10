@@ -125,7 +125,7 @@ pub async fn activity_reported(
     }
     if !lost.is_empty() {
         state.automation.device_changed(device_id);
-        state.alerts.wake();
+        state.alerts.device_reported(device_id);
     }
 }
 
@@ -157,7 +157,7 @@ pub async fn scan_reported(
     // Outdated packages are what some alert rules watch; unchanged ones give
     // them nothing new to judge.
     if stored == store::Stored::Replaced {
-        state.alerts.wake();
+        state.alerts.device_reported(device_id);
     }
 }
 

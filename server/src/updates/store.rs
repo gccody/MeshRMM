@@ -372,22 +372,23 @@ pub async fn pending(executor: &mut impl Executor, device_id: &str) -> db::Resul
 }
 
 /// For alert rules: each device's pending updates' categories and when they
-/// were first seen.
+/// were first seen; of the `only` devices, or of every device.
 pub async fn pending_ages(
     executor: &mut impl Executor,
+    only: Option<&[String]>,
 ) -> db::Result<HashMap<String, Vec<(UpdateCategory, i64)>>> {
-    let rows: Vec<(String, String, i64)> = executor
-        .fetch_all(
-            &Query::select()
-                .columns([
-                    DevicePendingUpdates::DeviceId,
-                    DevicePendingUpdates::Category,
-                    DevicePendingUpdates::FirstSeenAt,
-                ])
-                .from(DevicePendingUpdates::Table)
-                .to_owned(),
-        )
-        .await?;
+    let mut select = Query::select();
+    select
+        .columns([
+            DevicePendingUpdates::DeviceId,
+            DevicePendingUpdates::Category,
+            DevicePendingUpdates::FirstSeenAt,
+        ])
+        .from(DevicePendingUpdates::Table);
+    if let Some(ids) = only {
+        select.and_where(Expr::col(DevicePendingUpdates::DeviceId).is_in(ids.iter().cloned()));
+    }
+    let rows: Vec<(String, String, i64)> = executor.fetch_all(&select).await?;
     let mut ages: HashMap<String, Vec<(UpdateCategory, i64)>> = HashMap::new();
     for (device_id, category, first_seen) in rows {
         if let Some(category) = UpdateCategory::parse(&category) {
@@ -400,38 +401,44 @@ pub async fn pending_ages(
 }
 
 /// For alert rules: each device whose last scan says it must restart, and
-/// since when.
-pub async fn reboots_pending(executor: &mut impl Executor) -> db::Result<HashMap<String, i64>> {
-    let rows: Vec<(String, Option<i64>)> = executor
-        .fetch_all(
-            &Query::select()
-                .columns([
-                    DeviceUpdateStatus::DeviceId,
-                    DeviceUpdateStatus::RebootPendingSince,
-                ])
-                .from(DeviceUpdateStatus::Table)
-                .and_where(Expr::col(DeviceUpdateStatus::RebootPending).eq(true))
-                .to_owned(),
-        )
-        .await?;
+/// since when; of the `only` devices, or of every device.
+pub async fn reboots_pending(
+    executor: &mut impl Executor,
+    only: Option<&[String]>,
+) -> db::Result<HashMap<String, i64>> {
+    let mut select = Query::select();
+    select
+        .columns([
+            DeviceUpdateStatus::DeviceId,
+            DeviceUpdateStatus::RebootPendingSince,
+        ])
+        .from(DeviceUpdateStatus::Table)
+        .and_where(Expr::col(DeviceUpdateStatus::RebootPending).eq(true));
+    if let Some(ids) = only {
+        select.and_where(Expr::col(DeviceUpdateStatus::DeviceId).is_in(ids.iter().cloned()));
+    }
+    let rows: Vec<(String, Option<i64>)> = executor.fetch_all(&select).await?;
     Ok(rows
         .into_iter()
         .filter_map(|(device_id, since)| Some((device_id, since?)))
         .collect())
 }
 
-/// Each device that reported scans, with whether it must restart: for
-/// knowing which devices a rule can judge.
-pub async fn scanned_devices(executor: &mut impl Executor) -> db::Result<HashSet<String>> {
-    let rows: Vec<(String,)> = executor
-        .fetch_all(
-            &Query::select()
-                .column(DeviceUpdateStatus::DeviceId)
-                .from(DeviceUpdateStatus::Table)
-                .and_where(Expr::col(DeviceUpdateStatus::ScannedAt).is_not_null())
-                .to_owned(),
-        )
-        .await?;
+/// Each device that reported scans, of the `only` devices or of every
+/// device: for knowing which devices a rule can judge.
+pub async fn scanned_devices(
+    executor: &mut impl Executor,
+    only: Option<&[String]>,
+) -> db::Result<HashSet<String>> {
+    let mut select = Query::select();
+    select
+        .column(DeviceUpdateStatus::DeviceId)
+        .from(DeviceUpdateStatus::Table)
+        .and_where(Expr::col(DeviceUpdateStatus::ScannedAt).is_not_null());
+    if let Some(ids) = only {
+        select.and_where(Expr::col(DeviceUpdateStatus::DeviceId).is_in(ids.iter().cloned()));
+    }
+    let rows: Vec<(String,)> = executor.fetch_all(&select).await?;
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 

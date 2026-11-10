@@ -446,6 +446,7 @@ pub async fn delete_rule(
     )
     .await?;
     transaction.commit().await?;
+    state.alerts.rule_deleted(&rule);
     alerts::announce_counts(&state).await;
     state.monitors.wake();
     Ok(StatusCode::NO_CONTENT)

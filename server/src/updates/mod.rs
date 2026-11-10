@@ -268,7 +268,7 @@ pub async fn scan_reported(
             reboot_changed: false
         }
     ) {
-        state.alerts.wake();
+        state.alerts.device_reported(device_id);
     }
 }
 
