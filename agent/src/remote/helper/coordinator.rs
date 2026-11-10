@@ -17,7 +17,8 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
-use std::time::Duration;
+use std::thread::ThreadId;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use meshrmm_protocol::{
@@ -36,6 +37,10 @@ use crate::remote::thumbnail::{Capture, Signature};
 /// How long a helper may take to answer a request. Starting capture is the
 /// slowest, when ScreenCaptureKit first lists the displays.
 const CALL_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a capture that lost frames waits for the keyframe it asked for
+/// before asking again: the helper drops frames when its queue is full, the
+/// keyframe among them.
+const KEYFRAME_RETRY: Duration = Duration::from_secs(1);
 
 static REGISTRY: OnceLock<Arc<Registry>> = OnceLock::new();
 
@@ -130,6 +135,7 @@ impl Registry {
             next_id: AtomicU64::new(1),
             pending: Mutex::default(),
             closed: AtomicBool::new(false),
+            reader: OnceLock::new(),
             session: Mutex::default(),
             approval: Mutex::default(),
         });
@@ -283,6 +289,9 @@ pub(crate) struct Connection {
     next_id: AtomicU64,
     pending: Mutex<HashMap<u64, mpsc::SyncSender<Result<Reply, String>>>>,
     closed: AtomicBool,
+    /// The thread reading the helper's events, the only one that delivers
+    /// replies, so it must never wait for one.
+    reader: OnceLock<ThreadId>,
     /// The session using this helper, which receives its events.
     session: Mutex<Option<Arc<SessionEvents>>>,
     /// Where an approval prompt's answer goes.
@@ -290,7 +299,8 @@ pub(crate) struct Connection {
 }
 
 impl Connection {
-    fn read_events(&self, mut reader: BufReader<UnixStream>) {
+    fn read_events(self: &Arc<Self>, mut reader: BufReader<UnixStream>) {
+        let _ = self.reader.set(std::thread::current().id());
         loop {
             let event = match protocol::read::<Event>(&mut reader) {
                 Ok(Some(event)) => event,
@@ -328,8 +338,8 @@ impl Connection {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .clone();
-                    if let Some(session) = session {
-                        session.receive(event);
+                    if session.is_some_and(|session| session.receive(event, Instant::now())) {
+                        self.request_keyframe();
                     }
                 }
             }
@@ -358,18 +368,47 @@ impl Connection {
         self.call(request).map(|_| ())
     }
 
-    /// Sends `request` without waiting for the helper's reply.
+    /// Sends `request` without waiting for the helper's reply, which the
+    /// reader drops as nobody's.
     fn notify(&self, request: Request) {
-        let _ = protocol::write(
-            &mut *self.writer.lock().unwrap_or_else(|e| e.into_inner()),
-            &Call {
-                id: self.next_id.fetch_add(1, Ordering::Relaxed),
-                request,
-            },
-        );
+        let _ = self.write(&Call {
+            id: self.next_id.fetch_add(1, Ordering::Relaxed),
+            request,
+        });
+    }
+
+    /// Asks the helper for a keyframe on the reader's behalf, from a thread
+    /// of its own: the reader must not wait even for the writer, which a
+    /// caller's write the helper is not reading yet can hold while the helper
+    /// waits to send its replies.
+    fn request_keyframe(self: &Arc<Self>) {
+        let helper = Arc::clone(self);
+        if let Err(error) = std::thread::Builder::new()
+            .name("meshrmm-helper-keyframe".into())
+            .spawn(move || helper.notify(Request::Keyframe))
+        {
+            tracing::warn!(%error, "could not ask the session helper for a keyframe");
+        }
+    }
+
+    /// Writes `call`. A failed write may have sent half of it, so it ends the
+    /// connection: the reader sees the end and the session moves on as when
+    /// the helper disconnects.
+    fn write(&self, call: &Call) -> anyhow::Result<()> {
+        let mut writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let written = protocol::write(&mut *writer, call);
+        if written.is_err() {
+            let _ = writer.shutdown(std::net::Shutdown::Both);
+        }
+        written
     }
 
     fn call(&self, request: Request) -> anyhow::Result<Reply> {
+        if self.reader.get() == Some(&std::thread::current().id()) {
+            #[cfg(not(test))]
+            debug_assert!(false, "the session helper's reader waited for a reply");
+            bail!("the session helper's reader cannot wait for a reply");
+        }
         if self.closed.load(Ordering::SeqCst) {
             bail!("the session helper disconnected");
         }
@@ -379,11 +418,7 @@ impl Connection {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(id, sender);
-        let written = protocol::write(
-            &mut *self.writer.lock().unwrap_or_else(|e| e.into_inner()),
-            &Call { id, request },
-        );
-        if let Err(error) = written {
+        if let Err(error) = self.write(&Call { id, request }) {
             self.pending
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -426,33 +461,58 @@ struct FrameSink {
     publish: Box<dyn Fn(Frame) + Send>,
     next_sequence: Option<u64>,
     resynchronizing: bool,
-    request_keyframe: Box<dyn Fn() + Send>,
+    /// When the sink last asked for a keyframe.
+    keyframe_requested: Option<Instant>,
+}
+
+impl FrameSink {
+    fn new(publish: impl Fn(Frame) + Send + 'static) -> Self {
+        Self {
+            publish: Box::new(publish),
+            next_sequence: None,
+            resynchronizing: false,
+            keyframe_requested: None,
+        }
+    }
+
+    /// Publishes frame `sequence` unless frames were lost before it, after
+    /// which only a keyframe publishes again. Returns whether to ask the
+    /// helper for one: when frames were lost, and again while the keyframe
+    /// does not come, but at most once every `KEYFRAME_RETRY`.
+    fn receive(&mut self, sequence: u64, frame: Frame, now: Instant) -> bool {
+        if self.next_sequence.is_some_and(|next| next != sequence) {
+            self.resynchronizing = true;
+        }
+        self.next_sequence = Some(sequence + 1);
+        if frame.keyframe {
+            self.resynchronizing = false;
+        }
+        if !self.resynchronizing {
+            (self.publish)(frame);
+            return false;
+        }
+        let request = self
+            .keyframe_requested
+            .is_none_or(|requested| now.duration_since(requested) >= KEYFRAME_RETRY);
+        if request {
+            self.keyframe_requested = Some(now);
+        }
+        request
+    }
 }
 
 impl SessionEvents {
-    fn receive(&self, event: Event) {
+    /// Takes in `event`, received at `now`. Returns whether to ask the helper
+    /// for a keyframe, which the caller does once the frames are unlocked.
+    fn receive(&self, event: Event, now: Instant) -> bool {
         match event {
             Event::Frame(sequence, frame) => {
-                if let Some(sink) = self
+                return self
                     .frames
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .as_mut()
-                {
-                    if sink.next_sequence.is_some_and(|next| next != sequence) && !frame.keyframe {
-                        if !sink.resynchronizing {
-                            (sink.request_keyframe)();
-                        }
-                        sink.resynchronizing = true;
-                    }
-                    sink.next_sequence = Some(sequence + 1);
-                    if frame.keyframe {
-                        sink.resynchronizing = false;
-                    }
-                    if !sink.resynchronizing {
-                        (sink.publish)(frame);
-                    }
-                }
+                    .is_some_and(|sink| sink.receive(sequence, frame, now));
             }
             Event::CaptureEnded(error) => {
                 *self.capture_ended.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
@@ -494,6 +554,7 @@ impl SessionEvents {
             Event::AudioEnded => self.audio_ended.store(true, Ordering::SeqCst),
             Event::Reply { .. } | Event::ApprovalDecision(_) => {}
         }
+        false
     }
 }
 
@@ -609,17 +670,8 @@ impl Remote {
         publish: impl Fn(Frame) + Send + 'static,
     ) -> anyhow::Result<Started> {
         let helper = self.helper()?;
-        let remote = Arc::downgrade(self);
-        *self.events.frames.lock().unwrap_or_else(|e| e.into_inner()) = Some(FrameSink {
-            publish: Box::new(publish),
-            next_sequence: None,
-            resynchronizing: false,
-            request_keyframe: Box::new(move || {
-                if let Some(remote) = remote.upgrade() {
-                    let _ = remote.request_keyframe();
-                }
-            }),
-        });
+        *self.events.frames.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(FrameSink::new(publish));
         *self
             .events
             .capture_ended
@@ -1031,12 +1083,162 @@ impl ScreenInput for HelperInput {
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    /// How long the tests wait for what should happen at once, well under
+    /// `CALL_TIMEOUT`.
+    const PROMPTLY: Duration = Duration::from_secs(2);
+
+    fn frame(keyframe: bool) -> Frame {
+        Frame {
+            data: Vec::new(),
+            keyframe,
+            capture_timestamp_us: 0,
+            encode_complete_timestamp_us: 0,
+        }
+    }
+
+    /// A connection to a fake helper, and the helper's end of it.
+    fn connect() -> (Arc<Connection>, UnixStream) {
+        let (coordinator, helper) = UnixStream::pair().unwrap();
+        send(
+            &helper,
+            &Hello {
+                version: protocol::VERSION,
+                login_window: false,
+            },
+        );
+        let connection = Arc::new(Registry::default())
+            .attach(coordinator, 501, None)
+            .unwrap();
+        helper.set_read_timeout(Some(PROMPTLY)).unwrap();
+        (connection, helper)
+    }
+
+    /// Starts a session on `connection` whose frames go to `publish`.
+    fn begin(connection: &Connection, publish: impl Fn(Frame) + Send + 'static) {
+        let events = Arc::new(SessionEvents::default());
+        *events.frames.lock().unwrap() = Some(FrameSink::new(publish));
+        *connection.session.lock().unwrap() = Some(events);
+    }
+
+    fn send(mut helper: &UnixStream, message: &impl serde::Serialize) {
+        protocol::write(&mut helper, message).unwrap();
+    }
+
+    #[test]
+    fn a_frame_gap_asks_for_a_keyframe_and_the_reader_keeps_going() {
+        let (connection, helper) = connect();
+        let (published, frames) = mpsc::channel();
+        begin(&connection, move |frame| {
+            let _ = published.send(frame.keyframe);
+        });
+        send(&helper, &Event::Frame(0, frame(true)));
+        send(&helper, &Event::Frame(2, frame(false)));
+        assert_eq!(frames.recv_timeout(PROMPTLY), Ok(true));
+        // Another caller waits for a reply only the reader can deliver.
+        let (answered, answer) = mpsc::channel();
+        let caller = Arc::clone(&connection);
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = caller.call(Request::StopCapture);
+            let _ = answered.send((result.is_ok(), started.elapsed()));
+        });
+        let mut requests = BufReader::new(helper.try_clone().unwrap());
+        let mut keyframes = 0;
+        for _ in 0..2 {
+            let call: Call = protocol::read(&mut requests).unwrap().unwrap();
+            keyframes += usize::from(matches!(call.request, Request::Keyframe));
+            send(
+                &helper,
+                &Event::Reply {
+                    id: call.id,
+                    result: Ok(Reply::Done),
+                },
+            );
+        }
+        assert_eq!(keyframes, 1);
+        let (ok, elapsed) = answer
+            .recv_timeout(PROMPTLY)
+            .expect("the reader did not deliver the reply");
+        assert!(ok && elapsed < PROMPTLY);
+        // Frame 3 waits for the keyframe; frames resume with it.
+        send(&helper, &Event::Frame(3, frame(false)));
+        send(&helper, &Event::Frame(4, frame(true)));
+        send(&helper, &Event::Frame(5, frame(false)));
+        assert_eq!(frames.recv_timeout(PROMPTLY), Ok(true));
+        assert_eq!(frames.recv_timeout(PROMPTLY), Ok(false));
+        assert!(connection.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_sink_that_lost_frames_waits_for_a_keyframe_and_asks_again_while_none_comes() {
+        let (published, frames) = mpsc::channel();
+        let mut sink = FrameSink::new(move |frame| {
+            let _ = published.send(frame.keyframe);
+        });
+        let start = Instant::now();
+        let at = |elapsed: Duration| start + elapsed;
+        let ms = Duration::from_millis;
+        assert!(!sink.receive(0, frame(true), at(ms(0))));
+        assert!(!sink.receive(1, frame(false), at(ms(10))));
+        // Frames 2 and 3 were lost: one request for any number of gaps.
+        assert!(sink.receive(4, frame(false), at(ms(20))));
+        assert!(!sink.receive(6, frame(false), at(ms(30))));
+        assert!(!sink.receive(7, frame(false), at(ms(19) + KEYFRAME_RETRY)));
+        // The keyframe did not come, so the sink asks again.
+        assert!(sink.receive(8, frame(false), at(ms(20) + KEYFRAME_RETRY)));
+        assert!(!sink.receive(9, frame(false), at(ms(30) + KEYFRAME_RETRY)));
+        assert!(!sink.receive(10, frame(true), at(ms(40) + KEYFRAME_RETRY)));
+        assert!(!sink.receive(11, frame(false), at(ms(50) + KEYFRAME_RETRY)));
+        assert_eq!(
+            frames.try_iter().collect::<Vec<_>>(),
+            [true, false, true, false]
+        );
+    }
+
+    #[test]
+    fn a_call_from_the_reader_fails_at_once() {
+        let (connection, helper) = connect();
+        let (sender, results) = mpsc::channel();
+        let reader = Arc::downgrade(&connection);
+        begin(&connection, move |_| {
+            if let Some(connection) = reader.upgrade() {
+                let started = Instant::now();
+                let failed = connection.call(Request::StopCapture).is_err();
+                let _ = sender.send((failed, started.elapsed()));
+            }
+        });
+        send(&helper, &Event::Frame(0, frame(true)));
+        let (failed, elapsed) = results
+            .recv_timeout(PROMPTLY)
+            .expect("the reader waited for a reply");
+        assert!(failed && elapsed < PROMPTLY);
+        assert!(connection.pending.lock().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_write_ends_the_connection() {
+        let (connection, helper) = connect();
+        // The helper stops taking requests but stays connected.
+        helper.shutdown(std::net::Shutdown::Read).unwrap();
+        connection.notify(Request::Keyframe);
+        let deadline = Instant::now() + PROMPTLY;
+        while !connection.closed() {
+            assert!(
+                Instant::now() < deadline,
+                "the reader did not see the connection end"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Runs a helper in this process against a coordinator socket and streams
     /// the console through it. Needs the Screen Recording permission.
+    #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "captures the screen through a session helper"]
     fn streams_the_console_through_a_session_helper() {
