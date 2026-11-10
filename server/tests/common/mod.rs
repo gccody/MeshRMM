@@ -11,11 +11,28 @@ pub mod passkey;
 
 use std::path::Path;
 
-use meshrmm_server::{config::Config, db::Database};
+use meshrmm_server::{
+    config::Config,
+    db::{Database, Limits},
+};
 use sqlx::{Connection, PgConnection};
 use tempfile::TempDir;
 
 pub const POSTGRES_URL_VARIABLE: &str = "MESHRMM_TEST_POSTGRES_URL";
+
+/// How long the tests' queries wait for a connection, including opening it.
+/// The server's defaults fail fast, but a busy test machine can take that
+/// long to open one; tests of the timeouts set their own.
+pub const DATABASE_WAIT_SECONDS: u64 = 30;
+
+fn test_limits() -> Limits {
+    let wait = std::time::Duration::from_secs(DATABASE_WAIT_SECONDS);
+    Limits {
+        connections: 4,
+        acquire_timeout: wait,
+        write_timeout: wait,
+    }
+}
 
 /// A migrated, empty database that is removed when the test calls
 /// [`TestDatabase::drop_database`] (PostgreSQL) or the value is dropped
@@ -64,7 +81,7 @@ pub async fn sqlite() -> TestDatabase {
 pub async fn sqlite_with(migrate: bool) -> TestDatabase {
     let dir = tempfile::tempdir().unwrap();
     let url = format!("sqlite://{}", dir.path().join("test.db").display());
-    let database = Database::connect(&url, 4).await.unwrap();
+    let database = Database::connect_with(&url, test_limits()).await.unwrap();
     if migrate {
         database.migrate().await.unwrap();
     }
@@ -91,7 +108,7 @@ pub async fn postgres_with(admin_url: &str, migrate: bool) -> TestDatabase {
     let mut url = url::Url::parse(admin_url).unwrap();
     url.set_path(&name);
     let url = url.to_string();
-    let database = Database::connect(&url, 4).await.unwrap();
+    let database = Database::connect_with(&url, test_limits()).await.unwrap();
     if migrate {
         database.migrate().await.unwrap();
     }
@@ -120,10 +137,13 @@ pub fn config(dir: &Path, extra: &str) -> Config {
         public_url = "https://rmm.example.com"
         data_dir = "{data}"
         downloads.dir = "{downloads}"
+        database.acquire_timeout_seconds = {wait}
+        database.write_timeout_seconds = {wait}
         {extra}
         "#,
         data = dir.join("data").display(),
         downloads = dir.join("downloads").display(),
+        wait = DATABASE_WAIT_SECONDS,
     ))
     .unwrap()
 }

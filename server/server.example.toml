@@ -18,7 +18,14 @@ data_dir = "/var/lib/meshrmm"
 # SQLite (the default, a file in data_dir) or PostgreSQL:
 # url = "sqlite:///var/lib/meshrmm/meshrmm.db"
 # url = "postgres://meshrmm:password@db.internal/meshrmm"
-max_connections = 10
+# SQLite's read-only connections (besides its one writer), by default twice
+# the CPUs from 4 to 32; or PostgreSQL's connections, by default four times
+# the CPUs from 10 to 50, which must fit PostgreSQL's own max_connections.
+# max_connections = 16
+# How long a query waits for a connection, and a SQLite write for the writer,
+# before the request is answered 503 with Retry-After.
+# acquire_timeout_seconds = 5
+# write_timeout_seconds = 10
 
 [http]
 # Defaults to 0.0.0.0:443, or 127.0.0.1:8080 when tls.mode = "proxy".

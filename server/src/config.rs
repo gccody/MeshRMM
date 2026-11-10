@@ -6,6 +6,7 @@
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{Context, bail};
@@ -16,6 +17,8 @@ use figment::{
 use ipnet::IpNet;
 use serde::Deserialize;
 use url::{Host, Url};
+
+use crate::db;
 
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/meshrmm/server.toml";
 const DEFAULT_DATA_DIR: &str = "/var/lib/meshrmm";
@@ -71,15 +74,25 @@ pub struct DatabaseConfig {
     /// `sqlite://<path>` or `postgres://...`. Defaults to `meshrmm.db` in the
     /// data directory.
     pub url: Option<String>,
-    #[serde(default = "default_max_connections")]
-    pub max_connections: u32,
+    /// SQLite's read-only connections, besides its one writer, or all of
+    /// PostgreSQL's. Defaults to [`db::default_connections`].
+    pub max_connections: Option<u32>,
+    /// How long a read, or any query on PostgreSQL, waits for a connection
+    /// before the request is answered busy.
+    #[serde(default = "default_acquire_timeout_seconds")]
+    pub acquire_timeout_seconds: u64,
+    /// How long a write waits its turn for SQLite's one writer.
+    #[serde(default = "default_write_timeout_seconds")]
+    pub write_timeout_seconds: u64,
 }
 
 impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
             url: None,
-            max_connections: default_max_connections(),
+            max_connections: None,
+            acquire_timeout_seconds: default_acquire_timeout_seconds(),
+            write_timeout_seconds: default_write_timeout_seconds(),
         }
     }
 }
@@ -273,8 +286,12 @@ fn default_rcodesign() -> PathBuf {
     PathBuf::from(DEFAULT_RCODESIGN)
 }
 
-fn default_max_connections() -> u32 {
-    10
+fn default_acquire_timeout_seconds() -> u64 {
+    db::ACQUIRE_TIMEOUT.as_secs()
+}
+
+fn default_write_timeout_seconds() -> u64 {
+    db::WRITE_TIMEOUT.as_secs()
 }
 
 fn default_max_toolbox_file_bytes() -> u64 {
@@ -361,8 +378,14 @@ impl Config {
         {
             bail!("tls.trusted_proxies must list at least one address");
         }
-        if self.database.max_connections == 0 {
+        if self.database.max_connections == Some(0) {
             bail!("database.max_connections must be at least 1");
+        }
+        if !(1..=300).contains(&self.database.acquire_timeout_seconds) {
+            bail!("database.acquire_timeout_seconds must be between 1 and 300");
+        }
+        if !(1..=300).contains(&self.database.write_timeout_seconds) {
+            bail!("database.write_timeout_seconds must be between 1 and 300");
         }
         if self.toolbox.max_file_bytes == 0 {
             bail!("toolbox.max_file_bytes must be at least 1");
@@ -412,6 +435,18 @@ impl Config {
         match &self.database.url {
             Some(url) => url.clone(),
             None => format!("sqlite://{}", self.data_dir.join("meshrmm.db").display()),
+        }
+    }
+
+    /// `database.max_connections`, or the default for the database's backend.
+    pub fn database_limits(&self) -> db::Limits {
+        db::Limits {
+            connections: self
+                .database
+                .max_connections
+                .unwrap_or_else(|| db::default_connections(&self.database_url())),
+            acquire_timeout: Duration::from_secs(self.database.acquire_timeout_seconds),
+            write_timeout: Duration::from_secs(self.database.write_timeout_seconds),
         }
     }
 
@@ -632,6 +667,46 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn database_limits_default_by_backend_unless_set() {
+        let proxy = "public_url = \"https://rmm.example.com\"\ntls.mode = \"proxy\"";
+        let config = Config::from_toml(proxy).unwrap();
+        assert_eq!(
+            config.database_limits(),
+            db::Limits::new(db::default_connections("sqlite://meshrmm.db"))
+        );
+        let config = Config::from_toml(&format!(
+            "{proxy}\ndatabase.url = \"postgres://db.internal/meshrmm\""
+        ))
+        .unwrap();
+        assert_eq!(
+            config.database_limits().connections,
+            db::default_connections("postgres://db.internal/meshrmm")
+        );
+        let config = Config::from_toml(&format!(
+            "{proxy}\n[database]\nmax_connections = 3\nacquire_timeout_seconds = 2\nwrite_timeout_seconds = 30"
+        ))
+        .unwrap();
+        assert_eq!(
+            config.database_limits(),
+            db::Limits {
+                connections: 3,
+                acquire_timeout: Duration::from_secs(2),
+                write_timeout: Duration::from_secs(30),
+            }
+        );
+        for bad in [
+            "max_connections = 0",
+            "acquire_timeout_seconds = 0",
+            "write_timeout_seconds = 301",
+        ] {
+            assert!(
+                Config::from_toml(&format!("{proxy}\n[database]\n{bad}")).is_err(),
+                "{bad} was accepted"
+            );
+        }
     }
 
     #[test]

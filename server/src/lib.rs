@@ -71,8 +71,7 @@ pub async fn prepare(config: Config) -> anyhow::Result<AppState> {
     secrets::ensure_data_dir(&config.data_dir)?;
     let instance_key = InstanceKey::load_or_create(&config.data_dir)?;
     let storage = Storage::open(&config.data_dir)?;
-    let database =
-        Database::connect(&config.database_url(), config.database.max_connections).await?;
+    let database = Database::connect_with(&config.database_url(), config.database_limits()).await?;
     database.migrate().await?;
     let downloads = Downloads::load(&config).await?;
     tracing::info!(

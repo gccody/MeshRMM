@@ -628,3 +628,56 @@ async fn a_server_built_without_its_website_answers_with_404s() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body, br#"{"error":"route not found"}"#);
 }
+
+#[tokio::test]
+async fn a_request_that_finds_no_free_database_connection_is_told_to_retry() {
+    for app in common::apps().await {
+        let admin = common::set_up(&app).await;
+        let timeout = std::time::Duration::from_millis(200);
+        let database = meshrmm_server::db::Database::connect_with(
+            &app.state.config.database_url(),
+            meshrmm_server::db::Limits {
+                connections: 1,
+                acquire_timeout: timeout,
+                write_timeout: timeout,
+            },
+        )
+        .await
+        .unwrap();
+        let mut state = app.state.clone();
+        state.database = database.clone();
+        let router = meshrmm_server::http::router(state);
+        // Holds SQLite's writer, or PostgreSQL's one connection.
+        let transaction = database.begin().await.unwrap();
+
+        let started = std::time::Instant::now();
+        let response = request(
+            &router,
+            admin
+                .request(axum::http::Method::POST, "/v1/companies")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"name":"Acme"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            app.name
+        );
+        assert_eq!(response.headers()[header::RETRY_AFTER], "5", "{}", app.name);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "{}",
+            app.name
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], "server_busy", "{}", app.name);
+
+        transaction.rollback().await.unwrap();
+        database.close().await;
+        app.finish().await;
+    }
+}
