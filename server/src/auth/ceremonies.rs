@@ -2,28 +2,26 @@
 //! SSO redirects). Each entry is used once and expires; the browser holds
 //! only a random token naming it.
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::Mutex,
     time::{Duration, Instant},
 };
 
 use crate::secrets::{new_token, token_hash};
 
-/// Above this many pending ceremonies the oldest is dropped, so unfinished
+/// Above this many pending entries the oldest is dropped, so unfinished
 /// ones can't grow memory without bound.
-const MAX_PENDING: usize = 10_000;
+pub(super) const MAX_PENDING: usize = 10_000;
 
 #[derive(Debug)]
 pub struct Ceremonies<T> {
-    ttl: Duration,
-    pending: Mutex<HashMap<String, (Instant, T)>>,
+    pending: Mutex<Expiring<T>>,
 }
 
 impl<T> Ceremonies<T> {
     pub fn new(ttl: Duration) -> Self {
         Self {
-            ttl,
-            pending: Mutex::new(HashMap::new()),
+            pending: Mutex::new(Expiring::new(ttl)),
         }
     }
 
@@ -34,17 +32,7 @@ impl<T> Ceremonies<T> {
 
     fn start_at(&self, value: T, now: Instant) -> String {
         let token = new_token();
-        let mut pending = self.lock();
-        pending.retain(|_, (expires, _)| *expires > now);
-        if pending.len() >= MAX_PENDING
-            && let Some(oldest) = pending
-                .iter()
-                .min_by_key(|(_, (expires, _))| *expires)
-                .map(|(key, _)| key.clone())
-        {
-            pending.remove(&oldest);
-        }
-        pending.insert(token_hash(&token), (now + self.ttl, value));
+        self.lock().insert_at(token_hash(&token), value, now);
         token
     }
 
@@ -58,11 +46,94 @@ impl<T> Ceremonies<T> {
         (expires > now).then_some(value)
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (Instant, T)>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Expiring<T>> {
         // A panic while holding the lock leaves only pending ceremonies.
         self.pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// At most [`MAX_PENDING`] entries, each expiring `ttl` after it was added.
+/// Adding one drops what expired and, when full, the oldest, in time
+/// proportional to what it drops rather than to how many are kept.
+#[derive(Debug)]
+pub(super) struct Expiring<T> {
+    ttl: Duration,
+    entries: HashMap<String, (Instant, T)>,
+    /// Keys and expiry times in the order they were added, which with one
+    /// `ttl` is the order they expire. Keys removed since are skipped.
+    order: VecDeque<(Instant, String)>,
+    /// Entries looked at, for tests to bound the work an insert does.
+    #[cfg(test)]
+    pub(super) visited: usize,
+}
+
+impl<T> Expiring<T> {
+    pub(super) fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            #[cfg(test)]
+            visited: 0,
+        }
+    }
+
+    pub(super) fn insert_at(&mut self, key: String, value: T, now: Instant) {
+        while let Some((expires, _)) = self.order.front()
+            && *expires <= now
+        {
+            self.pop_oldest();
+        }
+        while self.entries.len() >= MAX_PENDING && self.pop_oldest() {}
+        // Removed entries leave their place in `order`; when those are most
+        // of it, they are dropped in one pass, once per as many removals.
+        if self.order.len() > 2 * self.entries.len() + 64 {
+            #[cfg(test)]
+            {
+                self.visited += self.order.len();
+            }
+            let entries = &self.entries;
+            self.order
+                .retain(|(expires, key)| Self::current(entries, key, *expires));
+        }
+        let expires = now + self.ttl;
+        self.order.push_back((expires, key.clone()));
+        self.entries.insert(key, (expires, value));
+    }
+
+    pub(super) fn get_mut(&mut self, key: &str) -> Option<&mut (Instant, T)> {
+        self.entries.get_mut(key)
+    }
+
+    pub(super) fn remove(&mut self, key: &str) -> Option<(Instant, T)> {
+        self.entries.remove(key)
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Takes the oldest place in `order`, removing its entry if it is still
+    /// there. Returns whether there was a place.
+    fn pop_oldest(&mut self) -> bool {
+        let Some((expires, key)) = self.order.pop_front() else {
+            return false;
+        };
+        #[cfg(test)]
+        {
+            self.visited += 1;
+        }
+        if Self::current(&self.entries, &key, expires) {
+            self.entries.remove(&key);
+        }
+        true
+    }
+
+    fn current(entries: &HashMap<String, (Instant, T)>, key: &str, expires: Instant) -> bool {
+        entries.get(key).is_some_and(|(kept, _)| *kept == expires)
     }
 }
 
@@ -105,5 +176,38 @@ mod tests {
         assert_eq!(ceremonies.lock().len(), MAX_PENDING);
         assert_eq!(ceremonies.take_at(&first, start), None);
         assert_eq!(ceremonies.take_at(&last, start), Some(MAX_PENDING));
+    }
+
+    #[test]
+    fn starting_one_when_full_does_not_scan_the_rest() {
+        let mut pending = Expiring::new(Duration::from_secs(60));
+        let start = Instant::now();
+        for n in 0..MAX_PENDING {
+            pending.insert_at(n.to_string(), n, start);
+        }
+        pending.visited = 0;
+        let starts = 10 * MAX_PENDING;
+        for n in 0..starts {
+            pending.insert_at(format!("new-{n}"), n, start + Duration::from_secs(1));
+            assert_eq!(pending.len(), MAX_PENDING);
+        }
+        assert!(pending.visited <= 2 * starts, "{}", pending.visited);
+        assert_eq!(pending.get_mut("0").map(|(_, n)| *n), None);
+        assert!(pending.get_mut(&format!("new-{}", starts - 1)).is_some());
+    }
+
+    #[test]
+    fn taken_ceremonies_leave_nothing_behind() {
+        let mut pending = Expiring::new(Duration::from_secs(60));
+        let start = Instant::now();
+        pending.insert_at("kept".to_owned(), 0, start);
+        for n in 0..100_000 {
+            pending.insert_at(n.to_string(), n, start);
+            assert_eq!(pending.remove(&n.to_string()).map(|(_, n)| n), Some(n));
+            assert!(pending.order.len() <= 2 * pending.len() + 65);
+        }
+        assert!(pending.visited <= 300_000, "{}", pending.visited);
+        assert_eq!(pending.len(), 1);
+        assert!(pending.get_mut("kept").is_some());
     }
 }
