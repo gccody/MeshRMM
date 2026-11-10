@@ -44,6 +44,14 @@ const MAX_PENDING_MINUTES: usize = 250_000;
 /// 2,000 rows bind 22,000: under SQLite's limit of 32,766 and PostgreSQL's of
 /// 65,535.
 const ROWS_PER_STATEMENT: usize = 2_000;
+/// When a batch is refused, minutes are tried one at a time; if this many in
+/// a row are refused with none stored, it is the database, not the minutes,
+/// and the rest wait for the next flush. Without it a database refusing
+/// everything would take one statement per waiting minute, every flush. The
+/// trade-off: if this many genuinely bad minutes sort first (by minute, so
+/// one minute's devices), the good ones behind them wait too, until the bad
+/// ones age out of the bound.
+const REFUSALS_BEFORE_GIVING_UP: usize = 1_000;
 
 /// A device's latest report.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -243,12 +251,12 @@ impl Pending {
         }
     }
 
-    fn take(&mut self) -> Vec<((i64, String), Totals)> {
+    fn take(&mut self) -> Vec<Queued> {
         std::mem::take(&mut self.minutes).into_iter().collect()
     }
 
     /// Queues again minutes a failed write took, under the ones queued since.
-    fn restore(&mut self, minutes: Vec<((i64, String), Totals)>) {
+    fn restore(&mut self, minutes: Vec<Queued>) {
         let newer = std::mem::replace(&mut self.minutes, minutes.into_iter().collect());
         for ((_, device_id), minute) in newer {
             self.insert(&device_id, minute);
@@ -276,6 +284,8 @@ pub struct Flushed {
 struct Writer {
     /// Whether the last flush failed, so an outage is logged once.
     failing: bool,
+    /// Statements tried for a single minute after a refused batch.
+    tried_alone: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -476,7 +486,7 @@ impl Metrics {
         if minutes.is_empty() {
             return Ok(Flushed::default());
         }
-        match self.write(minutes).await {
+        match self.write(&mut writer, minutes).await {
             Ok(flushed) => {
                 if std::mem::take(&mut writer.failing) {
                     tracing::info!("storing resource usage history again");
@@ -503,7 +513,11 @@ impl Metrics {
     }
 
     /// Writes the minutes, or fails with those not written.
-    async fn write(&self, minutes: Vec<Queued>) -> Result<Flushed, (sqlx::Error, Vec<Queued>)> {
+    async fn write(
+        &self,
+        writer: &mut Writer,
+        minutes: Vec<Queued>,
+    ) -> Result<Flushed, (sqlx::Error, Vec<Queued>)> {
         match self.write_together(&minutes).await {
             Ok(statements) => {
                 return Ok(Flushed {
@@ -524,6 +538,7 @@ impl Metrics {
         let mut refusal = None;
         let mut rest = minutes.into_iter();
         while let Some(minute) = rest.next() {
+            writer.tried_alone += 1;
             match self
                 .database
                 .execute(&upsert(std::slice::from_ref(&minute)))
@@ -535,6 +550,10 @@ impl Metrics {
                 }
                 Err(error @ sqlx::Error::Database(_)) => {
                     refused.push(minute);
+                    if flushed.minutes == 0 && refused.len() == REFUSALS_BEFORE_GIVING_UP {
+                        refused.extend(rest);
+                        return Err((refusal.unwrap_or(error), refused));
+                    }
                     refusal.get_or_insert(error);
                 }
                 Err(error) => {
@@ -545,7 +564,8 @@ impl Metrics {
             }
         }
         match refusal {
-            // Refusing every minute is about the database, not the minutes.
+            // Refusing every minute is about the database, not the minutes:
+            // they wait, as a failed flush's do.
             Some(error) if flushed.minutes == 0 => Err((error, refused)),
             Some(error) => {
                 tracing::warn!(
@@ -917,6 +937,29 @@ mod tests {
         );
         assert!(!metrics.writer.lock().await.failing);
         assert_eq!(stored_samples(&metrics).await, [1]);
+    }
+
+    #[tokio::test]
+    async fn a_database_refusing_everything_is_tried_alone_only_so_often() {
+        // No tables yet, so every statement is refused.
+        let metrics = store().await;
+        let waiting = REFUSALS_BEFORE_GIVING_UP + 500;
+        for device in 0..waiting {
+            let device_id = format!("device-{device}");
+            metrics.record_at(&device_id, sample(10.0, 10), 1_000 * MINUTE_MS);
+            metrics.disconnected(&device_id);
+        }
+        assert!(metrics.flush().await.is_err());
+        assert_eq!(
+            metrics.writer.lock().await.tried_alone,
+            REFUSALS_BEFORE_GIVING_UP as u64
+        );
+        assert_eq!(metrics.pending().minutes.len(), waiting, "all of them wait");
+
+        metrics.database.migrate().await.unwrap();
+        let flushed = metrics.flush().await.unwrap();
+        assert_eq!((flushed.minutes, flushed.statements), (waiting, 1));
+        assert_eq!(stored_samples(&metrics).await.len(), waiting);
     }
 
     #[tokio::test]
