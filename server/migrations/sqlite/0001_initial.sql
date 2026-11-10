@@ -919,7 +919,10 @@ CREATE TABLE device_update_status (
   -- When a scan first said the device must restart.
   reboot_pending_since INTEGER,
   -- When the server last asked the Agent for a scan on its own schedule.
-  scan_requested_at INTEGER
+  scan_requested_at INTEGER,
+  -- Identifies the pending updates stored from the last scan that worked, so
+  -- an unchanged list isn't rewritten. NULL before one is stored.
+  pending_hash TEXT
 );
 
 -- The updates each device's latest scan found pending. first_seen_at is
@@ -1077,7 +1080,10 @@ CREATE TABLE device_application_status (
   device_id TEXT NOT NULL PRIMARY KEY,
   managers TEXT NOT NULL,
   scanned_at INTEGER NOT NULL,
-  received_at INTEGER NOT NULL
+  received_at INTEGER NOT NULL,
+  -- Identifies the packages the scan stored, so unchanged ones aren't
+  -- rewritten.
+  packages_hash TEXT NOT NULL
 );
 
 -- The packages each device's latest scan found installed, with the newer

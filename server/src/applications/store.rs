@@ -2,9 +2,12 @@
 //! packages they have installed, and the updates they offer.
 use std::collections::{HashMap, HashSet};
 
-use meshrmm_protocol_types::{ApplicationScan, Held, ManagerState, PackageKey, PackageSource};
-use sea_query::{Expr, ExprTrait, OnConflict, Query};
+use meshrmm_protocol_types::{
+    ApplicationScan, Held, ManagerState, PackageKey, PackageSource, ScannedPackage,
+};
+use sea_query::{Expr, ExprTrait, LockType, OnConflict, Query};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use super::{
     library::Application,
@@ -13,6 +16,7 @@ use super::{
 use crate::{
     agents,
     db::{self, Database, Executor, tables::Agents},
+    secrets::hex,
 };
 
 /// Rows per insert, well within both databases' bind parameter limits.
@@ -79,50 +83,44 @@ pub async fn managers(
     }))
 }
 
+/// What storing a scan did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stored {
+    /// The device is no longer enrolled: nothing was stored.
+    NotEnrolled,
+    /// The scan's packages replaced the device's.
+    Replaced,
+    /// The scan would have stored the packages already stored, so only its
+    /// status was written.
+    Unchanged,
+}
+
+/// Identifies what a scan stores of a device's packages, in any order: the
+/// sources it replaces (the others' managers failed, keeping their
+/// packages) and its packages from those. A sanitized scan has one package
+/// per key.
+fn packages_hash(replaced: &[PackageSource], packages: &[&ScannedPackage]) -> String {
+    let mut packages = packages.to_vec();
+    packages.sort_by(|a, b| (a.source.as_str(), &a.id).cmp(&(b.source.as_str(), &b.id)));
+    let json = serde_json::to_vec(&(replaced, packages)).expect("packages serialize");
+    hex(&Sha256::digest(json))
+}
+
 /// Stores a scan the device's Agent reported, received at `now`. A manager
 /// whose scan failed keeps the packages it listed last time; one the device
-/// no longer has loses them. Returns `false`, storing nothing, if the device
-/// is no longer enrolled.
+/// no longer has loses them. A scan that would store the packages already
+/// stored writes only its status.
 pub async fn store_scan(
     database: &Database,
     device_id: &str,
     scan: ApplicationScan,
     now: i64,
-) -> db::Result<bool> {
+) -> db::Result<Stored> {
     let scan = scan.sanitized();
     let mut transaction = database.begin().await?;
     if !agents::is_active(&mut transaction, device_id).await? {
-        return Ok(false);
+        return Ok(Stored::NotEnrolled);
     }
-    let managers = serde_json::to_string(&scan.managers).expect("managers serialize");
-    transaction
-        .execute(
-            &Query::insert()
-                .into_table(DeviceApplicationStatus::Table)
-                .columns([
-                    DeviceApplicationStatus::DeviceId,
-                    DeviceApplicationStatus::Managers,
-                    DeviceApplicationStatus::ScannedAt,
-                    DeviceApplicationStatus::ReceivedAt,
-                ])
-                .values_panic([
-                    device_id.into(),
-                    storable(&managers).into(),
-                    scan.scanned_at_unix_ms.into(),
-                    now.into(),
-                ])
-                .on_conflict(
-                    OnConflict::column(DeviceApplicationStatus::DeviceId)
-                        .update_columns([
-                            DeviceApplicationStatus::Managers,
-                            DeviceApplicationStatus::ScannedAt,
-                            DeviceApplicationStatus::ReceivedAt,
-                        ])
-                        .to_owned(),
-                )
-                .to_owned(),
-        )
-        .await?;
     let failed = scan
         .managers
         .iter()
@@ -133,7 +131,77 @@ pub async fn store_scan(
         .into_iter()
         .filter(|source| *source != PackageSource::Custom && !failed.contains(&manager_of(*source)))
         .collect::<Vec<_>>();
-    let previous: Vec<(String, String, Option<i64>)> = transaction
+    let packages = scan
+        .packages
+        .iter()
+        .filter(|package| replaced.contains(&package.source))
+        .collect::<Vec<_>>();
+    let hash = packages_hash(&replaced, &packages);
+    // Another report for the device waits until this one commits, so it
+    // compares with this one's packages. SQLite's write transactions are
+    // serialized anyway.
+    let previous: Option<(String,)> = transaction
+        .fetch_optional(
+            &Query::select()
+                .column(DeviceApplicationStatus::PackagesHash)
+                .from(DeviceApplicationStatus::Table)
+                .and_where(Expr::col(DeviceApplicationStatus::DeviceId).eq(device_id))
+                .lock(LockType::Update)
+                .to_owned(),
+        )
+        .await?;
+    let unchanged = previous.is_some_and(|(previous,)| previous == hash);
+    let managers = serde_json::to_string(&scan.managers).expect("managers serialize");
+    let columns = [
+        DeviceApplicationStatus::DeviceId,
+        DeviceApplicationStatus::Managers,
+        DeviceApplicationStatus::ScannedAt,
+        DeviceApplicationStatus::ReceivedAt,
+        // In the transaction that writes the packages, so it never
+        // identifies ones that weren't.
+        DeviceApplicationStatus::PackagesHash,
+    ];
+    transaction
+        .execute(
+            &Query::insert()
+                .into_table(DeviceApplicationStatus::Table)
+                .columns(columns)
+                .values_panic([
+                    device_id.into(),
+                    storable(&managers).into(),
+                    scan.scanned_at_unix_ms.into(),
+                    now.into(),
+                    hash.into(),
+                ])
+                .on_conflict(
+                    OnConflict::column(DeviceApplicationStatus::DeviceId)
+                        .update_columns(columns.into_iter().skip(1))
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+    if !unchanged {
+        replace_packages(&mut transaction, device_id, &replaced, &packages, now).await?;
+    }
+    transaction.commit().await?;
+    Ok(if unchanged {
+        Stored::Unchanged
+    } else {
+        Stored::Replaced
+    })
+}
+
+/// Replaces the device's packages from the `replaced` sources with
+/// `packages`, keeping when each was first found outdated.
+async fn replace_packages(
+    executor: &mut impl Executor,
+    device_id: &str,
+    replaced: &[PackageSource],
+    packages: &[&ScannedPackage],
+    now: i64,
+) -> db::Result<()> {
+    let previous: Vec<(String, String, Option<i64>)> = executor
         .fetch_all(
             &Query::select()
                 .columns([
@@ -153,7 +221,7 @@ pub async fn store_scan(
             Some((PackageKey { source, id }, since?))
         })
         .collect::<HashMap<_, _>>();
-    transaction
+    executor
         .execute(
             &Query::delete()
                 .from_table(DevicePackages::Table)
@@ -165,11 +233,6 @@ pub async fn store_scan(
                 .to_owned(),
         )
         .await?;
-    let packages = scan
-        .packages
-        .iter()
-        .filter(|package| replaced.contains(&package.source))
-        .collect::<Vec<_>>();
     for chunk in packages.chunks(INSERT_CHUNK) {
         let mut insert = Query::insert();
         insert.into_table(DevicePackages::Table).columns([
@@ -202,10 +265,9 @@ pub async fn store_scan(
                 since.into(),
             ]);
         }
-        transaction.execute(&insert).await?;
+        executor.execute(&insert).await?;
     }
-    transaction.commit().await?;
-    Ok(true)
+    Ok(())
 }
 
 /// A package a device has installed, as the API shows it.

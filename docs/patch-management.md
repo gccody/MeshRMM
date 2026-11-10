@@ -28,7 +28,10 @@ A scan also says whether the computer has to restart to finish installing
 updates. The server keeps the latest scan's list and remembers when each
 update was first seen, which alert rules use. A failed scan (no network, a
 package manager another program holds) keeps the last list and shows the
-error.
+error. Most scans list what the last one did: the server keeps a hash of the
+stored list and, when a scan's updates (in any order) hash the same, writes
+only the scan's status (when it ran and arrived, the manager, the restart
+pending) and leaves the list alone.
 
 Agents scan when the server asks:
 

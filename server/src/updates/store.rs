@@ -7,6 +7,7 @@ use meshrmm_protocol_types::{
 };
 use sea_query::{Expr, ExprTrait, LockType, OnConflict, Order, Query};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::{
     agents,
@@ -14,6 +15,7 @@ use crate::{
         self, Database, Executor,
         tables::{Agents, DevicePendingUpdates, DeviceUpdateStatus, UpdateRuns},
     },
+    secrets::hex,
 };
 
 /// Rows per insert, well within both databases' bind parameter limits.
@@ -133,30 +135,62 @@ pub async fn scan_requested(
     .await
 }
 
+/// What storing a scan did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stored {
+    /// The device is no longer enrolled: nothing was stored.
+    NotEnrolled,
+    /// The scan failed: its error was stored, and the pending list kept.
+    Failed,
+    /// The scan's pending updates replaced the device's.
+    Replaced,
+    /// The scan listed the pending updates already stored, so only the
+    /// device's status was written; `reboot_changed` says whether its
+    /// restart pending changed.
+    Unchanged { reboot_changed: bool },
+}
+
+/// Identifies a list of pending updates in any order, so an unchanged one
+/// isn't rewritten. A sanitized scan has one update per ID.
+fn pending_hash(updates: &[PendingUpdate]) -> String {
+    let mut updates = updates.iter().collect::<Vec<_>>();
+    updates.sort_by(|a, b| a.id.cmp(&b.id));
+    let json = serde_json::to_vec(&updates).expect("updates serialize");
+    hex(&Sha256::digest(json))
+}
+
 /// Stores a scan the device's Agent reported, received at `now`. A failed
-/// scan keeps the last pending list. Returns `false`, storing nothing, if the
-/// device is no longer enrolled.
+/// scan keeps the last pending list, and so does one that lists the same
+/// updates: only its status is written then.
 pub async fn store_scan(
     database: &Database,
     device_id: &str,
     scan: UpdateScan,
     now: i64,
-) -> db::Result<bool> {
+) -> db::Result<Stored> {
     let scan = scan.sanitized();
     let mut transaction = database.begin().await?;
     if !agents::is_active(&mut transaction, device_id).await? {
-        return Ok(false);
+        return Ok(Stored::NotEnrolled);
     }
-    // Another report for the device waits until this one commits. SQLite's
-    // write transactions are serialized anyway.
-    let previous: Option<Status> = transaction
+    // Another report for the device waits until this one commits, so it
+    // compares with this one's list. SQLite's write transactions are
+    // serialized anyway.
+    let previous: Option<(bool, Option<i64>, Option<String>)> = transaction
         .fetch_optional(
-            &status_select()
+            &Query::select()
+                .columns([
+                    DeviceUpdateStatus::RebootPending,
+                    DeviceUpdateStatus::RebootPendingSince,
+                    DeviceUpdateStatus::PendingHash,
+                ])
+                .from(DeviceUpdateStatus::Table)
                 .and_where(Expr::col(DeviceUpdateStatus::DeviceId).eq(device_id))
                 .lock(LockType::Update)
                 .to_owned(),
         )
         .await?;
+    let (was_pending, was_since, stored_hash) = previous.unwrap_or_default();
     let manager = scan.manager.map(UpdateManager::as_str);
     if let Some(error) = &scan.error {
         let mut values = vec![
@@ -169,19 +203,13 @@ pub async fn store_scan(
         }
         upsert_status(&mut transaction, device_id, values).await?;
         transaction.commit().await?;
-        return Ok(true);
+        return Ok(Stored::Failed);
     }
-    let since = if scan.reboot_pending {
-        Some(
-            previous
-                .as_ref()
-                .filter(|previous| previous.reboot_pending)
-                .and_then(|previous| previous.reboot_pending_since)
-                .unwrap_or(now),
-        )
-    } else {
-        None
-    };
+    let since = scan
+        .reboot_pending
+        .then(|| was_since.filter(|_| was_pending).unwrap_or(now));
+    let hash = pending_hash(&scan.updates);
+    let unchanged = stored_hash.as_deref() == Some(hash.as_str());
     upsert_status(
         &mut transaction,
         device_id,
@@ -199,12 +227,23 @@ pub async fn store_scan(
                 scan.reboot_pending.into(),
             ),
             (DeviceUpdateStatus::RebootPendingSince, since.into()),
+            // In the transaction that writes the list, so it never
+            // identifies one that wasn't.
+            (DeviceUpdateStatus::PendingHash, hash.into()),
         ],
     )
     .await?;
-    replace_pending(&mut transaction, device_id, &scan.updates, now).await?;
+    if !unchanged {
+        replace_pending(&mut transaction, device_id, &scan.updates, now).await?;
+    }
     transaction.commit().await?;
-    Ok(true)
+    Ok(if unchanged {
+        Stored::Unchanged {
+            reboot_changed: (scan.reboot_pending, since) != (was_pending, was_since),
+        }
+    } else {
+        Stored::Replaced
+    })
 }
 
 /// Replaces the device's pending updates with `updates`, keeping when each

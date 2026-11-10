@@ -105,7 +105,11 @@ whole scan 30 minutes; a manager still scanning then fails. A manager whose
 scan fails keeps the packages from its last scan, and the device's tab shows
 the error. The server keeps each device's latest list and remembers when
 each package was first found outdated, which the fleet view and alert rules
-use. A scan the Agent hasn't reported 45 minutes after it was asked for is
+use. Most scans find what the last one did: the server keeps a hash of what
+the stored scan wrote (the packages of the managers whose scan worked, in
+any order, and which those were) and, when a scan hashes the same, writes
+only its status (when it ran and arrived, and each manager's version and
+error) and leaves the packages alone. A scan the Agent hasn't reported 45 minutes after it was asked for is
 lost.
 
 winget's table is read by the positions of the header's labels, which are

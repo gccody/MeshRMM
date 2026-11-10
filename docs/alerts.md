@@ -95,7 +95,9 @@ the maintenance task deletes them.
 `server/src/alerts/` holds it all. The engine's task
 (`alerts::spawn`) takes in new resource readings every five seconds and
 judges the device-state rules every 15 seconds, and at once after a rule
-changes or a device reports an update scan. Script failure rules are checked
+changes or a device reports an update or application scan, unless the scan
+found what the last one did (the same pending updates and restart pending,
+or the same packages): then there is nothing new to judge. Script failure rules are checked
 when an Agent reports a run, and when the engine finds a run lost; install
 failure rules when an install is reported failed or found lost.
 
