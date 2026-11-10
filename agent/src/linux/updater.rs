@@ -6,7 +6,8 @@
 //! `--apply-update` in a transient systemd unit, which outlives the service:
 //! that process waits for the coordinator to stop, swaps the executable,
 //! restarts the service, and puts the previous executable back if the new
-//! coordinator does not stay up.
+//! coordinator does not stay up or does not connect to the server within
+//! [`CONFIRM_TIMEOUT`].
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -20,8 +21,8 @@ use super::installer::{EXECUTABLE, INSTALL_DIRECTORY, SERVICE, systemctl};
 use crate::remote::config::Config;
 use crate::remote::service_link::ServiceLink;
 use crate::update_policy::{
-    NEXT_CHECK_FILE, NextCheck, UpdateAttempts, UpdateSchedule, random_bits, read_attempts,
-    read_next_check, unix_seconds,
+    CONFIRM_TIMEOUT, Confirmation, NEXT_CHECK_FILE, NextCheck, UpdateAttempts, UpdateSchedule,
+    random_bits, read_attempts, read_next_check, unix_seconds,
 };
 
 const SCHEDULE_TICK: Duration = Duration::from_secs(30);
@@ -29,7 +30,8 @@ const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_UPDATE_BYTES: u64 = 256 * 1024 * 1024;
 /// The coordinator ends remote sessions and runs their close actions first.
 const COORDINATOR_EXIT_TIMEOUT: Duration = Duration::from_secs(60);
-/// How long the new coordinator must keep running for the update to count.
+/// How long the new coordinator must keep running before the installer waits for it to connect,
+/// so one that crashes at once is rolled back without waiting for [`CONFIRM_TIMEOUT`].
 const HEALTHY_AFTER: Duration = Duration::from_secs(15);
 const ATTEMPTS_FILE: &str = "update-attempts.json";
 
@@ -54,7 +56,9 @@ pub(crate) async fn run(config: Config, link: Arc<ServiceLink>) {
     // A release a check found, waiting for the Agent to be free to stop.
     let mut staged: Option<Staged> = None;
     loop {
-        if staged.is_none() && schedule.due(Instant::now(), link.busy()) {
+        // The installer of this build can put the previous one back until it has connected,
+        // so this build does not replace itself meanwhile.
+        if staged.is_none() && !confirming() && schedule.due(Instant::now(), link.busy()) {
             let check_config = config.clone();
             let succeeded = match tokio::task::spawn_blocking(move || stage(&check_config)).await {
                 Ok(Ok(Some(update))) => {
@@ -170,6 +174,17 @@ fn updates_directory() -> anyhow::Result<std::path::PathBuf> {
     Ok(directory)
 }
 
+/// Whether the installer of this build is still waiting for it to connect.
+fn confirming() -> bool {
+    updates_directory()
+        .is_ok_and(|updates| crate::update_policy::confirming(&updates, unix_seconds()))
+}
+
+/// Records that the coordinator connected, which confirms an update being installed.
+pub(crate) fn record_connected() -> anyhow::Result<()> {
+    crate::update_policy::record_connected(&updates_directory()?)
+}
+
 /// Writes when the next check is due, so a restart keeps its place in the schedule.
 fn record_next_check(next: &NextCheck) {
     let written = updates_directory().and_then(|updates| {
@@ -222,25 +237,61 @@ pub fn apply(staged: &Path, coordinator: libc::pid_t) -> anyhow::Result<()> {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+    // Before the new build starts, so only its own connection confirms it, and it holds back
+    // updates of its own meanwhile.
+    let confirmation = match updates_directory().and_then(|updates| {
+        Confirmation::begin(&updates, CURRENT_VERSION, Instant::now(), unix_seconds())
+    }) {
+        Ok(confirmation) => confirmation,
+        Err(error) => {
+            restart();
+            return Err(error).context("could not prepare to confirm the Agent update");
+        }
+    };
     let previous = Path::new(INSTALL_DIRECTORY).join("meshrmm-agent.previous");
     let _ = std::fs::remove_file(&previous);
-    std::fs::rename(EXECUTABLE, &previous).context("could not set the installed Agent aside")?;
+    if let Err(error) = std::fs::rename(EXECUTABLE, &previous) {
+        drop(confirmation);
+        restart();
+        return Err(error).context("could not set the installed Agent aside");
+    }
     if let Err(error) = std::fs::rename(staged, EXECUTABLE) {
         let _ = std::fs::rename(&previous, EXECUTABLE);
+        drop(confirmation);
         restart();
         return Err(error).context("could not install the Agent update");
     }
     restart();
-    if stays_running() {
-        println!("Agent {CURRENT_VERSION} installed");
-        let _ = std::fs::remove_file(&previous);
-        return Ok(());
-    }
+    let failure = if !stays_running() {
+        "did not stay running"
+    } else {
+        tracing::info!(
+            timeout_minutes = CONFIRM_TIMEOUT.as_secs() / 60,
+            "the updated Agent is running; waiting for it to connect to the server"
+        );
+        if confirmation.wait(Instant::now, std::thread::sleep) {
+            println!("Agent {CURRENT_VERSION} installed");
+            tracing::info!(
+                release_version = CURRENT_VERSION,
+                "Agent update installed: the updated Agent connected to the server"
+            );
+            let _ = std::fs::remove_file(&previous);
+            return Ok(());
+        }
+        "did not connect to the server in time"
+    };
+    tracing::error!(
+        failure,
+        "the updated Agent did not prove it works; restoring the previous Agent"
+    );
     let failed = Path::new(INSTALL_DIRECTORY).join("meshrmm-agent.failed");
     let _ = std::fs::rename(EXECUTABLE, &failed);
-    std::fs::rename(&previous, EXECUTABLE).context("could not restore the previous Agent")?;
+    let restored =
+        std::fs::rename(&previous, EXECUTABLE).context("could not restore the previous Agent");
+    drop(confirmation);
     restart();
-    bail!("the updated Agent did not stay running; restored the previous Agent")
+    restored?;
+    bail!("the updated Agent {failure}; restored the previous Agent")
 }
 
 fn restart() {
