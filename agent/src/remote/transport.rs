@@ -32,6 +32,8 @@ mod sender_loop;
 mod service_channels;
 #[cfg(test)]
 mod service_isolation_tests;
+#[cfg(test)]
+mod service_stall_tests;
 mod service_workers;
 #[cfg(test)]
 mod tests;

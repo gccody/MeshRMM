@@ -201,24 +201,29 @@ pub(super) fn spawn_file_worker(
             };
             let ready = input.files_ready();
             let mut pending = true;
+            let mut sending = Sending::default();
+            // A transfer the channel holds up is not ended here: the file helper fails it when
+            // the peer has not acknowledged it for its own limit, and reports that through
+            // this worker like any other message.
             loop {
                 if *stop.borrow() {
                     break;
                 }
                 tokio::select! {
                     _ = stop.changed() => break,
+                    () = channel.closed() => break,
                     message = commands.recv() => {
                         let Some(message) = message else { break; };
                         if let Err(error) = input.apply_files(message) { tracing::warn!(%error, "file helper unavailable"); }
                     }
                     _ = ready.notified() => pending = true,
-                    capacity = channel.writable(), if pending && channel.ready_state() == RTCDataChannelState::Open => {
+                    sent = sending.finished(), if sending.busy() => {
+                        if let Err(error) = sent { tracing::warn!(%error, "file-transfer send failed"); break; }
+                    }
+                    capacity = channel.writable(), if !sending.busy() && pending && channel.ready_state() == RTCDataChannelState::Open => {
                         if let Err(error) = capacity { tracing::warn!(%error, "file channel unavailable"); break; }
                         if let Some(message) = input.poll_files() {
-                            if let Err(error) = meshrmm_session_transport::send(&channel, SessionMessage::FileTransfer(message)).await {
-                                tracing::warn!(%error, "file-transfer send failed");
-                                break;
-                            }
+                            sending.start(&channel, SessionMessage::FileTransfer(message));
                         } else { pending = false; }
                     }
                 }
@@ -246,25 +251,39 @@ pub(super) fn spawn_chat_worker(
                 channel
             };
             let ready = input.chat_ready();
+            // Whether the viewer is owed a ChatAvailable, and whether the chat window may have
+            // text to send. Text stays in the chat helper until the channel has room for it.
+            let mut announce = false;
+            let mut pending = false;
+            let mut sending = Sending::default();
             let result: anyhow::Result<()> = async {
             loop {
                 if *stop.borrow() { break; }
                 tokio::select! {
                     _ = stop.changed() => break,
+                    () = channel.closed() => break,
                     message = commands.recv() => {
                         let Some(message) = message else { break; };
                         match message {
                             SessionMessage::ChatAvailable => {
                                 input.start_chat()?;
-                                send_control_message(&channel, SessionMessage::ChatAvailable).await?;
+                                announce = true;
                             }
                             SessionMessage::Chat { text } => input.apply_chat(text)?,
                             _ => {},
                         }
                     }
-                    _ = ready.notified() => {
-                        while let Some(text) = input.poll_chat()? {
-                            send_control_message(&channel, SessionMessage::Chat { text }).await?;
+                    _ = ready.notified() => pending = true,
+                    sent = sending.finished(), if sending.busy() => sent?,
+                    capacity = channel.writable(), if !sending.busy() && (announce || pending) => {
+                        capacity?;
+                        if announce {
+                            announce = false;
+                            sending.start(&channel, SessionMessage::ChatAvailable);
+                        } else if let Some(text) = input.poll_chat()? {
+                            sending.start(&channel, SessionMessage::Chat { text });
+                        } else {
+                            pending = false;
                         }
                     }
                 }
@@ -299,7 +318,10 @@ pub(super) fn spawn_clipboard_worker(
             };
             let ready = input.clipboard_ready();
             let mut receiver = meshrmm_protocol::ClipboardReceiver::default();
+            // The rest of the latest copy only: a newer copy, or one from the viewer, replaces
+            // it, so a channel without room holds at most one copy and one chunk in a send.
             let mut outgoing = std::collections::VecDeque::new();
+            let mut sending = Sending::default();
             let mut poll = tokio::time::interval(std::time::Duration::from_millis(250));
             poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -308,6 +330,7 @@ pub(super) fn spawn_clipboard_worker(
                 }
                 tokio::select! {
                     _ = stop.changed() => break,
+                    () = channel.closed() => break,
                     message = commands.recv() => {
                         let Some(message) = message else { break; };
                         match receiver.receive(message) {
@@ -329,19 +352,50 @@ pub(super) fn spawn_clipboard_worker(
                             Err(error) => tracing::warn!(%error, "clipboard poll failed"),
                         }
                     }
-                    capacity = channel.writable(), if !outgoing.is_empty() => {
+                    sent = sending.finished(), if sending.busy() => {
+                        if let Err(error) = sent { tracing::warn!(%error, "clipboard send failed"); break; }
+                    }
+                    capacity = channel.writable(), if !sending.busy() && !outgoing.is_empty() => {
                         if let Err(error) = capacity { tracing::warn!(%error, "clipboard channel unavailable"); break; }
-                        if let Some(message) = outgoing.pop_front()
-                            && let Err(error) = meshrmm_session_transport::send(&channel, message).await {
-                                tracing::warn!(%error, "clipboard send failed");
-                                break;
-                            }
+                        if let Some(message) = outgoing.pop_front() {
+                            sending.start(&channel, message);
+                        }
                     }
                 }
             }
         },
     )?;
     Ok((sender, task))
+}
+
+/// The one message a service worker is handing to its channel. The worker keeps serving its
+/// stop signal and its peer's messages beside it, and the send waits for as long as the
+/// channel is open: a stall the connection survives delays the service, never ends it.
+#[derive(Default)]
+struct Sending(Option<std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>>>>>);
+
+impl Sending {
+    fn start(&mut self, channel: &ServiceChannel, message: SessionMessage) {
+        let channel = channel.clone();
+        self.0 = Some(Box::pin(async move {
+            meshrmm_session_transport::send(&channel, message).await
+        }));
+    }
+
+    fn busy(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// The send's result once it finishes. Cancel-safe: a send this leaves unfinished
+    /// carries on at the next call.
+    async fn finished(&mut self) -> anyhow::Result<()> {
+        let Some(sending) = self.0.as_mut() else {
+            return std::future::pending().await;
+        };
+        let result = sending.await;
+        self.0 = None;
+        result
+    }
 }
 
 pub(super) fn spawn_input_worker(

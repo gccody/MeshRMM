@@ -7,12 +7,13 @@ publish.workspace = true
 [lints]
 workspace = true
 [features]
-# A simulated link for other crates' tests of the queue estimates.
-test-support = []
+# A simulated link for other crates' tests of the queue estimates, and a link they can cut.
+test-support = ["dep:rustls"]
 [dependencies]
 anyhow.workspace = true
 bytes.workspace = true
 meshrmm-protocol.workspace = true
+rustls = { workspace = true, optional = true }
 tokio.workspace = true
 tracing.workspace = true
 webrtc = { workspace = true, features = ["pem"] }
@@ -21,3 +22,4 @@ serde_json.workspace = true
 thiserror.workspace = true
 [dev-dependencies]
 rustls.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
