@@ -58,19 +58,25 @@ impl Security {
     }
 }
 
-/// A ready-to-use SMTP configuration.
+/// A ready-to-use SMTP configuration. Its messages share its connections:
+/// one stays open for the next message while the `Smtp` lives, and closes
+/// when it is dropped.
 #[derive(Debug, Clone)]
 pub struct Smtp {
     host: String,
     port: u16,
-    security: Security,
-    credentials: Option<(String, String)>,
     from: Mailbox,
+    transport: AsyncSmtpTransport<Tokio1Executor>,
 }
 
 impl Smtp {
-    /// The configured server, or `None` when email is off.
-    pub fn from_settings(settings: &Settings, key: &InstanceKey) -> anyhow::Result<Option<Self>> {
+    /// The configured server, or `None` when email is off. The server
+    /// introduces itself to it as `hello_name`.
+    pub fn from_settings(
+        settings: &Settings,
+        key: &InstanceKey,
+        hello_name: &str,
+    ) -> anyhow::Result<Option<Self>> {
         let (Some(host), Some(from)) = (&settings.smtp_host, &settings.smtp_from) else {
             return Ok(None);
         };
@@ -93,23 +99,29 @@ impl Smtp {
             (Some(username), None) => Some((username.clone(), String::new())),
             _ => None,
         };
+        let tls = match security {
+            Security::StartTls => Tls::Required(TlsParameters::new(host.clone())?),
+            Security::Tls => Tls::Wrapper(TlsParameters::new(host.clone())?),
+            Security::None => Tls::None,
+        };
+        let mut transport = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(host)
+            .port(port)
+            .tls(tls)
+            .timeout(Some(SEND_TIMEOUT))
+            .hello_name(ClientId::Domain(hello_name.to_owned()));
+        if let Some((username, password)) = credentials {
+            transport = transport.credentials(Credentials::new(username, password));
+        }
         Ok(Some(Self {
             host: host.clone(),
             port,
-            security,
-            credentials,
             from: from.parse().context("the SMTP sender address is invalid")?,
+            transport: transport.build(),
         }))
     }
 
     /// Sends a plain-text message.
-    pub async fn send(
-        &self,
-        hello_name: &str,
-        to: &str,
-        subject: &str,
-        body: String,
-    ) -> anyhow::Result<()> {
+    pub async fn send(&self, to: &str, subject: &str, body: String) -> anyhow::Result<()> {
         let message = Message::builder()
             .from(self.from.clone())
             .to(to
@@ -119,20 +131,7 @@ impl Smtp {
             .header(ContentType::TEXT_PLAIN)
             .body(body)
             .context("could not build the message")?;
-        let tls = match self.security {
-            Security::StartTls => Tls::Required(TlsParameters::new(self.host.clone())?),
-            Security::Tls => Tls::Wrapper(TlsParameters::new(self.host.clone())?),
-            Security::None => Tls::None,
-        };
-        let mut transport = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&self.host)
-            .port(self.port)
-            .tls(tls)
-            .timeout(Some(SEND_TIMEOUT))
-            .hello_name(ClientId::Domain(hello_name.to_owned()));
-        if let Some((username, password)) = &self.credentials {
-            transport = transport.credentials(Credentials::new(username.clone(), password.clone()));
-        }
-        transport.build().send(message).await.with_context(|| {
+        self.transport.send(message).await.with_context(|| {
             format!(
                 "the SMTP server {}:{} refused or failed",
                 self.host, self.port
@@ -165,9 +164,9 @@ pub async fn deliver_link(
     body: String,
     link: String,
 ) -> Delivery {
-    let failure = match Smtp::from_settings(settings, &state.instance_key) {
+    let failure = match Smtp::from_settings(settings, &state.instance_key, &hello_name(state)) {
         Ok(None) => None,
-        Ok(Some(smtp)) => match smtp.send(&hello_name(state), to, subject, body).await {
+        Ok(Some(smtp)) => match smtp.send(to, subject, body).await {
             Ok(()) => {
                 return Delivery {
                     emailed: true,

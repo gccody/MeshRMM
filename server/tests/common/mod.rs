@@ -724,6 +724,8 @@ pub fn totp_code(secret_base32: &str, offset_steps: i64) -> String {
 pub struct FakeSmtp {
     pub port: u16,
     pub messages: tokio::sync::mpsc::UnboundedReceiver<String>,
+    /// How many connections it accepted.
+    pub connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl FakeSmtp {
@@ -733,11 +735,14 @@ impl FakeSmtp {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let (sender, messages) = tokio::sync::mpsc::unbounded_channel();
+        let connections = std::sync::Arc::<std::sync::atomic::AtomicUsize>::default();
+        let accepted = connections.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
+                accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let sender = sender.clone();
                 tokio::spawn(async move {
                     let (read, mut write) = stream.into_split();
@@ -774,7 +779,11 @@ impl FakeSmtp {
                 });
             }
         });
-        Self { port, messages }
+        Self {
+            port,
+            messages,
+            connections,
+        }
     }
 
     /// The next message, unfolded (quoted-printable soft breaks removed).

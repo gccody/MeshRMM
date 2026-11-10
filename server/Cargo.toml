@@ -29,7 +29,7 @@ http = "1.4.0"
 httpdate = "1.0.3"
 hyper-util = { version = "0.1.20", features = ["tokio"] }
 ipnet = { version = "2.12.2", features = ["serde"] }
-lettre = { version = "0.11.23", default-features = false, features = ["builder", "ring", "rustls-native-certs", "smtp-transport", "tokio1-rustls"] }
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "pool", "ring", "rustls-native-certs", "smtp-transport", "tokio1-rustls"] }
 meshrmm-protocol-types.workspace = true
 meshrmm-self-update.workspace = true
 openidconnect = { version = "4.0.1", default-features = false, features = ["accept-string-booleans"] }

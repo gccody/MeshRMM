@@ -638,11 +638,10 @@ pub async fn test_smtp(
     // is as powerful as being an administrator.
     require_administrator(&actor)?;
     let settings = settings::load(&mut &state.database).await?;
-    let smtp = Smtp::from_settings(&settings, &state.instance_key)?
+    let smtp = Smtp::from_settings(&settings, &state.instance_key, &mail::hello_name(&state))?
         .ok_or_else(|| ApiError::conflict("email isn't set up"))?;
     let to = request.to.as_deref().unwrap_or(&actor.user.email);
     smtp.send(
-        &mail::hello_name(&state),
         to,
         &format!("{} test email", settings.instance_name),
         format!(

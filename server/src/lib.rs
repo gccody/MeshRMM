@@ -88,6 +88,7 @@ pub async fn prepare(config: Config) -> anyhow::Result<AppState> {
         alerts: alerts::Engine::default(),
         monitors: monitors::Engine::default(),
         automation: automation::Engine::default(),
+        notifications: notifications::queue::Queues::default(),
         updates: updates::Engine::default(),
         wake: wake::Engine::default(),
         sessions: Sessions::new(Timeouts::new(idle)),
