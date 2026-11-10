@@ -104,8 +104,83 @@ export type ApplicationProblem = { name: string; outcome: "failed" | "skipped"; 
 export const applicationProblems = (device: Pick<JobDevice, "applications">) =>
   (device.applications ?? []).map((problem) => `${problem.name} ${problem.outcome}${problem.error ? `: ${problem.error}` : ""}`);
 
-// GET /v1/jobs/{id}
-export type JobDetail = Job & { devices: JobDevice[] };
+// GET /v1/jobs/{id}/devices: a page of the job's devices, in device ID
+// order, and how many have the outcome asked for (or how many there are).
+export type JobDevicesPage = { devices: JobDevice[]; matching: number };
+
+export const JOB_DEVICES_PAGE = 100;
+// The most the server sends in one page.
+export const MAX_JOB_DEVICES_PAGE = 200;
+
+// GET /v1/jobs/{id}/devices's address for the devices with `outcome` (or
+// every one) after the device `after` (or from the start).
+export function jobDevicesPath(jobId: string, outcome: Outcome | null, after: string | null, limit = JOB_DEVICES_PAGE) {
+  const params = new URLSearchParams();
+  if (outcome) params.set("outcome", outcome);
+  if (after) params.set("after", after);
+  params.set("limit", String(limit));
+  return `/v1/jobs/${encodeURIComponent(jobId)}/devices?${params}`;
+}
+
+// Which devices a list is for: an outcome's, or "all".
+export const jobDevicesKey = (outcome: Outcome | null) => outcome ?? "all";
+
+// The devices loaded for one outcome chip (`key`), in the server's order,
+// with how many match. `ticket` numbers the request the list was last
+// loaded or refreshed from the start by; `end` is whether the last page
+// reached the end.
+export type JobDeviceList = { key: string; devices: JobDevice[]; matching: number; ticket: number; end: boolean };
+
+// The server's answer to request `ticket` for the chip `key`: the devices
+// from the start (a first load, or a refresh of the rows loaded), or the
+// next page after the device `after`. `end` is whether it reached the end.
+export type JobDevicesAnswer =
+  | { kind: "start"; key: string; ticket: number; devices: JobDevice[]; matching: number; end: boolean }
+  | { kind: "more"; key: string; ticket: number; after: string; devices: JobDevice[]; matching: number; end: boolean };
+
+const ids = (devices: readonly JobDevice[]) => new Set(devices.map((device) => device.device_id));
+
+// The list after an answer, while the page wants the chip `wanted`. An
+// answer for another chip is dropped, and so is a load from the start older
+// than the one the list shows. A refresh puts its rows in place of those it
+// covers and keeps the rows after them, so loaded rows keep their places
+// and none shows twice. A next page joins only after the row it was asked
+// after, if that is still the last: devices move between outcomes, and the
+// list can't tell where else it would go.
+export function applyJobDevicesAnswer(list: JobDeviceList | null, answer: JobDevicesAnswer, wanted: string): JobDeviceList | null {
+  if (answer.key !== wanted) return list;
+  if (answer.kind === "start") {
+    if (list && list.key === answer.key && answer.ticket < list.ticket) return list;
+    const fresh = { key: answer.key, devices: answer.devices, matching: answer.matching, ticket: answer.ticket, end: answer.end };
+    const last = answer.devices.at(-1);
+    if (!list || list.key !== answer.key || answer.end || !last) return fresh;
+    const place = list.devices.findIndex((device) => device.device_id === last.device_id);
+    if (place === -1) return fresh;
+    const shown = ids(answer.devices);
+    const rest = list.devices.slice(place + 1).filter((device) => !shown.has(device.device_id));
+    return rest.length ? { ...fresh, devices: [...answer.devices, ...rest], end: list.end } : fresh;
+  }
+  if (!list || list.key !== answer.key || list.devices.at(-1)?.device_id !== answer.after) return list;
+  const loaded = ids(list.devices);
+  return {
+    ...list,
+    devices: [...list.devices, ...answer.devices.filter((device) => !loaded.has(device.device_id))],
+    matching: answer.ticket > list.ticket ? answer.matching : list.matching,
+    end: answer.end,
+  };
+}
+
+// How many more devices "Show more" can load.
+export const moreJobDevices = (list: JobDeviceList | null) =>
+  list && !list.end ? Math.max(0, list.matching - list.devices.length) : 0;
+
+// When the loaded rows are next read, at most once every `interval` since
+// they last were.
+export const devicesRefreshDelay = (lastAt: number, now: number, interval: number) => Math.max(0, lastAt + interval - now);
+
+// Whether a job's update changes what its page shows.
+export const jobChanged = (current: Job, next: Job) =>
+  current.finished_at_unix_ms !== next.finished_at_unix_ms || OUTCOMES.some((outcome) => current.counts[outcome] !== next.counts[outcome]) || current.counts.total !== next.counts.total;
 
 // What the event socket sends about jobs.
 export type JobEvent = { type: "job_update"; job: Job } | { type: "jobs_resync" };

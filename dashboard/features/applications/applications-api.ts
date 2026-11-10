@@ -1,6 +1,6 @@
 // Requests to the applications API.
 import { type AuthorizedFetch, expectJson, expectOk, jsonBody } from "../../lib/http";
-import type { JobDetail, OfflineChoice } from "../automation/model";
+import type { Job, OfflineChoice } from "../automation/model";
 import type { Application, ApplicationRun, DevicePackages, OutdatedPackage, RunAction, RunRequest } from "./model";
 
 export async function fetchLibrary(authorizedFetch: AuthorizedFetch) {
@@ -66,5 +66,5 @@ export type JobTarget = {
 
 // A job that installs, updates or uninstalls on many devices.
 export async function startApplicationJob(authorizedFetch: AuthorizedFetch, request: RunRequest, target: JobTarget) {
-  return expectJson<JobDetail>(await authorizedFetch("/v1/jobs", jsonBody({ applications: request, ...target })), "The job could not be started.");
+  return expectJson<Job>(await authorizedFetch("/v1/jobs", jsonBody({ applications: request, ...target })), "The job could not be started.");
 }

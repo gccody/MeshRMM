@@ -736,3 +736,152 @@ async fn job_queries_read_only_the_jobs_own_devices() {
     }
     assert!(misses.is_empty(), "{}", misses.join("\n\n"));
 }
+
+/// A page of a job's devices: the page cut from the job's rows, and the
+/// page joined to its devices and runs.
+fn page_statements() -> Vec<(String, Statement, &'static [&'static str])> {
+    use meshrmm_server::automation::jobs::{self, DevicePage, Outcome};
+    const KEY: &[&str] = &["sqlite_autoindex_job_devices_1", "job_devices_pkey"];
+    const BY_STATE: &[&str] = &["idx_job_devices_job"];
+    const BY_RESULT: &[&str] = &["idx_job_devices_result"];
+    const STARTED: &[&str] = &["idx_job_devices_job", "idx_job_devices_result"];
+    let page = |outcome: Option<Outcome>, after: bool, offset: u64| DevicePage {
+        outcome,
+        after: after.then(|| "00000000-0000-4000-8000-000000000400".to_owned()),
+        offset,
+        limit: 100,
+    };
+    let mut statements = Vec::new();
+    for (what, page, indexes) in [
+        ("every device", page(None, false, 200), KEY),
+        ("every device after one", page(None, true, 0), KEY),
+        (
+            "the queued devices",
+            page(Some(Outcome::Queued), false, 100),
+            BY_STATE,
+        ),
+        (
+            "the waiting devices",
+            page(Some(Outcome::Waiting), true, 0),
+            BY_STATE,
+        ),
+        (
+            "the failed devices",
+            page(Some(Outcome::Failed), false, 100),
+            BY_RESULT,
+        ),
+        (
+            "the succeeded devices",
+            page(Some(Outcome::Succeeded), true, 0),
+            BY_RESULT,
+        ),
+        (
+            "the running devices",
+            page(Some(Outcome::Running), false, 100),
+            STARTED,
+        ),
+    ] {
+        statements.push((
+            format!("a page of {what}"),
+            Statement::Select(jobs::page_query("job", &page, NOW)),
+            indexes,
+        ));
+        statements.push((
+            format!("a page of {what}, joined"),
+            Statement::Select(jobs::devices_query("job", &page, NOW)),
+            indexes,
+        ));
+    }
+    statements
+}
+
+/// A job of 20,000 devices among others, analyzed, since with no rows
+/// PostgreSQL would rather sort a few than walk an index in order. SQLite
+/// isn't analyzed in use, so its plans are read without rows.
+async fn seed_job_devices(connection: &mut PgConnection) {
+    for statement in [
+        "INSERT INTO jobs (id, kind, item_id, item_name, target, target_label, offline, expires_at, \
+         requested_by_user_id, created_at) SELECT 'job' || CASE WHEN g = 0 THEN '' ELSE g::text END, \
+         'script', 's', 'S', 'all', 'All', 'skip', 0, 'u', 0 FROM generate_series(0, 9) g",
+        "INSERT INTO job_devices (job_id, device_id, state, result, report_by, updated_at) \
+         SELECT 'job' || CASE WHEN g % 10 = 0 THEN '' ELSE (g % 10)::text END, \
+         md5(g::text)::uuid::text, \
+         CASE WHEN g % 7 = 0 THEN 'queued' WHEN g % 11 = 0 THEN 'skipped' WHEN g % 17 = 0 THEN 'waiting' ELSE 'started' END, \
+         CASE WHEN g % 7 = 0 OR g % 11 = 0 OR g % 17 = 0 THEN NULL WHEN g % 13 = 0 THEN 'failed' \
+         WHEN g % 3 = 0 THEN NULL ELSE 'succeeded' END, \
+         1800000000000 + (g % 2) * 3600000 - 1800000, 0 FROM generate_series(0, 199999) g",
+        "ANALYZE",
+    ] {
+        sqlx::query(statement)
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_page_of_a_jobs_devices_reads_only_the_page() {
+    // The page is named as the table it is cut from, so the joined plans
+    // show it scanned; the page's own plan must not.
+    const PAGE: &[&str] = &[
+        "SCAN job_devices",
+        "Seq Scan on job_devices",
+        "Bitmap Heap Scan on job_devices",
+        "TEMP B-TREE",
+        "Sort",
+    ];
+    const RUNS: &[&str] = &[
+        "idx_script_runs_job",
+        "idx_file_deliveries_job",
+        "idx_update_runs_job",
+        "idx_wake_requests_job",
+        "idx_application_runs_job",
+    ];
+    let mut misses = Vec::new();
+    let mut check_page = |backend: &str, query: &str, indexes: &[&str], plan: &str| {
+        check(&mut misses, backend, query, indexes, plan);
+        if query.ends_with("joined") {
+            // PostgreSQL merges the page with whichever index of the empty
+            // run tables it likes; SQLite looks each device's run up.
+            for index in RUNS.iter().filter(|_| backend == "SQLite") {
+                if !plan.contains(index) {
+                    misses.push(format!(
+                        "on {backend}, {query} does not use {index}:\n{plan}"
+                    ));
+                }
+            }
+            if plan.contains("Seq Scan") {
+                misses.push(format!(
+                    "on {backend}, {query} reads a whole table:\n{plan}"
+                ));
+            }
+        } else {
+            for shown in PAGE {
+                if plan.contains(shown) {
+                    misses.push(format!("on {backend}, {query} shows {shown}:\n{plan}"));
+                }
+            }
+        }
+    };
+    let sqlite = common::sqlite().await;
+    let mut connection = SqliteConnection::connect(&sqlite.url).await.unwrap();
+    for (query, statement, indexes) in page_statements() {
+        let plan = sqlite_plan(&mut connection, &statement).await;
+        check_page("SQLite", &query, indexes, &plan);
+    }
+    connection.close().await.unwrap();
+    sqlite.drop_database().await;
+
+    if let Some(admin_url) = common::postgres_admin_url() {
+        let postgres = common::postgres(&admin_url).await;
+        let mut connection = PgConnection::connect(&postgres.url).await.unwrap();
+        seed_job_devices(&mut connection).await;
+        for (query, statement, indexes) in page_statements() {
+            let plan = postgres_plan(&mut connection, &statement).await;
+            check_page("PostgreSQL", &query, indexes, &plan);
+        }
+        connection.close().await.unwrap();
+        postgres.drop_database().await;
+    }
+    assert!(misses.is_empty(), "{}", misses.join("\n\n"));
+}

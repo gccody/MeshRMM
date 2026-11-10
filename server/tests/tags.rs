@@ -42,16 +42,15 @@ async fn tags_of(browser: &mut Browser, device_id: &str) -> Value {
         .clone()
 }
 
-/// The names of the devices a job covers.
+/// The names of the devices a job covers, sorted.
 async fn job_devices(browser: &mut Browser, job_id: &str) -> Vec<String> {
-    let job = browser.get(&format!("/v1/jobs/{job_id}")).await;
-    assert_eq!(job.status, StatusCode::OK, "{:?}", job.body);
-    job.body["devices"]
-        .as_array()
-        .unwrap()
+    let mut names = common::job_devices(browser, job_id, None)
+        .await
         .iter()
         .map(|device| device["device_name"].as_str().unwrap().to_owned())
-        .collect()
+        .collect::<Vec<_>>();
+    names.sort();
+    names
 }
 
 #[tokio::test]

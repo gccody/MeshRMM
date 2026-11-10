@@ -1,6 +1,6 @@
 // Requests to the updates API.
 import { type AuthorizedFetch, expectJson, jsonBody } from "../../lib/http";
-import type { JobDetail } from "../automation/model";
+import type { Job } from "../automation/model";
 import { type DeviceUpdates, type FleetFilters, type FleetPage, type InstallChoice, type RebootBehavior, type RunKind, type UpdateCategory, type UpdateRun, fleetPagePath, installBody } from "./model";
 
 const device = (id: string) => `/v1/agents/${encodeURIComponent(id)}/updates`;
@@ -45,5 +45,5 @@ export type UpdateJobInput =
 
 export async function startUpdateJob(authorizedFetch: AuthorizedFetch, deviceIds: readonly string[], updates: UpdateJobInput, offline: { offline: "skip" | "wait"; wait_hours: number }) {
   const body = { updates, target: "devices", device_ids: [...deviceIds], company_ids: [], ...offline };
-  return expectJson<JobDetail>(await authorizedFetch("/v1/jobs", jsonBody(body)), updates.action === "scan" ? "The scan could not be started." : "The install could not be started.");
+  return expectJson<Job>(await authorizedFetch("/v1/jobs", jsonBody(body)), updates.action === "scan" ? "The scan could not be started." : "The install could not be started.");
 }

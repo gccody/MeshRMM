@@ -649,6 +649,49 @@ pub async fn user_with(
     add_user(app, admin, email, &[&role]).await
 }
 
+/// The job as `GET /v1/jobs/{id}` answers it, which has no devices, with
+/// `devices` added: every one, read a page at a time from
+/// `GET /v1/jobs/{id}/devices`, in its order.
+pub async fn job_with_devices(browser: &mut Browser, id: &str) -> serde_json::Value {
+    let job = browser.get(&format!("/v1/jobs/{id}")).await;
+    assert_eq!(job.status, axum::http::StatusCode::OK, "{:?}", job.body);
+    let mut job = job.body;
+    assert!(
+        job.get("devices").is_none(),
+        "a job comes without its devices"
+    );
+    job["devices"] = job_devices(browser, id, None).await.into();
+    job
+}
+
+/// The job's devices with `outcome`, or every one, read a page at a time,
+/// each page after the last device of the one before.
+pub async fn job_devices(
+    browser: &mut Browser,
+    id: &str,
+    outcome: Option<&str>,
+) -> Vec<serde_json::Value> {
+    const LIMIT: usize = 200;
+    let mut devices: Vec<serde_json::Value> = Vec::new();
+    loop {
+        let mut path = format!("/v1/jobs/{id}/devices?limit={LIMIT}");
+        if let Some(outcome) = outcome {
+            path.push_str(&format!("&outcome={outcome}"));
+        }
+        if let Some(last) = devices.last() {
+            path.push_str(&format!("&after={}", last["device_id"].as_str().unwrap()));
+        }
+        let page = browser.get(&path).await;
+        assert_eq!(page.status, axum::http::StatusCode::OK, "{:?}", page.body);
+        let rows = page.body["devices"].as_array().unwrap().clone();
+        let done = rows.len() < LIMIT;
+        devices.extend(rows);
+        if done {
+            return devices;
+        }
+    }
+}
+
 /// The audit events for `action`, newest first.
 pub async fn audit_events(app: &App, action: &str) -> Vec<meshrmm_server::audit::Event> {
     meshrmm_server::audit::list(

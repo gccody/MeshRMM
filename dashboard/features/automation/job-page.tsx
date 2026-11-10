@@ -1,5 +1,5 @@
 import { Ban, CircleAlert, LoaderCircle, RefreshCw, SearchX, X } from "lucide-react";
-import { type RefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type RefObject, useCallback, useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import { formatDateTime } from "../../lib/format";
 import { AuthenticationRequired, errorText } from "../../lib/http";
@@ -13,15 +13,16 @@ import { fetchRun } from "../toolbox/toolbox-api";
 import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
 import { AutomationAreaTabs } from "./area-tabs";
-import { cancelJob, fetchJob } from "./automation-api";
+import { cancelJob, fetchJob, fetchJobDevices } from "./automation-api";
 import { JobProgressBar, OutcomeChips, OutcomePill } from "./job-progress";
-import { type JobDetail, type JobDevice, type Outcome, applicationProblems, countsSummary, deviceResult, isApplicationJob, isJobFinished, isUpdateJob, jobStarter, progressLabel } from "./model";
+import { JOB_DEVICES_PAGE, type Job, type JobDevice, type JobDeviceList, MAX_JOB_DEVICES_PAGE, type Outcome, applicationProblems, applyJobDevicesAnswer, countsSummary, deviceResult, devicesRefreshDelay, isApplicationJob, isJobFinished, isUpdateJob, jobChanged, jobDevicesKey, jobStarter, moreJobDevices, progressLabel } from "./model";
 import { useJobEvents } from "./use-job-feed";
 
 // Unfinished jobs are read again this often, in case an event was missed.
 const POLL_INTERVAL_MS = 10_000;
-// Events arrive as each device reports; the devices are read at most this often.
-const EVENT_DEBOUNCE_MS = 1_000;
+// Events arrive as each device reports and update the counts at once; the
+// loaded devices are read again at most this often.
+const DEVICES_REFRESH_MS = 5_000;
 
 const DESTINATION_LABELS = {
   user: "The signed-in user's Documents",
@@ -47,11 +48,22 @@ function JobView({ id }: { id: string }) {
   const load = useCallback(() => fetchJob(authorizedFetch, id), [authorizedFetch, id]);
   const { data: job, error, reload, setData } = useResource(load, "The job could not be loaded.");
   const [filter, setFilter] = useState<Outcome | null>(null);
+  const key = jobDevicesKey(filter);
+  const [list, setList] = useState<JobDeviceList | null>(null);
+  const [devicesError, setDevicesError] = useState<string | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [output, setOutput] = useState<JobDevice | null>(null);
   const [cancelling, setCancelling] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const opener = useRef<HTMLElement | null>(null);
-  const pending = useRef<number | undefined>(undefined);
+  // Requests are numbered as they're sent, so an older one's answer never
+  // replaces a newer one's.
+  const tickets = useRef(0);
+  const wanted = useRef(key);
+  const chosen = useRef(filter);
+  const loaded = useRef<JobDeviceList | null>(null);
+  const refreshedAt = useRef(0);
+  const refreshTimer = useRef<number | undefined>(undefined);
   const finished = job ? isJobFinished(job) : false;
 
   useEffect(() => {
@@ -59,26 +71,104 @@ function JobView({ id }: { id: string }) {
     return () => setPageTitle(null);
   }, [job?.item_name, setPageTitle]);
 
-  useEffect(() => () => window.clearTimeout(pending.current), []);
+  useEffect(() => {
+    wanted.current = key;
+    chosen.current = filter;
+  }, [key, filter]);
+  useEffect(() => {
+    loaded.current = list;
+  }, [list]);
+
+  // The chip's devices from the start: as many as `count`, a page at a
+  // time, each page after the last device of the one before.
+  const loadFromStart = useCallback(async (outcome: Outcome | null, count: number) => {
+    const ticket = ++tickets.current;
+    const listKey = jobDevicesKey(outcome);
+    refreshedAt.current = Date.now();
+    try {
+      const devices: JobDevice[] = [];
+      let matching = 0;
+      let end = false;
+      while (!end && devices.length < count) {
+        const limit = Math.min(MAX_JOB_DEVICES_PAGE, count - devices.length);
+        const page = await fetchJobDevices(authorizedFetch, id, outcome, devices.at(-1)?.device_id ?? null, limit);
+        devices.push(...page.devices);
+        matching = page.matching;
+        end = page.devices.length < limit;
+      }
+      const current = wanted.current;
+      setList((list) => applyJobDevicesAnswer(list, { kind: "start", key: listKey, ticket, devices, matching, end }, current));
+      if (listKey === current) setDevicesError(null);
+    } catch (failure) {
+      if (listKey === wanted.current && !(failure instanceof AuthenticationRequired)) setDevicesError(errorText(failure, "The job's devices could not be loaded."));
+    }
+  }, [authorizedFetch, id]);
+
+  // The chip's first page, whenever it changes.
+  useEffect(() => {
+    void loadFromStart(filter, JOB_DEVICES_PAGE);
+  }, [filter, loadFromStart]);
+
+  // The rows loaded (a page at least), read again at most every few
+  // seconds while the job changes; the rest load when asked for.
+  const refreshDevices = useCallback(() => {
+    if (refreshTimer.current !== undefined) return;
+    refreshTimer.current = window.setTimeout(() => {
+      refreshTimer.current = undefined;
+      const list = loaded.current;
+      const count = list && list.key === wanted.current ? list.devices.length : 0;
+      void loadFromStart(chosen.current, Math.max(count, JOB_DEVICES_PAGE));
+    }, devicesRefreshDelay(refreshedAt.current, Date.now(), DEVICES_REFRESH_MS));
+  }, [loadFromStart]);
+  useEffect(() => {
+    const timer = refreshTimer;
+    return () => window.clearTimeout(timer.current);
+  }, []);
 
   useJobEvents((event) => {
-    if (event.type === "job_update" && event.job.id !== id) return;
-    // The counts are current at once; the devices follow.
-    if (event.type === "job_update") setData((current) => ({ ...current, ...event.job }));
-    if (pending.current !== undefined) return;
-    pending.current = window.setTimeout(() => {
-      pending.current = undefined;
+    if (event.type === "jobs_resync") {
       reload();
-    }, EVENT_DEBOUNCE_MS);
+      refreshDevices();
+      return;
+    }
+    if (event.job.id !== id || (job && !jobChanged(job, event.job))) return;
+    // The counts are current at once; the devices follow.
+    setData((current) => ({ ...current, ...event.job }));
+    refreshDevices();
   });
 
+  // In case an event was missed: the job's counts, and the rows loaded.
   useEffect(() => {
     if (!job || finished) return;
-    const timer = window.setInterval(reload, POLL_INTERVAL_MS);
+    const timer = window.setInterval(() => {
+      reload();
+      refreshDevices();
+    }, POLL_INTERVAL_MS);
     return () => window.clearInterval(timer);
-  }, [job, finished, reload]);
+  }, [job, finished, reload, refreshDevices]);
 
-  const devices = useMemo(() => (job?.devices ?? []).filter((device) => filter === null || device.outcome === filter), [job, filter]);
+  const showMore = async () => {
+    const last = list?.devices.at(-1);
+    if (!list || !last) return;
+    const ticket = ++tickets.current;
+    setLoadingMore(true);
+    try {
+      const page = await fetchJobDevices(authorizedFetch, id, filter, last.device_id);
+      const current = wanted.current;
+      const answer = { kind: "more", key, ticket, after: last.device_id, devices: page.devices, matching: page.matching, end: page.devices.length < JOB_DEVICES_PAGE } as const;
+      setList((list) => applyJobDevicesAnswer(list, answer, current));
+    } catch (failure) {
+      if (!(failure instanceof AuthenticationRequired)) setDevicesError(errorText(failure, "More devices could not be loaded."));
+    } finally {
+      setLoadingMore(false);
+    }
+  };
+
+  const refresh = () => {
+    reload();
+    const count = list && list.key === key ? list.devices.length : 0;
+    void loadFromStart(filter, Math.max(count, JOB_DEVICES_PAGE));
+  };
 
   const cancel = async () => {
     if (!job || !window.confirm("Cancel the devices that haven't started? Scripts and installs already running finish.")) return;
@@ -87,6 +177,7 @@ function JobView({ id }: { id: string }) {
     try {
       const next = await cancelJob(authorizedFetch, job.id);
       setData(() => next);
+      refreshDevices();
     } catch (failure) {
       if (!(failure instanceof AuthenticationRequired)) setActionError(errorText(failure, "The job could not be cancelled."));
     } finally {
@@ -107,11 +198,14 @@ function JobView({ id }: { id: string }) {
     );
   }
 
+  const devices = list?.devices ?? [];
+  const remaining = moreJobDevices(list);
+
   return (
     <>
       <HeaderActions>
         {job.can_cancel && <button type="button" className="danger-button" onClick={() => void cancel()} disabled={cancelling}>{cancelling ? <LoaderCircle size={16} className="spin" /> : <Ban size={16} />} Cancel the rest</button>}
-        <button type="button" className="icon-button" onClick={reload} aria-label="Refresh" title="Refresh"><RefreshCw size={16} /></button>
+        <button type="button" className="icon-button" onClick={refresh} aria-label="Refresh" title="Refresh"><RefreshCw size={16} /></button>
       </HeaderActions>
       <AutomationAreaTabs current="job" />
       {(actionError || (error && job)) && (
@@ -129,36 +223,51 @@ function JobView({ id }: { id: string }) {
         <OutcomeChips counts={job.counts} kind={job.kind} selected={filter} onSelect={setFilter} />
       </section>
       <section className="agent-panel">
-        {devices.length === 0 ? (
+        {!list ? (
+          devicesError
+            ? <div className="empty-state"><CircleAlert size={22} aria-hidden="true" /><strong>{devicesError}</strong><button type="button" className="secondary-button" onClick={refresh}><RefreshCw size={16} /> Try again</button></div>
+            : <div className="empty-state"><LoaderCircle size={22} className="spin" aria-hidden="true" /><strong>Loading the devices…</strong></div>
+        ) : devices.length === 0 && list.key === key ? (
           <div className="empty-state"><SearchX size={22} aria-hidden="true" /><strong>No devices to show</strong>{filter && <button type="button" className="secondary-button" onClick={() => setFilter(null)}>Show every device</button>}</div>
         ) : (
-          <table className="data-table" aria-label="Devices in the job">
-            <thead>
-              <tr>
-                <th scope="col">Device</th>
-                <th scope="col">Result</th>
-                <th scope="col">Finished</th>
-                <th scope="col"><span className="sr-only">Output</span></th>
-              </tr>
-            </thead>
-            <tbody>
-              {devices.map((device) => (
-                <tr key={device.device_id}>
-                  <td>
-                    <strong>{device.device_name ? <Link to={`/device?id=${encodeURIComponent(device.device_id)}`}>{device.device_name}</Link> : "Deleted device"}</strong>
-                    <span>{device.platform ? PLATFORM_LABELS[device.platform] : ""}</span>
-                  </td>
-                  <td><OutcomePill outcome={device.outcome} kind={job.kind} />{deviceResult(device) && <span>{deviceResult(device)}</span>}<ApplicationProblems device={device} /></td>
-                  <td className="nowrap">{device.completed_at_unix_ms ? formatDateTime(device.completed_at_unix_ms) : ""}</td>
-                  <td className="row-actions">
-                    {device.run_id && <button type="button" className="secondary-button" onClick={(event) => { opener.current = event.currentTarget; setOutput(device); }} aria-haspopup="dialog">View output</button>}
-                    {device.update_run_id && device.device_name && <Link className="secondary-button" to={`/device?${new URLSearchParams({ id: device.device_id, tab: "updates" })}`}>View updates</Link>}
-                    {device.application_run_id && device.device_name && <Link className="secondary-button" to={`/device?${new URLSearchParams({ id: device.device_id, tab: "applications" })}`}>View applications</Link>}
-                  </td>
+          <>
+            {devicesError && <p className="table-message form-error" role="alert"><CircleAlert size={16} aria-hidden="true" />{devicesError}</p>}
+            <table className="data-table" aria-label="Devices in the job" aria-busy={list.key !== key}>
+              <thead>
+                <tr>
+                  <th scope="col">Device</th>
+                  <th scope="col">Result</th>
+                  <th scope="col">Finished</th>
+                  <th scope="col"><span className="sr-only">Output</span></th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {devices.map((device) => (
+                  <tr key={device.device_id}>
+                    <td>
+                      <strong>{device.device_name ? <Link to={`/device?id=${encodeURIComponent(device.device_id)}`}>{device.device_name}</Link> : "Deleted device"}</strong>
+                      <span>{device.platform ? PLATFORM_LABELS[device.platform] : ""}</span>
+                    </td>
+                    <td><OutcomePill outcome={device.outcome} kind={job.kind} />{deviceResult(device) && <span>{deviceResult(device)}</span>}<ApplicationProblems device={device} /></td>
+                    <td className="nowrap">{device.completed_at_unix_ms ? formatDateTime(device.completed_at_unix_ms) : ""}</td>
+                    <td className="row-actions">
+                      {device.run_id && <button type="button" className="secondary-button" onClick={(event) => { opener.current = event.currentTarget; setOutput(device); }} aria-haspopup="dialog">View output</button>}
+                      {device.update_run_id && device.device_name && <Link className="secondary-button" to={`/device?${new URLSearchParams({ id: device.device_id, tab: "updates" })}`}>View updates</Link>}
+                      {device.application_run_id && device.device_name && <Link className="secondary-button" to={`/device?${new URLSearchParams({ id: device.device_id, tab: "applications" })}`}>View applications</Link>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {remaining > 0 && (
+              <div className="panel-footer fleet-footer">
+                <span className="field-help">{devices.length} of {list.matching} loaded</span>
+                <button type="button" className="secondary-button" disabled={loadingMore || list.key !== key} onClick={() => void showMore()}>
+                  {loadingMore && <LoaderCircle size={15} className="spin" />} Show {Math.min(JOB_DEVICES_PAGE, remaining)} more
+                </button>
+              </div>
+            )}
+          </>
         )}
       </section>
       {output?.run_id && <RunOutputModal runId={output.run_id} deviceName={output.device_name ?? "Deleted device"} returnFocus={opener} onClose={() => setOutput(null)} />}
@@ -190,7 +299,7 @@ function ApplicationProblems({ device }: { device: JobDevice }) {
 }
 
 // What the job sends, where, for whom, and what happens to offline devices.
-function JobFacts({ job }: { job: JobDetail }) {
+function JobFacts({ job }: { job: Job }) {
   return (
     <dl className="job-facts">
       {job.kind === "wake"

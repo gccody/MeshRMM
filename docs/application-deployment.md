@@ -364,7 +364,7 @@ log records:
 | `GET /v1/application-runs?device_id=&action=&limit=` | Runs, newest first (50 by default, at most 200). |
 | `GET /v1/application-runs/{id}` | A run with each application's `outcome`, `version`, `exit_code`, `error` and `output`. |
 | `GET /v1/packages/outdated` | Every outdated package in the fleet, with the devices it's outdated on, most devices first, and whether it's `held` (pinned). The website's totals and **Update all…** leave held packages out. |
-| `POST /v1/jobs` | `{applications: {…as for a run…}}` with the [job's target](automation.md#api). `409 application_pinned` as for a run. Each job device has `applications`: `[{name, outcome, error}]` for those that failed or were skipped. |
+| `POST /v1/jobs` | `{applications: {…as for a run…}}` with the [job's target](automation.md#api). `409 application_pinned` as for a run. Each of the job's devices (`GET /v1/jobs/{id}/devices`) has `applications`: `[{name, outcome, error}]` for those that failed or were skipped. |
 
 A run reads `{id, device_id, device_name, action, summary, status, progress,
 requested_by, policy_name, job_id, error, succeeded, unchanged, skipped, failed,

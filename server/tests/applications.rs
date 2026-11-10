@@ -823,14 +823,15 @@ async fn application_jobs_and_policies_run_on_each_device() {
                 .unwrap()
                 .clone()
         };
-        let skipped = outcome(&job.body, "Mac");
+        let job_id = job.body["id"].as_str().unwrap().to_owned();
+        let created = common::job_with_devices(&mut admin, &job_id).await;
+        let skipped = outcome(&created, "Mac");
         assert_eq!(skipped["outcome"], "skipped", "{name}");
         assert_eq!(skipped["detail"], "None of the applications is for macOS");
-        let job_id = job.body["id"].as_str().unwrap().to_owned();
         automation::pass(&app.state, now_ms()).await.unwrap();
         let command = command_of(&mut control, "run_applications").await;
         let run_id = command["run"]["run_id"].as_str().unwrap().to_owned();
-        let job = admin.get(&format!("/v1/jobs/{job_id}")).await.body;
+        let job = common::job_with_devices(&mut admin, &job_id).await;
         assert_eq!(outcome(&job, "Desk")["outcome"], "running", "{name}");
         assert_eq!(outcome(&job, "Desk")["application_run_id"], run_id);
         send_json(
@@ -842,7 +843,7 @@ async fn application_jobs_and_policies_run_on_each_device() {
         )
         .await;
         run_where(&mut admin, &run_id, |run| run["status"] == "failed").await;
-        let job = admin.get(&format!("/v1/jobs/{job_id}")).await.body;
+        let job = common::job_with_devices(&mut admin, &job_id).await;
         assert_eq!(outcome(&job, "Desk")["outcome"], "failed", "{name}");
         assert_eq!(outcome(&job, "Desk")["detail"], "1 application failed");
         assert_eq!(
@@ -1590,7 +1591,7 @@ async fn what_a_device_cant_use_is_skipped_without_alerts() {
         assert_eq!(job.status, StatusCode::CREATED, "{:?}", job.body);
         let job_id = job.body["id"].as_str().unwrap().to_owned();
         automation::pass(&app.state, now_ms()).await.unwrap();
-        let job = admin.get(&format!("/v1/jobs/{job_id}")).await.body;
+        let job = common::job_with_devices(&mut admin, &job_id).await;
         let tux_outcome = outcome(&job, "Tux");
         assert_eq!(tux_outcome["outcome"], "skipped", "{name}: {tux_outcome:?}");
         assert_eq!(
@@ -1630,7 +1631,7 @@ async fn what_a_device_cant_use_is_skipped_without_alerts() {
         assert_eq!(finished["skipped"], 1, "{name}: {finished:?}");
         assert_eq!(finished["failed"], 0);
         assert_eq!(finished["items"][0]["outcome"], "skipped");
-        let job = admin.get(&format!("/v1/jobs/{job_id}")).await.body;
+        let job = common::job_with_devices(&mut admin, &job_id).await;
         let desk_outcome = outcome(&job, "Desk");
         assert_eq!(
             desk_outcome["outcome"], "skipped",
