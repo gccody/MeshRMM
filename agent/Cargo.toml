@@ -135,4 +135,5 @@ x11rb = { version = "0.13.2", features = ["randr", "screensaver", "shm", "xfixes
 zbus = "5"
 
 [dev-dependencies]
+meshrmm-session-transport = { path = "../crates/session-transport", features = ["test-support"] }
 meshrmm-signaling-client = { workspace = true, features = ["test-support"] }
