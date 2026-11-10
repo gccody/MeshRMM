@@ -28,12 +28,15 @@ class FakeSocket extends EventTarget {
   }
 }
 
+// Firing a timer moves the clock on by its delay.
 function fakeTimers() {
   const pending = new Set();
   const delays = [];
+  let clock = 0;
   return {
     delays,
     pending,
+    now: () => clock,
     setTimeout(callback, ms) {
       const timer = { callback, ms };
       pending.add(timer);
@@ -47,6 +50,7 @@ function fakeTimers() {
       assert.equal(pending.size, 1, 'one reconnect is scheduled');
       const [timer] = pending;
       pending.delete(timer);
+      clock += timer.ms;
       timer.callback();
     },
   };
@@ -54,12 +58,13 @@ function fakeTimers() {
 
 const agent = (id, connected = true) => ({ id, name: id.toUpperCase(), platform: "windows", connected });
 
-function harness({ online } = {}) {
+// `random` 0.5 makes each reconnect wait three quarters of its step.
+function harness({ online, random = () => 0.5 } = {}) {
   const sockets = [];
   const connections = [];
   const timers = fakeTimers();
   const revision = { current: -1 };
-  const state = { agents: [], companies: [], refused: 0, readings: [], alerts: [], jobs: [], updates: [] };
+  const state = { agents: [], companies: [], refused: 0, refusedAt: [], readings: [], alerts: [], jobs: [], updates: [] };
   const stream = inventoryStream({
     openSocket: () => {
       const socket = new FakeSocket();
@@ -73,9 +78,13 @@ function harness({ online } = {}) {
     onJobs: event => { state.jobs.push(event); },
     onUpdates: event => { state.updates.push(event); },
     onConnection: connection => connections.push(connection),
-    onRefused: () => { state.refused++; },
+    onRefused: () => {
+      state.refused++;
+      state.refusedAt.push(timers.now());
+    },
     online,
     timers,
+    random,
   });
   return { stream, sockets, connections, timers, revision, state };
 }
@@ -88,15 +97,51 @@ test('the socket is on the page’s own origin', () => {
   assert.equal(eventsSocketUrl({ protocol: 'http:', host: 'localhost:5173' }), 'ws://localhost:5173/v1/events');
 });
 
-test('reconnects with backoff from 1 s doubling to 30 s', () => {
-  const { sockets, timers, connections } = harness();
-  for (let attempt = 0; attempt < 8; attempt++) {
+// The waits before the next `attempts` reconnects, each socket refused.
+function refusedDelays(random, attempts = 8) {
+  const { sockets, timers, connections } = harness({ random });
+  for (let attempt = 0; attempt < attempts; attempt++) {
     refuse(sockets.at(-1));
-    if (attempt < 7) timers.fire();
+    if (attempt < attempts - 1) timers.fire();
   }
-  assert.deepEqual(timers.delays, [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000]);
-  assert.equal(sockets.length, 8);
+  assert.equal(sockets.length, attempts);
   assert.deepEqual(connections, ['connecting', 'reconnecting']);
+  return timers.delays;
+}
+
+test('each reconnect waits between half its step and the step, which doubles from 1 s to 30 s', () => {
+  const steps = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000];
+  assert.deepEqual(refusedDelays(() => 0), steps.map(step => step / 2));
+  assert.deepEqual(refusedDelays(() => 0.5), steps.map(step => step * 0.75));
+  const longest = refusedDelays(() => 0.999_999, 20);
+  for (const [index, delay] of longest.entries()) {
+    assert.ok(delay <= Math.min(1_000 * 2 ** index, 30_000), `wait ${index} is ${delay} ms`);
+    assert.ok(delay > Math.min(1_000 * 2 ** index, 30_000) * 0.99, `wait ${index} is ${delay} ms`);
+  }
+});
+
+test('a socket that opens and fails before its snapshot keeps the backoff growing', () => {
+  const { sockets, timers, connections } = harness();
+  for (let attempt = 0; attempt < 3; attempt++) {
+    sockets.at(-1).open();
+    // The server closes with 1011 when it cannot read the devices.
+    sockets.at(-1).close(1011, 'devices unavailable');
+    timers.fire();
+  }
+  assert.deepEqual(timers.delays, [750, 1_500, 3_000]);
+  assert.deepEqual(connections, ['connecting', 'reconnecting']);
+});
+
+test('a socket that delivers its snapshot resets the backoff', () => {
+  const { sockets, timers } = harness();
+  refuse(sockets[0]);
+  timers.fire();
+  refuse(sockets[1]);
+  timers.fire();
+  sockets[2].open();
+  sockets[2].receive({ type: 'snapshot', revision: 1, agents: [], generated_at_unix_ms: 1 });
+  sockets[2].close(1001, 'going away');
+  assert.deepEqual(timers.delays, [750, 1_500, 750]);
 });
 
 test('a socket that never opened asks the caller to check the session', () => {
@@ -116,17 +161,53 @@ test('losing access closes with 4001, which also asks for a session check', () =
   assert.equal(state.refused, 1);
 });
 
-test('wake() while waiting connects now and resets the delay to 1 s', () => {
+test('while the server stays unreachable, refused sockets check the session about once a minute', () => {
+  const { sockets, state, timers } = harness();
+  while (timers.now() < 10 * 60_000) {
+    refuse(sockets.at(-1));
+    timers.fire();
+  }
+  assert.equal(state.refusedAt[0], 0, 'the first refusal checks at once');
+  const gaps = state.refusedAt.slice(1).map((at, index) => at - state.refusedAt[index]);
+  assert.ok(gaps.length >= 7, `${state.refusedAt.length} checks in ten minutes`);
+  for (const gap of gaps) assert.ok(gap >= 60_000 && gap < 60_000 + 30_000, `checks ${gap} ms apart`);
+});
+
+test('4001 checks the session at once, even just after a refused socket did', () => {
+  const { sockets, state, timers } = harness();
+  refuse(sockets[0]);
+  timers.fire();
+  sockets[1].open();
+  sockets[1].close(ACCESS_REVOKED_CLOSE_CODE, 'sign in again');
+  assert.deepEqual(state.refusedAt, [0, 750]);
+  timers.fire();
+  refuse(sockets[2]);
+  assert.deepEqual(state.refusedAt, [0, 750], 'a refusal straight after is covered by that check');
+});
+
+test('after the stream goes live, the next outage’s first refusal checks at once', () => {
+  const { sockets, state, timers } = harness();
+  refuse(sockets[0]);
+  timers.fire();
+  sockets[1].open();
+  sockets[1].receive({ type: 'snapshot', revision: 1, agents: [], generated_at_unix_ms: 1 });
+  sockets[1].close(1001, 'going away');
+  timers.fire();
+  refuse(sockets[2]);
+  assert.deepEqual(state.refusedAt, [0, 1_500]);
+});
+
+test('wake() while waiting connects now and resets the step to 1 s', () => {
   const { stream, sockets, timers } = harness();
   refuse(sockets[0]);
   timers.fire();
   refuse(sockets[1]);
-  assert.deepEqual(timers.delays, [1_000, 2_000]);
+  assert.deepEqual(timers.delays, [750, 1_500]);
   stream.wake();
   assert.equal(sockets.length, 3);
   assert.equal(timers.pending.size, 0);
   refuse(sockets[2]);
-  assert.deepEqual(timers.delays, [1_000, 2_000, 1_000]);
+  assert.deepEqual(timers.delays, [750, 1_500, 750]);
 });
 
 test('wake() on an open socket asks for a fresh snapshot', () => {
@@ -240,14 +321,14 @@ test('an unreadable message asks for a snapshot', () => {
   assert.deepEqual(sockets[0].sent, ['refresh', 'refresh']);
 });
 
-test('a closed socket reports reconnecting, keeps the devices, and reconnects after 1 s', () => {
+test('a closed socket reports reconnecting, keeps the devices, and reconnects within 1 s', () => {
   const { sockets, state, connections, timers } = harness();
   sockets[0].open();
   sockets[0].receive({ type: 'snapshot', revision: 1, agents: [agent('a')], generated_at_unix_ms: 1 });
   sockets[0].close(1001, 'going away');
   assert.deepEqual(connections, ['connecting', 'live', 'reconnecting']);
   assert.deepEqual(state.agents.map(item => item.id), ['a']);
-  assert.deepEqual(timers.delays, [1_000]);
+  assert.deepEqual(timers.delays, [750]);
   timers.fire();
   assert.equal(sockets.length, 2);
   sockets[1].open();
