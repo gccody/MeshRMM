@@ -127,6 +127,13 @@ pub fn ip_key(ip: IpAddr) -> String {
     }
 }
 
+/// The rate-limit key for an account, from its normalised email. The email
+/// is whatever a client sent, so it is hashed to a fixed length, and known
+/// and unknown addresses are counted alike.
+pub fn account_key(email: &str) -> String {
+    token_hash(email)
+}
+
 /// Second-factor challenges issued after a correct password.
 #[derive(Debug)]
 pub struct Challenges {
@@ -323,6 +330,16 @@ mod tests {
         assert_eq!(key("::ffff:203.0.113.9"), "203.0.113.9");
         assert_eq!(key("2001:db8:1:2:aaaa::1"), key("2001:db8:1:2:bbbb::2"));
         assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
+    }
+
+    #[test]
+    fn account_keys_have_a_fixed_length() {
+        assert_eq!(account_key("ada@example.com").len(), 64);
+        assert_eq!(account_key(&"a".repeat(10_000)).len(), 64);
+        assert_ne!(
+            account_key("ada@example.com"),
+            account_key("bob@example.com")
+        );
     }
 
     #[test]

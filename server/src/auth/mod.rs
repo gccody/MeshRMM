@@ -2,6 +2,7 @@
 //! limits on guessing.
 pub mod accounts;
 pub mod ceremonies;
+pub mod devices;
 pub mod limits;
 pub mod oidc;
 pub mod passkeys;
@@ -9,14 +10,14 @@ pub mod password;
 pub mod second_factor;
 pub mod session;
 
-use std::time::Duration;
+use std::{net::IpAddr, time::Duration};
 
 use webauthn_rs::prelude::{DiscoverableAuthentication, PasskeyRegistration};
 
 pub use self::session::{Authorized, SignedIn};
 use self::{
     ceremonies::Ceremonies,
-    limits::{Challenges, RateLimiter, SetupGate},
+    limits::{Challenges, RateLimiter, SetupGate, account_key, ip_key},
 };
 
 const WINDOW: Duration = Duration::from_secs(15 * 60);
@@ -40,8 +41,19 @@ pub struct PendingRegistration {
 pub struct AuthState {
     /// Failed sign-ins per client address.
     pub sign_in_by_ip: RateLimiter,
-    /// Failed sign-ins per account, however many addresses try.
+    /// Wrong passwords per account and client address: what a guesser
+    /// exhausts, without touching other addresses' attempts at the account.
+    pub sign_in_by_pair: RateLimiter,
+    /// Wrong passwords per account from a browser with its device cookie,
+    /// instead of the pair and account-wide limits.
+    pub sign_in_by_device: RateLimiter,
+    /// Wrong passwords per account, however many addresses try: the bound on
+    /// guessing from many addresses. Browsers with the account's device
+    /// cookie are neither counted nor refused by it.
     pub sign_in_by_account: RateLimiter,
+    /// Wrong second-factor codes per user, however many challenges they
+    /// span. Only someone with the password gets that far.
+    pub second_factor_by_user: RateLimiter,
     /// Wrong passwords re-entered to confirm an account change, per user.
     pub password_confirmations: RateLimiter,
     /// Setup, invitation and reset tokens tried per client address.
@@ -63,7 +75,10 @@ impl Default for AuthState {
     fn default() -> Self {
         Self {
             sign_in_by_ip: RateLimiter::new(30, WINDOW),
-            sign_in_by_account: RateLimiter::new(10, WINDOW),
+            sign_in_by_pair: RateLimiter::new(10, WINDOW),
+            sign_in_by_device: RateLimiter::new(10, WINDOW),
+            sign_in_by_account: RateLimiter::new(50, WINDOW),
+            second_factor_by_user: RateLimiter::new(10, WINDOW),
             password_confirmations: RateLimiter::new(10, WINDOW),
             token_attempts: RateLimiter::new(30, WINDOW),
             reset_requests: RateLimiter::new(5, WINDOW),
@@ -74,6 +89,93 @@ impl Default for AuthState {
             passkey_registrations: Ceremonies::new(PASSKEY_TTL),
             passkey_sign_ins: Ceremonies::new(PASSKEY_TTL),
             sso_sign_ins: Ceremonies::new(SSO_TTL),
+        }
+    }
+}
+
+/// The limits a password attempt was counted under, to hand back if the
+/// password is right.
+#[derive(Debug)]
+pub struct PasswordAttempt {
+    ip: String,
+    account: Option<Account>,
+}
+
+#[derive(Debug)]
+struct Account {
+    key: String,
+    /// The account and the client address, or with a device cookie the
+    /// account and the device.
+    own: String,
+    device: bool,
+}
+
+impl AuthState {
+    /// Counts a password attempt from `ip` at the account with the normalised
+    /// `email` (`None` if the address isn't valid, which no account has),
+    /// from a browser whose device cookie for that account names `device`.
+    /// Unknown accounts are counted like known ones, so a refusal doesn't
+    /// tell them apart. Returns `Err(seconds)` if a limit is used up.
+    pub fn count_password_attempt(
+        &self,
+        ip: IpAddr,
+        email: Option<&str>,
+        device: Option<&str>,
+    ) -> Result<PasswordAttempt, u64> {
+        let ip = ip_key(ip);
+        self.sign_in_by_ip.hit(&ip)?;
+        let Some(email) = email else {
+            return Ok(PasswordAttempt { ip, account: None });
+        };
+        let key = account_key(email);
+        let account = match device {
+            Some(device) => Account {
+                own: format!("{key}/{device}"),
+                key,
+                device: true,
+            },
+            None => Account {
+                own: format!("{key}/{ip}"),
+                key,
+                device: false,
+            },
+        };
+        let own = self.own_limit(&account);
+        if let Err(seconds) = own.hit(&account.own) {
+            self.sign_in_by_ip.refund(&ip);
+            return Err(seconds);
+        }
+        if !account.device
+            && let Err(seconds) = self.sign_in_by_account.hit(&account.key)
+        {
+            own.refund(&account.own);
+            self.sign_in_by_ip.refund(&ip);
+            return Err(seconds);
+        }
+        Ok(PasswordAttempt {
+            ip,
+            account: Some(account),
+        })
+    }
+
+    /// A right password isn't a guess: hands back its counts and forgets
+    /// the earlier failures from the same address or device, but not other
+    /// addresses' failures at the account.
+    pub fn password_accepted(&self, attempt: &PasswordAttempt) {
+        self.sign_in_by_ip.refund(&attempt.ip);
+        if let Some(account) = &attempt.account {
+            self.own_limit(account).clear(&account.own);
+            if !account.device {
+                self.sign_in_by_account.refund(&account.key);
+            }
+        }
+    }
+
+    fn own_limit(&self, account: &Account) -> &RateLimiter {
+        if account.device {
+            &self.sign_in_by_device
+        } else {
+            &self.sign_in_by_pair
         }
     }
 }

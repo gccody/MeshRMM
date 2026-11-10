@@ -421,3 +421,198 @@ async fn users_see_and_end_their_sessions() {
         app.finish().await;
     }
 }
+
+/// Signs in as a client at `ip`, with the browser's cookie if it has one.
+async fn sign_in_from(
+    browser: &mut common::Browser,
+    ip: &str,
+    email: &str,
+    password: &str,
+) -> common::Response {
+    browser
+        .post_from(
+            ip,
+            "/v1/auth/sign-in",
+            json!({ "email": email, "password": password }),
+        )
+        .await
+}
+
+/// A browser presenting only `cookie`.
+fn browser_with(app: &common::App, cookie: &str) -> common::Browser {
+    let mut browser = app.browser();
+    browser.cookie = Some(cookie.to_owned());
+    browser
+}
+
+#[tokio::test]
+async fn a_strangers_guesses_dont_lock_the_owner_out() {
+    let app = common::App::sqlite().await;
+    common::set_up(&app).await;
+    let mut stranger = app.browser();
+    for _ in 0..10 {
+        let guess = sign_in_from(&mut stranger, "198.51.100.7", ADMIN_EMAIL, "a guess").await;
+        assert_eq!(guess.status, StatusCode::UNAUTHORIZED, "{:?}", guess.body);
+    }
+    let owner = sign_in_from(
+        &mut app.browser(),
+        "203.0.113.20",
+        ADMIN_EMAIL,
+        ADMIN_PASSWORD,
+    )
+    .await;
+    assert_eq!(owner.status, StatusCode::OK, "{:?}", owner.body);
+    // The stranger, at the limit, learns nothing from the right password,
+    // and the owner's sign-in didn't give them more guesses.
+    for password in ["another guess", ADMIN_PASSWORD] {
+        let limited = sign_in_from(&mut stranger, "198.51.100.7", ADMIN_EMAIL, password).await;
+        assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(limited.code(), "rate_limited");
+    }
+    app.finish().await;
+}
+
+#[tokio::test]
+async fn the_account_limit_bounds_guessing_from_many_addresses() {
+    let app = common::App::sqlite().await;
+    let mut admin = common::set_up(&app).await;
+    let (mut other, _) =
+        common::add_user(&app, &mut admin, "tech@example.com", &["technician"]).await;
+    let other_device = common::device_cookie(
+        &sign_in_from(
+            &mut other,
+            "203.0.113.30",
+            "tech@example.com",
+            "a long enough password",
+        )
+        .await,
+    )
+    .unwrap();
+    let owner = sign_in_from(
+        &mut app.browser(),
+        "203.0.113.20",
+        ADMIN_EMAIL,
+        ADMIN_PASSWORD,
+    )
+    .await;
+    let device = common::device_cookie(&owner).expect("a sign-in sets a device cookie");
+    assert!(
+        owner.headers.get_all("set-cookie").iter().any(|value| {
+            let value = value.to_str().unwrap();
+            value.starts_with("__Host-meshrmm-device=")
+                && value.ends_with("HttpOnly; Secure; SameSite=Lax")
+        }),
+        "{:?}",
+        owner.headers
+    );
+
+    // An unknown address is limited exactly like a known one.
+    for email in [ADMIN_EMAIL, "nobody@example.com"] {
+        for address in 1..=5 {
+            let ip = format!("198.51.100.{address}");
+            for _ in 0..10 {
+                let guess = sign_in_from(&mut app.browser(), &ip, email, "a guess").await;
+                assert_eq!(guess.status, StatusCode::UNAUTHORIZED, "{email} {ip}");
+                assert_eq!(guess.code(), "invalid_credentials");
+            }
+        }
+        let limited = sign_in_from(&mut app.browser(), "198.51.100.6", email, "a guess").await;
+        assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS, "{email}");
+        assert_eq!(limited.code(), "rate_limited");
+        assert!(limited.headers.contains_key("retry-after"));
+    }
+    let limited = sign_in_from(
+        &mut app.browser(),
+        "198.51.100.6",
+        ADMIN_EMAIL,
+        ADMIN_PASSWORD,
+    )
+    .await;
+    assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS);
+
+    // The owner's browser still gets in; a forged cookie or another
+    // account's doesn't.
+    let forged = format!(
+        "__Host-meshrmm-device={}.{}",
+        "ab".repeat(16),
+        "0".repeat(64)
+    );
+    for cookie in [forged.as_str(), other_device.as_str()] {
+        let refused = sign_in_from(
+            &mut browser_with(&app, cookie),
+            "203.0.113.21",
+            ADMIN_EMAIL,
+            ADMIN_PASSWORD,
+        )
+        .await;
+        assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS, "{cookie}");
+    }
+    let signed_in = sign_in_from(
+        &mut browser_with(&app, &device),
+        "203.0.113.21",
+        ADMIN_EMAIL,
+        ADMIN_PASSWORD,
+    )
+    .await;
+    assert_eq!(signed_in.status, StatusCode::OK, "{:?}", signed_in.body);
+    app.finish().await;
+}
+
+#[tokio::test]
+async fn a_device_cookie_has_a_limit_of_its_own() {
+    let app = common::App::sqlite().await;
+    common::set_up(&app).await;
+    let owner = sign_in_from(
+        &mut app.browser(),
+        "203.0.113.20",
+        ADMIN_EMAIL,
+        ADMIN_PASSWORD,
+    )
+    .await;
+    let device = common::device_cookie(&owner).unwrap();
+    let mut stolen = browser_with(&app, &device);
+    for _ in 0..10 {
+        let guess = sign_in_from(&mut stolen, "198.51.100.7", ADMIN_EMAIL, "a guess").await;
+        assert_eq!(guess.status, StatusCode::UNAUTHORIZED);
+    }
+    let limited = sign_in_from(&mut stolen, "198.51.100.7", ADMIN_EMAIL, ADMIN_PASSWORD).await;
+    assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS);
+    // Its failures are its own, not the address's.
+    let without = sign_in_from(
+        &mut app.browser(),
+        "198.51.100.7",
+        ADMIN_EMAIL,
+        ADMIN_PASSWORD,
+    )
+    .await;
+    assert_eq!(without.status, StatusCode::OK, "{:?}", without.body);
+    app.finish().await;
+}
+
+#[tokio::test]
+async fn ipv6_addresses_in_one_64_share_an_attempt_limit() {
+    let app = common::App::sqlite().await;
+    common::set_up(&app).await;
+    for host in 1..=10 {
+        let ip = format!("2001:db8:1:2::{host:x}");
+        let guess = sign_in_from(&mut app.browser(), &ip, ADMIN_EMAIL, "a guess").await;
+        assert_eq!(guess.status, StatusCode::UNAUTHORIZED, "{ip}");
+    }
+    let limited = sign_in_from(
+        &mut app.browser(),
+        "2001:db8:1:2:ffff::1",
+        ADMIN_EMAIL,
+        ADMIN_PASSWORD,
+    )
+    .await;
+    assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS);
+    let other = sign_in_from(
+        &mut app.browser(),
+        "2001:db8:1:3::1",
+        ADMIN_EMAIL,
+        ADMIN_PASSWORD,
+    )
+    .await;
+    assert_eq!(other.status, StatusCode::OK, "{:?}", other.body);
+    app.finish().await;
+}

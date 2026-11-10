@@ -284,6 +284,19 @@ change something must carry the server's own `Origin` and an
 `X-MeshRMM-Request` header. Agents authenticate with a bearer credential the
 server stores only as a SHA-256 hash; viewers with handoff and session tokens.
 
+Wrong passwords are limited in memory (`AuthState` in
+`server/src/auth/mod.rs`), and only failures count: 30 per client address
+(an IPv6 /64 is one address) and 10 per account and address in 15 minutes,
+so a guesser uses up only their own attempts. Across addresses an account
+takes 50 wrong passwords in 15 minutes, the bound on guessing from many
+addresses. A full sign-in leaves a signed, HttpOnly
+`__Host-meshrmm-device` cookie naming the account
+(`server/src/auth/devices.rs`); attempts from a browser presenting it get 10
+of their own and skip the account-wide limit, so a stranger's failures can't
+keep the owner out of a browser they have signed in on. Wrong second-factor
+codes are limited to 10 per user in 15 minutes, across challenges; unknown
+emails are counted like known ones.
+
 Scripts and integrations use personal [API tokens](api.md) (`Authorization:
 Bearer mrmm_pat_…`, also stored as SHA-256 hashes). The `Authorized` extractor
 (`server/src/auth/session.rs`) accepts a session or a token
