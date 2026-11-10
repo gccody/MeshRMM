@@ -3081,6 +3081,9 @@ dependencies = [
 [[package]]
 name = "meshrmm-log-file"
 version = "0.2.0"
+dependencies = [
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "meshrmm-protocol"
@@ -3193,6 +3196,7 @@ dependencies = [
  "hyper-util",
  "ipnet",
  "lettre",
+ "meshrmm-log-file",
  "meshrmm-protocol-types",
  "meshrmm-self-update",
  "openidconnect",

@@ -15,6 +15,7 @@ pub mod downloads;
 pub mod files;
 pub mod health;
 pub mod http;
+pub mod logging;
 pub mod mail;
 pub mod maintenance;
 pub mod monitors;
