@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use bytes::Bytes;
 use meshrmm_protocol::AudioFormat;
+use meshrmm_session_transport::MeteredChannel;
 use tokio::sync::{mpsc, watch};
-use webrtc::data_channel::RTCDataChannel;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 use webrtc::peer_connection::RTCPeerConnection;
@@ -74,8 +74,8 @@ pub(super) async fn start_audio(
     let audio_capture = spawn_audio_capture(Arc::clone(input), audio_mode.subscribe(), audio_tx)?;
     cleanup.workers.push(audio_capture);
     let output = AudioOutput {
-        pcm_channel: audio_channel,
-        opus_channel,
+        pcm_channel: MeteredChannel::new(audio_channel),
+        opus_channel: MeteredChannel::new(opus_channel),
         opus: None,
         opus_unavailable: false,
     };
@@ -133,8 +133,8 @@ fn spawn_audio_capture(
 /// Encodes captured audio in the mode the viewer chose and picks the channel
 /// that carries that format.
 struct AudioOutput {
-    pcm_channel: Arc<RTCDataChannel>,
-    opus_channel: Arc<RTCDataChannel>,
+    pcm_channel: MeteredChannel,
+    opus_channel: MeteredChannel,
     opus: Option<meshrmm_audio::OpusEncoder>,
     opus_unavailable: bool,
 }
@@ -152,7 +152,7 @@ impl AudioOutput {
         &mut self,
         mode: AudioMode,
         packet: Vec<u8>,
-    ) -> Option<(AudioFormat, &RTCDataChannel, Vec<Vec<u8>>, u32)> {
+    ) -> Option<(AudioFormat, &MeteredChannel, Vec<Vec<u8>>, u32)> {
         if mode == AudioMode::Opus && self.opus.is_none() && !self.opus_unavailable {
             match meshrmm_audio::OpusEncoder::new() {
                 Ok(encoder) => self.opus = Some(encoder),
@@ -254,7 +254,7 @@ fn spawn_audio_sender(
             }
             sender_bits.store(bits, Ordering::Relaxed);
             for packet in packets {
-                if channel.buffered_amount().await >= buffered_audio_limit(bits) {
+                if channel.queued().await >= buffered_audio_limit(bits) {
                     stats.packets_dropped += 1;
                     continue;
                 }

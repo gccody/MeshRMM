@@ -6,6 +6,9 @@ rust-version.workspace = true
 publish.workspace = true
 [lints]
 workspace = true
+[features]
+# A simulated link for other crates' tests of the queue estimates.
+test-support = []
 [dependencies]
 anyhow.workspace = true
 bytes.workspace = true

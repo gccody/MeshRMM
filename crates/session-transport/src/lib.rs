@@ -1,5 +1,8 @@
 //! Independent reliable streams with a sticky, backwards-compatible route.
 pub mod identity;
+pub mod queue;
+#[cfg(any(test, feature = "test-support"))]
+pub mod simulated_link;
 use anyhow::Context;
 use meshrmm_protocol::SessionMessage;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,6 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{Notify, OnceCell};
 use webrtc::data_channel::RTCDataChannel;
+
+pub use queue::{MAX_IN_FLIGHT, MeteredChannel, SendQueue};
 
 pub const CLIPBOARD_CHANNEL: &str = "meshrmm-clipboard-v1";
 pub const FILE_CHANNEL: &str = "meshrmm-files-v1";
@@ -24,19 +29,24 @@ pub fn service_label(message: &SessionMessage) -> Option<&'static str> {
     }
 }
 
-/// Writers wait while more than this is queued on a channel.
-const SEND_BUFFER_LIMIT: usize = 64 * 1024;
+/// Writers wait while more than this is queued on a channel behind the network (see
+/// [`SendQueue::backlog`]); what is in flight does not count. webrtc-sctp keeps one pending
+/// queue of at most 128 KiB for every channel of a connection, sent in order and blocking
+/// `send` when full, so this leaves at least half of it to the others and puts at most this
+/// ahead of their messages. With what SCTP holds in flight a channel buffers at most this
+/// plus [`MAX_IN_FLIGHT`].
+pub const SEND_QUEUE_LIMIT: usize = 64 * 1024;
 
 /// One observer per physical channel, shared by legacy service routes too.
 /// Callbacks only wake consumers; no socket work runs in a callback.
 #[derive(Clone)]
 pub struct ServiceChannel {
-    channel: Arc<RTCDataChannel>,
+    channel: MeteredChannel,
     changed: Arc<Notify>,
     low_buffer_wake: Arc<OnceCell<()>>,
 }
 impl std::ops::Deref for ServiceChannel {
-    type Target = Arc<RTCDataChannel>;
+    type Target = MeteredChannel;
     fn deref(&self) -> &Self::Target {
         &self.channel
     }
@@ -44,7 +54,7 @@ impl std::ops::Deref for ServiceChannel {
 impl ServiceChannel {
     pub async fn new(channel: Arc<RTCDataChannel>) -> Self {
         let result = Self {
-            channel,
+            channel: MeteredChannel::new(channel),
             changed: Arc::new(Notify::new()),
             low_buffer_wake: Arc::new(OnceCell::new()),
         };
@@ -61,15 +71,13 @@ impl ServiceChannel {
         result
     }
 
-    /// Wakes writers when the send buffer drains. webrtc-rs keeps a threshold and handler set
-    /// before a channel opens only for channels this side created: one the peer created reaches
-    /// `on_data_channel` unopened and would lose both. So they are set once the channel is open.
+    /// Wakes writers when the send buffer drains below its threshold, which `writable` sets.
+    /// webrtc-rs keeps a handler set before a channel opens only for channels this side
+    /// created: one the peer created reaches `on_data_channel` unopened and would lose it. So
+    /// it is set once the channel is open.
     async fn wake_when_buffer_drains(&self) {
         self.low_buffer_wake
             .get_or_init(|| async {
-                self.channel
-                    .set_buffered_amount_low_threshold(SEND_BUFFER_LIMIT - 1)
-                    .await;
                 let changed = self.changed.clone();
                 self.channel
                     .on_buffered_amount_low(Box::new(move || {
@@ -115,8 +123,19 @@ impl ServiceChannel {
                     "session channel is not open"
                 );
                 self.wake_when_buffer_drains().await;
-                if self.buffered_amount().await < SEND_BUFFER_LIMIT {
+                let (buffered, backlog) = self.channel.backlog().await;
+                if backlog < SEND_QUEUE_LIMIT {
                     return Ok(());
+                }
+                // Wake once acknowledgements bring the backlog under the limit, at the rate
+                // measured now. A slower rate only wakes this later, never past the buffer
+                // falling under the limit.
+                let threshold = buffered - (backlog - SEND_QUEUE_LIMIT) - 1;
+                self.channel
+                    .set_buffered_amount_low_threshold(threshold)
+                    .await;
+                if self.channel.buffered_amount().await <= threshold {
+                    continue;
                 }
                 changed.await;
             }
@@ -185,7 +204,7 @@ impl ServiceRoute {
     }
 }
 
-pub async fn send(channel: &RTCDataChannel, message: SessionMessage) -> anyhow::Result<()> {
+pub async fn send(channel: &ServiceChannel, message: SessionMessage) -> anyhow::Result<()> {
     let bytes = bytes::Bytes::from(message.encode().context("invalid session message")?);
     tokio::time::timeout(Duration::from_secs(5), channel.send(&bytes))
         .await
@@ -357,7 +376,7 @@ mod network_tests {
             .await
             .unwrap()
             .unwrap();
-            if files.buffered_amount().await >= SEND_BUFFER_LIMIT {
+            if files.buffered_amount().await >= SEND_QUEUE_LIMIT {
                 break;
             }
         }
@@ -387,6 +406,106 @@ mod network_tests {
         files.close().await.unwrap();
         assert!(files.wait_open().await.is_err());
         assert!(files.writable().await.is_err());
+        a.close().await.unwrap();
+        b.close().await.unwrap();
+    }
+
+    /// Two peers on a virtual network whose router delays every packet by `one_way`.
+    async fn delayed_peers(one_way: Duration) -> (RTCPeerConnection, RTCPeerConnection) {
+        use webrtc::api::setting_engine::SettingEngine;
+        use webrtc::util::vnet::net::{Net, NetConfig};
+        use webrtc::util::vnet::router::{Router, RouterConfig};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let wan = Arc::new(tokio::sync::Mutex::new(
+            Router::new(RouterConfig {
+                cidr: "1.2.3.0/24".to_owned(),
+                min_delay: one_way,
+                ..Default::default()
+            })
+            .unwrap(),
+        ));
+        let mut peers = Vec::new();
+        for address in ["1.2.3.4", "1.2.3.5"] {
+            let net = Arc::new(Net::new(Some(NetConfig {
+                static_ips: vec![address.to_owned()],
+                ..Default::default()
+            })));
+            let nic = net.get_nic().unwrap();
+            wan.lock().await.add_net(Arc::clone(&nic)).await.unwrap();
+            nic.lock().await.set_router(Arc::clone(&wan)).await.unwrap();
+            let mut settings = SettingEngine::default();
+            settings.set_vnet(Some(net));
+            peers.push(
+                APIBuilder::new()
+                    .with_setting_engine(settings)
+                    .build()
+                    .new_peer_connection(RTCConfiguration::default())
+                    .await
+                    .unwrap(),
+            );
+        }
+        wan.lock().await.start().await.unwrap();
+        let b = peers.pop().unwrap();
+        (peers.pop().unwrap(), b)
+    }
+
+    /// Bytes in flight are not queued: over a 100 ms round trip a transfer keeps several
+    /// times the queue limit unacknowledged, which a limit on `buffered_amount` would not.
+    #[tokio::test]
+    async fn a_transfer_over_a_delayed_link_is_not_held_to_its_queue_limit_in_flight() {
+        const CHUNK: usize = 16 * 1024;
+        const TOTAL: usize = 8 * 1024 * 1024;
+        let (a, b) = delayed_peers(Duration::from_millis(50)).await;
+        let (arrived, mut received) = tokio::sync::watch::channel(0);
+        b.on_data_channel(Box::new(move |channel| {
+            let arrived = arrived.clone();
+            Box::pin(async move {
+                channel.on_message(Box::new(move |message| {
+                    arrived.send_modify(|total| *total += message.data.len());
+                    Box::pin(async {})
+                }));
+            })
+        }));
+        let files = ServiceChannel::new(
+            a.create_data_channel(
+                FILE_CHANNEL,
+                Some(RTCDataChannelInit {
+                    ordered: Some(true),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        connect(&a, &b).await;
+        tokio::time::timeout(Duration::from_secs(20), files.wait_open())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut most_buffered = 0;
+        tokio::time::timeout(Duration::from_secs(120), async {
+            for _ in 0..TOTAL / CHUNK {
+                files.writable().await.unwrap();
+                most_buffered = most_buffered.max(files.buffered_amount().await);
+                files
+                    .send(&bytes::Bytes::from(vec![0; CHUNK]))
+                    .await
+                    .unwrap();
+            }
+            received.wait_for(|total| *total == TOTAL).await.unwrap();
+        })
+        .await
+        .unwrap();
+        let round_trip = files.round_trip().unwrap();
+        assert!(
+            round_trip >= Duration::from_millis(100),
+            "the link's round trip measured {round_trip:?}"
+        );
+        assert!(
+            most_buffered > 4 * SEND_QUEUE_LIMIT,
+            "at most {most_buffered} bytes were unacknowledged when the channel took more"
+        );
         a.close().await.unwrap();
         b.close().await.unwrap();
     }

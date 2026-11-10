@@ -55,7 +55,8 @@ impl AudioMode {
     }
 }
 
-/// Queue at most ~150 ms of the active stream in the data channel.
+/// Queue at most ~150 ms of the active stream behind the network; what is in
+/// flight does not count (see `MeteredChannel::queued`).
 pub(super) fn buffered_audio_limit(bits_per_second: u32) -> usize {
     bits_per_second as usize * 150 / 8_000
 }
@@ -63,6 +64,62 @@ pub(super) fn buffered_audio_limit(bits_per_second: u32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sends 20 ms packets of `bits` for `seconds`, dropping those the queue has
+    /// no room for as the audio sender does, and returns how many it dropped.
+    fn stream_audio(
+        bits: u32,
+        queue: &mut meshrmm_session_transport::SendQueue,
+        link: &mut meshrmm_session_transport::simulated_link::SimulatedLink,
+        now: &mut std::time::Instant,
+        seconds: u64,
+    ) -> usize {
+        let packet = bits as usize / 8 / 50;
+        let mut dropped = 0;
+        for _ in 0..seconds * 50 {
+            if queue.queued(*now, link.buffered(*now)) >= buffered_audio_limit(bits) {
+                dropped += 1;
+            } else {
+                link.send(*now, packet);
+                queue.sent(*now, packet);
+            }
+            *now += std::time::Duration::from_millis(20);
+        }
+        dropped
+    }
+
+    #[test]
+    fn audio_drops_packets_for_a_slow_link_and_not_for_a_long_round_trip() {
+        for bits in [meshrmm_audio::OPUS_BITS_PER_SECOND, 1_536_000] {
+            for round_trip in [10, 100, 300].map(std::time::Duration::from_millis) {
+                let mut now = std::time::Instant::now();
+                let rate = u64::from(bits / 8);
+                let mut link = meshrmm_session_transport::simulated_link::SimulatedLink::new(
+                    now,
+                    2 * rate,
+                    round_trip,
+                );
+                let mut queue = meshrmm_session_transport::SendQueue::default();
+                assert_eq!(
+                    stream_audio(bits, &mut queue, &mut link, &mut now, 10),
+                    0,
+                    "{bits} bit/s at {round_trip:?}"
+                );
+                // Resuming after silence is not congestion either.
+                now += std::time::Duration::from_secs(5);
+                assert_eq!(
+                    stream_audio(bits, &mut queue, &mut link, &mut now, 2),
+                    0,
+                    "{bits} bit/s at {round_trip:?} after a pause"
+                );
+                link.set_capacity(rate / 2);
+                assert!(
+                    stream_audio(bits, &mut queue, &mut link, &mut now, 5) > 0,
+                    "{bits} bit/s at {round_trip:?} on a link at half its rate"
+                );
+            }
+        }
+    }
 
     #[test]
     fn the_audio_buffer_limit_follows_the_stream_rate() {

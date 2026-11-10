@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use bytes::Bytes;
 use meshrmm_protocol::{DEFAULT_FRAGMENT_PAYLOAD, EncodedFrame, VideoStreamId, fragment_frame};
+use meshrmm_session_transport::MeteredChannel;
 use tokio::sync::{Notify, mpsc};
 use webrtc::data_channel::RTCDataChannel;
 
@@ -46,7 +47,7 @@ pub(super) fn spawn_video_sender(
         let bitrate = AdaptiveBitrate::new(quality_ceiling.load(Ordering::Acquire).max(1));
         let ladder = RestartLadder::new(quality_ceiling.load(Ordering::Acquire).max(1));
         VideoSender {
-            channel,
+            channel: MeteredChannel::new(channel),
             slot,
             recovery,
             quality_ceiling,
@@ -136,7 +137,7 @@ impl VideoStats {
 }
 
 struct VideoSender {
-    channel: Arc<RTCDataChannel>,
+    channel: MeteredChannel,
     slot: Arc<LatestFrameSlot>,
     recovery: mpsc::UnboundedSender<ControlCommand>,
     quality_ceiling: Arc<AtomicU32>,
@@ -168,7 +169,7 @@ impl VideoSender {
 
             let reference_chain_lost = self.track_reference_chain(&source);
             let now_us = monotonic_timestamp_us();
-            let (live_bitrate, buffered_bytes) =
+            let (live_bitrate, queued_bytes) =
                 self.adapt_bitrate(now_us, reference_chain_lost).await;
             if self.recovering && !source.keyframe {
                 self.stats.recovery_frames_dropped += 1;
@@ -176,7 +177,7 @@ impl VideoSender {
                 continue;
             }
             if self
-                .drop_congested_frame(&source, now_us, live_bitrate, buffered_bytes)
+                .drop_congested_frame(&source, now_us, live_bitrate, queued_bytes)
                 .await
             {
                 continue;
@@ -206,7 +207,7 @@ impl VideoSender {
     }
 
     /// Returns whether the encoder takes live bitrate changes, and the bytes
-    /// buffered on the video channel.
+    /// queued behind the network on the video channel.
     async fn adapt_bitrate(&mut self, now_us: u64, reference_chain_lost: bool) -> (bool, usize) {
         let requested_maximum = self.quality_ceiling.load(Ordering::Acquire).max(1);
         let live_bitrate = self.encoder_status.live_bitrate();
@@ -217,14 +218,12 @@ impl VideoSender {
             let _ = self.recovery.send(ControlCommand::Bitrate(bits_per_second));
         }
         self.ladder.set_maximum(requested_maximum);
-        let buffered_bytes = self.channel.buffered_amount().await;
+        let queued_bytes = self.channel.queued().await;
         if live_bitrate {
-            if let Some(bits_per_second) = self.bitrate.observe(
-                now_us,
-                buffered_bytes,
-                self.slot.len(),
-                reference_chain_lost,
-            ) {
+            if let Some(bits_per_second) =
+                self.bitrate
+                    .observe(now_us, queued_bytes, self.slot.len(), reference_chain_lost)
+            {
                 let _ = self.recovery.send(ControlCommand::Bitrate(bits_per_second));
                 tracing::info!(
                     bits_per_second,
@@ -240,8 +239,8 @@ impl VideoSender {
                 now_us,
                 encoder_bitrate,
                 self.bitrate
-                    .congested(buffered_bytes, queued_frames, reference_chain_lost),
-                self.bitrate.healthy(buffered_bytes, queued_frames),
+                    .congested(queued_bytes, queued_frames, reference_chain_lost),
+                self.bitrate.healthy(queued_bytes, queued_frames),
                 self.encoder_status.recording(),
             ) {
                 let _ = self
@@ -250,13 +249,13 @@ impl VideoSender {
                 tracing::info!(
                     previous_bits_per_second = encoder_bitrate,
                     bits_per_second,
-                    buffered_bytes,
+                    queued_bytes,
                     queued_frames,
                     "requested a video encoder restart at a new bitrate step"
                 );
             }
         }
-        (live_bitrate, buffered_bytes)
+        (live_bitrate, queued_bytes)
     }
 
     fn request_keyframe(&mut self, now_us: u64) {
@@ -275,20 +274,19 @@ impl VideoSender {
         source: &EncodedFrame,
         now_us: u64,
         live_bitrate: bool,
-        mut buffered_bytes: usize,
+        mut queued_bytes: usize,
     ) -> bool {
         let congested_bytes = self.bitrate.congested_bytes();
         let drain_bytes = self.bitrate.drain_bytes();
-        if buffered_bytes >= congested_bytes {
+        if queued_bytes >= congested_bytes {
             let drain_started = tokio::time::Instant::now();
-            while buffered_bytes > drain_bytes
-                && drain_started.elapsed() < VIDEO_BUFFER_DRAIN_TIMEOUT
+            while queued_bytes > drain_bytes && drain_started.elapsed() < VIDEO_BUFFER_DRAIN_TIMEOUT
             {
                 tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-                buffered_bytes = self.channel.buffered_amount().await;
+                queued_bytes = self.channel.queued().await;
             }
         }
-        if buffered_bytes < congested_bytes {
+        if queued_bytes < congested_bytes {
             return false;
         }
         self.stats.buffered_frames_dropped += 1;
@@ -297,12 +295,12 @@ impl VideoSender {
         if live_bitrate
             && let Some(bits_per_second) =
                 self.bitrate
-                    .observe(now_us, buffered_bytes, queued_frames_dropped, true)
+                    .observe(now_us, queued_bytes, queued_frames_dropped, true)
         {
             let _ = self.recovery.send(ControlCommand::Bitrate(bits_per_second));
             tracing::warn!(
                 bits_per_second,
-                buffered_bytes,
+                queued_bytes,
                 queued_frames_dropped,
                 "transport stayed congested; reduced bitrate and reset the predictive chain"
             );
@@ -310,7 +308,7 @@ impl VideoSender {
         self.request_keyframe(now_us);
         tracing::debug!(
             frame_id = source.frame_id,
-            buffered_bytes,
+            queued_bytes,
             "dropping frame and requesting H.264 recovery after the transport drain deadline"
         );
         true

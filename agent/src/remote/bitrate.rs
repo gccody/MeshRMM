@@ -4,6 +4,9 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+// Video queued behind the network, in time at the current bitrate (see
+// `MeteredChannel::queued`): bytes in flight are not counted, so these mean the
+// same at any round trip.
 const VIDEO_BUFFER_DRAIN_MS: u32 = 50;
 const VIDEO_BUFFER_CONGESTED_MS: u32 = 150;
 const BITRATE_DECREASE_INTERVAL_US: u64 = 500_000;
@@ -75,11 +78,11 @@ impl AdaptiveBitrate {
     pub(super) fn observe(
         &mut self,
         now_us: u64,
-        buffered_bytes: usize,
+        queued_bytes: usize,
         queued_frames: usize,
         reference_chain_lost: bool,
     ) -> Option<u32> {
-        if self.congested(buffered_bytes, queued_frames, reference_chain_lost) {
+        if self.congested(queued_bytes, queued_frames, reference_chain_lost) {
             self.healthy_since_us = 0;
             if self.last_decrease_us == 0
                 || now_us.saturating_sub(self.last_decrease_us) >= BITRATE_DECREASE_INTERVAL_US
@@ -95,7 +98,7 @@ impl AdaptiveBitrate {
             return None;
         }
 
-        if !self.healthy(buffered_bytes, queued_frames) || self.current >= self.maximum {
+        if !self.healthy(queued_bytes, queued_frames) || self.current >= self.maximum {
             self.healthy_since_us = 0;
             return None;
         }
@@ -126,17 +129,17 @@ impl AdaptiveBitrate {
 
     pub(super) fn congested(
         &self,
-        buffered_bytes: usize,
+        queued_bytes: usize,
         queued_frames: usize,
         reference_chain_lost: bool,
     ) -> bool {
         reference_chain_lost
-            || buffered_bytes >= self.congested_bytes()
+            || queued_bytes >= self.congested_bytes()
             || queued_frames >= (super::video::MAX_ENCODED_FRAME_QUEUE * 4) / 5
     }
 
-    pub(super) fn healthy(&self, buffered_bytes: usize, queued_frames: usize) -> bool {
-        buffered_bytes <= self.drain_bytes() && queued_frames <= 1
+    pub(super) fn healthy(&self, queued_bytes: usize, queued_frames: usize) -> bool {
+        queued_bytes <= self.drain_bytes() && queued_frames <= 1
     }
 
     pub(super) fn drain_bytes(&self) -> usize {
@@ -324,6 +327,9 @@ impl EncoderStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use meshrmm_session_transport::SendQueue;
+    use meshrmm_session_transport::simulated_link::SimulatedLink;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn video_pacing_bounds_sustained_overshoot_and_idle_bursts() {
@@ -424,6 +430,73 @@ mod tests {
         assert_eq!(low.congested_bytes(), 56_250);
         assert_eq!(high.drain_bytes(), 75_000);
         assert_eq!(high.congested_bytes(), 225_000);
+    }
+
+    /// Streams at the controller's bitrate over `link` for `seconds`, judging once a
+    /// frame, and returns each bitrate change with the time it was made.
+    fn stream_over(
+        bitrate: &mut AdaptiveBitrate,
+        queue: &mut SendQueue,
+        link: &mut SimulatedLink,
+        start: Instant,
+        now: &mut Instant,
+        seconds: u64,
+    ) -> Vec<(Duration, u32)> {
+        let mut changes = Vec::new();
+        for tick in 0..seconds * 1_000 {
+            let bytes = (bitrate.current / 8_000) as usize;
+            link.send(*now, bytes);
+            queue.sent(*now, bytes);
+            if tick % 33 == 0 {
+                let queued = queue.queued(*now, link.buffered(*now));
+                let now_us = (*now - start).as_micros() as u64;
+                if let Some(bits_per_second) = bitrate.observe(now_us, queued, 0, false) {
+                    changes.push((*now - start, bits_per_second));
+                }
+            }
+            *now += Duration::from_millis(1);
+        }
+        changes
+    }
+
+    #[test]
+    fn adaptive_bitrate_judges_the_queue_the_same_at_any_round_trip() {
+        const MAXIMUM: u32 = 12_000_000;
+        let roomy = u64::from(MAXIMUM / 8) * 2;
+        for round_trip in [10, 100, 300].map(Duration::from_millis) {
+            let start = Instant::now();
+            let mut now = start;
+            let mut link = SimulatedLink::new(now, roomy, round_trip);
+            let mut queue = SendQueue::default();
+            let mut bitrate = AdaptiveBitrate::new(MAXIMUM);
+            let changes = stream_over(&mut bitrate, &mut queue, &mut link, start, &mut now, 20);
+            assert!(
+                changes.is_empty(),
+                "{round_trip:?}: a link with room changed the bitrate: {changes:?}"
+            );
+
+            // A link at half the bitrate is congestion, seen within a second.
+            link.set_capacity(roomy / 4);
+            let congested_at = now - start;
+            let changes = stream_over(&mut bitrate, &mut queue, &mut link, start, &mut now, 5);
+            let (first_cut, _) = *changes.first().unwrap_or_else(|| {
+                panic!("{round_trip:?}: a link at half the bitrate was not congestion")
+            });
+            assert!(
+                first_cut - congested_at <= Duration::from_secs(1),
+                "{round_trip:?}: the first cut came after {:?}",
+                first_cut - congested_at
+            );
+            assert!(bitrate.current < MAXIMUM / 2);
+
+            // Once the link has room again the bitrate climbs back to its maximum.
+            link.set_capacity(roomy);
+            stream_over(&mut bitrate, &mut queue, &mut link, start, &mut now, 150);
+            assert_eq!(
+                bitrate.current, MAXIMUM,
+                "{round_trip:?}: the bitrate did not recover"
+            );
+        }
     }
 
     const SAMPLE_US: u64 = 100_000;

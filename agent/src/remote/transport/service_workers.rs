@@ -215,7 +215,7 @@ pub(super) fn spawn_file_worker(
                     capacity = channel.writable(), if pending && channel.ready_state() == RTCDataChannelState::Open => {
                         if let Err(error) = capacity { tracing::warn!(%error, "file channel unavailable"); break; }
                         if let Some(message) = input.poll_files() {
-                            if let Err(error) = send_control_message(&channel, SessionMessage::FileTransfer(message)).await {
+                            if let Err(error) = meshrmm_session_transport::send(&channel, SessionMessage::FileTransfer(message)).await {
                                 tracing::warn!(%error, "file-transfer send failed");
                                 break;
                             }
@@ -332,7 +332,7 @@ pub(super) fn spawn_clipboard_worker(
                     capacity = channel.writable(), if !outgoing.is_empty() => {
                         if let Err(error) = capacity { tracing::warn!(%error, "clipboard channel unavailable"); break; }
                         if let Some(message) = outgoing.pop_front()
-                            && let Err(error) = send_control_message(&channel, message).await {
+                            && let Err(error) = meshrmm_session_transport::send(&channel, message).await {
                                 tracing::warn!(%error, "clipboard send failed");
                                 break;
                             }
