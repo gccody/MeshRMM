@@ -273,6 +273,164 @@ pub(crate) fn read_attempts(path: &Path) -> Option<UpdateAttempts> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
+/// How long an installed update has to prove it works: its coordinator must connect to the
+/// server, be accepted, and handle the server's first message within this time, or the previous
+/// build is put back. The control connection retries at least every two minutes, so this rides
+/// out a server restart or a short network outage. A server or network that stays down longer
+/// rolls the update back to the build that was working, which is harmless while nothing can
+/// reach the Agent anyway, and the release is tried again on the attempt schedule above: an
+/// outage costs a device at most [`MAX_ATTEMPTS_PER_VERSION`] tries a day, and delays a good
+/// release by at most a day once the server is back, without ever refusing it. An Agent that
+/// cannot reach its server installs the update all the same, since the release may be what it
+/// needs to connect to a newer server, and is rolled back if the new build cannot either.
+pub(crate) const CONFIRM_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// How often the installer looks for the new coordinator's [`CONNECTED_FILE`].
+const CONFIRM_POLL: Duration = Duration::from_secs(2);
+/// In the private update directory: the [`PendingUpdate`] an installer is confirming.
+pub(crate) const PENDING_FILE: &str = "update-pending.json";
+/// In the private update directory: the [`Connected`] record of the last coordinator the server
+/// accepted. Only the Agent's own privileged processes can write or remove files there, so a
+/// local user can neither forge a confirmation nor stop one from being written.
+pub(crate) const CONNECTED_FILE: &str = "connected.json";
+
+/// An installed update waiting for its coordinator to connect, written by the installer before
+/// the new build starts and removed when it commits or rolls back.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PendingUpdate {
+    pub version: String,
+    pub until_unix: u64,
+}
+
+impl PendingUpdate {
+    /// Whether the installer may still be waiting at `now_unix`, so the new build must not start
+    /// an update of its own, which would replace the executable the installer can put back. One
+    /// left by an installer that never finished, as when the computer restarted meanwhile,
+    /// expires at its deadline, and one due further ahead than the timeout means the clock was
+    /// changed.
+    pub(crate) fn holds(&self, now_unix: u64) -> bool {
+        self.until_unix
+            .checked_sub(now_unix)
+            .is_some_and(|left| left > 0 && left <= CONFIRM_TIMEOUT.as_secs())
+    }
+}
+
+/// Whether an installer is confirming the update that started this build; see
+/// [`PendingUpdate::holds`].
+pub(crate) fn confirming(updates: &Path, now_unix: u64) -> bool {
+    serde_json::from_slice::<PendingUpdate>(
+        &std::fs::read(updates.join(PENDING_FILE)).unwrap_or_default(),
+    )
+    .is_ok_and(|pending| pending.holds(now_unix))
+}
+
+/// Written by a coordinator the first time the server accepts it and it handles the server's
+/// first message.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Connected {
+    pub version: String,
+}
+
+/// Records that this build connected, for an installer confirming it.
+pub(crate) fn record_connected(updates: &Path) -> anyhow::Result<()> {
+    let record = Connected {
+        version: CURRENT_VERSION.to_owned(),
+    };
+    crate::installer::replace_file(&updates.join(CONNECTED_FILE), &serde_json::to_vec(&record)?)
+}
+
+/// What an installer waiting for the new build has seen.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Confirmed {
+    /// The new build's coordinator connected: the update is committed.
+    Connected,
+    Waiting,
+    /// It did not connect within [`CONFIRM_TIMEOUT`]: the update is rolled back.
+    TimedOut,
+}
+
+/// An installer's wait for the build it installs to connect. Dropping it removes the
+/// [`PENDING_FILE`], once the update is committed or rolled back.
+pub(crate) struct Confirmation {
+    updates: std::path::PathBuf,
+    version: String,
+    deadline: Instant,
+}
+
+impl Confirmation {
+    /// Starts confirming `version` at `now` (`now_unix` on the wall clock), before it is
+    /// installed: only a connection recorded from here on counts.
+    pub(crate) fn begin(
+        updates: &Path,
+        version: &str,
+        now: Instant,
+        now_unix: u64,
+    ) -> anyhow::Result<Self> {
+        match std::fs::remove_file(updates.join(CONNECTED_FILE)) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(anyhow::Error::new(error)
+                    .context("could not remove the last coordinator's connection record"));
+            }
+            _ => {}
+        }
+        let pending = PendingUpdate {
+            version: version.to_owned(),
+            until_unix: now_unix.saturating_add(CONFIRM_TIMEOUT.as_secs()),
+        };
+        crate::installer::replace_file(
+            &updates.join(PENDING_FILE),
+            &serde_json::to_vec(&pending)?,
+        )?;
+        Ok(Self {
+            updates: updates.to_owned(),
+            version: version.to_owned(),
+            deadline: now + CONFIRM_TIMEOUT,
+        })
+    }
+
+    /// Whether the new build has connected by `now`.
+    pub(crate) fn poll(&self, now: Instant) -> Confirmed {
+        let connected = std::fs::read(self.updates.join(CONNECTED_FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Connected>(&bytes).ok())
+            .is_some_and(|record| record.version == self.version);
+        if connected {
+            Confirmed::Connected
+        } else if now >= self.deadline {
+            Confirmed::TimedOut
+        } else {
+            Confirmed::Waiting
+        }
+    }
+
+    /// Waits until the new build connects, returning true, or the time runs out. `now` reads the
+    /// clock and `pause` waits.
+    pub(crate) fn wait(
+        &self,
+        mut now: impl FnMut() -> Instant,
+        mut pause: impl FnMut(Duration),
+    ) -> bool {
+        loop {
+            match self.poll(now()) {
+                Confirmed::Connected => return true,
+                Confirmed::TimedOut => return false,
+                Confirmed::Waiting => pause(CONFIRM_POLL),
+            }
+        }
+    }
+}
+
+impl Drop for Confirmation {
+    fn drop(&mut self) {
+        match std::fs::remove_file(self.updates.join(PENDING_FILE)) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                // It expires at its deadline.
+                tracing::warn!(%error, "could not remove the pending Agent update record");
+            }
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -570,5 +728,129 @@ mod tests {
         // A clock set back before the recorded attempt must not block updates until it catches up.
         let rewound = UpdateAttempts::next(Some(&exhausted), "1.2.0", 10).unwrap();
         assert_eq!(rewound.attempts, 1);
+    }
+
+    /// A private update directory for one test, removed when dropped.
+    struct Updates(std::path::PathBuf);
+
+    impl Updates {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "meshrmm-update-confirmation-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn connected(&self, version: &str) {
+            let record = Connected {
+                version: version.to_owned(),
+            };
+            std::fs::write(
+                self.0.join(CONNECTED_FILE),
+                serde_json::to_vec(&record).unwrap(),
+            )
+            .unwrap();
+        }
+    }
+
+    impl Drop for Updates {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Waits on a clock that only `pause` moves, calling `paused` with the time waited so far
+    /// before each pause; returns the result and the time it waited.
+    fn wait_on_fake_clock(
+        confirmation: &Confirmation,
+        start: Instant,
+        mut paused: impl FnMut(Duration),
+    ) -> (bool, Duration) {
+        let now = std::cell::Cell::new(start);
+        let connected = confirmation.wait(
+            || now.get(),
+            |pause| {
+                paused(now.get() - start);
+                now.set(now.get() + pause);
+            },
+        );
+        (connected, now.get() - start)
+    }
+
+    #[test]
+    fn waits_minutes_for_the_new_build_to_connect_then_rolls_back() {
+        assert!(CONFIRM_TIMEOUT >= Duration::from_secs(10 * 60));
+        let updates = Updates::new();
+        let start = Instant::now();
+        let confirmation = Confirmation::begin(&updates.0, "9.9.9", start, NOW).unwrap();
+        // A build that runs, or even connects as another version, but never connects as the
+        // one installed is rolled back once the time runs out, and not before.
+        let (connected, waited) = wait_on_fake_clock(&confirmation, start, |waited| {
+            if waited == Duration::from_secs(60) {
+                updates.connected("1.0.0");
+            }
+        });
+        assert!(!connected);
+        assert_eq!(waited, CONFIRM_TIMEOUT);
+        assert_eq!(confirmation.poll(start), Confirmed::Waiting);
+        assert_eq!(
+            confirmation.poll(start + CONFIRM_TIMEOUT),
+            Confirmed::TimedOut
+        );
+    }
+
+    #[test]
+    fn commits_the_update_once_its_coordinator_connects() {
+        let updates = Updates::new();
+        let start = Instant::now();
+        let confirmation = Confirmation::begin(&updates.0, CURRENT_VERSION, start, NOW).unwrap();
+        let (connected, waited) = wait_on_fake_clock(&confirmation, start, |waited| {
+            if waited == Duration::from_secs(5 * 60) {
+                record_connected(&updates.0).unwrap();
+            }
+        });
+        assert!(connected);
+        assert_eq!(waited, Duration::from_secs(5 * 60) + CONFIRM_POLL);
+        // A connection at the last moment still counts.
+        assert_eq!(
+            confirmation.poll(start + CONFIRM_TIMEOUT * 2),
+            Confirmed::Connected
+        );
+    }
+
+    #[test]
+    fn a_connection_recorded_before_the_install_does_not_count() {
+        let updates = Updates::new();
+        updates.connected("9.9.9");
+        let start = Instant::now();
+        let confirmation = Confirmation::begin(&updates.0, "9.9.9", start, NOW).unwrap();
+        assert_eq!(confirmation.poll(start), Confirmed::Waiting);
+        assert!(!updates.0.join(CONNECTED_FILE).exists());
+    }
+
+    #[test]
+    fn the_new_build_holds_its_own_updates_while_it_is_confirmed() {
+        let updates = Updates::new();
+        assert!(!confirming(&updates.0, NOW), "no update installing");
+        let confirmation = Confirmation::begin(&updates.0, "9.9.9", Instant::now(), NOW).unwrap();
+        assert!(confirming(&updates.0, NOW));
+        assert!(confirming(&updates.0, NOW + CONFIRM_TIMEOUT.as_secs() - 1));
+        // One left by an installer that never finished expires.
+        assert!(!confirming(&updates.0, NOW + CONFIRM_TIMEOUT.as_secs()));
+        // A clock set back far enough to put the deadline beyond the timeout means it moved.
+        assert!(!confirming(&updates.0, NOW - 1));
+        // Committing or rolling back ends it at once.
+        drop(confirmation);
+        assert!(!updates.0.join(PENDING_FILE).exists());
+        assert!(!confirming(&updates.0, NOW));
+    }
+
+    #[test]
+    fn a_damaged_pending_record_holds_nothing_back() {
+        let updates = Updates::new();
+        std::fs::write(updates.0.join(PENDING_FILE), b"{").unwrap();
+        assert!(!confirming(&updates.0, NOW));
     }
 }

@@ -19,8 +19,8 @@ use crate::private_directory;
 use crate::remote::config::Config;
 use crate::service::service_name_for_path;
 use crate::update_policy::{
-    MAX_ATTEMPTS_PER_VERSION, NEXT_CHECK_FILE, NextCheck, UpdateAttempts, read_attempts,
-    read_next_check, unix_seconds,
+    CONFIRM_TIMEOUT, Confirmation, MAX_ATTEMPTS_PER_VERSION, NEXT_CHECK_FILE, NextCheck,
+    UpdateAttempts, read_attempts, read_next_check, unix_seconds,
 };
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -33,7 +33,8 @@ const ATTEMPTS_FILE: &str = "update-attempts.json";
 const PREVIOUS_INSTANCE_TIMEOUT: Duration = Duration::from_secs(60);
 const TERMINATED_INSTANCE_TIMEOUT: Duration = Duration::from_secs(15);
 const START_TIMEOUT: Duration = Duration::from_secs(30);
-/// An update that stops right after reporting Running is rolled back too.
+/// An update that stops right after reporting Running is rolled back at once, rather than once
+/// it has failed to connect for [`CONFIRM_TIMEOUT`].
 const UPDATE_STARTUP_GRACE: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -64,7 +65,9 @@ impl StagedUpdate {
             .arg(&self.current)
             .arg(&self.staged)
             // The helper waits for this process to exit before replacing its executable.
-            .arg(std::process::id().to_string());
+            .arg(std::process::id().to_string())
+            // And for this version's coordinator to connect before it commits the update.
+            .arg(&self.version);
         if self.json_logs {
             command.arg("--json-logs");
         }
@@ -167,6 +170,19 @@ pub fn scheduled_check(config_directory: &Path) -> Option<NextCheck> {
     read_next_check(&config_directory.join("updates").join(NEXT_CHECK_FILE))
 }
 
+/// Whether the helper that installed this build is still waiting for it to connect, so it must
+/// not start an update of its own.
+pub fn confirming(config_directory: &Path) -> bool {
+    crate::update_policy::confirming(&config_directory.join("updates"), unix_seconds())
+}
+
+/// Records that the coordinator connected, which confirms an update the helper is installing.
+pub fn record_connected(config_directory: &Path) -> anyhow::Result<()> {
+    let updates = config_directory.join("updates");
+    private_directory::secure(&updates)?;
+    crate::update_policy::record_connected(&updates)
+}
+
 /// Writes when the next check is due, so a restart keeps its place in the schedule.
 pub fn record_next_check(config_directory: &Path, next: &NextCheck) {
     let updates = config_directory.join("updates");
@@ -180,14 +196,19 @@ pub fn record_next_check(config_directory: &Path, next: &NextCheck) {
 
 /// Runs as a copy of the previous Agent after the service that staged the update stops. Whatever
 /// fails after that, the helper leaves an Agent executable installed and tries to start the
-/// service again, so a failed update does not leave the endpoint offline until it reboots.
+/// service again, so a failed update does not leave the endpoint offline until it reboots. The
+/// update is committed only once the new build's coordinator has connected to the server.
 pub fn apply_scheduled_update() -> anyhow::Result<()> {
     let arguments = std::env::args_os().skip(2).collect::<Vec<_>>();
-    let [target, staged, process_id, options @ ..] = arguments.as_slice() else {
+    let [target, staged, process_id, version, options @ ..] = arguments.as_slice() else {
         bail!(
-            "the Agent update helper requires target and staged executable paths and the service process ID"
+            "the Agent update helper requires target and staged executable paths, the service process ID and the release version"
         );
     };
+    let version = version
+        .to_str()
+        .filter(|version| meshrmm_protocol::is_release_version(version))
+        .context("the Agent update helper received an invalid release version")?;
     let target = PathBuf::from(target);
     let staged = PathBuf::from(staged);
     let process_id = process_id
@@ -208,12 +229,26 @@ pub fn apply_scheduled_update() -> anyhow::Result<()> {
         target = %target.display(),
         staged = %staged.display(),
         service_process_id = process_id,
+        release_version = version,
         "Agent update helper started"
     );
 
-    let result = install_update(service_name_for_path(&target), &target, &staged, process_id);
+    let release = Release {
+        version,
+        updates: &helper_directory,
+    };
+    let result = install_update(
+        service_name_for_path(&target),
+        &target,
+        &staged,
+        process_id,
+        &release,
+    );
     match &result {
-        Ok(()) => tracing::info!("Agent update installed and the updated service is running"),
+        Ok(()) => tracing::info!(
+            release_version = version,
+            "Agent update installed: the updated Agent connected to the server"
+        ),
         Err(error) => tracing::error!(error = ?error, "Agent update failed"),
     }
     remove_if_present(&staged);
@@ -276,13 +311,21 @@ fn is_update_file(name: &str) -> bool {
     name.ends_with(".exe") && (name.starts_with("update-helper-") || name.starts_with("agent-"))
 }
 
+/// The release a helper installs, and the private update directory its coordinator confirms it in.
+struct Release<'a> {
+    version: &'a str,
+    updates: &'a Path,
+}
+
 /// Replaces the Agent once its previous instance has exited, and restores and restarts the
-/// previous executable when the update cannot be installed or does not start.
+/// previous executable when the update cannot be installed, does not start, or its coordinator
+/// does not connect to the server within [`CONFIRM_TIMEOUT`].
 fn install_update(
     service_name: &str,
     target: &Path,
     staged: &Path,
     process_id: u32,
+    release: &Release,
 ) -> anyhow::Result<()> {
     if let Err(error) = stop_instance(service_name, target, Some(process_id)) {
         return Err(restart_installed(
@@ -292,29 +335,62 @@ fn install_update(
     }
     tracing::info!("the previous Agent service instance exited; replacing its executable");
 
+    // Before the new build starts, so only its own connection confirms it, and it holds back
+    // updates of its own meanwhile.
+    let confirmation = match Confirmation::begin(
+        release.updates,
+        release.version,
+        Instant::now(),
+        unix_seconds(),
+    ) {
+        Ok(confirmation) => confirmation,
+        Err(error) => {
+            return Err(restart_installed(
+                service_name,
+                error.context("could not prepare to confirm the Agent update"),
+            ));
+        }
+    };
     let backup = target.with_extension("exe.previous");
     if let Err(error) = replace_executable(target, staged, &backup) {
+        drop(confirmation);
         return Err(restart_installed(service_name, error));
     }
     tracing::info!(target = %target.display(), "installed the Agent update; starting the service");
 
-    let Err(start_error) = start_and_confirm(service_name, UPDATE_STARTUP_GRACE) else {
+    let proved = start_and_confirm(service_name, UPDATE_STARTUP_GRACE)
+        .context("the updated Agent service did not stay running")
+        .and_then(|()| {
+            tracing::info!(
+                timeout_minutes = CONFIRM_TIMEOUT.as_secs() / 60,
+                "the updated Agent service is running; waiting for its coordinator to connect to the server"
+            );
+            if confirmation.wait(Instant::now, sleep) {
+                Ok(())
+            } else {
+                bail!(
+                    "the updated Agent did not connect to the server within {} minutes",
+                    CONFIRM_TIMEOUT.as_secs() / 60
+                )
+            }
+        });
+    let Err(update_error) = proved else {
         remove_if_present(&backup);
         return Ok(());
     };
     tracing::error!(
-        error = ?start_error,
-        "the updated Agent service did not stay running; restoring the previous executable"
+        error = ?update_error,
+        "the updated Agent did not prove it works; restoring the previous executable"
     );
-    let start_error = start_error.context("the updated Agent service did not stay running");
     let error = match stop_instance(service_name, target, None)
         .and_then(|()| restore_backup(target, &backup))
     {
-        Ok(()) => start_error,
-        Err(restore_error) => start_error.context(format!(
+        Ok(()) => update_error,
+        Err(restore_error) => update_error.context(format!(
             "the previous executable could not be restored: {restore_error:#}"
         )),
     };
+    drop(confirmation);
     Err(restart_installed(service_name, error))
 }
 

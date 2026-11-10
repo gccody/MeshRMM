@@ -390,6 +390,7 @@ pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
             link,
             active_session: None,
             session_close: None,
+            connection_recorded: false,
         }
         .run()
         .await
@@ -417,6 +418,9 @@ struct Coordinator {
     // Outlives session tasks, which end whenever the viewer drops its
     // connection, so the close action runs only once the session ends.
     session_close: Option<(RemoteSessionId, std::sync::Arc<session_close::SessionClose>)>,
+    /// Whether this process has recorded that the server accepted it, which commits an update
+    /// that installed it (see [`crate::update_policy::CONFIRM_TIMEOUT`]).
+    connection_recorded: bool,
 }
 
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
@@ -477,6 +481,40 @@ impl Coordinator {
         }
     }
 
+    /// Once per process, after the server accepted this coordinator and it handled the server's
+    /// first message, records that this build works, for the installer that may be waiting to
+    /// commit the update that started it. Only the installed Agent's coordinator records it.
+    fn record_connection(&mut self) {
+        if self.connection_recorded {
+            return;
+        }
+        self.connection_recorded = true;
+        #[cfg(windows)]
+        let recorded = (self.mode == ExecutionMode::Worker).then(|| {
+            self.config
+                .config_path
+                .parent()
+                .context("Agent configuration has no parent directory")
+                .and_then(crate::updater::record_connected)
+        });
+        #[cfg(target_os = "linux")]
+        let recorded =
+            (self.mode == ExecutionMode::Service).then(crate::linux_updater::record_connected);
+        #[cfg(target_os = "macos")]
+        let recorded =
+            (self.mode == ExecutionMode::Service).then(crate::macos_updater::record_connected);
+        match recorded {
+            Some(Ok(())) => {
+                tracing::info!("recorded that the server accepted this Agent build")
+            }
+            Some(Err(error)) => tracing::warn!(
+                error = ?error,
+                "could not record that the server accepted this Agent build; an update that installed it is rolled back"
+            ),
+            None => {}
+        }
+    }
+
     /// Handles the server's messages until the connection ends, returning whether the Agent is
     /// stopping.
     async fn serve(&mut self, socket: &mut SignalingConnection) -> anyhow::Result<bool> {
@@ -529,6 +567,7 @@ impl Coordinator {
                             if let ControlFlow::Break(stopping) = self.handle_text(socket, text.as_str()).await? {
                                 break Ok(stopping);
                             }
+                            self.record_connection();
                         }
                         Message::Ping(payload) => socket
                             .send(Message::Pong(payload))

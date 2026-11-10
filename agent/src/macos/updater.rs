@@ -5,7 +5,7 @@
 //! check out, and starts the new Agent's `--apply-update`. That process waits
 //! for the coordinator to stop, swaps the app bundle, restarts the launchd
 //! jobs, and puts the previous bundle back if the new coordinator does not
-//! stay up.
+//! stay up or does not connect to the server within [`CONFIRM_TIMEOUT`].
 //!
 //! An Agent signed with a Developer ID takes only the server's build signed
 //! by the same team; an ad-hoc signed one takes the release build, which the
@@ -22,8 +22,8 @@ use super::installer::{APP, BUNDLE_IDENTIFIER, DAEMON_LABEL, HELPER_LABEL, SUPPO
 use crate::remote::config::Config;
 use crate::remote::service_link::ServiceLink;
 use crate::update_policy::{
-    NEXT_CHECK_FILE, NextCheck, UpdateAttempts, UpdateSchedule, random_bits, read_attempts,
-    read_next_check, unix_seconds,
+    CONFIRM_TIMEOUT, Confirmation, NEXT_CHECK_FILE, NextCheck, UpdateAttempts, UpdateSchedule,
+    random_bits, read_attempts, read_next_check, unix_seconds,
 };
 
 const SCHEDULE_TICK: Duration = Duration::from_secs(30);
@@ -31,7 +31,8 @@ const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_UPDATE_BYTES: u64 = 256 * 1024 * 1024;
 /// The coordinator ends remote sessions and runs their close actions first.
 const COORDINATOR_EXIT_TIMEOUT: Duration = Duration::from_secs(60);
-/// How long the new coordinator must keep running for the update to count.
+/// How long the new coordinator must keep running before the installer waits for it to connect,
+/// so one that crashes at once is rolled back without waiting for [`CONFIRM_TIMEOUT`].
 const HEALTHY_AFTER: Duration = Duration::from_secs(15);
 const ATTEMPTS_FILE: &str = "update-attempts.json";
 
@@ -50,7 +51,9 @@ pub(crate) async fn run(config: Config, link: Arc<ServiceLink>) {
     // A release a check found, waiting for the Agent to be free to stop.
     let mut staged: Option<Staged> = None;
     loop {
-        if staged.is_none() && schedule.due(Instant::now(), link.busy()) {
+        // The installer of this build can put the previous one back until it has connected,
+        // so this build does not replace itself meanwhile.
+        if staged.is_none() && !confirming() && schedule.due(Instant::now(), link.busy()) {
             let check_config = config.clone();
             let succeeded = match tokio::task::spawn_blocking(move || stage(&check_config)).await {
                 Ok(Ok(Some(update))) => {
@@ -98,6 +101,17 @@ fn updates_directory() -> anyhow::Result<PathBuf> {
     let directory = super::installer::config_directory()?.join("updates");
     std::fs::create_dir_all(&directory)?;
     Ok(directory)
+}
+
+/// Whether the installer of this build is still waiting for it to connect.
+fn confirming() -> bool {
+    updates_directory()
+        .is_ok_and(|updates| crate::update_policy::confirming(&updates, unix_seconds()))
+}
+
+/// Records that the coordinator connected, which confirms an update being installed.
+pub(crate) fn record_connected() -> anyhow::Result<()> {
+    crate::update_policy::record_connected(&updates_directory()?)
 }
 
 /// A newer Agent, downloaded, verified and unpacked in its staging folder.
@@ -250,29 +264,64 @@ pub fn apply(staged: &Path, coordinator: libc::pid_t) -> anyhow::Result<()> {
     if let Err(error) = super::installer::forget_lost_permissions(staged) {
         tracing::warn!(error = ?error, "the Agent's privacy permissions may be out of date");
     }
+    // Before the new build starts, so only its own connection confirms it, and it holds back
+    // updates of its own meanwhile.
+    let confirmation = match updates_directory().and_then(|updates| {
+        Confirmation::begin(&updates, CURRENT_VERSION, Instant::now(), unix_seconds())
+    }) {
+        Ok(confirmation) => confirmation,
+        Err(error) => {
+            restart();
+            return Err(error).context("could not prepare to confirm the Agent update");
+        }
+    };
     let previous = Path::new(SUPPORT_DIRECTORY).join("MeshRMM Agent.app.previous");
     let _ = std::fs::remove_dir_all(&previous);
-    std::fs::rename(APP, &previous).context("could not set the installed Agent aside")?;
+    if let Err(error) = std::fs::rename(APP, &previous) {
+        drop(confirmation);
+        restart();
+        return Err(error).context("could not set the installed Agent aside");
+    }
     if let Err(error) = std::fs::rename(staged, APP) {
         let _ = std::fs::rename(&previous, APP);
+        drop(confirmation);
         restart();
         return Err(error).context("could not install the Agent update");
     }
     restart();
-    if stays_running() {
-        println!("Agent {CURRENT_VERSION} installed");
-        let _ = std::fs::remove_dir_all(&previous);
-        if let Some(staging) = staged.parent() {
-            let _ = std::fs::remove_dir_all(staging);
+    let failure = if !stays_running() {
+        "did not stay running"
+    } else {
+        tracing::info!(
+            timeout_minutes = CONFIRM_TIMEOUT.as_secs() / 60,
+            "the updated Agent is running; waiting for it to connect to the server"
+        );
+        if confirmation.wait(Instant::now, std::thread::sleep) {
+            println!("Agent {CURRENT_VERSION} installed");
+            tracing::info!(
+                release_version = CURRENT_VERSION,
+                "Agent update installed: the updated Agent connected to the server"
+            );
+            let _ = std::fs::remove_dir_all(&previous);
+            if let Some(staging) = staged.parent() {
+                let _ = std::fs::remove_dir_all(staging);
+            }
+            return Ok(());
         }
-        return Ok(());
-    }
+        "did not connect to the server in time"
+    };
+    tracing::error!(
+        failure,
+        "the updated Agent did not prove it works; restoring the previous Agent"
+    );
     let failed = Path::new(SUPPORT_DIRECTORY).join("MeshRMM Agent.app.failed");
     let _ = std::fs::remove_dir_all(&failed);
     let _ = std::fs::rename(APP, &failed);
-    std::fs::rename(&previous, APP).context("could not restore the previous Agent")?;
+    let restored = std::fs::rename(&previous, APP).context("could not restore the previous Agent");
+    drop(confirmation);
     restart();
-    bail!("the updated Agent did not stay running; restored the previous Agent")
+    restored?;
+    bail!("the updated Agent {failure}; restored the previous Agent")
 }
 
 fn restart() {

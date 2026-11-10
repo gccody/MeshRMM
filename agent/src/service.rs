@@ -166,7 +166,10 @@ fn run_service() -> anyhow::Result<()> {
         }
 
         let busy = worker.as_ref().is_some_and(Coordinator::busy);
-        if staged.is_none() && updates.due(Instant::now(), busy) {
+        // The helper that installed this build can put the previous one back until it has
+        // connected, so this build does not replace itself meanwhile.
+        let confirming = config_directory.is_some_and(crate::updater::confirming);
+        if staged.is_none() && !confirming && updates.due(Instant::now(), busy) {
             match crate::updater::check_and_stage(config) {
                 Ok(Some(update)) => staged = Some(update),
                 Ok(None) => {
