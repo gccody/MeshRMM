@@ -189,7 +189,7 @@ impl WindowContext {
             title: RefCell::new(title),
             debug_visible: Cell::new(false),
             debug_refreshed: Cell::new(std::time::Instant::now()),
-            recording_visible: Cell::new(false),
+            settings_shown: Default::default(),
             controls: Cell::new(Controls::default()),
             toolbar: RefCell::new(toolbar::ToolbarModel::default()),
             chat_popup: OnceCell::new(),

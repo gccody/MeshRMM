@@ -132,7 +132,7 @@ struct WindowContext {
     title: RefCell<HSTRING>,
     debug_visible: Cell<bool>,
     debug_refreshed: Cell<std::time::Instant>,
-    recording_visible: Cell<bool>,
+    settings_shown: settings::SettingsShown,
     controls: Cell<Controls>,
     toolbar: RefCell<toolbar::ToolbarModel>,
     chat_popup: OnceCell<meshrmm_chat::ChatPopup>,
