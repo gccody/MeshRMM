@@ -5,11 +5,13 @@
 //! a device the monitors that apply to it when it connects
 //! ([`greeting`]), and again whenever that set changes, because a rule, its
 //! targets, the device's company or tags, a script or a rule owner's access
-//! changed. It looks again on every presence change, when woken after a rule
-//! changes, and every [`RESYNC_INTERVAL`]. Agents report results
-//! ([`reported`]); the server keeps the latest per monitor and device, and
-//! raises and resolves the rule's alerts through the alert engine. An offline
-//! device reports nothing, so its alerts stay as they are.
+//! changed. A presence change looks again at the devices it names; a rule
+//! change, a deleted tag and every [`RESYNC_INTERVAL`] look at every
+//! connected device, at most once per [`FULL_PASS_SPACING`]. Agents report
+//! results ([`reported`]); the server keeps the latest per monitor and
+//! device, and raises and resolves the rule's alerts through the alert
+//! engine. An offline device reports nothing, so its alerts stay as they
+//! are.
 pub mod remediation;
 pub mod settings;
 pub mod store;
@@ -17,7 +19,10 @@ pub mod store;
 use std::{
     collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -27,7 +32,10 @@ use meshrmm_protocol_types::{
 };
 use sea_query::{Expr, ExprTrait, Query};
 use serde::Serialize;
-use tokio::sync::Notify;
+use tokio::sync::{
+    Notify,
+    broadcast::error::{RecvError, TryRecvError},
+};
 
 use self::store::MonitorState;
 use crate::{
@@ -42,6 +50,7 @@ use crate::{
     },
     http::AppState,
     rbac::{self, Permission},
+    realtime::presence::PresenceEvent,
     targets,
     time::now_ms,
     users,
@@ -52,6 +61,15 @@ use crate::{
 pub const RESYNC_INTERVAL: Duration = Duration::from_secs(60);
 /// Changes this close together are handled together.
 const SETTLE: Duration = Duration::from_millis(250);
+/// Above this many devices named in one settling window, one pass over every
+/// connected device is cheaper than reading each: a device costs three small
+/// reads, while a full pass reads every device and its tags and hashes every
+/// connected device's set.
+const MAX_DEVICE_SYNCS: usize = 200;
+/// The least time between two passes over every connected device, so a
+/// reconnect storm naming more than [`MAX_DEVICE_SYNCS`] devices in every
+/// window reads the fleet once per this long rather than back to back.
+pub const FULL_PASS_SPACING: Duration = Duration::from_secs(5);
 /// How long the rules read for one pass or report serve the next ones.
 /// Waking the engine forgets them at once.
 const RULES_FRESH: Duration = Duration::from_secs(15);
@@ -64,11 +82,14 @@ pub struct Engine {
 #[derive(Debug, Default)]
 struct Inner {
     wake: Notify,
+    /// Whether the next pass looks at every connected device.
+    everyone: AtomicBool,
     /// Devices that get their monitors at the next pass even if unchanged.
     forced: Mutex<HashSet<String>>,
     /// What each connected device was last sent.
     sent: Mutex<HashMap<String, u64>>,
     rules: Mutex<Option<(Instant, Arc<RuleSet>)>>,
+    full_passes: AtomicU64,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -82,8 +103,19 @@ impl Engine {
     /// Compares every connected device's monitors with what it was sent,
     /// soon, such as after a rule changed.
     pub fn wake(&self) {
-        *lock(&self.inner.rules) = None;
+        self.forget_rules();
+        self.inner.everyone.store(true, Ordering::Relaxed);
         self.inner.wake.notify_one();
+    }
+
+    /// How many times every connected device's monitors were compared with
+    /// what it was sent.
+    pub fn full_passes(&self) -> u64 {
+        self.inner.full_passes.load(Ordering::Relaxed)
+    }
+
+    fn forget_rules(&self) {
+        *lock(&self.inner.rules) = None;
     }
 
     /// The monitor rules, read again if those at hand are old.
@@ -101,7 +133,7 @@ impl Engine {
     /// Sends the device its monitors at the next pass, changed or not.
     fn resend(&self, device_id: &str) {
         lock(&self.inner.forced).insert(device_id.to_owned());
-        self.wake();
+        self.inner.wake.notify_one();
     }
 }
 
@@ -113,26 +145,135 @@ fn fingerprint(monitors: &[MonitorDefinition]) -> u64 {
     hasher.finish()
 }
 
+/// What the engine has yet to look at.
+#[derive(Debug, Default)]
+struct Changes {
+    /// Every connected device, because something fleet-wide changed.
+    everyone: bool,
+    /// The rules read last may be out of date.
+    stale_rules: bool,
+    devices: HashSet<String>,
+}
+
+/// What one pass looks at.
+#[derive(Debug, PartialEq, Eq)]
+enum Pass {
+    Everyone,
+    /// These devices; none when there is nothing to do.
+    Devices(HashSet<String>),
+}
+
+impl Changes {
+    fn note(&mut self, event: Result<Arc<PresenceEvent>, RecvError>) {
+        let Ok(event) = event else {
+            // Which devices changed meanwhile is lost, and a tag may have
+            // been deleted among them.
+            self.everyone = true;
+            self.stale_rules = true;
+            return;
+        };
+        match &*event {
+            // A device's company, tags and platform are on its presence, so
+            // a change to any of them names the device.
+            PresenceEvent::AgentUpsert { agent, .. } => {
+                self.devices.insert(agent.id.clone());
+            }
+            PresenceEvent::AgentDeleted { agent_id, .. } => {
+                self.devices.insert(agent_id.clone());
+            }
+            // Deleting a tag also takes it out of the rules targeting it, and
+            // a rule that needed all of several tags then covers the devices
+            // that have the rest, which no event names.
+            PresenceEvent::TagDeleted { .. } => {
+                self.everyone = true;
+                self.stale_rules = true;
+            }
+            PresenceEvent::Snapshot { .. } => self.everyone = true,
+            // Names and colors decide nothing. A deleted company's devices
+            // were moved out of it and are named on their own, and the rules
+            // that targeted it covered only those.
+            PresenceEvent::TagUpsert { .. }
+            | PresenceEvent::CompanyUpsert { .. }
+            | PresenceEvent::CompanyDeleted { .. } => {}
+        }
+    }
+
+    /// What to look at now, given whether a full pass may run yet.
+    fn next(&mut self, full_pass_allowed: bool) -> Pass {
+        if self.devices.len() > MAX_DEVICE_SYNCS {
+            self.everyone = true;
+            self.devices.clear();
+        }
+        if self.everyone && full_pass_allowed {
+            self.everyone = false;
+            self.devices.clear();
+            return Pass::Everyone;
+        }
+        // Until a full pass may run, a few devices are still looked at one
+        // by one.
+        Pass::Devices(std::mem::take(&mut self.devices))
+    }
+}
+
 /// Runs the engine until the returned task is aborted.
 pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut presence = state.presence.subscribe();
         let mut resync = tokio::time::interval(RESYNC_INTERVAL);
         resync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut changes = Changes::default();
+        let mut last_full_pass: Option<tokio::time::Instant> = None;
         loop {
+            // A full pass held back by the spacing runs once it may.
+            let held_back = changes.everyone.then(|| {
+                last_full_pass.map_or_else(tokio::time::Instant::now, |at| at + FULL_PASS_SPACING)
+            });
             tokio::select! {
-                _ = resync.tick() => {}
+                _ = resync.tick() => changes.everyone = true,
                 () = state.monitors.inner.wake.notified() => {}
                 event = presence.recv() => {
-                    if matches!(event, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                    if matches!(event, Err(RecvError::Closed)) {
                         return;
                     }
+                    changes.note(event);
                 }
+                () = tokio::time::sleep_until(held_back.unwrap_or_else(tokio::time::Instant::now)),
+                    if held_back.is_some() => {}
             }
             tokio::time::sleep(SETTLE).await;
-            // What arrived meanwhile is covered by this pass.
-            while presence.try_recv().is_ok() {}
-            if let Err(error) = sync(&state).await {
+            loop {
+                match presence.try_recv() {
+                    Ok(event) => changes.note(Ok(event)),
+                    Err(TryRecvError::Lagged(skipped)) => {
+                        changes.note(Err(RecvError::Lagged(skipped)));
+                    }
+                    Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+                }
+            }
+            if std::mem::take(&mut changes.stale_rules) {
+                state.monitors.forget_rules();
+            }
+            changes.everyone |= state.monitors.inner.everyone.swap(false, Ordering::Relaxed);
+            changes
+                .devices
+                .extend(lock(&state.monitors.inner.forced).iter().cloned());
+            let allowed = last_full_pass.is_none_or(|at| at.elapsed() >= FULL_PASS_SPACING);
+            let result = match changes.next(allowed) {
+                Pass::Everyone => {
+                    last_full_pass = Some(tokio::time::Instant::now());
+                    sync(&state).await
+                }
+                Pass::Devices(devices) => {
+                    let mut result = Ok(());
+                    for device_id in &devices {
+                        if let Err(error) = sync_device(&state, device_id).await {
+                            result = Err(error);
+                        }
+                    }
+                    result
+                }
+            };
+            if let Err(error) = result {
                 tracing::warn!(
                     error = format!("{error:#}"),
                     "could not update the devices' monitors"
@@ -144,6 +285,11 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
 
 /// Sends each connected device whose monitors changed its new set.
 pub async fn sync(state: &AppState) -> anyhow::Result<()> {
+    state
+        .monitors
+        .inner
+        .full_passes
+        .fetch_add(1, Ordering::Relaxed);
     let connected = state.agents.connected();
     if connected.is_empty() {
         lock(&state.monitors.inner.sent).clear();
@@ -151,28 +297,47 @@ pub async fn sync(state: &AppState) -> anyhow::Result<()> {
     }
     let catalog = Catalog::load(state, None).await?;
     let forced = std::mem::take(&mut *lock(&state.monitors.inner.forced));
-    let empty = fingerprint(&[]);
     for device_id in &connected {
-        let monitors = catalog.definitions(device_id);
-        let print = fingerprint(&monitors);
-        let previous = lock(&state.monitors.inner.sent)
-            .get(device_id)
-            .copied()
-            .unwrap_or(empty);
-        if print == previous && !forced.contains(device_id) {
-            continue;
-        }
-        let count = monitors.len();
-        if state
-            .agents
-            .send(device_id, AgentCommand::SetMonitors { monitors })
-        {
-            tracing::info!(device_id, monitors = count, "sent the device its monitors");
-            lock(&state.monitors.inner.sent).insert(device_id.clone(), print);
-        }
+        offer(state, &catalog, device_id, forced.contains(device_id));
     }
     lock(&state.monitors.inner.sent).retain(|device_id, _| connected.contains(device_id));
     Ok(())
+}
+
+/// Sends the device its new set if its monitors changed, reading only what
+/// they depend on, or forgets it if its Agent isn't connected.
+async fn sync_device(state: &AppState, device_id: &str) -> anyhow::Result<()> {
+    if !state.agents.is_connected(device_id) {
+        lock(&state.monitors.inner.forced).remove(device_id);
+        lock(&state.monitors.inner.sent).remove(device_id);
+        return Ok(());
+    }
+    let catalog = Catalog::load(state, Some(device_id)).await?;
+    let forced = lock(&state.monitors.inner.forced).remove(device_id);
+    offer(state, &catalog, device_id, forced);
+    Ok(())
+}
+
+/// Sends the connected device its monitors in `catalog` if they differ from
+/// what it was last sent, or if `forced`.
+fn offer(state: &AppState, catalog: &Catalog, device_id: &str, forced: bool) {
+    let monitors = catalog.definitions(device_id);
+    let print = fingerprint(&monitors);
+    let previous = lock(&state.monitors.inner.sent)
+        .get(device_id)
+        .copied()
+        .unwrap_or_else(|| fingerprint(&[]));
+    if print == previous && !forced {
+        return;
+    }
+    let count = monitors.len();
+    if state
+        .agents
+        .send(device_id, AgentCommand::SetMonitors { monitors })
+    {
+        tracing::info!(device_id, monitors = count, "sent the device its monitors");
+        lock(&state.monitors.inner.sent).insert(device_id.to_owned(), print);
+    }
 }
 
 /// The monitors to send an Agent that just connected, if it has any.
@@ -717,5 +882,77 @@ mod tests {
                 .unwrap()
                 .contains("no longer has the alerts.manage and scripts.run permissions;")
         );
+    }
+
+    fn upsert(id: &str) -> Result<Arc<PresenceEvent>, RecvError> {
+        Ok(Arc::new(PresenceEvent::AgentUpsert {
+            revision: 1,
+            agent: crate::realtime::presence::PresenceAgent {
+                id: id.into(),
+                name: id.into(),
+                platform: "linux".into(),
+                connected: true,
+                updating_to: None,
+                company_id: None,
+                tag_ids: vec![],
+                notes_revision: 0,
+                created_at: 0,
+                system: None,
+            },
+        }))
+    }
+
+    fn devices(ids: &[&str]) -> Pass {
+        Pass::Devices(ids.iter().map(|id| (*id).to_owned()).collect())
+    }
+
+    #[test]
+    fn presence_changes_are_looked_at_device_by_device() {
+        let mut changes = Changes::default();
+        // A device that flaps is looked at once.
+        changes.note(upsert("a"));
+        changes.note(upsert("a"));
+        changes.note(Ok(Arc::new(PresenceEvent::AgentDeleted {
+            revision: 2,
+            agent_id: "b".into(),
+        })));
+        changes.note(Ok(Arc::new(PresenceEvent::CompanyDeleted {
+            revision: 3,
+            company_id: "c".into(),
+        })));
+        assert_eq!(changes.next(true), devices(&["a", "b"]));
+        assert_eq!(changes.next(true), devices(&[]));
+
+        // A deleted tag changes rules' targets, and a subscriber that fell
+        // behind doesn't know what changed: both look at everyone, with the
+        // rules read again.
+        changes.note(Ok(Arc::new(PresenceEvent::TagDeleted {
+            revision: 4,
+            tag_id: "t".into(),
+        })));
+        assert!(changes.stale_rules);
+        assert_eq!(changes.next(true), Pass::Everyone);
+        changes.stale_rules = false;
+        changes.note(Err(RecvError::Lagged(3)));
+        assert!(changes.stale_rules);
+
+        // Until the full pass may run, devices are still looked at one by
+        // one, and the full pass waits.
+        changes.note(upsert("c"));
+        assert_eq!(changes.next(false), devices(&["c"]));
+        assert!(changes.everyone);
+        assert_eq!(changes.next(true), Pass::Everyone);
+        assert_eq!(changes.next(true), devices(&[]));
+
+        // So many devices at once make one full pass instead, held back by
+        // the spacing like any other.
+        for device in 0..=MAX_DEVICE_SYNCS {
+            changes.note(upsert(&device.to_string()));
+        }
+        assert_eq!(changes.next(false), devices(&[]));
+        changes.note(upsert("d"));
+        assert_eq!(changes.next(false), devices(&["d"]));
+        assert_eq!(changes.next(true), Pass::Everyone);
+        assert_eq!(changes.next(true), devices(&[]));
     }
 }

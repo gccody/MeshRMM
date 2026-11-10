@@ -82,9 +82,16 @@ the Agent's.
   and check; a script check carries the script's language and body). The
   engine's task (`monitors::spawn`) sends a device its set again whenever it
   changes: after a rule, its targets, a device's company or tags, a script,
-  or a rule owner's access changes, checked on every presence change, when a
-  rule is saved, and every minute. A device that never had monitors gets
-  none sent.
+  or a rule owner's access changes. A presence change (an Agent connecting
+  or disconnecting, a device tagged, moved or deleted) looks again at the
+  devices it names only, reading just their rows, collected over 250 ms so a
+  device that flaps is looked at once. Every connected device is compared
+  when a rule is saved, when a tag is deleted (it leaves the rules that
+  target it, which may then cover other devices), when the task fell behind
+  the presence events, when more than 200 devices change at once, and every
+  minute; such full passes run at most once per 5 seconds, with the devices
+  named in between still looked at one by one. A device that never had
+  monitors gets none sent.
 - **Scheduling.** The Agent runs its monitors on a thread of their own, off
   the connection's loop, each within its first interval (at most 30 seconds
   in) and then up to a tenth of the interval (at most 30 seconds) late, so a
