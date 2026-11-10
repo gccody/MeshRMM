@@ -202,8 +202,13 @@ task.
 - **Monitors**: the engine's task sends each connected Agent its monitors
   when they change, comparing what each was last sent: for the devices a
   presence change names, and for every connected device on rule changes,
-  deleted tags and every minute, at most once per 5 seconds. The Agent's results are judged as they
-  arrive; self-healing attempts are made on the alert engine's passes. See
+  deleted tags and every minute, at most once per 5 seconds. The set sent on
+  connecting says what the server holds of each monitor's latest result, and
+  the Agent answers with only the results that differ. The Agent sends
+  failures and changes at once and passes of passing monitors every 15
+  minutes; each message's results are matched against what the device was
+  sent, kept in one statement and judged against one read of its open
+  alerts. Self-healing attempts are made on the alert engine's passes. See
   [monitors](monitors.md).
 - **Automation**: the engine's task fires due policies, starts jobs' runs on
   connected devices and broadcasts jobs whose counts changed; event sockets

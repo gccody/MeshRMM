@@ -443,6 +443,30 @@ pub async fn unresolved_for(
         .await
 }
 
+/// The device's unresolved alerts of any of `rule_ids` without a subject,
+/// as a monitor raises them, in one read.
+pub async fn unresolved_of_rules(
+    executor: &mut impl Executor,
+    device_id: &str,
+    rule_ids: &[&str],
+) -> db::Result<Vec<Alert>> {
+    if rule_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    executor
+        .fetch_all(
+            &select()
+                .and_where(
+                    Expr::col((Alerts::Table, Alerts::RuleId)).is_in(rule_ids.iter().copied()),
+                )
+                .and_where(Expr::col((Alerts::Table, Alerts::DeviceId)).eq(device_id))
+                .and_where(Expr::col((Alerts::Table, Alerts::Subject)).eq(""))
+                .and_where(Expr::col((Alerts::Table, Alerts::State)).ne(State::Resolved.as_str()))
+                .to_owned(),
+        )
+        .await
+}
+
 /// Makes an unresolved alert describe the latest failed check, without
 /// counting another occurrence. Returns whether it was unresolved.
 pub async fn refresh(

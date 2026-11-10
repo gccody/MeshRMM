@@ -371,7 +371,7 @@ async fn monitors_follow_their_targets_and_platforms() {
             .await
             .unwrap()
             .unwrap();
-        let AgentCommand::SetMonitors { monitors } = command else {
+        let AgentCommand::SetMonitors { monitors, .. } = command else {
             panic!("expected monitors");
         };
         assert_eq!(monitors.len(), 2, "{name}");
@@ -449,7 +449,7 @@ async fn monitors_follow_their_targets_and_platforms() {
             .await
             .expect("no monitors arrived");
             match next.unwrap() {
-                AgentCommand::SetMonitors { monitors } => {
+                AgentCommand::SetMonitors { monitors, .. } => {
                     if monitors.len() == 1 {
                         assert_eq!(monitors[0].id, events_id);
                         break;
@@ -471,7 +471,7 @@ async fn monitors_sent(connection: &mut AgentConnection, within: Duration) -> Op
             .await
             .ok()?
             .expect("the connection was replaced");
-        if let AgentCommand::SetMonitors { monitors } = command {
+        if let AgentCommand::SetMonitors { monitors, .. } = command {
             let mut ids = monitors
                 .into_iter()
                 .map(|monitor| monitor.id)
@@ -1525,7 +1525,7 @@ async fn monitors_and_self_healing_need_their_permissions() {
                 .contains("operator@example.com"),
             "{listed}"
         );
-        let Some(AgentCommand::SetMonitors { monitors: sent }) =
+        let Some(AgentCommand::SetMonitors { monitors: sent, .. }) =
             monitors::greeting(&app.state, device).await.unwrap()
         else {
             panic!("it still watches");
@@ -1692,6 +1692,204 @@ async fn monitors_and_self_healing_need_their_permissions() {
             StatusCode::NO_CONTENT,
             "{name}"
         );
+        app.finish().await;
+    }
+}
+
+/// What a message of results costs when its monitors were sent to the
+/// device on this connection and no alert changes: one read of the device's
+/// unresolved alerts of their rules, and one write keeping the results.
+const QUIET_REPORT_STATEMENTS: u64 = 2;
+
+/// Monitor rules for services `svc0` and on, each alerting on its first
+/// failure.
+async fn service_rules(admin: &mut Browser, count: usize) -> Vec<String> {
+    let mut ids = Vec::new();
+    for n in 0..count {
+        let rule = create_rule(
+            admin,
+            service_rule(
+                &format!("Service {n}"),
+                json!({ "monitor": { "interval_seconds": 60, "failures": 1,
+                    "check": { "kind": "service", "name": format!("svc{n}") } } }),
+            ),
+        )
+        .await;
+        ids.push(rule["id"].as_str().unwrap().to_owned());
+    }
+    ids
+}
+
+fn passes(ids: &[String]) -> Vec<MonitorResult> {
+    ids.iter()
+        .map(|id| result(id, true, 0, "running"))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_message_of_results_is_kept_and_judged_together() {
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let agent = app.enroll_on(&mut admin, "Web", "linux").await;
+        let device = agent.device_id.as_str();
+        let ids = service_rules(&mut admin, 40).await;
+        let _connection = app.state.agents.connect(device);
+        let Some(AgentCommand::SetMonitors { monitors, known }) =
+            monitors::greeting(&app.state, device).await.unwrap()
+        else {
+            panic!("expected monitors");
+        };
+        assert_eq!(monitors.len(), ids.len(), "{name}");
+        assert_eq!(known, Some(Vec::new()), "{name}: nothing is held yet");
+        monitors::reported(&app.state, device, passes(&ids)).await;
+
+        // A refresh of passing monitors costs the same however many it
+        // carries, and tells the website the new values but nothing about
+        // alerts.
+        let mut events = app.state.alerts.subscribe();
+        let mut costs = Vec::new();
+        for count in [1, 10, ids.len()] {
+            let before = app.db().counts();
+            monitors::reported(&app.state, device, passes(&ids[..count])).await;
+            costs.push(app.db().counts() - before);
+        }
+        for cost in &costs {
+            assert_eq!(
+                (cost.statements, cost.writes, cost.transactions),
+                (QUIET_REPORT_STATEMENTS, 1, 0),
+                "{name}: {costs:?}"
+            );
+        }
+        for count in [1, 10, ids.len()] {
+            let event = events.try_recv().unwrap();
+            let alerts::AlertEvent::MonitorUpdate { states, .. } = &*event else {
+                panic!("{name}: unexpected {event:?}");
+            };
+            assert_eq!(states.len(), count, "{name}");
+        }
+        assert!(events.try_recv().is_err(), "{name}: no alert events");
+
+        // Failing and recovering monitors in one message raise and resolve
+        // alerts as they would one by one.
+        let mut message = passes(&ids);
+        message[0] = result(&ids[0], false, 1, "svc0 is stopped.");
+        message[1] = result(&ids[1], false, 1, "svc1 is stopped.");
+        monitors::reported(&app.state, device, message).await;
+        alerts_until(&mut admin, "", 2).await;
+        let mut message = passes(&ids);
+        message[0] = result(&ids[0], false, 2, "svc0 is still stopped.");
+        message[2] = result(&ids[2], false, 1, "svc2 is stopped.");
+        // A monitor's later result in a message stands for it.
+        message[3] = result(&ids[3], false, 1, "svc3 is stopped.");
+        message.push(result(&ids[3], true, 0, "running"));
+        monitors::reported(&app.state, device, message).await;
+        let open = alerts_until(&mut admin, "", 2).await;
+        assert_eq!(
+            alert_of(&open, &ids[0])["detail"],
+            "svc0 is still stopped.",
+            "{name}"
+        );
+        alert_of(&open, &ids[2]);
+        let resolved = alerts_until(&mut admin, "?state=resolved", 1).await;
+        assert_eq!(alert_of(&resolved, &ids[1])["resolution"], "cleared");
+        let listed = admin.get(&format!("/v1/agents/{device}/monitors")).await;
+        let fourth = listed
+            .body
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|monitor| monitor["rule_id"] == ids[3].as_str())
+            .unwrap();
+        assert_eq!(fourth["state"]["passing"], true, "{name}: {fourth}");
+        assert_eq!(fourth["alert_id"], Value::Null);
+
+        // Results for monitors the device wasn't sent are dropped.
+        let before = app.db().counts();
+        monitors::reported(
+            &app.state,
+            device,
+            vec![result("00000000000000000000000000000000", false, 9, "?")],
+        )
+        .await;
+        assert_eq!((app.db().counts() - before).writes, 0, "{name}");
+        app.finish().await;
+    }
+}
+
+/// What greeting a device with monitors reads, besides the rules: the
+/// device's row, its tags and platform, and what the server holds of its
+/// monitors' results.
+const GREETING_STATEMENTS: u64 = 4;
+
+#[tokio::test]
+async fn a_reconnecting_agent_is_told_what_the_server_holds() {
+    for app in apps().await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let agent = app.enroll_on(&mut admin, "Web", "linux").await;
+        let device = agent.device_id.clone();
+        let mut ids = service_rules(&mut admin, 3).await;
+        ids.sort();
+
+        let mut socket = agent.connect(&server).await.unwrap();
+        let set = next_of(&mut socket, "set_monitors").await;
+        assert_eq!(set["known"], json!([]), "{name}: nothing is held yet");
+        let reported = vec![
+            result(&ids[0], true, 0, "running"),
+            result(&ids[1], true, 0, "running"),
+            result(&ids[2], false, 3, "stopped"),
+        ];
+        send_json(
+            &mut socket,
+            json!({ "type": "monitor_results", "results": reported }),
+        )
+        .await;
+        alerts_until(&mut admin, "", 1).await;
+        drop(socket);
+
+        // The next connection is told what the server holds, so an Agent
+        // whose results are the same sends none.
+        let mut socket = agent.connect(&server).await.unwrap();
+        let set = next_of(&mut socket, "set_monitors").await;
+        let mut known = set["known"].as_array().unwrap().clone();
+        known.sort_by_key(|known| known["monitor_id"].as_str().unwrap().to_owned());
+        let expected = reported
+            .iter()
+            .map(|result| {
+                json!({ "monitor_id": result.monitor_id,
+                    "checked_at_unix_ms": result.checked_at_unix_ms,
+                    "passing": result.passing, "failures": result.failures })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(known, expected, "{name}");
+
+        // Saying so costs one read more than the monitors alone, and
+        // nothing for a device without monitors.
+        monitors::greeting(&app.state, &device).await.unwrap();
+        let before = app.db().counts();
+        monitors::greeting(&app.state, &device).await.unwrap();
+        let cost = app.db().counts() - before;
+        assert_eq!(
+            (cost.statements, cost.writes),
+            (GREETING_STATEMENTS, 0),
+            "{name}: {cost:?}"
+        );
+        for id in &ids {
+            let deleted = admin.delete(&format!("/v1/alert-rules/{id}")).await;
+            assert_eq!(deleted.status, StatusCode::NO_CONTENT);
+        }
+        monitors::greeting(&app.state, &device).await.unwrap();
+        let before = app.db().counts();
+        assert!(
+            monitors::greeting(&app.state, &device)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!((app.db().counts() - before).statements, 0, "{name}");
+        drop(socket);
         app.finish().await;
     }
 }

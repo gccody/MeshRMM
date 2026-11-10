@@ -4,11 +4,14 @@
 //!
 //! The server sends an Agent every monitor that applies to it
 //! ([`crate::AgentCommand::SetMonitors`]) when it connects and whenever that
-//! set changes. The Agent runs each one every `interval_seconds`, off its
-//! control connection, and reports results
-//! ([`crate::AgentStatusMessage::MonitorResults`]): at once when one starts
-//! or stops passing or fails again, and every
-//! [`MONITOR_STATUS_INTERVAL_SECONDS`] for the rest. The server decides from
+//! set changes; on connecting it also says what it holds of each monitor's
+//! latest result ([`KnownMonitorResult`]). The Agent runs each one every
+//! `interval_seconds`, off its control connection, and reports results
+//! ([`crate::AgentStatusMessage::MonitorResults`]): at once when one fails,
+//! starts or stops passing, is the first the server would hold, or was asked
+//! for; and the latest of the rest together every
+//! [`MONITOR_REFRESH_INTERVAL_SECONDS`]. On connecting it sends only the
+//! results the server lacks or holds differently. The server decides from
 //! the number of consecutive failures whether to raise an alert.
 //!
 //! The validators here are shared: the server checks a rule with them before
@@ -30,8 +33,10 @@ pub const MAX_MONITOR_TIMEOUT_SECONDS: u32 = 300;
 pub const DEFAULT_MONITOR_TIMEOUT_SECONDS: u32 = 30;
 /// The most consecutive failures a rule may wait for before alerting.
 pub const MAX_MONITOR_FAILURES: u32 = 100;
-/// How often the Agent reports results that didn't change.
-pub const MONITOR_STATUS_INTERVAL_SECONDS: u64 = 60;
+/// How often the Agent sends the latest results of monitors that keep
+/// passing, which it doesn't send as they come. Each connection starts at a
+/// random point in the interval, so a fleet's refreshes spread out.
+pub const MONITOR_REFRESH_INTERVAL_SECONDS: u64 = 15 * 60;
 /// The most monitors one device runs, and results one report carries.
 pub const MAX_MONITORS: usize = 256;
 /// A result's detail, in characters, and its output, in bytes.
@@ -539,6 +544,16 @@ pub struct MonitorResult {
     /// [`MAX_MONITOR_OUTPUT_BYTES`].
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub output: String,
+}
+
+/// What the server holds of a monitor's latest result on the device. It
+/// tells the Agent when it connects, so the Agent sends only what is news.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnownMonitorResult {
+    pub monitor_id: String,
+    pub checked_at_unix_ms: u64,
+    pub passing: bool,
+    pub failures: u32,
 }
 
 /// A self-healing action the server asks the Agent to take.

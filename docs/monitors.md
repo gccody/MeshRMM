@@ -99,14 +99,36 @@ the Agent's.
   script checks. A check that overruns its time limit by 5 seconds counts as
   failing, and the monitor doesn't start again until it finishes. Monitors
   keep running while the Agent is reconnecting.
-- **Reporting.** A failure, or a change between passing and failing, is
-  reported at once; steady passes go together every minute. On reconnecting
-  the Agent sends every monitor's latest result again. The Agent counts
-  failures in a row; the server stores each monitor's latest result per
-  device (`monitor_states`), raises the rule's alert once the count reaches
-  the rule's threshold, keeps it describing the latest failure, and resolves
-  it on a pass. A result for a monitor that no longer applies is dropped and
-  the device gets its monitors again.
+- **Reporting.** The Agent reports at once a failure (every one, with its
+  count), a change between passing and failing, a monitor's first result
+  (also after its definition changes), the result Check now asks for, and
+  each self-healing action's outcome. A pass of a monitor the server already
+  holds as passing isn't sent as it comes: every 15 minutes
+  (`MONITOR_REFRESH_INTERVAL_SECONDS`) the Agent sends the latest results the
+  server doesn't hold yet together, usually in one message, starting at a
+  random point in the interval on each connection so a fleet's refreshes
+  spread out. So a passing monitor's last check time and value on the
+  website can be up to 15 minutes old (longer only while the device is
+  offline); failures and recoveries show at once.
+- **Reconnecting.** The monitors the server sends an Agent when it connects
+  (`set_monitors`) carry `known`: what the server holds of each one's latest
+  result (when it was checked, whether it passed, and its failures in a
+  row). The Agent waits for them (at most 10 seconds), then sends only the
+  results the server lacks or holds with another outcome or count, such as
+  ones it sent as the old connection dropped. A monitor still passing as the
+  server holds it sends nothing until the next refresh. Results the socket
+  refuses go again 5 seconds later.
+- **Judging.** The Agent counts failures in a row; the server stores each
+  monitor's latest result per device (`monitor_states`), raises the rule's
+  alert once the count reaches the rule's threshold, keeps it describing the
+  latest failure, and resolves it on a pass. It takes a message's results
+  together: it matches them against the monitors it last sent the device
+  (reading the device's row, tags and platform only if it sent none on this
+  connection), keeps them in one statement, and reads the device's
+  unresolved alerts of those rules once. A message of passes with no alert
+  open costs those two statements and changes no alert, however many
+  results it carries. A result for a monitor the device wasn't sent is
+  dropped and the device gets its monitors again.
 - **Offline devices** report nothing, so their monitor alerts stay as they
   are until the device reconnects and checks again.
 
@@ -241,7 +263,8 @@ rule editor marks the other conditions as needing `scripts.run`.
   attempts.
 - A device's **Monitors** tab (`/device?id=…&tab=monitors`, with
   `alerts.view`) lists the monitors that apply to it with what each last
-  found, when, its output and alert, why one isn't checked there, and
+  found, when (for a passing monitor, as of the Agent's last refresh, up to
+  15 minutes ago), its output and alert, why one isn't checked there, and
   **Check now** (with `alerts.respond`), which updates live.
 
 ## API
@@ -272,8 +295,12 @@ carries `output`, `notified` and the `remediation_*` columns;
 - `cargo test -p meshrmm-server --lib` covers the monitor and self-healing
   settings and their wording, and turning script runs into attempts.
 - `cargo test -p meshrmm-server --test monitors` runs on SQLite and
-  PostgreSQL: monitors reaching Agents on connect and after changes, results
-  raising and resolving alerts with thresholds, Check now, targets and
+  PostgreSQL: monitors reaching Agents on connect and after changes, with
+  what the server holds of their results and for how many statements,
+  results raising and resolving alerts with thresholds, a message of
+  results kept and judged together (a refresh costing two statements
+  however many it carries, and failures and recoveries in one message
+  raising and resolving alerts as one by one), Check now, targets and
   platforms, restarting a service and resolving as `remediated`, attempts
   waiting their turn and failing with a notification, lost actions and late
   answers, lost script runs, script self-healing for a load rule, `cleared`
@@ -281,7 +308,9 @@ carries `output`, `notified` and the `remediation_*` columns;
   during an attempt, taking self-healing off a quiet rule, stopping for a
   problem that keeps coming back, permissions (including for probes and
   limited tokens), owners losing access, and API tokens.
-- `cargo test -p meshrmm-agent monitors` covers the scheduler, every check's
+- `cargo test -p meshrmm-agent monitors` covers the scheduler, which results
+  go at once and which wait for the refresh, what a reconnect sends given
+  what the server holds, results the socket refused, every check's
   judging, and reading each tool's output from captures of the real tools
   (`agent/src/remote/monitors/testdata/`): Windows Event Log XML, journal
   JSON, `systemctl show`, `/proc/<pid>/stat`, `ping` and certificates.
