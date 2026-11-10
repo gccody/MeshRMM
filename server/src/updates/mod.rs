@@ -5,9 +5,11 @@
 //! than the instance's scan interval (or a restart pending, to see it
 //! clear), every interval while it stays connected, when a user asks, and as
 //! a device's part of a scan job. A scan replaces the device's pending list,
-//! keeping when each update was first seen. Installs are update runs, asked
-//! for by a user on one device or as a device's part of an install job; the
-//! Agent reports progress and then each update's outcome, and scans again.
+//! keeping when each update was first seen, unless it lists the same
+//! updates as the stored list: then only its status is written. Installs
+//! are update runs, asked for by a user on one device or as a device's part
+//! of an install job; the Agent reports progress and then each update's
+//! outcome, and scans again.
 //!
 //! The engine's task marks runs whose Agent never reported as lost, and asks
 //! connected devices with old scans for a new one, a few at a time.
@@ -217,15 +219,15 @@ pub async fn scan_reported(
 ) {
     let now = now_ms();
     let error = scan.error.clone();
-    match store::store_scan(&state.database, device_id, scan, now).await {
-        Ok(true) => {}
-        Ok(false) => return,
+    let stored = match store::store_scan(&state.database, device_id, scan, now).await {
+        Ok(store::Stored::NotEnrolled) => return,
+        Ok(stored) => stored,
         Err(error) => {
             tracing::warn!(device_id, %error, "could not store a device's update scan");
             return;
         }
-    }
-    tracing::info!(device_id, error, "stored a device's update scan");
+    };
+    tracing::info!(device_id, error, ?stored, "stored a device's update scan");
     let finished = match runs::finish_scans(
         &mut &state.database,
         device_id,
@@ -247,9 +249,19 @@ pub async fn scan_reported(
     if !finished.is_empty() {
         state.automation.device_changed(device_id);
     }
+    // The website shows when the device last scanned, so it hears of every
+    // scan.
     publish_device(state, device_id).await;
-    // Pending updates and restarts are what some alert rules watch.
-    state.alerts.wake();
+    // Pending updates and restarts are what some alert rules watch; when
+    // neither changed, there is nothing new to judge.
+    if !matches!(
+        stored,
+        store::Stored::Unchanged {
+            reboot_changed: false
+        }
+    ) {
+        state.alerts.wake();
+    }
 }
 
 /// Notes an install's progress and tells the website.

@@ -732,6 +732,7 @@ pub enum DeviceUpdateStatus {
     RebootPending,
     RebootPendingSince,
     ScanRequestedAt,
+    PendingHash,
 }
 
 #[derive(Iden)]

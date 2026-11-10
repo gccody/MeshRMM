@@ -635,6 +635,161 @@ async fn scans_install_update_and_uninstall_on_a_device() {
     }
 }
 
+/// Stores a scan as if the device's Agent reported it at `now`.
+async fn store(app: &App, device_id: &str, scan: Value, now: i64) -> applications::store::Stored {
+    applications::store::store_scan(
+        app.db(),
+        device_id,
+        serde_json::from_value(scan).unwrap(),
+        now,
+    )
+    .await
+    .unwrap()
+}
+
+fn scan_at(scanned_at: i64, managers: &Value, packages: Vec<Value>) -> Value {
+    let mut scan = scan(managers.clone(), packages);
+    scan["scanned_at_unix_ms"] = scanned_at.into();
+    scan
+}
+
+/// Renames the device's stored package `id` behind the store's back, so a
+/// rewrite of the packages shows.
+async fn mark(app: &App, device_id: &str, id: &str) {
+    app.db()
+        .execute(
+            &sea_query::Query::update()
+                .table(sea_query::Alias::new("device_packages"))
+                .value(sea_query::Alias::new("name"), "Marked")
+                .and_where(sea_query::Expr::col(sea_query::Alias::new("device_id")).eq(device_id))
+                .and_where(sea_query::Expr::col(sea_query::Alias::new("package_id")).eq(id))
+                .to_owned(),
+        )
+        .await
+        .unwrap();
+}
+
+/// The names of the device's packages, in order.
+fn names(listed: &Value) -> Vec<&str> {
+    listed["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|package| package["name"].as_str().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn scans_that_find_the_same_packages_write_only_their_status() {
+    use applications::store::Stored;
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let desk = app.enroll(&mut admin, "Desk").await;
+        let id = desk.device_id.as_str();
+        let now = now_ms();
+        let managers =
+            json!([{ "source": "winget", "version": "1.29" }, { "source": "chocolatey" }]);
+        let firefox = || {
+            package(
+                "winget",
+                "Mozilla.Firefox",
+                "Mozilla Firefox",
+                "130.0",
+                Some("131.0"),
+            )
+        };
+        let found = || {
+            vec![
+                firefox(),
+                package("chocolatey", "7zip", "7-Zip", "24.08", None),
+            ]
+        };
+        assert_eq!(
+            store(&app, id, scan_at(1, &managers, found()), now).await,
+            Stored::Replaced,
+            "{name}"
+        );
+        let since = packages(&mut admin, id).await["packages"][0]["outdated_since"].clone();
+        assert!(since.is_i64(), "{name}");
+        mark(&app, id, "7zip").await;
+
+        // The same packages in another order, from a newer winget: the
+        // packages stay, the status says when the scan was and what found
+        // them.
+        let mut reversed = found();
+        reversed.reverse();
+        let newer = json!([{ "source": "winget", "version": "1.30" }, { "source": "chocolatey" }]);
+        assert_eq!(
+            store(&app, id, scan_at(2, &newer, reversed), now + 1_000).await,
+            Stored::Unchanged,
+            "{name}"
+        );
+        let listed = packages(&mut admin, id).await;
+        assert_eq!(
+            names(&listed),
+            ["Mozilla Firefox", "Marked"],
+            "{name}: not rewritten"
+        );
+        assert_eq!(listed["packages"][0]["outdated_since"], since);
+        assert_eq!(listed["status"]["scanned_at"], 2, "{name}");
+        assert_eq!(listed["status"]["received_at"], now + 1_000);
+        assert_eq!(listed["status"]["managers"][0]["version"], "1.30");
+
+        // A manager whose scan fails keeps its packages and shows its error,
+        // the same as the scan before it.
+        let failing = json!([{ "source": "winget", "version": "1.30" }, { "source": "chocolatey", "error": "choco failed" }]);
+        assert_eq!(
+            store(&app, id, scan_at(3, &failing, vec![firefox()]), now + 2_000).await,
+            Stored::Replaced,
+            "{name}"
+        );
+        assert_eq!(
+            store(&app, id, scan_at(4, &failing, vec![firefox()]), now + 3_000).await,
+            Stored::Unchanged,
+            "{name}"
+        );
+        let listed = packages(&mut admin, id).await;
+        assert_eq!(names(&listed), ["Mozilla Firefox", "Marked"], "{name}");
+        assert_eq!(listed["status"]["managers"][1]["error"], "choco failed");
+        assert_eq!(listed["status"]["scanned_at"], 4);
+
+        // Different packages replace them.
+        let updated = vec![
+            package(
+                "winget",
+                "Mozilla.Firefox",
+                "Mozilla Firefox",
+                "131.0",
+                None,
+            ),
+            package("chocolatey", "7zip", "7-Zip", "24.08", None),
+        ];
+        assert_eq!(
+            store(&app, id, scan_at(5, &newer, updated.clone()), now + 4_000).await,
+            Stored::Replaced,
+            "{name}"
+        );
+        let listed = packages(&mut admin, id).await;
+        assert_eq!(names(&listed), ["7-Zip", "Mozilla Firefox"], "{name}");
+        assert_eq!(listed["packages"][1]["outdated_since"], Value::Null);
+
+        // Once the device's packages are removed, the same scan stores them
+        // again.
+        applications::store::forget(&mut app.db(), id)
+            .await
+            .unwrap();
+        assert_eq!(
+            store(&app, id, scan_at(6, &newer, updated), now + 5_000).await,
+            Stored::Replaced,
+            "{name}"
+        );
+        let listed = packages(&mut admin, id).await;
+        assert_eq!(names(&listed), ["7-Zip", "Mozilla Firefox"], "{name}");
+        app.finish().await;
+    }
+}
+
 #[tokio::test]
 async fn application_jobs_and_policies_run_on_each_device() {
     for app in apps().await {

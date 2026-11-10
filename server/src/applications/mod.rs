@@ -5,9 +5,10 @@
 //! Agents scan for applications whenever they scan for operating system
 //! updates (see [`crate::updates`]), and when asked: by a user, and before
 //! and after every run. A scan replaces the device's packages, keeping when
-//! each was first found outdated. Runs are asked for by a user on one device
-//! or as a device's part of a job; the Agent reports progress, then each
-//! application's outcome. A device runs one at a time.
+//! each was first found outdated, unless it would store the same packages:
+//! then only its status is written. Runs are asked for by a user on one
+//! device or as a device's part of a job; the Agent reports progress, then
+//! each application's outcome. A device runs one at a time.
 //!
 //! The engine's task marks runs whose Agent never reported as lost, and
 //! removes runs older than [`HISTORY_MS`].
@@ -128,15 +129,15 @@ pub async fn scan_reported(
     scan: ApplicationScan,
 ) {
     let now = now_ms();
-    match store::store_scan(&state.database, device_id, scan, now).await {
-        Ok(true) => {}
-        Ok(false) => return,
+    let stored = match store::store_scan(&state.database, device_id, scan, now).await {
+        Ok(store::Stored::NotEnrolled) => return,
+        Ok(stored) => stored,
         Err(error) => {
             tracing::warn!(device_id, %error, "could not store a device's application scan");
             return;
         }
-    }
-    tracing::debug!(device_id, "stored a device's application scan");
+    };
+    tracing::debug!(device_id, ?stored, "stored a device's application scan");
     match runs::finish_scans(&mut &state.database, device_id, &run_ids, now).await {
         Ok(finished) if !finished.is_empty() => state.automation.device_changed(device_id),
         Ok(_) => {}
@@ -144,8 +145,11 @@ pub async fn scan_reported(
             tracing::warn!(device_id, %error, "could not finish a device's application scans");
         }
     }
-    // Outdated packages are what some alert rules watch.
-    state.alerts.wake();
+    // Outdated packages are what some alert rules watch; unchanged ones give
+    // them nothing new to judge.
+    if stored == store::Stored::Replaced {
+        state.alerts.wake();
+    }
 }
 
 /// Notes a run's progress.

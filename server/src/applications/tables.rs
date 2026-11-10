@@ -29,13 +29,14 @@ pub enum ApplicationSources {
     Detection,
 }
 
-#[derive(Iden)]
+#[derive(Iden, Clone, Copy)]
 pub enum DeviceApplicationStatus {
     Table,
     DeviceId,
     Managers,
     ScannedAt,
     ReceivedAt,
+    PackagesHash,
 }
 
 #[derive(Iden)]

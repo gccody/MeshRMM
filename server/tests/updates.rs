@@ -231,6 +231,163 @@ async fn agents_report_scans_the_website_shows() {
     }
 }
 
+/// Stores a scan as if the device's Agent reported it at `now`.
+async fn store(app: &App, device_id: &str, scan: Value, now: i64) -> updates::store::Stored {
+    updates::store::store_scan(
+        app.db(),
+        device_id,
+        serde_json::from_value(scan).unwrap(),
+        now,
+    )
+    .await
+    .unwrap()
+}
+
+fn scan_at(scanned_at: i64, updates: Vec<Value>, reboot_pending: bool) -> Value {
+    let mut scan = scan("dnf", updates, reboot_pending);
+    scan["scanned_at_unix_ms"] = scanned_at.into();
+    scan
+}
+
+/// Retitles the device's stored update `id` behind the store's back, so a
+/// rewrite of the list shows.
+async fn mark(app: &App, device_id: &str, id: &str) {
+    app.db()
+        .execute(
+            &sea_query::Query::update()
+                .table(sea_query::Alias::new("device_pending_updates"))
+                .value(sea_query::Alias::new("title"), "Marked")
+                .and_where(sea_query::Expr::col(sea_query::Alias::new("device_id")).eq(device_id))
+                .and_where(sea_query::Expr::col(sea_query::Alias::new("update_id")).eq(id))
+                .to_owned(),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn scans_that_list_the_same_updates_write_only_their_status() {
+    use updates::store::Stored;
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let desk = app.enroll(&mut admin, "Desk").await;
+        let id = desk.device_id.as_str();
+        let now = now_ms();
+        let listed = || vec![update("a", "security"), update("b", "other")];
+        assert_eq!(
+            store(&app, id, scan_at(1, listed(), false), now).await,
+            Stored::Replaced,
+            "{name}"
+        );
+        let first_seen =
+            device_updates(&mut admin, id).await["updates"][0]["first_seen_at"].clone();
+        mark(&app, id, "a").await;
+
+        // The same updates in another order: the list stays, the status
+        // says when the scan was.
+        let mut reversed = listed();
+        reversed.reverse();
+        assert_eq!(
+            store(&app, id, scan_at(2, reversed, false), now + 1_000).await,
+            Stored::Unchanged {
+                reboot_changed: false
+            },
+            "{name}"
+        );
+        let shown = device_updates(&mut admin, id).await;
+        assert_eq!(
+            titles(&shown),
+            ["Marked", "Update b"],
+            "{name}: not rewritten"
+        );
+        assert_eq!(shown["updates"][0]["first_seen_at"], first_seen);
+        assert_eq!(shown["status"]["scanned_at"], 2, "{name}");
+        assert_eq!(shown["status"]["received_at"], now + 1_000);
+
+        // A restart pending is the scan's own, not the list's.
+        assert_eq!(
+            store(&app, id, scan_at(3, listed(), true), now + 2_000).await,
+            Stored::Unchanged {
+                reboot_changed: true
+            },
+            "{name}"
+        );
+        assert_eq!(
+            store(&app, id, scan_at(4, listed(), true), now + 3_000).await,
+            Stored::Unchanged {
+                reboot_changed: false
+            },
+            "{name}"
+        );
+        let shown = device_updates(&mut admin, id).await;
+        assert_eq!(shown["status"]["reboot_pending"], true, "{name}");
+        assert_eq!(shown["status"]["reboot_pending_since"], now + 2_000);
+        assert_eq!(shown["status"]["scanned_at"], 4);
+
+        // A failed scan shows its error; the next that works clears it.
+        assert_eq!(
+            store(
+                &app,
+                id,
+                json!({ "scanned_at_unix_ms": 5, "manager": "dnf", "error": "dnf failed" }),
+                now + 4_000,
+            )
+            .await,
+            Stored::Failed,
+            "{name}"
+        );
+        let shown = device_updates(&mut admin, id).await;
+        assert_eq!(shown["status"]["scan_error"], "dnf failed", "{name}");
+        assert_eq!(shown["status"]["received_at"], now + 4_000);
+        assert_eq!(
+            store(&app, id, scan_at(6, listed(), true), now + 5_000).await,
+            Stored::Unchanged {
+                reboot_changed: false
+            },
+            "{name}"
+        );
+        let shown = device_updates(&mut admin, id).await;
+        assert_eq!(shown["status"]["scan_error"], Value::Null, "{name}");
+        assert_eq!(shown["status"]["scanned_at"], 6);
+        assert_eq!(titles(&shown), ["Marked", "Update b"]);
+
+        // Different updates replace the list.
+        assert_eq!(
+            store(
+                &app,
+                id,
+                scan_at(7, vec![update("a", "security")], true),
+                now + 6_000
+            )
+            .await,
+            Stored::Replaced,
+            "{name}"
+        );
+        let shown = device_updates(&mut admin, id).await;
+        assert_eq!(titles(&shown), ["Update a"], "{name}");
+        assert_eq!(shown["updates"][0]["first_seen_at"], first_seen);
+
+        // Once the device's updates are removed, the same scan stores them
+        // again.
+        updates::store::forget(app.db(), id).await.unwrap();
+        assert_eq!(
+            store(
+                &app,
+                id,
+                scan_at(8, vec![update("a", "security")], true),
+                now + 7_000
+            )
+            .await,
+            Stored::Replaced,
+            "{name}"
+        );
+        let shown = device_updates(&mut admin, id).await;
+        assert_eq!(titles(&shown), ["Update a"], "{name}");
+        app.finish().await;
+    }
+}
+
 #[tokio::test]
 async fn users_scan_and_install_on_a_device_and_see_its_history() {
     for app in apps().await {
