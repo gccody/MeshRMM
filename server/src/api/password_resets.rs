@@ -184,6 +184,7 @@ pub async fn lookup(
 ) -> Result<Json<ResetDetails>, ApiError> {
     super::limit_token_attempts(&state, ip)?;
     let (reset, user) = find(&mut &state.database, &request.token).await?;
+    super::token_accepted(&state, ip);
     Ok(Json(ResetDetails {
         email: user.email,
         expires_at: reset.expires_at,
@@ -210,6 +211,7 @@ pub async fn complete(
     // The token is checked before the costly hash, so guessing is limited.
     super::limit_token_attempts(&state, ip)?;
     find(&mut &state.database, &request.token).await?;
+    super::token_accepted(&state, ip);
     let hash = password::hash(&request.password).await?;
     let mut transaction = state.database.begin().await?;
     let (reset, user) = find(&mut transaction, &request.token).await?;

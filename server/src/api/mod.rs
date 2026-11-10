@@ -631,13 +631,24 @@ async fn second_factor_removed(
     Ok(())
 }
 
-/// Counts a try at a one-time link token from `ip`.
+/// Counts a try at a one-time link token from `ip`. Hand it back with
+/// [`token_accepted`] once the token turns out to be valid.
 fn limit_token_attempts(state: &AppState, ip: std::net::IpAddr) -> Result<(), ApiError> {
     state
         .auth
         .token_attempts
         .hit(&crate::auth::limits::ip_key(ip))
         .map_err(ApiError::rate_limited)
+}
+
+/// A valid one-time link token isn't a guess: only wrong ones count, so
+/// people opening their links from one office address don't use the limit
+/// up.
+fn token_accepted(state: &AppState, ip: std::net::IpAddr) {
+    state
+        .auth
+        .token_attempts
+        .refund(&crate::auth::limits::ip_key(ip));
 }
 
 /// Users may only grant what they hold: a role, or a set of permissions,

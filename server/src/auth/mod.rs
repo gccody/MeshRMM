@@ -37,6 +37,15 @@ pub struct PendingRegistration {
     pub state: PasskeyRegistration,
 }
 
+/// A passkey sign-in waiting for the browser's answer.
+#[derive(Debug)]
+pub struct PendingSignIn {
+    /// The [`AuthState::ceremony_starts`] key the prompt was counted under,
+    /// handed back once a passkey answers it.
+    pub ip_key: String,
+    pub state: DiscoverableAuthentication,
+}
+
 /// Sign-in state kept in memory.
 #[derive(Debug)]
 pub struct AuthState {
@@ -61,14 +70,17 @@ pub struct AuthState {
     pub token_attempts: RateLimiter,
     /// Password reset emails requested per client address.
     pub reset_requests: RateLimiter,
-    /// Passkey sign-ins and SSO redirects started per client address.
+    /// Passkey sign-ins and SSO redirects started per client address: a cap
+    /// on the anonymous prompts the server keeps. A passkey sign-in that a
+    /// registered passkey answers hands its start back, as its prompt is
+    /// gone, so people signing in from one office address don't use it up.
     pub ceremony_starts: RateLimiter,
     /// Unknown personal API tokens tried per client address.
     pub api_token_failures: RateLimiter,
     pub challenges: Challenges,
     pub setup: SetupGate,
     pub passkey_registrations: Ceremonies<PendingRegistration>,
-    pub passkey_sign_ins: Ceremonies<DiscoverableAuthentication>,
+    pub passkey_sign_ins: Ceremonies<PendingSignIn>,
     pub sso_sign_ins: Ceremonies<oidc::Pending>,
 }
 

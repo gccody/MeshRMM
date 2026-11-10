@@ -20,7 +20,7 @@ use super::{confirm_password, second_factor_removed, signed_in_response};
 use crate::{
     audit::{self, Actor, Target},
     auth::{
-        Authorized, PendingRegistration, SignedIn, devices,
+        Authorized, PendingRegistration, PendingSignIn, SignedIn, devices,
         limits::ip_key,
         passkeys::{self, MAX_PER_USER, PasskeyView},
         second_factor,
@@ -274,10 +274,11 @@ pub async fn sign_in_options(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
 ) -> Result<Json<Prompt<RequestChallengeResponse>>, ApiError> {
+    let ip_key = ip_key(ip);
     state
         .auth
         .ceremony_starts
-        .hit(&ip_key(ip))
+        .hit(&ip_key)
         .map_err(ApiError::rate_limited)?;
     let settings = settings::load(&mut &state.database).await?;
     let relying_party = passkeys::relying_party(&state.config, &settings.instance_name)?;
@@ -286,7 +287,10 @@ pub async fn sign_in_options(
         .map_err(|error| anyhow::anyhow!("could not start a passkey prompt: {error}"))?;
     // A modal prompt after the user asks for one, not autofill.
     options.mediation = None;
-    let ceremony = state.auth.passkey_sign_ins.start(authentication);
+    let ceremony = state.auth.passkey_sign_ins.start(PendingSignIn {
+        ip_key,
+        state: authentication,
+    });
     Ok(Json(Prompt { ceremony, options }))
 }
 
@@ -318,7 +322,7 @@ pub async fn sign_in(
         .sign_in_by_ip
         .hit(&ip_key)
         .map_err(ApiError::rate_limited)?;
-    let authentication = state
+    let pending = state
         .auth
         .passkey_sign_ins
         .take(&request.ceremony)
@@ -343,7 +347,7 @@ pub async fn sign_in(
     };
     let result = match relying_party.finish_discoverable_authentication(
         &request.credential,
-        authentication,
+        pending.state,
         &[DiscoverableKey::from(&stored.passkey)],
     ) {
         Ok(result) => result,
@@ -360,7 +364,10 @@ pub async fn sign_in(
             return Err(invalid_passkey());
         }
     };
+    // A registered passkey answered: neither a guess nor a prompt left
+    // pending.
     state.auth.sign_in_by_ip.refund(&ip_key);
+    state.auth.ceremony_starts.refund(&pending.ip_key);
     let user = users::by_id(&mut database, &stored.user_id)
         .await?
         .ok_or_else(invalid_passkey)?;

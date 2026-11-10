@@ -68,7 +68,10 @@ that outlast it or take over an account, and revoking it is enough:
 
 - signing in and out, and everything under `/v1/account` (profile,
   password, two-factor authentication, passkeys, sessions);
-- making API tokens (`POST /v1/api-tokens`); listing and revoking them work;
+- making API tokens (`POST /v1/api-tokens`). Listing tokens and revoking
+  any but the token itself need `api_tokens.manage`, its user's own tokens
+  included, so a token limited to other permissions can't find or revoke
+  them;
 - the sign-in policy and API token settings (`/v1/settings/authentication`),
   single sign-on and SCIM settings;
 - email settings (`/v1/settings/smtp`, reading and testing them included),
@@ -100,7 +103,7 @@ without a limit can users make tokens that never expire.
 ### Revoking
 
 A user revokes their own tokens on their account page, and a token can
-revoke itself (`DELETE /v1/api-tokens/{id}`). Holders of `api_tokens.manage`
+always revoke itself (`DELETE /v1/api-tokens/{id}`). Holders of `api_tokens.manage`
 see every user's tokens under **Authentication → API tokens** and revoke any
 of them. A revoked token stops working at once. Expired tokens stay listed
 for 30 days so their users see why a script stopped, then disappear.
@@ -121,9 +124,9 @@ user, `GET /v1/audit` gives each event an `api_token` (`{id, name}` or
 
 | Route | |
 |---|---|
-| `GET /v1/api-tokens` | The caller's tokens, the server's `policy` (`enabled`, `max_lifetime_days`) and the `permissions` a new token may be limited to. `?user_id=` for another user's and `?all=true` for everyone's (`api_tokens.manage`). |
+| `GET /v1/api-tokens` | The caller's tokens, the server's `policy` (`enabled`, `max_lifetime_days`) and the `permissions` a new token may be limited to. `?user_id=` for another user's and `?all=true` for everyone's (`api_tokens.manage`). With an API token, `api_tokens.manage` is needed for any of them. |
 | `POST /v1/api-tokens` | Website only. `{name, expires_in_days, permissions}`: `expires_in_days` is required, `null` for never (only without a lifetime limit); `permissions` `null` or missing for all of the user's. `201` with the token and its `secret`, the only time it is shown. `400 lifetime_too_long`, `403 permission_escalation`, `403 api_tokens_disabled`, `409 too_many_tokens` (50 per user). |
-| `DELETE /v1/api-tokens/{id}` | Revokes the caller's token, or anyone's with `api_tokens.manage`. |
+| `DELETE /v1/api-tokens/{id}` | Revokes the caller's token, or anyone's with `api_tokens.manage`. An API token revokes itself, and any other token only with `api_tokens.manage`. |
 | `GET /v1/api-tokens/current` | The token the request carries and what it may do now. `400 not_an_api_token` from the website. |
 
 ## Requests and errors
@@ -148,8 +151,10 @@ user, `GET /v1/audit` gives each event an `api_token` (`{id, name}` or
 | 429 | `rate_limited`; wait the seconds in `Retry-After` |
 
 Unknown tokens count against the client's address like failed sign-ins: 30
-in 15 minutes, after which every API token from that address (an IPv6 /64)
-gets `429` until the oldest failure is 15 minutes old. Behind a reverse
+in 15 minutes, after which unknown tokens from that address (an IPv6 /64)
+get `429` until the oldest failure is 15 minutes old. Valid tokens from it
+keep working, so one misconfigured script doesn't stop the other
+integrations behind the same address. Behind a reverse
 proxy, set `http.trusted_proxies` so the server sees clients' addresses
 rather than the proxy's (`tls.trusted_proxies`, see
 [self-hosting](self-hosting.md#behind-a-reverse-proxy-proxy)). A revoked

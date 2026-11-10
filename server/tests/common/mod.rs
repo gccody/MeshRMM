@@ -719,6 +719,55 @@ pub async fn audit_events(app: &App, action: &str) -> Vec<meshrmm_server::audit:
     .unwrap()
 }
 
+/// Makes the database refuse every `event` (`INSERT`, `UPDATE` or `DELETE`)
+/// on `table`, as a write failing under load would, or with `refuse` false
+/// accept them again. It runs over a connection of its own, so the app's
+/// transactions see it like any other schema change.
+pub async fn refuse_writes(app: &App, event: &str, table: &str, refuse: bool) {
+    let trigger = format!("refuse_{}_{table}", event.to_ascii_lowercase());
+    let statements = match (app.name, refuse) {
+        ("sqlite", true) => vec![format!(
+            "CREATE TRIGGER {trigger} BEFORE {event} ON {table} \
+             BEGIN SELECT RAISE(ABORT, 'refused'); END"
+        )],
+        ("sqlite", false) => vec![format!("DROP TRIGGER {trigger}")],
+        (_, true) => vec![
+            format!(
+                "CREATE FUNCTION {trigger}() RETURNS trigger LANGUAGE plpgsql \
+                 AS $$ BEGIN RAISE EXCEPTION 'refused'; END $$"
+            ),
+            format!(
+                "CREATE TRIGGER {trigger} BEFORE {event} ON {table} \
+                 FOR EACH ROW EXECUTE FUNCTION {trigger}()"
+            ),
+        ],
+        (_, false) => vec![
+            format!("DROP TRIGGER {trigger} ON {table}"),
+            format!("DROP FUNCTION {trigger}()"),
+        ],
+    };
+    let url = app.state.config.database_url();
+    if app.name == "sqlite" {
+        let mut connection = sqlx::SqliteConnection::connect(&url).await.unwrap();
+        for statement in statements {
+            sqlx::raw_sql(sqlx::AssertSqlSafe(statement))
+                .execute(&mut connection)
+                .await
+                .unwrap();
+        }
+        connection.close().await.unwrap();
+    } else {
+        let mut connection = PgConnection::connect(&url).await.unwrap();
+        for statement in statements {
+            sqlx::raw_sql(sqlx::AssertSqlSafe(statement))
+                .execute(&mut connection)
+                .await
+                .unwrap();
+        }
+        connection.close().await.unwrap();
+    }
+}
+
 pub const ADMIN_EMAIL: &str = "admin@example.com";
 pub const ADMIN_PASSWORD: &str = "correct horse battery staple";
 

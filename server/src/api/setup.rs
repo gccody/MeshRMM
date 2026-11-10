@@ -12,7 +12,6 @@ use serde_json::json;
 use super::signed_in_response;
 use crate::{
     audit::{self, Actor, Target},
-    auth::limits::ip_key,
     auth::{
         password,
         session::{self, AuthMethod, Client},
@@ -47,11 +46,7 @@ pub async fn complete(
     headers: HeaderMap,
     JsonBody(request): JsonBody<SetupRequest>,
 ) -> Result<Response, ApiError> {
-    state
-        .auth
-        .token_attempts
-        .hit(&ip_key(ip))
-        .map_err(ApiError::rate_limited)?;
+    super::limit_token_attempts(&state, ip)?;
     let mut database = &state.database;
     if users::count(&mut database).await? > 0 {
         return Err(already_complete());
@@ -71,6 +66,7 @@ pub async fn complete(
     if !state.auth.setup.matches(&request.token) {
         return Err(invalid_token());
     }
+    super::token_accepted(&state, ip);
     let password_hash = password::hash(&request.password).await?;
     if !state.auth.setup.consume(&request.token) {
         return Err(invalid_token());

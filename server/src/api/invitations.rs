@@ -377,6 +377,7 @@ pub async fn lookup(
     let mut database = &state.database;
     super::limit_token_attempts(&state, ip)?;
     let row = find(&mut database, &request.token).await?;
+    super::token_accepted(&state, ip);
     let settings = settings::load(&mut database).await?;
     Ok(Json(InvitationDetails {
         email: row.email,
@@ -407,6 +408,7 @@ pub async fn accept(
     // The token is checked before the costly hash, so guessing is limited.
     super::limit_token_attempts(&state, ip)?;
     find(&mut &state.database, &request.token).await?;
+    super::token_accepted(&state, ip);
     let hash = password::hash(&request.password).await?;
     let mut transaction = state.database.begin().await?;
     let row = find(&mut transaction, &request.token).await?;
