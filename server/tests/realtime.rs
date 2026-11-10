@@ -927,8 +927,8 @@ async fn make_idle(
 /// The most statements connecting a device with nothing pending runs, with
 /// the monitor rules read: authenticating, looking for wake requests, the
 /// address, the presence refresh (five), the remote session, a rotated
-/// credential, the update status, the rules (four), and the application
-/// runs to settle.
+/// credential, the update status for the scan schedule, the rules (four),
+/// and the application runs to settle.
 const IDLE_CONNECT_STATEMENTS: u64 = 16;
 
 #[tokio::test]
@@ -982,20 +982,15 @@ async fn update_status(events: &mut Ws, device_id: &str) -> Value {
     }
 }
 
-async fn scan_requested_at(app: &App, device_id: &str) -> Option<i64> {
-    use sea_query::{Expr, ExprTrait, Query};
-    let (requested,): (Option<i64>,) = app
-        .db()
-        .fetch_one(
-            &Query::select()
-                .column("scan_requested_at")
-                .from("device_update_status")
-                .and_where(Expr::col("device_id").eq(device_id))
-                .to_owned(),
-        )
-        .await
-        .unwrap();
-    requested
+/// The update scan schedule the Agent was sent when it connected.
+async fn schedule_of(control: &mut Ws) -> Value {
+    loop {
+        let message = receive_any_json(control).await;
+        assert_ne!(message["type"], "scan_updates", "{message}");
+        if message["type"] == "set_update_scan_schedule" {
+            return message["schedule"].clone();
+        }
+    }
 }
 
 #[tokio::test]
@@ -1086,33 +1081,36 @@ async fn a_connect_still_does_what_is_pending() {
         assert_eq!(status["connected"], false, "{name}: {status}");
         drop(events);
 
-        // A scan two hours old is recent enough for the default interval, and
+        // The Agent is told when its last scan arrived, and the interval;
         // a saved change to the interval applies to the next connect.
         app.db()
             .execute(
                 &Query::update()
                     .table("device_update_status")
                     .value("received_at", now_ms() - 2 * HOUR_MS)
-                    .value("scan_requested_at", Option::<i64>::None)
                     .and_where(Expr::col("device_id").eq(desk.device_id.as_str()))
                     .to_owned(),
             )
             .await
             .unwrap();
-        let control = connect_settled(&app, &server, &desk).await;
-        assert_eq!(
-            scan_requested_at(&app, &desk.device_id).await,
-            None,
-            "{name}"
+        let mut control = connect_settled(&app, &server, &desk).await;
+        let schedule = schedule_of(&mut control).await;
+        assert_eq!(schedule["interval_hours"], 24, "{name}: {schedule}");
+        let ago = schedule["last_scan"]["received_ms_ago"].as_i64().unwrap();
+        assert!(
+            (2 * HOUR_MS..3 * HOUR_MS).contains(&ago),
+            "{name}: {schedule}"
         );
+        assert_eq!(schedule["last_scan"]["reboot_pending"], false);
         disconnect_settled(&mut presence, control, &desk.device_id).await;
         let saved = admin
             .patch("/v1/settings", json!({ "update_scan_interval_hours": 1 }))
             .await;
         assert_eq!(saved.status, 200, "{:?}", saved.body);
-        let control = connect_settled(&app, &server, &desk).await;
-        assert!(
-            scan_requested_at(&app, &desk.device_id).await.is_some(),
+        let mut control = connect_settled(&app, &server, &desk).await;
+        assert_eq!(
+            schedule_of(&mut control).await["interval_hours"],
+            1,
             "{name}"
         );
         disconnect_settled(&mut presence, control, &desk.device_id).await;

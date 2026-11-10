@@ -916,8 +916,6 @@ CREATE TABLE device_update_status (
   reboot_pending BOOLEAN NOT NULL DEFAULT FALSE,
   -- When a scan first said the device must restart.
   reboot_pending_since BIGINT,
-  -- When the server last asked the Agent for a scan on its own schedule.
-  scan_requested_at BIGINT,
   -- Identifies the pending updates stored from the last scan that worked, so
   -- an unchanged list isn't rewritten. NULL before one is stored.
   pending_hash TEXT

@@ -327,6 +327,10 @@ pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
             // Likewise, so a result that arrives while offline is sent on
             // the next connection.
             updates: updates::Updates::new(),
+            // Likewise, so a scan that finished offline still counts.
+            update_schedule: updates::Schedule::new(
+                meshrmm_signaling_client::random_fraction().unwrap_or(0.5),
+            ),
             applications: applications::Applications::new(),
             wake: wake::Relay::new(),
             files: files::Files::new(),
@@ -353,6 +357,7 @@ struct Coordinator {
     metrics: metrics::Reports,
     system_info: system_info::Collector,
     updates: updates::Updates,
+    update_schedule: updates::Schedule,
     applications: applications::Applications,
     wake: wake::Relay,
     files: files::Files,
@@ -433,6 +438,8 @@ impl Coordinator {
             .context("could not send the application activity")?;
         self.monitors.connected();
         self.thumbnails.connected();
+        // The server sends this connection's schedule first thing.
+        self.update_schedule.connected();
         loop {
             if self
                 .active_session
@@ -465,7 +472,17 @@ impl Coordinator {
                 results = self.wake.next() => report_wake_results(socket, results),
                 (request_id, reply) = self.files.next() => report_file_reply(socket, request_id, reply),
                 messages = self.monitors.next() => report_monitors(socket, &self.monitors, messages),
+                () = self.update_schedule.due() => {
+                    tracing::info!("starting the scheduled update scan");
+                    self.update_schedule.started(updates::now_unix_ms());
+                    // A scan already running answers it.
+                    self.updates.scan(None);
+                    self.applications.scan(None);
+                }
                 report = self.updates.next() => {
+                    if let AgentStatusMessage::UpdateScan { scan, .. } = &report {
+                        self.update_schedule.scanned(scan, updates::now_unix_ms());
+                    }
                     let sent = match serde_json::to_string(&report) {
                         Ok(text) => socket.send(Message::Text(text.into())).await,
                         Err(error) => Err(error.into()),
@@ -531,10 +548,16 @@ impl Coordinator {
                     return Ok(ControlFlow::Continue(()));
                 }
                 AgentCommand::ScanUpdates { run_id } => {
-                    tracing::info!(?run_id, "the server asked for an update scan");
-                    self.updates.scan(run_id);
+                    tracing::info!(%run_id, "the server asked for an update scan");
+                    self.updates.scan(Some(run_id));
                     // Applications scan on the update scan's cadence.
                     self.applications.scan(None);
+                    return Ok(ControlFlow::Continue(()));
+                }
+                AgentCommand::SetUpdateScanSchedule { schedule } => {
+                    let now = updates::now_unix_ms();
+                    self.update_schedule
+                        .set(schedule, now, metrics::booted_at_unix_ms(now));
                     return Ok(ControlFlow::Continue(()));
                 }
                 AgentCommand::InstallUpdates { install } => {

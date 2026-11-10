@@ -35,6 +35,21 @@ pub const INTERVAL: Duration = Duration::from_secs(METRICS_INTERVAL_SECONDS);
 /// How long a volume list is reused before the disks are asked again.
 const VOLUME_REFRESH: Duration = Duration::from_secs(60);
 
+/// When the computer started, in Unix milliseconds by its clock at `now`,
+/// from how long it has been up. `None` when the uptime can't be read.
+pub(crate) fn booted_at_unix_ms(now: i64) -> Option<i64> {
+    match platform::uptime_seconds() {
+        Ok(seconds) => Some(now.saturating_sub(i64::try_from(seconds).ok()?.saturating_mul(1000))),
+        Err(error) => {
+            tracing::warn!(
+                error = format!("{error:#}"),
+                "could not read how long the computer has been up"
+            );
+            None
+        }
+    }
+}
+
 /// Processor time, in any unit, split into busy and idle.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct CpuTime {

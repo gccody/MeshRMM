@@ -41,7 +41,6 @@ pub struct Status {
     pub scan_error: Option<String>,
     pub reboot_pending: bool,
     pub reboot_pending_since: Option<i64>,
-    pub scan_requested_at: Option<i64>,
 }
 
 impl Status {
@@ -66,7 +65,6 @@ fn status_select() -> sea_query::SelectStatement {
             DeviceUpdateStatus::ScanError,
             DeviceUpdateStatus::RebootPending,
             DeviceUpdateStatus::RebootPendingSince,
-            DeviceUpdateStatus::ScanRequestedAt,
         ])
         .from(DeviceUpdateStatus::Table)
         .to_owned()
@@ -119,20 +117,6 @@ async fn upsert_status(
         )
         .await?;
     Ok(())
-}
-
-/// Notes that the server asked the device's Agent for a scan at `now`.
-pub async fn scan_requested(
-    executor: &mut impl Executor,
-    device_id: &str,
-    now: i64,
-) -> db::Result<()> {
-    upsert_status(
-        executor,
-        device_id,
-        vec![(DeviceUpdateStatus::ScanRequestedAt, now.into())],
-    )
-    .await
 }
 
 /// What storing a scan did.

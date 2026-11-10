@@ -98,6 +98,18 @@ fn titles(updates: &Value) -> Vec<&str> {
         .collect()
 }
 
+/// The update scan schedule the Agent is sent, failing on any scan asked
+/// for before it.
+async fn schedule_of(control: &mut Ws) -> Value {
+    loop {
+        let message = receive_any_json(control).await;
+        assert_ne!(message["type"], "scan_updates", "{message}");
+        if message["type"] == "set_update_scan_schedule" {
+            return message["schedule"].clone();
+        }
+    }
+}
+
 /// The next event of `kind` on the website's socket.
 async fn event_of(events: &mut Ws, kind: &str) -> Value {
     loop {
@@ -119,14 +131,14 @@ async fn agents_report_scans_the_website_shows() {
         assert_eq!(never["status"]["scanned_at"], Value::Null, "{name}");
         assert_eq!(never["updates"], json!([]));
 
-        // A device that never scanned is asked to when it connects.
+        // A device that never scanned is told so with the schedule, and
+        // scans by it.
         let mut control = desk.connect(&server).await.unwrap();
-        let mut asked = false;
-        for _ in 0..2 {
-            let command = receive_any_json(&mut control).await;
-            asked |= command == json!({ "type": "scan_updates" });
-        }
-        assert!(asked, "{name}");
+        assert_eq!(
+            schedule_of(&mut control).await,
+            json!({ "interval_hours": 24 }),
+            "{name}"
+        );
 
         let mut events = admin.events(&server).await.unwrap();
         report_scan(
@@ -1013,6 +1025,128 @@ async fn runs_the_agent_never_reports_are_lost() {
         let lost = run(&mut admin, &run_id).await;
         assert_eq!(lost["status"], "lost", "{name}");
         assert_eq!(lost["error"], "The device never reported how it went");
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn agents_are_told_the_scan_schedule_and_asked_only_for_scans_people_want() {
+    for app in apps().await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let desk = app.enroll(&mut admin, "Desk").await;
+        let laptop = app.enroll(&mut admin, "Laptop").await;
+
+        // A scan that said to restart is in the schedule, with how long ago
+        // it arrived, and the Agent isn't asked to scan.
+        let mut control = desk.connect(&server).await.unwrap();
+        assert_eq!(
+            schedule_of(&mut control).await,
+            json!({ "interval_hours": 24 })
+        );
+        report_scan(
+            &mut control,
+            &[],
+            scan("windows_update", vec![update("a", "security")], true),
+        )
+        .await;
+        eventually(&mut admin, &desk.device_id, |updates| {
+            updates["status"]["reboot_pending"] == true
+        })
+        .await;
+        drop(control);
+        let mut control = desk.connect(&server).await.unwrap();
+        let schedule = schedule_of(&mut control).await;
+        assert_eq!(schedule["interval_hours"], 24, "{name}: {schedule}");
+        assert_eq!(schedule["last_scan"]["reboot_pending"], true, "{schedule}");
+        let ago = schedule["last_scan"]["received_ms_ago"].as_i64().unwrap();
+        assert!((0..60_000).contains(&ago), "{name}: {schedule}");
+        let mut other = laptop.connect(&server).await.unwrap();
+        assert_eq!(
+            schedule_of(&mut other).await,
+            json!({ "interval_hours": 24 }),
+            "{name}"
+        );
+
+        // A changed interval reaches every connected Agent, without a last
+        // scan, which each keeps; saving it unchanged sends nothing.
+        let saved = admin
+            .patch("/v1/settings", json!({ "update_scan_interval_hours": 6 }))
+            .await;
+        assert_eq!(saved.status, StatusCode::OK, "{:?}", saved.body);
+        for control in [&mut control, &mut other] {
+            assert_eq!(
+                receive_any_json(control).await,
+                json!({ "type": "set_update_scan_schedule", "schedule": { "interval_hours": 6 } }),
+                "{name}"
+            );
+        }
+        for change in [
+            json!({ "update_scan_interval_hours": 6 }),
+            json!({ "instance_name": "Renamed" }),
+        ] {
+            let saved = admin.patch("/v1/settings", change).await;
+            assert_eq!(saved.status, StatusCode::OK, "{:?}", saved.body);
+        }
+        // Only a person's scan, with its run, follows.
+        let started = admin
+            .post(
+                &format!("/v1/agents/{}/updates/scan", desk.device_id),
+                json!({}),
+            )
+            .await;
+        assert_eq!(started.status, StatusCode::ACCEPTED, "{:?}", started.body);
+        assert_eq!(
+            receive_any_json(&mut control).await,
+            json!({ "type": "scan_updates", "run_id": started.body["id"] }),
+            "{name}"
+        );
+
+        // Off, the schedule says so, on a change and on connecting.
+        let saved = admin
+            .patch("/v1/settings", json!({ "update_scan_interval_hours": 0 }))
+            .await;
+        assert_eq!(saved.status, StatusCode::OK, "{:?}", saved.body);
+        assert_eq!(
+            receive_any_json(&mut other).await,
+            json!({ "type": "set_update_scan_schedule", "schedule": {} }),
+            "{name}"
+        );
+        drop(control);
+        let mut control = desk.connect(&server).await.unwrap();
+        let schedule = schedule_of(&mut control).await;
+        assert!(
+            schedule.get("interval_hours").is_none(),
+            "{name}: {schedule}"
+        );
+        assert_eq!(schedule["last_scan"]["reboot_pending"], true, "{schedule}");
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn the_engine_does_no_work_for_each_device() {
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let mut connections = Vec::new();
+        let mut work = Vec::new();
+        for devices in [2, 20] {
+            // Connected, never scanned, so every one is overdue.
+            while connections.len() < devices {
+                let agent = app
+                    .enroll(&mut admin, &format!("Device {}", connections.len()))
+                    .await;
+                connections.push(app.state.agents.connect(&agent.device_id));
+            }
+            let before = app.db().counts();
+            updates::pass(&app.state, now_ms()).await.unwrap();
+            work.push(app.db().counts() - before);
+        }
+        assert_eq!(work[0], work[1], "{name}");
+        assert_eq!(work[0].writes, 0, "{name}: {work:?}");
+        drop(connections);
         app.finish().await;
     }
 }

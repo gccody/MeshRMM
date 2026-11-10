@@ -126,7 +126,7 @@ export function SettingsPanel() {
                   .map((hours) => <option key={hours} value={hours}>{formatScanInterval(hours)}</option>)}
               </select>
               </label>
-              <p id="update-scan-interval-help">A device that’s offline at its time scans when it next connects. Scan policies and Scan now add scans of their own.</p>
+              <p id="update-scan-interval-help">A device that’s offline at its time scans within an hour of connecting again. Scan policies and Scan now add scans of their own.</p>
             </section>
             <section className="settings-section" id="settings-remote-sessions" role="tabpanel" aria-labelledby="settings-tab-remote-sessions" hidden={settingsTab !== "remote-sessions"} tabIndex={0}>
               <h2>Remote sessions</h2>

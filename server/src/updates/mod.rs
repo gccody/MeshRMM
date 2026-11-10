@@ -1,46 +1,40 @@
 //! Operating system updates: what each device has pending, scans and
 //! installs, and the history of installs. See docs/patch-management.md.
 //!
-//! Agents scan when the server asks: when one connects with a scan older
-//! than the instance's scan interval (or a restart pending, to see it
-//! clear), every interval while it stays connected, when a user asks, and as
-//! a device's part of a scan job. A scan replaces the device's pending list,
-//! keeping when each update was first seen, unless it lists the same
-//! updates as the stored list: then only its status is written. Installs
-//! are update runs, asked for by a user on one device or as a device's part
-//! of an install job; the Agent reports progress and then each update's
-//! outcome, and scans again.
+//! Agents keep their own scan schedule. When one connects, the server tells
+//! it the instance's scan interval and the last scan it received from the
+//! device, and tells every connected Agent again when the interval changes;
+//! the Agent scans an interval after its last scan (spread out at random),
+//! soon after a restart a scan said was pending, and within the hour when
+//! its last scan is too old. Users' **Scan now** and scan jobs ask for a scan
+//! at once. A scan replaces the device's pending list, keeping when each
+//! update was first seen, unless it lists the same updates as the stored
+//! list: then only its status is written. Installs are update runs, asked
+//! for by a user on one device or as a device's part of an install job; the
+//! Agent reports progress and then each update's outcome, and scans again.
 //!
-//! The engine's task marks runs whose Agent never reported as lost, and asks
-//! connected devices with old scans for a new one, a few at a time.
+//! The engine's task marks runs whose Agent never reported as lost.
 pub mod runs;
 pub mod store;
 
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
-use meshrmm_protocol_types::{AgentCommand, UpdateInstallResult, UpdateInstallStatus, UpdateScan};
-use sea_query::{Expr, ExprTrait, Query};
+use meshrmm_protocol_types::{
+    AgentCommand, LastUpdateScan, UpdateInstallResult, UpdateInstallStatus, UpdateScan,
+    UpdateScanSchedule,
+};
 use serde::Serialize;
 use tokio::sync::broadcast;
 
 use self::{runs::Run, store::DeviceSummary};
 use crate::{
-    db::{
-        self,
-        tables::{Agents, DeviceUpdateStatus, UpdateRuns},
-    },
+    db,
     http::AppState,
-    time::{DAY_MS, HOUR_MS, now_ms},
+    time::{DAY_MS, now_ms},
 };
 
-/// How often the engine looks for lost runs and old scans.
+/// How often the engine looks for lost runs.
 const INTERVAL: Duration = Duration::from_secs(60);
-/// The most devices asked to scan on their schedule per pass, so a fleet's
-/// package mirrors aren't all hit at once.
-const SCHEDULED_SCANS_PER_PASS: usize = 50;
-/// A device asked to scan on its schedule isn't asked again for this long,
-/// in case its Agent doesn't answer.
-const SCHEDULED_SCAN_RETRY_MS: i64 = HOUR_MS;
 /// Changes a subscriber may fall behind by before it misses some.
 const EVENT_BACKLOG: usize = 256;
 
@@ -101,11 +95,10 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
     })
 }
 
-/// One pass of the engine at `now`: lost runs, then scheduled scans.
+/// One pass of the engine at `now`: lost runs. Agents keep the scan
+/// schedule themselves, so there is nothing else to do.
 pub async fn pass(state: &AppState, now: i64) -> anyhow::Result<()> {
-    sweep(state, now).await?;
-    scan_scheduled(state, now).await?;
-    Ok(())
+    sweep(state, now).await
 }
 
 /// Marks runs the Agent never reported as lost.
@@ -123,98 +116,51 @@ pub async fn sweep(state: &AppState, now: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The instance's scan interval, or `None` when devices scan only when
-/// asked or by policies.
-async fn scan_interval_ms(state: &AppState) -> db::Result<Option<i64>> {
+/// The instance's scan interval in hours, or `None` when devices scan only
+/// when asked or by policies.
+fn interval_hours(hours: i64) -> Option<u32> {
+    u32::try_from(hours).ok().filter(|hours| *hours > 0)
+}
+
+/// What a device's Agent is told when it connects: the instance's scan
+/// interval, and the last scan the server received from the device, by which
+/// the Agent schedules its own scans. Only reads.
+pub async fn greeting(state: &AppState, device_id: &str) -> db::Result<AgentCommand> {
     let hours = state
         .settings
         .get(&state.database)
         .await?
         .update_scan_interval_hours;
-    Ok((hours > 0).then_some(hours * HOUR_MS))
-}
-
-/// Asks connected devices whose last scan is older than the scan interval
-/// for a new one.
-async fn scan_scheduled(state: &AppState, now: i64) -> anyhow::Result<()> {
-    let Some(interval) = scan_interval_ms(state).await? else {
-        return Ok(());
-    };
-    let connected = state.agents.connected();
-    if connected.is_empty() {
-        return Ok(());
-    }
-    let mut database = &state.database;
-    let rows: Vec<(String, Option<i64>, Option<i64>)> = database
-        .fetch_all(
-            &Query::select()
-                .column((Agents::Table, Agents::Id))
-                .columns([
-                    (DeviceUpdateStatus::Table, DeviceUpdateStatus::ReceivedAt),
-                    (
-                        DeviceUpdateStatus::Table,
-                        DeviceUpdateStatus::ScanRequestedAt,
-                    ),
-                ])
-                .from(Agents::Table)
-                .left_join(
-                    DeviceUpdateStatus::Table,
-                    Expr::col((DeviceUpdateStatus::Table, DeviceUpdateStatus::DeviceId))
-                        .equals((Agents::Table, Agents::Id)),
-                )
-                .and_where(Expr::col((Agents::Table, Agents::DeletionRequestedAt)).is_null())
-                .and_where(
-                    Expr::col((Agents::Table, Agents::Id)).not_in_subquery(
-                        Query::select()
-                            .column(UpdateRuns::DeviceId)
-                            .from(UpdateRuns::Table)
-                            .and_where(Expr::col(UpdateRuns::Status).eq("pending"))
-                            .to_owned(),
-                    ),
-                )
-                .to_owned(),
-        )
-        .await?;
-    let due = rows
-        .into_iter()
-        .filter(|(id, received, requested)| {
-            connected.contains(id)
-                && received.is_none_or(|received| now - received > interval)
-                && requested.is_none_or(|requested| now - requested > SCHEDULED_SCAN_RETRY_MS)
-        })
-        .map(|(id, _, _)| id)
-        .take(SCHEDULED_SCANS_PER_PASS)
-        .collect::<Vec<_>>();
-    for device_id in due {
-        store::scan_requested(&mut database, &device_id, now).await?;
-        if state
-            .agents
-            .send(&device_id, AgentCommand::ScanUpdates { run_id: None })
-        {
-            tracing::debug!(device_id, "asked a device for its scheduled update scan");
-        }
-    }
-    Ok(())
-}
-
-/// A device's Agent connected: whether to ask it for a scan, because its
-/// last one is older than the scan interval, or because it had to restart
-/// (to see the restart done). Notes the request.
-pub async fn connected(state: &AppState, device_id: &str) -> db::Result<bool> {
-    let mut database = &state.database;
-    let status = store::status(&mut database, device_id).await?;
+    let status = store::status(&mut &state.database, device_id).await?;
     let now = now_ms();
-    let stale = match scan_interval_ms(state).await? {
-        Some(interval) => status
-            .received_at
-            .is_none_or(|received| now - received > interval),
-        None => false,
-    };
-    let scan = stale || status.reboot_pending;
-    if scan {
-        store::scan_requested(&mut database, device_id, now).await?;
-    }
-    Ok(scan)
+    Ok(AgentCommand::SetUpdateScanSchedule {
+        schedule: UpdateScanSchedule {
+            interval_hours: interval_hours(hours),
+            last_scan: status.received_at.map(|received| LastUpdateScan {
+                received_ms_ago: now.saturating_sub(received).max(0),
+                reboot_pending: status.reboot_pending,
+            }),
+        },
+    })
+}
+
+/// The instance's scan interval was saved as `hours`: every connected Agent
+/// is told once. Each keeps the last scan it knows of, so only the interval
+/// is sent, without reading any device.
+pub fn interval_changed(state: &AppState, hours: i64) {
+    let told = state
+        .agents
+        .send_to_all(AgentCommand::SetUpdateScanSchedule {
+            schedule: UpdateScanSchedule {
+                interval_hours: interval_hours(hours),
+                last_scan: None,
+            },
+        });
+    tracing::info!(
+        hours,
+        told,
+        "told the connected Agents the new update scan interval"
+    );
 }
 
 /// Stores a scan the device's Agent reported, finishes the runs it answers

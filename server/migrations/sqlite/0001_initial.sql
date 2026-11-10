@@ -918,8 +918,6 @@ CREATE TABLE device_update_status (
   reboot_pending INTEGER NOT NULL DEFAULT 0 CHECK (reboot_pending IN (0, 1)),
   -- When a scan first said the device must restart.
   reboot_pending_since INTEGER,
-  -- When the server last asked the Agent for a scan on its own schedule.
-  scan_requested_at INTEGER,
   -- Identifies the pending updates stored from the last scan that worked, so
   -- an unchanged list isn't rewritten. NULL before one is stored.
   pending_hash TEXT

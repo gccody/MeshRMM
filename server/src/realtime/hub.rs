@@ -149,6 +149,21 @@ impl AgentHub {
         }
     }
 
+    /// Queues `message` for every connection, returning how many accepted
+    /// it. The connections are only copied under the lock.
+    pub fn send_to_all(&self, message: impl Into<ToAgent>) -> usize {
+        let message = message.into();
+        let senders = self
+            .lock()
+            .values()
+            .map(|registered| registered.sender.clone())
+            .collect::<Vec<_>>();
+        senders
+            .iter()
+            .filter(|sender| sender.try_send(message.clone()).is_ok())
+            .count()
+    }
+
     /// Ends the device's connection, if any.
     pub fn disconnect(&self, device_id: &str) {
         self.lock().remove(device_id);

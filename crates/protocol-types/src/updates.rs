@@ -1,7 +1,9 @@
 //! Operating system updates: what an Agent finds pending when it scans, and
 //! how an install the server asks for went. See docs/patch-management.md.
 //!
-//! The server asks for scans and installs on the control connection
+//! The server tells the Agent how often to scan on its own
+//! ([`crate::AgentCommand::SetUpdateScanSchedule`]), asks for scans people
+//! and jobs want and for installs on the control connection
 //! ([`crate::AgentCommand::ScanUpdates`], [`crate::AgentCommand::InstallUpdates`]),
 //! and the Agent reports on it ([`crate::AgentStatusMessage::UpdateScan`],
 //! [`crate::AgentStatusMessage::UpdateProgress`],
@@ -20,6 +22,31 @@ pub const UPDATE_SCAN_TIMEOUT_SECONDS: u64 = 30 * 60;
 pub const UPDATE_INSTALL_TIMEOUT_SECONDS: u64 = 4 * 60 * 60;
 /// The longest a restart after an install may be put off.
 pub const MAX_REBOOT_DELAY_MINUTES: u32 = 24 * 60;
+
+/// The scans an Agent runs on its own, which the Agent keeps to: the server
+/// only says what the schedule is.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateScanSchedule {
+    /// Hours between scans; `None` when devices scan only when asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_hours: Option<u32>,
+    /// The latest scan the server has received from the device. Sent only
+    /// when the Agent connects, and then `None` if it never received one;
+    /// the Agent goes by the later of this and the latest scan it knows of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_scan: Option<LastUpdateScan>,
+}
+
+/// A scan the server received from the device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastUpdateScan {
+    /// How long before the schedule was sent the server received it, in
+    /// milliseconds, so the device's clock needn't agree with the server's.
+    pub received_ms_ago: i64,
+    /// It said the computer had to restart to finish installing updates.
+    #[serde(default)]
+    pub reboot_pending: bool,
+}
 
 /// The update service or package manager that found and installs updates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
