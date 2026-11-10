@@ -1,5 +1,6 @@
 import { ArrowDown, ArrowUp, File as FileIcon, FileQuestion, Folder, FolderSymlink, Link2, MoreHorizontal } from "lucide-react";
 import { type DragEvent, type KeyboardEvent, type MouseEvent, type ReactNode, useEffect, useRef, useState } from "react";
+import { timeFormat } from "../../lib/format";
 import { usePopover } from "../../lib/use-popover";
 import { useWindowedRows } from "../../lib/use-windowed-rows";
 import { formatBytes } from "../metrics/model";
@@ -43,10 +44,8 @@ const COLUMNS: { sort: FileSort; label: string; className: string }[] = [
   { sort: "type", label: "Type", className: "file-type-column" },
 ];
 
-const modifiedText = (modified?: number) =>
-  modified === undefined
-    ? ""
-    : new Date(modified).toLocaleString([], { year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+const modifiedTime = timeFormat({ year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+const modifiedText = (modified?: number) => modified === undefined ? "" : modifiedTime(modified);
 
 function EntryIcon({ entry }: { entry: FileEntry }) {
   if (entry.kind === "directory") return entry.link ? <FolderSymlink size={16} aria-hidden="true" /> : <Folder size={16} aria-hidden="true" />;

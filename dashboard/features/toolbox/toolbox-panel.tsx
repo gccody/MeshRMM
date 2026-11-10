@@ -23,6 +23,7 @@ import {
 } from "lucide-react";
 import { type KeyboardEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router";
+import { timeFormat } from "../../lib/format";
 import { AuthenticationRequired, type AuthorizedFetch, errorText } from "../../lib/http";
 import { useDeviceNames } from "../agents/use-devices";
 import { HeaderActions } from "../workspace/header-actions";
@@ -347,8 +348,7 @@ function ToolboxList<T extends { id: string; folder: string; name: string }>({ l
   );
 }
 
-const formatWhen = (unixMs: number) =>
-  new Date(unixMs).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+const formatWhen = timeFormat({ month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 
 function RunHistory({ version, onOpen }: { version: number; onOpen: (run: ScriptRun, event: { currentTarget: HTMLElement }) => void }) {
   const { authorizedFetch, inventory } = useWorkspace();

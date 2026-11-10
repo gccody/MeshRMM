@@ -120,9 +120,14 @@ export class DeviceStore {
     this.#now = now;
   }
 
-  // A snapshot or a loaded list: replaces everything.
+  // A snapshot or a loaded list: replaces everything. The server sends the
+  // devices sorted, but by lowercased name, which the browser's collation
+  // can order differently, so they are sorted again. Chrome's and Edge's
+  // sort takes one comparison a device for a list already in order, so
+  // checking the order first would save nothing there.
   replace({ agents, companies, tags }: Inventory) {
-    this.#agents = new Map(agents.map((agent) => [agent.id, agent]));
+    this.#agents = new Map();
+    for (const agent of agents) this.#agents.set(agent.id, agent);
     this.#order = [...this.#agents.values()].sort(this.#compare);
     this.#moved = new Map();
     this.#online = 0;

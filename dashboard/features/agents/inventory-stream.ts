@@ -479,10 +479,9 @@ export function inventoryStream({
 
   return {
     // Called when the tab is shown, the network returns or Refresh is
-    // pressed while the stream is down. A live socket kept receiving changes
-    // in the background, and one still connecting or awaiting its snapshot
-    // is about to deliver it, so neither asks the server to send the whole
-    // fleet again. A live socket that went silent is replaced, since a dead
+    // pressed. A live socket kept receiving changes in the background, and
+    // one still connecting or awaiting its snapshot is about to deliver it,
+    // so neither asks the server to send the whole fleet again. A live socket that went silent is replaced, since a dead
     // one would deliver no snapshot. Without a socket it skips the backoff
     // wait but keeps the step: only going live restarts it.
     wake() {
@@ -505,6 +504,21 @@ export function inventoryStream({
       socket = null;
     },
   };
+}
+
+// What the Refresh button does. A live stream is current: it has every
+// change since its snapshot, and asks for a new snapshot itself when it
+// misses one. So Refresh only has it check its socket, which replaces one
+// that went silent, as a dead one would, and downloads nothing. Asking the
+// server for a snapshot instead would read and send the whole fleet just to
+// show what the page already holds. While the stream is down, Refresh skips
+// the reconnect wait and loads the list over HTTP meanwhile.
+export function refreshInventory(connection: InventoryConnection, { wake, load }: {
+  wake: () => void;
+  load: () => Promise<boolean>;
+}) {
+  wake();
+  return connection === "live" ? Promise.resolve(true) : load();
 }
 
 // The website's event socket, on this page's own origin.

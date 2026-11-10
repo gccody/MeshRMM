@@ -1,6 +1,7 @@
 // Devices' hardware and software as the API returns them, and the sorting
 // and searching the website does on them. Imports carry the .ts extension so
 // node:test can load this module directly.
+import { timeFormat } from "../../lib/format.ts";
 
 export type OperatingSystem = {
   id: string;
@@ -183,9 +184,11 @@ export function describeOs(os: OperatingSystem) {
 }
 
 // The date part only, as dates of installs carry no meaningful time.
+const installDate = timeFormat({ year: "numeric", month: "short", day: "numeric", timeZone: "UTC" });
+
 export function formatDate(unixMs: number | null | undefined) {
   if (unixMs === null || unixMs === undefined) return "—";
-  return new Date(unixMs).toLocaleDateString([], { year: "numeric", month: "short", day: "numeric", timeZone: "UTC" });
+  return installDate(unixMs);
 }
 
 export function formatLinkSpeed(bitsPerSecond: number | null) {
