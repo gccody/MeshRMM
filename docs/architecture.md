@@ -171,6 +171,9 @@ task.
   notes handlers publish catalog changes, including companies and tags
   themselves. Website sockets (`/v1/events`, authenticated by the
   session cookie and `Origin`) get a snapshot, then revision-numbered changes.
+  Presence reads the database outside the lock that numbers changes, so
+  publishers never queue behind each other's reads, and sockets that ask for
+  a snapshot at the same time share one read of the fleet.
   Disabling a user or removing their `devices.view` permission closes their
   sockets.
 - **Metrics**: the latest resource readings of each Agent, held in memory.

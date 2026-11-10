@@ -18,19 +18,16 @@ use crate::{
     db::tables::Agents,
     http::{ApiError, AppState},
     rbac::Permission,
-    realtime::presence::PresenceEvent,
     secrets::{hex, new_token, token_hash},
     time::now_ms,
 };
 
 /// `GET /v1/agents`: enrolled devices, online ones first, then by name, as
 /// the presence snapshot the website's event socket starts from.
-pub async fn list(
-    State(state): State<AppState>,
-    actor: Authorized,
-) -> Result<Json<PresenceEvent>, ApiError> {
+pub async fn list(State(state): State<AppState>, actor: Authorized) -> Result<Response, ApiError> {
     actor.require(Permission::DevicesView)?;
-    Ok(Json(state.presence.snapshot().await?))
+    let snapshot = state.presence.snapshot().await?;
+    Ok(Json(&*snapshot).into_response())
 }
 
 /// `DELETE /v1/agents/{id}`: removes the device and tells its Agent to
