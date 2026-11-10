@@ -249,8 +249,7 @@ impl ScreenInput for DesktopInputController {
             // or replaying stale input onto the new desktop.
             return Ok(());
         };
-        send_command(&writer, &ParentCommand::Input(input))
-            .context("failed to send input to the active desktop")
+        send_input(&writer, input).context("failed to send input to the active desktop")
     }
 
     fn annotate(&self, mut annotation: meshrmm_protocol::Annotation) -> anyhow::Result<()> {
@@ -285,7 +284,7 @@ impl ScreenInput for DesktopInputController {
         else {
             return Ok(());
         };
-        send_command(&writer, &ParentCommand::ReleaseInput)
+        send_after_input(&writer, &ParentCommand::ReleaseInput)
             .context("failed to release input on the active desktop")
     }
 

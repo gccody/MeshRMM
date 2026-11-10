@@ -76,6 +76,8 @@ pub struct State {
     pub credentials: CredentialState,
     /// The technician's input is blocked.
     pub input_blocked: bool,
+    /// The agent is typing the clipboard's text.
+    pub typing: bool,
     /// The mouse draws on the device's screen, and whether the shown
     /// display can show a drawing.
     pub annotating: bool,

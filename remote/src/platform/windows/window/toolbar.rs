@@ -124,6 +124,7 @@ impl WindowContext {
             )),
             credentials: self.control.credential_state(),
             input_blocked: self.control.technician_blocked(),
+            typing: self.control.typing(),
             annotating: self.annotating(),
             annotation_available: active.session != meshrmm_protocol::DesktopSession::Background,
             chat_available: chat.available(),

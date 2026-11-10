@@ -37,6 +37,7 @@ mod service_stall_tests;
 mod service_workers;
 #[cfg(test)]
 mod tests;
+pub(super) mod typing;
 mod video_sender;
 
 use audio::{AudioPipeline, start_audio};

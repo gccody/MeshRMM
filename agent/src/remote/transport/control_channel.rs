@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use bytes::Bytes;
 use meshrmm_protocol::{
-    Display, DisplayId, RemoteSessionId, SessionMessage, TogglePolicy, VideoStreamId,
+    Display, DisplayId, RemoteInput, RemoteSessionId, SessionMessage, TogglePolicy, VideoStreamId,
 };
 use meshrmm_session_transport::ServiceChannel;
 use tokio::sync::{Notify, mpsc, watch};
@@ -12,6 +12,7 @@ use webrtc::data_channel::RTCDataChannel;
 use super::ControlCommand;
 use super::audio::apply_audio_event;
 use super::service_workers::WorkerQueues;
+use super::typing::InputCommand;
 use crate::remote::audio_mode::{AudioEvent, AudioMode};
 use crate::remote::session_close::SessionClose;
 
@@ -179,6 +180,8 @@ impl ControlRouting {
                 Some(ControlCommand::VideoProfileRejected { profile, reason })
             }
             SessionMessage::SelectDisplay { display_id } => {
+                // Text is typed on the display it was sent for.
+                let _ = self.queues.input.try_send(InputCommand::StopTyping);
                 Some(ControlCommand::SelectDisplay(display_id))
             }
             SessionMessage::SetSessionCloseAction { action } => {
@@ -219,9 +222,19 @@ impl ControlRouting {
                 })
             }
             SessionMessage::Input(event) => {
-                if queues.input.try_send(event).is_err() {
-                    // Never silently drop a key-up. End the session so
-                    // the input worker releases all pressed keys.
+                let motion = matches!(event, RemoteInput::PointerMove { .. });
+                match queues.input.try_send(InputCommand::Input(event)) {
+                    Ok(()) => None,
+                    // A later move, or a click with its position, puts the
+                    // pointer where it belongs.
+                    Err(mpsc::error::TrySendError::Full(_)) if motion => None,
+                    // Never silently drop a key-up. End the session so the
+                    // input worker releases all pressed keys.
+                    Err(_) => Some(ControlCommand::Stop),
+                }
+            }
+            SessionMessage::StopTyping => {
+                if queues.input.try_send(InputCommand::StopTyping).is_err() {
                     Some(ControlCommand::Stop)
                 } else {
                     None

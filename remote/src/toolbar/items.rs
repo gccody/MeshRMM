@@ -120,13 +120,19 @@ fn push_remote_control_items(items: &mut Vec<Item>, state: &State) {
     power.enabled = state.power.is_some();
     power.label = (state.power == Some(true)).then(|| "Safe Mode".to_owned());
     items.push(power);
+    // While the agent types, the same item stops it.
     let mut type_clipboard = Item::new(
         Action::TypeClipboard,
         Icon::Clipboard,
-        "Type clipboard text into the remote computer",
+        if state.typing {
+            "Stop typing the clipboard text"
+        } else {
+            "Type clipboard text into the remote computer"
+        },
         2,
     );
-    type_clipboard.enabled = !state.input_blocked;
+    type_clipboard.enabled = state.typing || !state.input_blocked;
+    type_clipboard.active = state.typing;
     items.push(type_clipboard);
 }
 

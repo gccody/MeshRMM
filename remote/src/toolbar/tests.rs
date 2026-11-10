@@ -83,6 +83,19 @@ fn items_follow_the_session_state() {
     }
     // Annotations are not input.
     assert!(find(&items, Action::Annotate).unwrap().enabled);
+    // Typing that is under way can be stopped, even with input blocked.
+    let typing = items_for(|state| {
+        state.typing = true;
+        state.input_blocked = true;
+    });
+    let stop = find(&typing, Action::TypeClipboard).unwrap();
+    assert!(stop.enabled && stop.active);
+    assert_eq!(stop.tooltip, "Stop typing the clipboard text");
+    assert!(
+        !find(&items_for(|_| {}), Action::TypeClipboard)
+            .unwrap()
+            .active
+    );
     assert!(find(&items_for(|_| {}), Action::Recording).is_none());
     let maximized = items_for(|state| state.caption = Some(true));
     assert_eq!(

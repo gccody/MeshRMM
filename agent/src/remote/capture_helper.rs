@@ -42,6 +42,7 @@ use crate::win32::{HandleListAttribute, OwnedHandle, create_pipe, wide};
 mod approval;
 mod capture;
 mod child;
+mod command_writer;
 mod events;
 mod input_controller;
 mod launch;
@@ -55,6 +56,7 @@ mod wire;
 pub use approval::ApprovalHelper;
 pub use child::run_child;
 use child::*;
+use command_writer::*;
 use events::*;
 use input_controller::*;
 use launch::*;
@@ -634,47 +636,6 @@ pub fn capture_thumbnail(previous: Option<&Signature>) -> anyhow::Result<Capture
 fn terminate_and_wait(process: &OwnedHandle) {
     let _ = unsafe { TerminateProcess(process.0, 1) };
     let _ = unsafe { WaitForSingleObject(process.0, STOP_TIMEOUT_MS) };
-}
-
-struct CommandWriter {
-    sender: mpsc::SyncSender<Vec<u8>>,
-    queued: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-impl CommandWriter {
-    fn new(writer: impl Write + Send + 'static) -> io::Result<Self> {
-        let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(64);
-        let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let pending = Arc::clone(&queued);
-        thread::Builder::new()
-            .name("meshrmm-helper-writer".into())
-            .spawn(move || {
-                let mut writer = BufWriter::new(writer);
-                while let Ok(bytes) = receiver.recv() {
-                    let result = writer.write_all(&bytes).and_then(|()| writer.flush());
-                    pending.fetch_sub(bytes.len(), Ordering::AcqRel);
-                    if result.is_err() {
-                        break;
-                    }
-                }
-            })?;
-        Ok(Self { sender, queued })
-    }
-
-    fn send(&self, bytes: Vec<u8>) -> anyhow::Result<()> {
-        let length = bytes.len();
-        let limit = 2 * MAX_CLIPBOARD_WIRE_BYTES + MAX_CONTROL_BYTES;
-        self.queued
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
-                queued.checked_add(length).filter(|next| *next <= limit)
-            })
-            .map_err(|_| anyhow::anyhow!("helper pipe byte budget exhausted"))?;
-        if self.sender.try_send(bytes).is_err() {
-            self.queued.fetch_sub(length, Ordering::AcqRel);
-            anyhow::bail!("helper command queue full or closed");
-        }
-        Ok(())
-    }
 }
 
 fn send_command(input: &InputWriter, command: &ParentCommand) -> anyhow::Result<()> {

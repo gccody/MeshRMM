@@ -184,6 +184,12 @@ pub enum SessionMessage {
     SetHeadlessResolution {
         resolution: HeadlessResolution,
     },
+    /// Sent by the viewer: stop typing the last `TypeText`'s text.
+    StopTyping,
+    /// Sent by the Agent when it starts or stops typing a `TypeText`'s text.
+    Typing {
+        active: bool,
+    },
 }
 
 /// Size of the virtual monitor a Windows Agent adds to a console that has no
@@ -284,7 +290,7 @@ impl SessionMessage {
             return Err(postcard::Error::DeserializeBadEncoding);
         }
         if let Self::Input(RemoteInput::TypeText { text, .. }) = &message
-            && (text.len() > MAX_CLIPBOARD_TEXT_BYTES || text.contains('\0'))
+            && (text.len() > crate::MAX_TYPED_TEXT_BYTES || text.contains('\0'))
         {
             return Err(postcard::Error::DeserializeBadEncoding);
         }

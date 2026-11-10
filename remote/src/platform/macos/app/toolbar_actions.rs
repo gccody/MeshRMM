@@ -35,6 +35,7 @@ impl RemoteView {
             chroma: None,
             credentials: control.credential_state(),
             input_blocked: control.technician_blocked(),
+            typing: control.typing(),
             annotating: self.annotating(),
             annotation_available: active.session != meshrmm_protocol::DesktopSession::Background,
             chat_available: chat.available(),

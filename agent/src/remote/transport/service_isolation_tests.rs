@@ -134,11 +134,13 @@ async fn stalled_file_operation_does_not_delay_input_chat_or_clipboard() {
         spawn_clipboard_worker(input, ServiceChannel::new(channel).await, None).unwrap();
     files.try_send(FileMessage::Pick).unwrap();
     assert_eq!(received.recv().await, Some("file blocked"));
-    keys.try_send(RemoteInput::PointerMove {
-        display_id: DisplayId(1),
-        x: 0,
-        y: 0,
-    })
+    keys.try_send(super::typing::InputCommand::Input(
+        RemoteInput::PointerMove {
+            display_id: DisplayId(1),
+            x: 0,
+            y: 0,
+        },
+    ))
     .unwrap();
     chat.try_send(SessionMessage::Chat {
         text: "still responsive".into(),

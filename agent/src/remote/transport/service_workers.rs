@@ -1,9 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-use meshrmm_protocol::{
-    Annotation, FileMessage, RemoteInput, RemoteSessionId, SessionMessage, TogglePolicy,
-};
+use meshrmm_protocol::{Annotation, FileMessage, RemoteSessionId, SessionMessage, TogglePolicy};
 use meshrmm_session_transport::{
     CHAT_CHANNEL, CLIPBOARD_CHANNEL, FILE_CHANNEL, ServiceChannel, ServiceRoute,
 };
@@ -12,6 +10,7 @@ use webrtc::data_channel::RTCDataChannel;
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 
 use super::control_channel::send_control_message;
+use super::typing::{InputCommand, InputWorker};
 use super::{ControlCommand, SenderCleanup};
 use crate::remote::native_task::{NativeTask, command_worker};
 use crate::remote::platform::ScreenInput;
@@ -19,7 +18,7 @@ use crate::remote::platform::ScreenInput;
 /// Queues of the workers that apply viewer messages off the control channel.
 #[derive(Clone)]
 pub(super) struct WorkerQueues {
-    pub(super) input: mpsc::Sender<RemoteInput>,
+    pub(super) input: mpsc::Sender<InputCommand>,
     pub(super) maintenance: mpsc::Sender<SessionMessage>,
     pub(super) annotation: mpsc::Sender<Annotation>,
     pub(super) clipboard: mpsc::Sender<SessionMessage>,
@@ -398,93 +397,130 @@ impl Sending {
     }
 }
 
+/// Starts the worker that applies the viewer's input and types its text a piece at a time,
+/// taking the input queued meanwhile between pieces. It also reports the input's state to the
+/// viewer.
 pub(super) fn spawn_input_worker(
     input: Arc<dyn crate::remote::platform::ScreenInput>,
     channel: Arc<RTCDataChannel>,
     errors: mpsc::UnboundedSender<ControlCommand>,
-) -> anyhow::Result<(
-    mpsc::Sender<meshrmm_protocol::RemoteInput>,
-    crate::remote::native_task::NativeTask,
-)> {
-    let cleanup_input = Arc::clone(&input);
+) -> anyhow::Result<(mpsc::Sender<InputCommand>, NativeTask)> {
     let status_channel = Arc::clone(&channel);
-    let input_errors = errors.clone();
     let (updates, mut pending) = mpsc::channel(8);
     // This task owns no native resources; dropping the worker closes its queue.
+    let status_errors = errors.clone();
     tokio::spawn(async move {
         while let Some(message) = pending.recv().await {
             if channel.ready_state() != RTCDataChannelState::Open {
                 continue;
             }
             if let Err(error) = send_control_message(&channel, message).await {
-                let _ = errors.send(ControlCommand::MaintenanceError(format!(
+                let _ = status_errors.send(ControlCommand::MaintenanceError(format!(
                     "input status: {error:#}"
                 )));
                 break;
             }
         }
     });
-    let mut cursor = None;
-    let mut ownership = None;
-    let mut pointer_display = None;
-    let mut state = None;
-    let mut credentials = None;
-    Ok(crate::remote::native_task::command_worker(
-        "meshrmm-input",
-        1024,
-        std::time::Duration::from_millis(16),
-        move |event| {
-            if let Some(event) = event {
-                if let Err(error) = input.apply(event) {
-                    tracing::warn!(%error, "remote input failed; releasing session input");
-                    let _ = input_errors.send(ControlCommand::Stop);
-                }
-            } else if status_channel.ready_state() == RTCDataChannelState::Open {
-                let viewer_controls_input = input.viewer_controls_input();
-                if ownership != Some(viewer_controls_input)
-                    && input_errors
-                        .send(ControlCommand::InputOwnership(viewer_controls_input))
-                        .is_ok()
-                {
-                    ownership = Some(viewer_controls_input);
-                }
-                if let Some(next) = input.credential_state()
-                    && credentials.as_ref() != Some(&next)
-                    && updates
-                        .try_send(SessionMessage::CredentialState(next.clone()))
-                        .is_ok()
-                {
-                    credentials = Some(next);
-                }
-                let next_pointer = input.agent_pointer_display();
-                if pointer_display != Some(next_pointer)
-                    && updates
-                        .try_send(SessionMessage::AgentPointerDisplay {
-                            display_id: next_pointer,
-                        })
-                        .is_ok()
-                {
-                    pointer_display = Some(next_pointer);
-                }
-                let shape = input.cursor_shape();
-                if cursor != Some(shape)
-                    && updates
-                        .try_send(SessionMessage::CursorShape { shape })
-                        .is_ok()
-                {
-                    cursor = Some(shape);
-                }
-                if let Some(next) = input.maintenance_state()
-                    && (state.as_ref() != Some(&next)
-                        || matches!(next, SessionMessage::MaintenanceError { .. }))
-                    && updates.try_send(next.clone()).is_ok()
-                {
-                    state = Some(next);
-                }
+    let (sender, mut commands) = mpsc::channel(1024);
+    let task = NativeTask::spawn("meshrmm-input", move |mut stop| async move {
+        let mut status = InputStatus::default();
+        let mut worker = InputWorker::new(Arc::clone(&input), errors.clone());
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(16));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            if *stop.borrow() {
+                break;
             }
-        },
-        move || {
-            let _ = cleanup_input.release_all();
-        },
-    )?)
+            // In this order: input that arrived while a piece was typed goes first.
+            tokio::select! {
+                biased;
+                _ = stop.changed() => break,
+                command = commands.recv() => {
+                    let Some(command) = command else { break; };
+                    worker.command(command);
+                }
+                _ = tick.tick() => {
+                    if status_channel.ready_state() == RTCDataChannelState::Open {
+                        status.report(input.as_ref(), worker.typing(), &updates, &errors);
+                    }
+                }
+                () = std::future::ready(()), if worker.typing() => worker.type_piece(),
+            }
+        }
+        // Pieces end with their keys released; this releases the viewer's own.
+        let _ = input.release_all();
+    })?;
+    Ok((sender, task))
+}
+
+/// The input state the viewer was last told.
+#[derive(Default)]
+struct InputStatus {
+    cursor: Option<meshrmm_protocol::CursorShape>,
+    ownership: Option<bool>,
+    pointer_display: Option<Option<meshrmm_protocol::DisplayId>>,
+    state: Option<SessionMessage>,
+    credentials: Option<meshrmm_protocol::CredentialState>,
+    typing: Option<bool>,
+}
+
+impl InputStatus {
+    /// Tells the viewer what changed. What does not fit in `updates` is sent next time.
+    fn report(
+        &mut self,
+        input: &dyn ScreenInput,
+        typing: bool,
+        updates: &mpsc::Sender<SessionMessage>,
+        errors: &mpsc::UnboundedSender<ControlCommand>,
+    ) {
+        let viewer_controls_input = input.viewer_controls_input();
+        if self.ownership != Some(viewer_controls_input)
+            && errors
+                .send(ControlCommand::InputOwnership(viewer_controls_input))
+                .is_ok()
+        {
+            self.ownership = Some(viewer_controls_input);
+        }
+        if let Some(next) = input.credential_state()
+            && self.credentials.as_ref() != Some(&next)
+            && updates
+                .try_send(SessionMessage::CredentialState(next.clone()))
+                .is_ok()
+        {
+            self.credentials = Some(next);
+        }
+        let next_pointer = input.agent_pointer_display();
+        if self.pointer_display != Some(next_pointer)
+            && updates
+                .try_send(SessionMessage::AgentPointerDisplay {
+                    display_id: next_pointer,
+                })
+                .is_ok()
+        {
+            self.pointer_display = Some(next_pointer);
+        }
+        let shape = input.cursor_shape();
+        if self.cursor != Some(shape)
+            && updates
+                .try_send(SessionMessage::CursorShape { shape })
+                .is_ok()
+        {
+            self.cursor = Some(shape);
+        }
+        if let Some(next) = input.maintenance_state()
+            && (self.state.as_ref() != Some(&next)
+                || matches!(next, SessionMessage::MaintenanceError { .. }))
+            && updates.try_send(next.clone()).is_ok()
+        {
+            self.state = Some(next);
+        }
+        if self.typing.unwrap_or(false) != typing
+            && updates
+                .try_send(SessionMessage::Typing { active: typing })
+                .is_ok()
+        {
+            self.typing = Some(typing);
+        }
+    }
 }

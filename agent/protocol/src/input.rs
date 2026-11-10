@@ -2,6 +2,27 @@ use serde::{Deserialize, Serialize};
 
 use crate::DisplayId;
 
+/// The most characters "Type clipboard" types. A Linux Agent types a
+/// character in 8 ms, 12 ms when it also presses or releases Shift, so the
+/// longest text takes 40 seconds, and at most a minute.
+pub const MAX_TYPED_TEXT_CHARS: usize = 5_000;
+/// The most UTF-8 bytes a `TypeText` may carry: every character of the
+/// longest text could take four.
+pub const MAX_TYPED_TEXT_BYTES: usize = 4 * MAX_TYPED_TEXT_CHARS;
+
+/// Why `text` cannot be typed, said for the technician, or `None` when it can.
+pub fn typed_text_problem(text: &str) -> Option<String> {
+    if text.contains('\0') {
+        return Some("the text contains a null character".into());
+    }
+    let characters = text.chars().count();
+    (characters > MAX_TYPED_TEXT_CHARS).then(|| {
+        format!(
+            "the text has {characters} characters, and at most {MAX_TYPED_TEXT_CHARS} can be typed"
+        )
+    })
+}
+
 /// Platform-neutral cursor shapes that can be represented by native viewers.
 /// Endpoint-specific or custom cursors are sent as `Default`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,8 +95,10 @@ pub enum RemoteInput {
         extended: bool,
         pressed: bool,
     },
-    /// Type literal text as Unicode keyboard events on the active desktop.
-    /// Appended to preserve existing postcard tags.
+    /// Type literal text as keyboard events on the active desktop. The Agent
+    /// types it a piece at a time and says so with `Typing` while it does; a
+    /// `StopTyping`, a new text or a key the technician presses stops it. At
+    /// most [`MAX_TYPED_TEXT_CHARS`] characters.
     TypeText { display_id: DisplayId, text: String },
 }
 
@@ -130,10 +153,7 @@ mod tests {
             SessionMessage::decode(&message.encode().unwrap()).unwrap(),
             message
         );
-        for text in [
-            "x".repeat(crate::MAX_CLIPBOARD_TEXT_BYTES + 1),
-            "bad\0text".into(),
-        ] {
+        for text in ["x".repeat(MAX_TYPED_TEXT_BYTES + 1), "bad\0text".into()] {
             let message = SessionMessage::Input(RemoteInput::TypeText {
                 display_id: DisplayId(2),
                 text,
@@ -142,11 +162,21 @@ mod tests {
         }
         let message = SessionMessage::Input(RemoteInput::TypeText {
             display_id: DisplayId(2),
-            text: "x".repeat(crate::MAX_CLIPBOARD_TEXT_BYTES),
+            text: "🔑".repeat(MAX_TYPED_TEXT_CHARS),
         });
         let bytes = message.encode().unwrap();
         assert!(bytes.len() < 65536);
         assert_eq!(SessionMessage::decode(&bytes).unwrap(), message);
+    }
+
+    #[test]
+    fn typed_text_is_limited_in_characters() {
+        assert_eq!(typed_text_problem(&"🔑".repeat(MAX_TYPED_TEXT_CHARS)), None);
+        assert_eq!(
+            typed_text_problem(&"a".repeat(MAX_TYPED_TEXT_CHARS + 1)).as_deref(),
+            Some("the text has 5001 characters, and at most 5000 can be typed")
+        );
+        assert!(typed_text_problem("a\0").is_some());
     }
 
     #[test]
