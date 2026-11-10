@@ -2,12 +2,15 @@
 //! and maintenance.
 mod common;
 
+use std::collections::BTreeMap;
+
 use meshrmm_server::{
     db::Database,
-    maintenance::{self, Purged},
+    maintenance,
     time::{DAY_MS, MINUTE_MS},
 };
 use sea_query::{Alias, Expr, ExprTrait, Func, Query};
+use sqlx::Connection;
 
 const NOW: i64 = 1_800_000_000_000;
 
@@ -448,19 +451,24 @@ async fn maintenance_purges_only_expired_rows_and_old_history() {
                 .unwrap();
         }
 
-        let purged = maintenance::purge(database, NOW).await.unwrap();
+        let purged = maintenance::purge(database, NOW).await;
+        assert_eq!(purged.failed, Vec::<String>::new(), "{}", test.name);
+        let rows: BTreeMap<&str, u64> = purged
+            .deleted
+            .iter()
+            .map(|(table, deleted)| (table.as_str(), deleted.rows))
+            .collect();
         assert_eq!(
-            purged,
-            Purged {
-                api_tokens: 1,
-                handoffs: 1,
-                script_runs: 1,
-                device_metrics: 1,
-                resolved_alerts: 1,
-                application_changes: 1,
-                wakes: 1,
-                ..Purged::default()
-            },
+            rows,
+            BTreeMap::from([
+                ("alerts", 1),
+                ("api_tokens", 1),
+                ("device_application_changes", 1),
+                ("device_metrics", 1),
+                ("remote_handoffs", 1),
+                ("script_runs", 1),
+                ("wake_requests", 1),
+            ]),
             "{}",
             test.name
         );
@@ -495,6 +503,154 @@ async fn maintenance_purges_only_expired_rows_and_old_history() {
             "{}",
             test.name
         );
+        test.drop_database().await;
+    }
+}
+
+async fn insert_metrics(database: &Database, rows: impl IntoIterator<Item = (String, i64)>) {
+    let mut insert = Query::insert();
+    insert.into_table("device_metrics").columns([
+        "device_id",
+        "minute",
+        "samples",
+        "cpu_percent",
+        "cpu_percent_max",
+        "memory_used_bytes",
+        "memory_total_bytes",
+        "network_received_bytes_per_second",
+        "network_sent_bytes_per_second",
+        "storage_used_bytes",
+        "storage_total_bytes",
+    ]);
+    for (device, minute) in rows {
+        insert.values_panic([
+            device.into(),
+            minute.into(),
+            1.into(),
+            1.0.into(),
+            1.0.into(),
+            1.into(),
+            2.into(),
+            0.into(),
+            0.into(),
+            1.into(),
+            2.into(),
+        ]);
+    }
+    database.execute(&insert).await.unwrap();
+}
+
+async fn insert_job(database: &Database, id: &str, created_at: i64, devices: usize) {
+    database
+        .execute(
+            &Query::insert()
+                .into_table("jobs")
+                .columns([
+                    "id",
+                    "kind",
+                    "item_id",
+                    "item_name",
+                    "target",
+                    "target_label",
+                    "offline",
+                    "expires_at",
+                    "requested_by_user_id",
+                    "created_at",
+                ])
+                .values_panic([
+                    id.into(),
+                    "script".into(),
+                    "script".into(),
+                    "Script".into(),
+                    "all".into(),
+                    "All devices".into(),
+                    "skip".into(),
+                    created_at.into(),
+                    "user".into(),
+                    created_at.into(),
+                ])
+                .to_owned(),
+        )
+        .await
+        .unwrap();
+    let mut insert = Query::insert();
+    insert
+        .into_table("job_devices")
+        .columns(["job_id", "device_id", "state", "updated_at"]);
+    for device in 0..devices {
+        insert.values_panic([
+            id.into(),
+            format!("device-{device}").into(),
+            "started".into(),
+            created_at.into(),
+        ]);
+    }
+    database.execute(&insert).await.unwrap();
+}
+
+#[tokio::test]
+async fn maintenance_purges_a_batch_at_a_time_until_nothing_is_due() {
+    for test in common::databases().await {
+        let database = &test.database;
+        insert_metrics(
+            database,
+            (0..25).map(|n| {
+                (
+                    format!("device-{}", n % 4),
+                    NOW - 8 * DAY_MS - n * MINUTE_MS,
+                )
+            }),
+        )
+        .await;
+        insert_metrics(
+            database,
+            (0..3).map(|n| (format!("device-{n}"), NOW - 6 * DAY_MS)),
+        )
+        .await;
+        // A job on more devices than a batch holds, and a recent one.
+        insert_job(database, "old", NOW - 31 * DAY_MS, 25).await;
+        insert_job(database, "recent", NOW - DAY_MS, 2).await;
+
+        let purged = maintenance::purge_in_batches(database, NOW, 10).await;
+        assert_eq!(purged.failed, Vec::<String>::new(), "{}", test.name);
+        let deleted = |table: &str| {
+            let deleted = purged.deleted[table];
+            (deleted.rows, deleted.batches)
+        };
+        assert_eq!(deleted("device_metrics"), (25, 3), "{}", test.name);
+        assert_eq!(deleted("job_devices"), (25, 3), "{}", test.name);
+        assert_eq!(deleted("jobs"), (1, 1), "{}", test.name);
+        assert_eq!(count(database, "device_metrics").await, 3, "{}", test.name);
+        assert_eq!(count(database, "job_devices").await, 2, "{}", test.name);
+        assert_eq!(count(database, "jobs").await, 1, "{}", test.name);
+
+        let again = maintenance::purge_in_batches(database, NOW, 10).await;
+        assert_eq!(again, maintenance::Purged::default(), "{}", test.name);
+        test.drop_database().await;
+    }
+}
+
+#[tokio::test]
+async fn a_table_the_purge_fails_on_does_not_stop_the_rest() {
+    for test in common::databases().await {
+        let database = &test.database;
+        let drop = "DROP TABLE remote_sessions";
+        match test.name {
+            "sqlite" => {
+                let mut connection = sqlx::SqliteConnection::connect(&test.url).await.unwrap();
+                sqlx::query(drop).execute(&mut connection).await.unwrap();
+            }
+            _ => {
+                let mut connection = sqlx::PgConnection::connect(&test.url).await.unwrap();
+                sqlx::query(drop).execute(&mut connection).await.unwrap();
+            }
+        }
+        insert_metrics(database, [("device".to_owned(), NOW - 8 * DAY_MS)]).await;
+
+        let purged = maintenance::purge(database, NOW).await;
+        assert_eq!(purged.failed, ["remote_sessions"], "{}", test.name);
+        assert_eq!(purged.rows("device_metrics"), 1, "{}", test.name);
+        assert_eq!(count(database, "device_metrics").await, 0, "{}", test.name);
         test.drop_database().await;
     }
 }
