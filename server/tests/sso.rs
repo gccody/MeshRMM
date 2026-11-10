@@ -619,6 +619,107 @@ async fn sso_callbacks_must_come_back_to_the_browser_that_started() {
     }
 }
 
+/// Tries `password` for the administrator from `ip`.
+async fn password_sign_in(browser: &mut Browser, ip: &str, password: &str) -> StatusCode {
+    browser
+        .post_from(
+            ip,
+            "/v1/auth/sign-in",
+            json!({ "email": ADMIN_EMAIL, "password": password }),
+        )
+        .await
+        .status
+}
+
+/// Someone who signs in through SSO and one day needs their password gets
+/// in from that browser while guesses from many addresses have used up the
+/// account's limit, as after a password sign-in.
+#[tokio::test]
+async fn an_sso_sign_in_gives_the_browser_a_device_cookie() {
+    let provider = MockProvider::start().await;
+    let app = App::sqlite().await;
+    let mut admin = common::set_up(&app).await;
+    admin
+        .put("/v1/settings/sso", settings(&provider, json!({})))
+        .await;
+    let (mut browser, authorization) = start(&app, "/").await;
+    let code = provider.approve(
+        &authorization,
+        json!({ "sub": "ada", "email": ADMIN_EMAIL, "email_verified": true }),
+    );
+    let request = browser
+        .request(
+            Method::GET,
+            &format!(
+                "/v1/auth/sso/callback?code={code}&state={}",
+                authorization.state
+            ),
+        )
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = browser.bytes(request).await;
+    assert_eq!(response.header("location"), format!("{ORIGIN}/"));
+    let device = response
+        .headers
+        .get_all("set-cookie")
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .find(|value| value.starts_with("__Host-meshrmm-device="))
+        .expect("an SSO sign-in sets a device cookie");
+    assert!(
+        device.ends_with("HttpOnly; Secure; SameSite=Lax"),
+        "{device}"
+    );
+    let device = device.split(';').next().unwrap().to_owned();
+
+    for address in 1..=5 {
+        for _ in 0..10 {
+            let guess = password_sign_in(
+                &mut app.browser(),
+                &format!("198.51.100.{address}"),
+                "a guess",
+            )
+            .await;
+            assert_eq!(guess, StatusCode::UNAUTHORIZED);
+        }
+    }
+    let unknown = password_sign_in(&mut app.browser(), "203.0.113.20", ADMIN_PASSWORD).await;
+    assert_eq!(unknown, StatusCode::TOO_MANY_REQUESTS);
+    let mut known = app.browser();
+    known.cookie = Some(device);
+    let signed_in = password_sign_in(&mut known, "203.0.113.20", ADMIN_PASSWORD).await;
+    assert_eq!(signed_in, StatusCode::OK);
+    app.finish().await;
+}
+
+/// An office behind one address that signs in through SSO all day doesn't
+/// use up the cap on starts; refused and abandoned sign-ins still count.
+#[tokio::test]
+async fn only_unfinished_sso_sign_ins_count_against_the_cap() {
+    let provider = MockProvider::start().await;
+    let app = App::sqlite().await;
+    let mut admin = common::set_up(&app).await;
+    admin
+        .put("/v1/settings/sso", settings(&provider, json!({})))
+        .await;
+    for attempt in 0..70 {
+        let (_, location) = sign_in(&app, &provider, verified("ada")).await;
+        assert_eq!(location, format!("{ORIGIN}/toolbox"), "attempt {attempt}");
+    }
+    let (mut browser, authorization) = start(&app, "/").await;
+    let location = callback(
+        &mut browser,
+        &format!("error=access_denied&state={}", authorization.state),
+    )
+    .await;
+    assert_eq!(location, failed("denied"));
+    for _ in 0..59 {
+        start(&app, "/").await;
+    }
+    assert_eq!(start_refused(app.browser()).await, failed("rate_limited"));
+    app.finish().await;
+}
+
 /// Signs `sub` in through the provider, as a member of the group that makes
 /// them an administrator, and opens their event socket.
 async fn watching(
