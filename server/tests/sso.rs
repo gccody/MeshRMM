@@ -2,11 +2,15 @@
 //! linking and creating accounts, and roles from the groups claim.
 mod common;
 
+use std::{sync::Arc, time::Duration};
+
 use axum::http::{Method, StatusCode};
 use common::{
     ADMIN_EMAIL, ADMIN_PASSWORD, App, Browser, ORIGIN,
-    oidc_provider::{Authorization, CLIENT_ID, CLIENT_SECRET, MockProvider},
+    oidc_provider::{Authorization, CLIENT_ID, CLIENT_SECRET, Fetches, MockProvider},
 };
+use meshrmm_server::auth::oidc_discovery::{DiscoveryCache, Timings};
+use sea_query::{Expr, ExprTrait, Query};
 use serde_json::{Value, json};
 
 fn settings(provider: &MockProvider, extra: Value) -> Value {
@@ -30,7 +34,10 @@ fn settings(provider: &MockProvider, extra: Value) -> Value {
 /// Starts an SSO sign-in in a new browser. Returns the browser (holding the
 /// binding cookie) and what the provider was asked for.
 async fn start(app: &App, next: &str) -> (Browser, Authorization) {
-    let mut browser = app.browser();
+    start_in(app.browser(), next).await
+}
+
+async fn start_in(mut browser: Browser, next: &str) -> (Browser, Authorization) {
     let request = browser
         .request(Method::GET, &format!("/v1/auth/sso/start?next={next}"))
         .body(axum::body::Body::empty())
@@ -75,6 +82,35 @@ async fn sign_in(app: &App, provider: &MockProvider, claims: Value) -> (Browser,
 fn failed(code: &str) -> String {
     format!("{ORIGIN}/login?sso_error={code}")
 }
+
+/// Where the browser is sent when starting a sign-in fails.
+async fn start_refused(mut browser: Browser) -> String {
+    let request = browser
+        .request(Method::GET, "/v1/auth/sso/start")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = browser.bytes(request).await;
+    assert_eq!(response.status, StatusCode::SEE_OTHER);
+    response.header("location").to_owned()
+}
+
+/// The requests to `provider` since `before`.
+fn fetched_since(provider: &MockProvider, before: Fetches) -> Fetches {
+    let now = provider.fetches();
+    Fetches {
+        discovery: now.discovery - before.discovery,
+        keys: now.keys - before.keys,
+    }
+}
+
+const ONE_EACH: Fetches = Fetches {
+    discovery: 1,
+    keys: 1,
+};
+const NONE: Fetches = Fetches {
+    discovery: 0,
+    keys: 0,
+};
 
 fn role_ids(user: &Value, key: &str) -> Vec<String> {
     user[key]
@@ -694,6 +730,190 @@ async fn losing_roles_from_sso_groups_applies_to_the_next_request() {
         assert_eq!(
             browser.get("/v1/users").await.status,
             StatusCode::FORBIDDEN,
+            "{name}"
+        );
+        app.finish().await;
+    }
+}
+
+fn verified(sub: &str) -> Value {
+    json!({ "sub": sub, "email": format!("{sub}@example.com"), "email_verified": true })
+}
+
+#[tokio::test]
+async fn the_providers_metadata_is_fetched_once_for_many_sign_ins() {
+    let provider = MockProvider::start().await;
+    for app in common::apps().await {
+        let name = app.name;
+        let mut admin = common::set_up(&app).await;
+        // Saving fetches afresh, and sign-ins use what it fetched.
+        let before = provider.fetches();
+        let saved = admin
+            .put("/v1/settings/sso", settings(&provider, json!({})))
+            .await;
+        assert_eq!(saved.status, StatusCode::OK, "{name}: {:?}", saved.body);
+        assert_eq!(fetched_since(&provider, before), ONE_EACH, "{name}");
+        let before = provider.fetches();
+        for _ in 0..5 {
+            start(&app, "/").await;
+        }
+        let (_, location) = sign_in(&app, &provider, verified("ada")).await;
+        assert_eq!(location, format!("{ORIGIN}/toolbox"), "{name}");
+        assert_eq!(fetched_since(&provider, before), NONE, "{name}");
+
+        // Sign-ins on a server that has fetched nothing share one fetch.
+        let restarted = app.restarted().await;
+        let before = provider.fetches();
+        futures_util::future::join_all((0..8).map(|_| start_in(restarted.browser(), "/"))).await;
+        assert_eq!(fetched_since(&provider, before), ONE_EACH, "{name}");
+        start_in(restarted.browser(), "/").await;
+        assert_eq!(fetched_since(&provider, before), ONE_EACH, "{name}");
+        restarted.finish().await;
+
+        // Changed settings are fetched for afresh.
+        app.db()
+            .execute(
+                &Query::update()
+                    .table("oidc_provider")
+                    .value("updated_at", Expr::col("updated_at").add(1))
+                    .to_owned(),
+            )
+            .await
+            .unwrap();
+        let before = provider.fetches();
+        start(&app, "/").await;
+        start(&app, "/").await;
+        assert_eq!(fetched_since(&provider, before), ONE_EACH, "{name}");
+        app.finish().await;
+    }
+}
+
+/// How long the provider's metadata is used in tests that let it expire.
+const LIFETIME: Duration = Duration::from_secs(1);
+
+fn short_lived(state: &mut meshrmm_server::http::AppState) {
+    state.sso_discovery = Arc::new(DiscoveryCache::new(Timings {
+        lifetime: LIFETIME,
+        ..Timings::default()
+    }));
+}
+
+async fn expire() {
+    tokio::time::sleep(LIFETIME + Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn the_providers_metadata_is_fetched_again_when_it_expires() {
+    let provider = MockProvider::start().await;
+    for app in common::apps_with(short_lived).await {
+        let name = app.name;
+        let mut admin = common::set_up(&app).await;
+        admin
+            .put("/v1/settings/sso", settings(&provider, json!({})))
+            .await;
+        let (mut early, early_authorization) = start(&app, "/").await;
+
+        // The provider rotates its keys before the metadata expires; the
+        // next sign-in fetches it again, once.
+        provider.rotate_key();
+        expire().await;
+        let before = provider.fetches();
+        let (mut late, late_authorization) = start(&app, "/").await;
+        start(&app, "/").await;
+        assert_eq!(fetched_since(&provider, before), ONE_EACH, "{name}");
+
+        // Both sign-ins complete with the new key, the one started before
+        // the refresh too, without fetching anything more.
+        for (browser, authorization, sub) in [
+            (&mut early, &early_authorization, "early"),
+            (&mut late, &late_authorization, "late"),
+        ] {
+            let code = provider.approve(authorization, verified(sub));
+            let location = callback(
+                browser,
+                &format!("code={code}&state={}", authorization.state),
+            )
+            .await;
+            assert_eq!(location, format!("{ORIGIN}/"), "{name}: {sub}");
+        }
+        assert_eq!(fetched_since(&provider, before), ONE_EACH, "{name}");
+
+        // While the discovery document doesn't load, sign-ins go on with
+        // what was fetched before, trying again only now and then.
+        provider.set_discovery_down(true);
+        expire().await;
+        let before = provider.fetches();
+        for sub in ["during", "outage"] {
+            let (_, location) = sign_in(&app, &provider, verified(sub)).await;
+            assert_eq!(location, format!("{ORIGIN}/toolbox"), "{name}: {sub}");
+        }
+        assert_eq!(
+            fetched_since(&provider, before),
+            Fetches {
+                discovery: 1,
+                keys: 0
+            },
+            "{name}"
+        );
+        // With nothing fetched before, they fail.
+        let restarted = app.restarted().await;
+        assert_eq!(
+            start_refused(restarted.browser()).await,
+            failed("failed"),
+            "{name}"
+        );
+        restarted.finish().await;
+        provider.set_discovery_down(false);
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn rotated_keys_are_fetched_once_and_unknown_keys_refused() {
+    let provider = MockProvider::start().await;
+    for app in common::apps().await {
+        let name = app.name;
+        let mut admin = common::set_up(&app).await;
+        admin
+            .put("/v1/settings/sso", settings(&provider, json!({})))
+            .await;
+        start(&app, "/").await;
+
+        // A token signed with the provider's new key fetches its keys again.
+        provider.rotate_key();
+        let before = provider.fetches();
+        let (_, location) = sign_in(&app, &provider, verified("ada")).await;
+        assert_eq!(location, format!("{ORIGIN}/toolbox"), "{name}");
+        assert_eq!(
+            fetched_since(&provider, before),
+            Fetches {
+                discovery: 0,
+                keys: 1
+            },
+            "{name}"
+        );
+
+        // Tokens signed with keys the provider never published are refused,
+        // and the keys were fetched a moment ago, so aren't fetched again.
+        for _ in 0..5 {
+            let (mut browser, authorization) = start(&app, "/").await;
+            let code = provider.approve(&authorization, verified("ada"));
+            provider.unknown_key();
+            let location = callback(
+                &mut browser,
+                &format!("code={code}&state={}", authorization.state),
+            )
+            .await;
+            assert_eq!(location, failed("failed"), "{name}");
+        }
+        let (_, location) = sign_in(&app, &provider, verified("ada")).await;
+        assert_eq!(location, format!("{ORIGIN}/toolbox"), "{name}");
+        assert_eq!(
+            fetched_since(&provider, before),
+            Fetches {
+                discovery: 0,
+                keys: 1
+            },
             "{name}"
         );
         app.finish().await;

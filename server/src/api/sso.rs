@@ -189,6 +189,7 @@ async fn begin(
         &state.config,
         &state.instance_key,
         &provider,
+        &state.sso_discovery,
         safe_next(next),
         |pending| state.auth.sso_sign_ins.start(pending),
     )
@@ -262,12 +263,19 @@ async fn finish(
         .await?
         .ok_or(Failure::Unavailable)?;
     let next = pending.next.clone();
-    let identity = oidc::complete(&state.config, &state.instance_key, &provider, pending, code)
-        .await
-        .map_err(|error| {
-            tracing::warn!(error = format!("{error:#}"), "an SSO sign-in failed");
-            Failure::Failed
-        })?;
+    let identity = oidc::complete(
+        &state.config,
+        &state.instance_key,
+        &provider,
+        &state.sso_discovery,
+        pending,
+        code,
+    )
+    .await
+    .map_err(|error| {
+        tracing::warn!(error = format!("{error:#}"), "an SSO sign-in failed");
+        Failure::Failed
+    })?;
     let mut transaction = state.database.begin().await?;
     let user = match account_for(&mut transaction, &provider, &identity, ip).await {
         Ok(user) => user,
@@ -623,7 +631,7 @@ impl<'a> ProviderSettings<'a> {
 }
 
 /// `PUT /v1/settings/sso`: sets up the provider. When it is turned on, its
-/// discovery document must load.
+/// discovery document must load, fetched afresh; sign-ins then use it.
 pub async fn put_settings(
     State(state): State<AppState>,
     actor: Authorized,
@@ -631,11 +639,13 @@ pub async fn put_settings(
 ) -> Result<Json<SsoSettings>, ApiError> {
     require_administrator(&actor)?;
     let settings = ProviderSettings::validate(&request)?;
-    if request.enabled {
-        oidc::discover(settings.issuer_url).await.map_err(|error| {
+    let discovered = if request.enabled {
+        Some(oidc::discover(settings.issuer_url).await.map_err(|error| {
             ApiError::bad_request(format!("{error:#}")).with_code("discovery_failed")
-        })?;
-    }
+        })?)
+    } else {
+        None
+    };
     let mut transaction = state.database.begin().await?;
     check_roles_exist(&mut transaction, &settings.group_roles, &request).await?;
     let previous = oidc::load(&mut transaction).await?;
@@ -675,6 +685,11 @@ pub async fn put_settings(
     .await?;
     let settings = view(&state, &mut transaction).await?;
     transaction.commit().await?;
+    if let (Some(metadata), Some(provider)) = (discovered, &settings.provider) {
+        state
+            .sso_discovery
+            .prime(&provider.issuer_url, provider.updated_at, metadata);
+    }
     Ok(Json(settings))
 }
 
@@ -840,6 +855,7 @@ pub async fn delete_settings(
     )
     .await?;
     transaction.commit().await?;
+    state.sso_discovery.clear();
     Ok(StatusCode::NO_CONTENT)
 }
 

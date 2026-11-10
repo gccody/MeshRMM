@@ -5,6 +5,7 @@ pub mod ceremonies;
 pub mod devices;
 pub mod limits;
 pub mod oidc;
+pub mod oidc_discovery;
 pub mod passkeys;
 pub mod password;
 pub mod second_factor;

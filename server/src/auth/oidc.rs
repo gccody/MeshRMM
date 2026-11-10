@@ -1,21 +1,30 @@
 //! Single sign-on with an OpenID Connect provider: its settings, and the
 //! authorization code flow (with PKCE and a nonce) that identifies a user.
 //!
-//! The provider's metadata and keys are fetched when a sign-in starts, so a
-//! key rotation at the provider needs nothing from the operator.
-use std::{collections::BTreeSet, net::IpAddr, sync::OnceLock, time::Duration};
+//! The provider's metadata and keys are kept between sign-ins by
+//! [`DiscoveryCache`] and fetched again hourly, or as soon as an ID token is
+//! signed with a key they lack, so a key rotation at the provider needs
+//! nothing from the operator.
+use std::{
+    collections::BTreeSet,
+    net::IpAddr,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use anyhow::{Context, anyhow, bail};
 use base64::Engine;
 use openidconnect::{
-    AccessToken, AuthorizationCode, ClientId, ClientSecret, CsrfToken, HttpRequest, HttpResponse,
-    IssuerUrl, Nonce, OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope,
+    AccessToken, AuthorizationCode, ClaimsVerificationError, ClientId, ClientSecret, CsrfToken,
+    HttpRequest, HttpResponse, IssuerUrl, JsonWebKeySetUrl, Nonce, OAuth2TokenResponse,
+    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, SignatureVerificationError,
     TokenResponse,
-    core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata},
+    core::{CoreAuthenticationFlow, CoreClient, CoreJsonWebKeySet, CoreProviderMetadata},
 };
 use sea_query::{Expr, ExprTrait, Order, Query};
 use serde_json::{Value, json};
 
+use super::oidc_discovery::{Discovered, DiscoveryCache};
 use crate::{
     audit::{self, Actor, Target},
     config::Config,
@@ -253,7 +262,8 @@ async fn send(request: HttpRequest) -> Result<HttpResponse, HttpError> {
         .map_err(|error| HttpError(error.to_string()))
 }
 
-/// Fetches the provider's metadata and signing keys.
+/// Fetches the provider's metadata and signing keys. Sign-ins use the ones
+/// [`DiscoveryCache`] keeps instead.
 pub async fn discover(issuer_url: &str) -> anyhow::Result<CoreProviderMetadata> {
     let issuer = parse_issuer(issuer_url).map_err(|message| anyhow!(message))?;
     let http = |request| send(request);
@@ -261,6 +271,27 @@ pub async fn discover(issuer_url: &str) -> anyhow::Result<CoreProviderMetadata> 
         .await
         .map_err(|error| anyhow!(error_chain(&error)))
         .context("the provider's discovery document could not be used")
+}
+
+/// Fetches the provider's signing keys by themselves.
+pub(super) async fn fetch_keys(url: &JsonWebKeySetUrl) -> anyhow::Result<CoreJsonWebKeySet> {
+    let http = |request| send(request);
+    CoreJsonWebKeySet::fetch_async(url, &http)
+        .await
+        .map_err(|error| anyhow!(error_chain(&error)))
+        .context("the provider's signing keys could not be used")
+}
+
+/// Whether an ID token failed to verify the way it does when the provider
+/// signs with a key newer than the ones kept: none of them has its key ID,
+/// or the one that does doesn't match its signature.
+fn signed_with_unknown_key(error: &ClaimsVerificationError) -> bool {
+    matches!(
+        error,
+        ClaimsVerificationError::SignatureVerification(
+            SignatureVerificationError::NoMatchingKey | SignatureVerificationError::CryptoError(_)
+        )
+    )
 }
 
 /// An error and its causes on one line, for messages administrators read.
@@ -282,7 +313,7 @@ fn client(
     config: &Config,
     key: &InstanceKey,
     provider: &Provider,
-    metadata: CoreProviderMetadata,
+    metadata: &CoreProviderMetadata,
 ) -> anyhow::Result<
     CoreClient<
         openidconnect::EndpointSet,
@@ -300,7 +331,7 @@ fn client(
         .transpose()?
         .map(|secret| ClientSecret::new(String::from_utf8_lossy(&secret).into_owned()));
     Ok(CoreClient::from_provider_metadata(
-        metadata,
+        metadata.clone(),
         ClientId::new(provider.client_id.clone()),
         secret,
     )
@@ -317,7 +348,9 @@ pub struct Pending {
     nonce: String,
     /// Where on the website to go afterwards.
     pub next: String,
-    metadata: CoreProviderMetadata,
+    /// The provider's metadata and keys the sign-in started with, shared
+    /// with the cache.
+    discovered: Arc<Discovered>,
     provider_updated_at: i64,
 }
 
@@ -346,11 +379,12 @@ pub async fn begin(
     config: &Config,
     key: &InstanceKey,
     provider: &Provider,
+    discovery: &DiscoveryCache,
     next: String,
     store: impl FnOnce(Pending) -> String,
 ) -> anyhow::Result<Started> {
-    let metadata = discover(&provider.issuer_url).await?;
-    let client = client(config, key, provider, metadata.clone())?;
+    let discovered = discovery.get(provider).await?;
+    let client = client(config, key, provider, &discovered.metadata)?;
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
     let nonce = Nonce::new_random();
     let binding = new_token();
@@ -359,7 +393,7 @@ pub async fn begin(
         pkce_verifier: pkce_verifier.secret().clone(),
         nonce: nonce.secret().clone(),
         next,
-        metadata,
+        discovered,
         provider_updated_at: provider.updated_at,
     });
     let mut request = client
@@ -393,18 +427,21 @@ pub struct Identity {
     pub groups: Option<Vec<String>>,
 }
 
-/// Exchanges the authorization code and verifies the ID token.
+/// Exchanges the authorization code and verifies the ID token. A token
+/// signed with a key the sign-in's metadata lacks is checked again with
+/// newer keys from `discovery`, as after a key rotation at the provider.
 pub async fn complete(
     config: &Config,
     key: &InstanceKey,
     provider: &Provider,
+    discovery: &DiscoveryCache,
     pending: Pending,
     code: &str,
 ) -> anyhow::Result<Identity> {
     if pending.provider_updated_at != provider.updated_at {
         bail!("the SSO settings changed during the sign-in");
     }
-    let client = client(config, key, provider, pending.metadata)?;
+    let client = client(config, key, provider, &pending.discovered.metadata)?;
     let http = |request| send(request);
     let response = client
         .exchange_code(AuthorizationCode::new(code.to_owned()))?
@@ -416,11 +453,24 @@ pub async fn complete(
     let id_token = response
         .id_token()
         .context("the provider's token response has no ID token")?;
-    let verifier = client.id_token_verifier();
-    let claims = id_token
-        .claims(&verifier, &Nonce::new(pending.nonce))
-        .map_err(|error| anyhow!(error_chain(&error)))
-        .context("the ID token is invalid")?;
+    let nonce = Nonce::new(pending.nonce);
+    let refreshed_client;
+    let mut verifier = client.id_token_verifier();
+    let claims = match id_token.claims(&verifier, &nonce) {
+        Err(error) if signed_with_unknown_key(&error) => {
+            match discovery.refresh_keys(provider, &pending.discovered).await {
+                Some(refreshed) => {
+                    refreshed_client = self::client(config, key, provider, &refreshed.metadata)?;
+                    verifier = refreshed_client.id_token_verifier();
+                    id_token.claims(&verifier, &nonce)
+                }
+                None => Err(error),
+            }
+        }
+        verified => verified,
+    }
+    .map_err(|error| anyhow!(error_chain(&error)))
+    .context("the ID token is invalid")?;
     if let Some(expected) = claims.access_token_hash() {
         let signing_algorithm = id_token
             .signing_alg()

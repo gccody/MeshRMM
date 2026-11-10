@@ -101,6 +101,7 @@ pub async fn prepare(config: Config) -> anyhow::Result<AppState> {
         settings: Arc::default(),
         instance_key,
         auth: Arc::new(AuthState::default()),
+        sso_discovery: Arc::default(),
         storage,
         agents,
         website: Website::embedded(),
