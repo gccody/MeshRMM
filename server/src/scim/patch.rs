@@ -60,15 +60,40 @@ enum Path {
     },
 }
 
+/// The most names a path goes down after any schema URN: an attribute and
+/// one of its sub-attributes, as in `name.givenName` or
+/// `emails[type eq "work"].value`. No attribute of the User, Group or
+/// enterprise extension schemas goes deeper. A path is applied by recursing
+/// once per name, so this bound is also what keeps a path of a million
+/// names, which fits in one request, from overflowing the stack.
+const MAX_PATH_DEPTH: usize = 2;
+
+/// The dotted names in `attribute`, refused when there are more than `most`
+/// or one is empty.
+fn names(attribute: &str, most: usize) -> Result<Vec<String>, PatchError> {
+    let names = attribute
+        .splitn(most + 1, '.')
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if names.len() > most {
+        return Err(invalid(
+            "invalidPath",
+            format!("a path goes at most {MAX_PATH_DEPTH} attributes deep, as name.givenName does"),
+        ));
+    }
+    if names.iter().any(|name| name.trim().is_empty()) {
+        return Err(invalid("invalidPath", "a path has an empty attribute name"));
+    }
+    Ok(names)
+}
+
 fn parse_path(raw: &str) -> Result<Path, PatchError> {
     let raw = raw.trim();
     let Some(open) = raw.find('[') else {
         if raw.is_empty() {
             return Err(invalid("invalidPath", "the path is empty"));
         }
-        return Ok(Path::Attribute(
-            strip_urn(raw).split('.').map(str::to_owned).collect(),
-        ));
+        return Ok(Path::Attribute(names(strip_urn(raw), MAX_PATH_DEPTH)?));
     };
     let close = raw
         .rfind(']')
@@ -76,14 +101,16 @@ fn parse_path(raw: &str) -> Result<Path, PatchError> {
         .ok_or_else(|| invalid("invalidPath", format!("unbalanced brackets in {raw}")))?;
     let filter = filter::parse(&raw[open + 1..close])
         .map_err(|error| invalid("invalidPath", format!("{raw}: {error}")))?;
+    // The filtered attribute and its sub-attribute are one name each.
+    let attribute = names(strip_urn(&raw[..open]), 1)?.remove(0);
     let rest = &raw[close + 1..];
     let sub_attribute = match rest.strip_prefix('.') {
-        Some(sub) if !sub.is_empty() => Some(sub.to_owned()),
+        Some(sub) => Some(names(sub, 1)?.remove(0)),
         None if rest.is_empty() => None,
-        _ => return Err(invalid("invalidPath", format!("invalid path {raw}"))),
+        None => return Err(invalid("invalidPath", format!("invalid path {raw}"))),
     };
     Ok(Path::Value {
-        attribute: strip_urn(&raw[..open]).to_owned(),
+        attribute,
         filter,
         sub_attribute,
     })
@@ -103,6 +130,9 @@ pub fn apply(resource: &mut Value, operations: &[Operation]) -> Result<(), Patch
     let object = resource
         .as_object_mut()
         .ok_or_else(|| invalid("invalidValue", "the resource isn't an object"))?;
+    // Every path is read before any is applied, so a bad one is refused with
+    // nothing changed.
+    let mut changes = Vec::new();
     for operation in operations {
         let kind = match operation.op.to_ascii_lowercase().as_str() {
             "add" => Kind::Add,
@@ -117,7 +147,7 @@ pub fn apply(resource: &mut Value, operations: &[Operation]) -> Result<(), Patch
         };
         match operation.path.as_deref().map(str::trim) {
             Some(path) if !path.is_empty() => {
-                apply_path(object, kind, &parse_path(path)?, operation.value.clone())?;
+                changes.push((kind, parse_path(path)?, operation.value.clone()));
             }
             _ => {
                 if kind == Kind::Remove {
@@ -130,10 +160,13 @@ pub fn apply(resource: &mut Value, operations: &[Operation]) -> Result<(), Patch
                     ));
                 };
                 for (key, value) in values {
-                    apply_path(object, kind, &parse_path(key)?, Some(value.clone()))?;
+                    changes.push((kind, parse_path(key)?, Some(value.clone())));
                 }
             }
         }
+    }
+    for (kind, path, value) in changes {
+        apply_path(object, kind, &path, value)?;
     }
     Ok(())
 }
@@ -465,5 +498,107 @@ mod tests {
             let operation: Operation = serde_json::from_value(operation).unwrap();
             assert!(apply(&mut resource, &[operation]).is_err());
         }
+    }
+
+    /// The error `operations` are refused with, checking that the resource
+    /// is left as it was.
+    fn refused(resource: &Value, operations: Value) -> PatchError {
+        let mut patched = resource.clone();
+        let request: PatchRequest =
+            serde_json::from_value(json!({ "Operations": operations })).unwrap();
+        let error = apply(&mut patched, &request.operations).unwrap_err();
+        assert_eq!(&patched, resource, "a refused patch changed the resource");
+        error
+    }
+
+    #[test]
+    fn paths_deeper_than_an_attribute_and_its_sub_attribute_are_refused() {
+        let user = json!({
+            "userName": "a@x.com",
+            "active": true,
+            "name": { "givenName": "A" },
+            "emails": [{ "value": "a@x.com", "type": "work" }],
+        });
+        for op in ["add", "replace", "remove"] {
+            for path in [
+                "name.givenName.first",
+                "urn:ietf:params:scim:schemas:core:2.0:User:name.givenName.first",
+                "emails[type eq \"work\"].value.more",
+                "name.x[type eq \"work\"].value",
+            ] {
+                let error = refused(&user, json!([{ "op": op, "path": path, "value": "B" }]));
+                assert_eq!(error.scim_type, "invalidPath", "{op} {path}");
+            }
+        }
+        for op in ["add", "replace"] {
+            let operations = json!([{ "op": op, "value": { "name.givenName.first": "B" } }]);
+            assert_eq!(refused(&user, operations).scim_type, "invalidPath", "{op}");
+            // Nothing is applied before the bad path is found.
+            let operations = json!([
+                { "op": op, "path": "active", "value": false },
+                { "op": op, "value": { "displayName": "B", "name.givenName.first": "B" } },
+            ]);
+            assert_eq!(refused(&user, operations).scim_type, "invalidPath", "{op}");
+        }
+        for path in [
+            "name..givenName",
+            "name.",
+            ".name",
+            "emails[type eq \"work\"].",
+        ] {
+            let operations = json!([{ "op": "replace", "path": path, "value": "B" }]);
+            assert_eq!(
+                refused(&user, operations).scim_type,
+                "invalidPath",
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_of_100000_segments_is_refused_without_recursing() {
+        let deep = vec!["a"; 100_000].join(".");
+        let started = std::time::Instant::now();
+        for operation in [
+            json!({ "op": "add", "path": deep, "value": 1 }),
+            json!({ "op": "replace", "path": deep, "value": 1 }),
+            json!({ "op": "remove", "path": deep }),
+            json!({ "op": "add", "value": { deep.clone(): 1 } }),
+            json!({ "op": "replace", "value": { deep.clone(): 1 } }),
+            json!({ "op": "add", "path": format!("emails[type eq \"work\"].{deep}"), "value": 1 }),
+        ] {
+            let error = refused(&json!({}), json!([operation]));
+            assert_eq!(error.scim_type, "invalidPath");
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn schema_urns_and_sub_attributes_still_work() {
+        let enterprise = "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User";
+        let patched = patch(
+            json!({ "userName": "a@x.com" }),
+            json!([
+                { "op": "add", "path": format!("{enterprise}:manager.displayName"), "value": "Boss" },
+                { "op": "replace", "value": { enterprise: { "department": "IT" } } },
+                {
+                    "op": "replace",
+                    "path": "urn:ietf:params:scim:schemas:core:2.0:User:name.givenName",
+                    "value": "A",
+                },
+                {
+                    "op": "add",
+                    "path": "urn:ietf:params:scim:schemas:core:2.0:User:emails[type eq \"work\"].value",
+                    "value": "a@y.com",
+                },
+            ]),
+        );
+        assert_eq!(patched["manager"], json!({ "displayName": "Boss" }));
+        assert_eq!(patched["User"], json!({ "department": "IT" }));
+        assert_eq!(patched["name"], json!({ "givenName": "A" }));
+        assert_eq!(
+            patched["emails"],
+            json!([{ "type": "work", "value": "a@y.com" }])
+        );
     }
 }
