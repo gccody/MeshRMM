@@ -103,6 +103,7 @@ async fn a_passkey_signs_in_on_its_own() {
             signed_in.body
         );
         assert_eq!(signed_in.body["status"], "signed_in");
+        assert!(common::device_cookie(&signed_in).is_some(), "{name}");
         let account = browser.get("/v1/account").await;
         assert_eq!(account.body["user"]["email"], ADMIN_EMAIL, "{name}");
         assert_eq!(account.body["session"]["auth_method"], "passkey");

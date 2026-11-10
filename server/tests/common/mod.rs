@@ -420,6 +420,19 @@ impl Browser {
         response
     }
 
+    /// Posts `body` as a client at `ip` (the TCP peer, which isn't a trusted
+    /// proxy, so it is the client address).
+    pub async fn post_from(&mut self, ip: &str, path: &str, body: serde_json::Value) -> Response {
+        let peer = std::net::SocketAddr::new(ip.parse().unwrap(), 50_000);
+        let request = self
+            .request(axum::http::Method::POST, path)
+            .extension(axum::extract::ConnectInfo(peer))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        self.raw(request).await
+    }
+
     /// A request the way the website sends it, with the session cookie.
     pub fn request(&self, method: axum::http::Method, path: &str) -> axum::http::request::Builder {
         let mut request = axum::http::Request::builder()
@@ -734,6 +747,17 @@ pub async fn set_up(app: &App) -> Browser {
         .await;
     assert_eq!(response.status, 201, "{}: {:?}", app.name, response.body);
     browser
+}
+
+/// The device cookie a sign-in's response set, as a `Cookie` header pair.
+pub fn device_cookie(response: &Response) -> Option<String> {
+    response
+        .headers
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| value.starts_with("__Host-meshrmm-device="))
+        .map(|value| value.split(';').next().unwrap().to_owned())
 }
 
 /// The token in a one-time link such as `https://host/invite#token=...`.

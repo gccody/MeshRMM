@@ -14,8 +14,7 @@ use super::{AccessUnchanged, SignInResult, signed_in_response};
 use crate::{
     audit::{self, Actor, Target},
     auth::{
-        limits::ip_key,
-        passkeys, password,
+        devices, passkeys, password,
         second_factor::{self, TotpState},
         session::{self, AuthMethod, Client},
     },
@@ -47,19 +46,14 @@ pub async fn password(
     headers: HeaderMap,
     JsonBody(request): JsonBody<PasswordSignIn>,
 ) -> Result<Response, ApiError> {
-    let ip_key = ip_key(ip);
-    let limits = &state.auth;
-    limits
-        .sign_in_by_ip
-        .hit(&ip_key)
-        .map_err(ApiError::rate_limited)?;
     let email = users::normalize_email(&request.email).ok();
-    if let Some(email) = &email
-        && let Err(seconds) = limits.sign_in_by_account.hit(email)
-    {
-        limits.sign_in_by_ip.refund(&ip_key);
-        return Err(ApiError::rate_limited(seconds));
-    }
+    let device = email
+        .as_deref()
+        .and_then(|email| devices::device(&state.instance_key, &headers, email));
+    let attempt = state
+        .auth
+        .count_password_attempt(ip, email.as_deref(), device.as_deref())
+        .map_err(ApiError::rate_limited)?;
     let mut database = &state.database;
     let user = match &email {
         Some(email) => users::by_email(&mut database, email).await?,
@@ -88,10 +82,7 @@ pub async fn password(
         return Err(invalid_credentials());
     }
     // A right password isn't a guess; only failures count.
-    limits.sign_in_by_ip.refund(&ip_key);
-    if let Some(email) = &email {
-        limits.sign_in_by_account.refund(email);
-    }
+    state.auth.password_accepted(&attempt);
     let user = user.expect("a password matched, so the account exists");
     // Only someone who knows the password learns the account is disabled.
     if user.disabled {
@@ -192,12 +183,13 @@ pub async fn second_factor(
         .await?
         .filter(|user| !user.disabled)
         .ok_or_else(expired)?;
-    // Wrong codes count against the account like wrong passwords, so new
-    // challenges don't buy more guesses.
+    // Wrong codes count against the user, so new challenges don't buy more
+    // guesses. Only someone with the password gets here, so a stranger's
+    // wrong passwords don't use these up.
     state
         .auth
-        .sign_in_by_account
-        .hit(&user.email)
+        .second_factor_by_user
+        .hit(&user.id)
         .map_err(ApiError::rate_limited)?;
     let (method, accepted) = match (&request.code, &request.recovery_code, &request.passkey) {
         (Some(code), None, None) => (
@@ -247,6 +239,7 @@ pub async fn second_factor(
                 .with_code("invalid_code"),
         );
     }
+    state.auth.second_factor_by_user.refund(&user.id);
     state.auth.challenges.complete(&request.challenge);
     finish(&state, &user, Some(method), Client::new(ip, &headers)).await
 }
@@ -278,15 +271,14 @@ async fn check_passkey(
     Ok(true)
 }
 
-/// Starts the session and records the sign-in.
+/// Starts the session, records the sign-in and gives the browser a device
+/// cookie for the account.
 async fn finish(
     state: &AppState,
     user: &User,
     second_factor: Option<&str>,
     client: Client,
 ) -> Result<Response, ApiError> {
-    // Stored emails are normalized, so this is the key failures used.
-    state.auth.sign_in_by_account.clear(&user.email);
     let mut transaction = state.database.begin().await?;
     let settings = settings::load(&mut transaction).await?;
     let cookie = session::start(
@@ -306,11 +298,17 @@ async fn finish(
     )
     .await?;
     transaction.commit().await?;
-    Ok(signed_in_response(
+    let mut response = signed_in_response(
         StatusCode::OK,
         cookie,
         settings.require_two_factor && second_factor.is_none(),
-    ))
+    );
+    // Stored emails are normalized, as the cookie's account must be.
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        devices::cookie(&state.instance_key, &user.email),
+    );
+    Ok(response)
 }
 
 /// `POST /v1/auth/sign-out`: ends this browser's session, if it has one.

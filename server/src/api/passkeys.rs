@@ -3,7 +3,7 @@
 use axum::{
     Json,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::Response,
 };
 use sea_query::{Expr, ExprTrait, Query};
@@ -20,7 +20,7 @@ use super::{confirm_password, second_factor_removed, signed_in_response};
 use crate::{
     audit::{self, Actor, Target},
     auth::{
-        Authorized, PendingRegistration, SignedIn,
+        Authorized, PendingRegistration, SignedIn, devices,
         limits::ip_key,
         passkeys::{self, MAX_PER_USER, PasskeyView},
         second_factor,
@@ -387,6 +387,10 @@ pub async fn sign_in(
     )
     .await?;
     transaction.commit().await?;
-    state.auth.sign_in_by_account.clear(&user.email);
-    Ok(signed_in_response(StatusCode::OK, cookie, false))
+    let mut response = signed_in_response(StatusCode::OK, cookie, false);
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        devices::cookie(&state.instance_key, &user.email),
+    );
+    Ok(response)
 }

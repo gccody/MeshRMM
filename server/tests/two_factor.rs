@@ -56,6 +56,7 @@ async fn password_step(browser: &mut Browser, email: &str, password: &str) -> St
     );
     assert_eq!(response.body["methods"], json!(["totp", "recovery_code"]));
     assert!(browser.cookie.is_none());
+    assert_eq!(common::device_cookie(&response), None);
     response.body["challenge"].as_str().unwrap().to_owned()
 }
 
@@ -182,7 +183,7 @@ async fn authenticator_codes_and_recovery_codes_sign_in() {
 }
 
 #[tokio::test]
-async fn wrong_codes_are_limited_per_challenge_and_per_account() {
+async fn wrong_codes_are_limited_per_challenge_and_per_user() {
     let app = common::App::sqlite().await;
     let mut admin = common::set_up(&app).await;
     let (secret, _, _) = enroll(&mut admin, ADMIN_PASSWORD).await;
@@ -207,7 +208,7 @@ async fn wrong_codes_are_limited_per_challenge_and_per_account() {
     assert_eq!(right.code(), "challenge_expired");
 
     // A fresh challenge doesn't reset the count: wrong codes count against
-    // the account's sign-in limit like wrong passwords.
+    // the user, from any address.
     let challenge = password_step(&mut browser, ADMIN_EMAIL, ADMIN_PASSWORD).await;
     for _ in 0..5 {
         let wrong = browser
@@ -218,13 +219,52 @@ async fn wrong_codes_are_limited_per_challenge_and_per_account() {
             .await;
         assert_eq!(wrong.code(), "invalid_code");
     }
-    let limited = browser
-        .post(
+    let mut elsewhere = app.browser();
+    let response = elsewhere
+        .post_from(
+            "203.0.113.20",
             "/v1/auth/sign-in",
             json!({ "email": ADMIN_EMAIL, "password": ADMIN_PASSWORD }),
         )
         .await;
+    let challenge = response.body["challenge"].as_str().unwrap();
+    let limited = elsewhere
+        .post(
+            "/v1/auth/sign-in/second-factor",
+            json!({ "challenge": challenge, "code": common::totp_code(&secret, 1) }),
+        )
+        .await;
     assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS);
+    app.finish().await;
+}
+
+#[tokio::test]
+async fn a_strangers_wrong_passwords_dont_block_the_second_factor() {
+    let app = common::App::sqlite().await;
+    let mut admin = common::set_up(&app).await;
+    let (secret, _, _) = enroll(&mut admin, ADMIN_PASSWORD).await;
+    let mut stranger = app.browser();
+    for _ in 0..10 {
+        let guess = stranger
+            .post_from(
+                "198.51.100.7",
+                "/v1/auth/sign-in",
+                json!({ "email": ADMIN_EMAIL, "password": "a guess" }),
+            )
+            .await;
+        assert_eq!(guess.status, StatusCode::UNAUTHORIZED);
+    }
+    let mut owner = app.browser();
+    let challenge = password_step(&mut owner, ADMIN_EMAIL, ADMIN_PASSWORD).await;
+    let signed_in = owner
+        .post(
+            "/v1/auth/sign-in/second-factor",
+            json!({ "challenge": challenge, "code": common::totp_code(&secret, 1) }),
+        )
+        .await;
+    assert_eq!(signed_in.status, StatusCode::OK, "{:?}", signed_in.body);
+    // The device cookie comes with the whole sign-in, not the password.
+    assert!(common::device_cookie(&signed_in).is_some());
     app.finish().await;
 }
 
