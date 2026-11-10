@@ -1,6 +1,8 @@
 //! SCIM filters (RFC 7644 section 3.4.2.2), evaluated against a resource's
-//! JSON. One company's users and groups fit in memory, so listing filters
-//! the full set instead of translating filters to SQL.
+//! JSON. A list runs the conditions identity providers look resources up by
+//! (`userName eq`, `displayName eq`, `members[value eq]`...) in SQL: each
+//! resource type takes them from a filter's top-level `and` with [`split`],
+//! and [`matches`] evaluates the rest on the resources SQL found.
 //!
 //! Supported: `eq`, `ne`, `co`, `sw`, `ew`, `pr`, `and`, `or`, `not(...)`,
 //! parentheses, and value paths such as `emails[type eq "work"]` or
@@ -347,6 +349,74 @@ fn matches_in(resource: &Value, filter: &Filter, prefix: &[String]) -> bool {
     }
 }
 
+/// Splits `filter` into the conditions `translate` turns into SQL, taken
+/// from its top-level `and`, and the rest, for [`matches`]. A resource
+/// matches the filter exactly when it meets every condition and matches the
+/// rest, so `translate` must only take a condition SQL tests exactly as
+/// [`matches`] would.
+pub fn split<T>(
+    filter: Filter,
+    translate: impl Fn(&Filter) -> Option<T>,
+) -> (Vec<T>, Option<Filter>) {
+    let mut conditions = Vec::new();
+    let mut rest: Option<Filter> = None;
+    // A long chain of `and` nests deeply, so it is walked without recursion.
+    let mut pending = vec![filter];
+    while let Some(filter) = pending.pop() {
+        match filter {
+            Filter::And(left, right) => {
+                pending.push(*right);
+                pending.push(*left);
+            }
+            filter => match translate(&filter) {
+                Some(condition) => conditions.push(condition),
+                None => {
+                    rest = Some(match rest {
+                        Some(left) => Filter::And(Box::new(left), Box::new(filter)),
+                        None => filter,
+                    });
+                }
+            },
+        }
+    }
+    (conditions, rest)
+}
+
+/// The string `filter` says the attribute at `path` equals, as in
+/// `userName eq "ada@example.com"`, or with a value path,
+/// `emails[value eq "ada@example.com"]` for `["emails", "value"]`.
+pub fn equals<'a>(filter: &'a Filter, path: &[&str]) -> Option<&'a str> {
+    match filter {
+        Filter::Compare {
+            path: tested,
+            op: Op::Eq,
+            value: Value::String(value),
+        } if tested.iter().map(String::as_str).eq(path.iter().copied()) => Some(value),
+        Filter::ValuePath { attribute, filter } => match path {
+            [first, inner @ ..] if !inner.is_empty() && first == attribute => equals(filter, inner),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether `filter` tests the top-level attribute `attribute` (lowercase),
+/// so evaluating it needs that attribute's values.
+pub fn mentions(filter: &Filter, attribute: &str) -> bool {
+    match filter {
+        Filter::Compare { path, .. } | Filter::Present(path) => {
+            path.first().is_some_and(|first| first == attribute)
+        }
+        Filter::ValuePath {
+            attribute: tested, ..
+        } => tested == attribute,
+        Filter::And(left, right) | Filter::Or(left, right) => {
+            mentions(left, attribute) || mentions(right, attribute)
+        }
+        Filter::Not(inner) => mentions(inner, attribute),
+    }
+}
+
 /// Whether one element of a multi-valued attribute matches the filter inside
 /// a value path, such as `type eq "work"` in `emails[type eq "work"]`.
 pub fn element_matches(element: &Value, attribute: &str, filter: &Filter) -> bool {
@@ -408,6 +478,84 @@ mod tests {
         assert!(!check(r#"members[value eq "U2"]"#));
         assert!(check(r#"userName ne "someone@else""#));
         assert!(!check(r#"title pr"#));
+    }
+
+    #[test]
+    fn split_takes_the_conditions_sql_tests_from_the_top_level_and() {
+        let split_text = |text: &str| {
+            split(parse(text).unwrap(), |filter| {
+                equals(filter, &["username"]).map(str::to_owned)
+            })
+        };
+        assert_eq!(
+            split_text(r#"userName eq "a""#),
+            (vec!["a".to_owned()], None)
+        );
+        let (conditions, rest) =
+            split_text(r#"userName eq "a" and active eq true and (userName eq "b")"#);
+        assert_eq!(conditions, ["a", "b"]);
+        assert_eq!(rest, Some(parse("active eq true").unwrap()));
+        let (conditions, rest) = split_text(r#"active eq true and userName eq "a" and title pr"#);
+        assert_eq!(conditions, ["a"]);
+        assert_eq!(rest, Some(parse("active eq true and title pr").unwrap()));
+        // Under `or` and `not`, a condition stays in the rest.
+        for text in [
+            r#"userName eq "a" or userName eq "b""#,
+            r#"not (userName eq "a")"#,
+            r#"userName co "a""#,
+            r#"userName eq 1"#,
+            r#"userName ne "a""#,
+        ] {
+            assert_eq!(
+                split_text(text),
+                (vec![], Some(parse(text).unwrap())),
+                "{text}"
+            );
+        }
+        let chain = vec![r#"userName eq "a""#; 200].join(" and ");
+        assert_eq!(split_text(&chain).0.len(), 200);
+    }
+
+    #[test]
+    fn equals_reads_attribute_and_value_paths() {
+        let check =
+            |text: &str, path: &[&str]| equals(&parse(text).unwrap(), path).map(str::to_owned);
+        let value = ["emails", "value"];
+        assert_eq!(
+            check(r#"emails.value eq "a""#, &value).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            check(r#"emails[value eq "a"]"#, &value).as_deref(),
+            Some("a")
+        );
+        assert_eq!(check(r#"emails[value eq "a"]"#, &["emails"]), None);
+        assert_eq!(check(r#"emails[value co "a"]"#, &value), None);
+        assert_eq!(
+            check(r#"emails[value eq "a" or value eq "b"]"#, &value),
+            None
+        );
+        assert_eq!(check(r#"name.givenName eq "a""#, &["name"]), None);
+        assert_eq!(
+            check(
+                r#"urn:ietf:params:scim:schemas:core:2.0:Group:displayName eq "a""#,
+                &["displayname"]
+            )
+            .as_deref(),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn mentions_finds_top_level_attributes() {
+        let check = |text: &str| mentions(&parse(text).unwrap(), "members");
+        assert!(check("members pr"));
+        assert!(check(r#"members.value eq "a""#));
+        assert!(check(
+            r#"displayName eq "a" or not (members[value co "a"])"#
+        ));
+        assert!(!check(r#"displayName eq "a""#));
+        assert!(!check(r#"emails[members eq "a"]"#));
     }
 
     #[test]

@@ -1051,3 +1051,167 @@ async fn a_page_of_a_jobs_devices_reads_only_the_page() {
     }
     assert!(misses.is_empty(), "{}", misses.join("\n\n"));
 }
+
+/// SCIM's lookups and pages, and what their plans must not show: an
+/// identity provider looks each user and group up on every sync, so a
+/// lookup searches an index rather than reading every user or group, and a
+/// page walks the list's order in an index.
+fn scim_statements() -> Vec<Checked> {
+    use meshrmm_server::scim::{
+        Whose,
+        groups::{self, GroupKey},
+        users::{self, UserKey},
+    };
+    const WHOLE_TABLE: &[&str] = &["SCAN users", "SCAN scim_groups", "Seq Scan"];
+    const ALL_MEMBERS: &[&str] = &["SCAN scim_group_members", "Seq Scan"];
+    let page = vec!["a".to_owned(), "b".to_owned()];
+    let email = || vec![UserKey::Email("ada@example.com".into())];
+    let name = || vec![GroupKey::Name("admins".into())];
+    let member = || vec![GroupKey::Member("user".into())];
+    vec![
+        (
+            "a SCIM lookup of a user by userName",
+            Statement::Select(users::page_query(&email(), 0, 100)),
+            &["sqlite_autoindex_users_2", "users_email_key"],
+            WHOLE_TABLE,
+        ),
+        (
+            "a SCIM count of the users with a userName",
+            Statement::Select(users::count_query(&email())),
+            &["sqlite_autoindex_users_2", "users_email_key"],
+            WHOLE_TABLE,
+        ),
+        (
+            "a SCIM lookup of a user by externalId",
+            Statement::Select(users::page_query(
+                &[UserKey::ExternalId("ext".into())],
+                0,
+                100,
+            )),
+            &["sqlite_autoindex_users_4", "users_scim_external_id_key"],
+            WHOLE_TABLE,
+        ),
+        (
+            "a SCIM lookup of a user by id",
+            Statement::Select(users::page_query(&[UserKey::Id("id".into())], 0, 100)),
+            &["sqlite_autoindex_users_1", "users_pkey"],
+            WHOLE_TABLE,
+        ),
+        (
+            "a page of SCIM users",
+            Statement::Select(users::page_query(&[], 200, 100)),
+            &["idx_users_created"],
+            &[],
+        ),
+        (
+            "the groups of a page of SCIM users",
+            Statement::Select(users::memberships_query(Whose::Ids(&page))),
+            &["idx_scim_group_members_user"],
+            ALL_MEMBERS,
+        ),
+        (
+            "a SCIM lookup of a group by displayName",
+            Statement::Select(groups::page_query(&name(), 0, 100)),
+            &["idx_scim_groups_display_name_key"],
+            WHOLE_TABLE,
+        ),
+        (
+            "a SCIM count of the groups with a displayName",
+            Statement::Select(groups::count_query(&name())),
+            &["idx_scim_groups_display_name_key"],
+            WHOLE_TABLE,
+        ),
+        (
+            "a SCIM lookup of a group by externalId",
+            Statement::Select(groups::page_query(
+                &[GroupKey::ExternalId("ext".into())],
+                0,
+                100,
+            )),
+            &[
+                "sqlite_autoindex_scim_groups_3",
+                "scim_groups_external_id_key",
+            ],
+            WHOLE_TABLE,
+        ),
+        (
+            "a SCIM lookup of a user's groups",
+            Statement::Select(groups::page_query(&member(), 0, 100)),
+            &["idx_scim_group_members_user"],
+            WHOLE_TABLE,
+        ),
+        (
+            "a SCIM count of a user's groups",
+            Statement::Select(groups::count_query(&member())),
+            &["idx_scim_group_members_user"],
+            WHOLE_TABLE,
+        ),
+        (
+            "a SCIM check that a user is in a group",
+            Statement::Select(groups::page_query(
+                &[
+                    GroupKey::Id("group".into()),
+                    GroupKey::Member("user".into()),
+                ],
+                0,
+                100,
+            )),
+            &["sqlite_autoindex_scim_groups_1", "scim_groups_pkey"],
+            WHOLE_TABLE,
+        ),
+        (
+            "a page of SCIM groups",
+            Statement::Select(groups::page_query(&[], 200, 100)),
+            &[
+                "sqlite_autoindex_scim_groups_2",
+                "scim_groups_display_name_key",
+            ],
+            &[],
+        ),
+        (
+            "the members of a page of SCIM groups",
+            Statement::Select(groups::members_query(Whose::Ids(&page))),
+            &[
+                "sqlite_autoindex_scim_group_members_1",
+                "scim_group_members_pkey",
+            ],
+            ALL_MEMBERS,
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn scim_lookups_use_their_indexes() {
+    let mut misses = Vec::new();
+    let mut check_all =
+        |backend: &str, query: &str, indexes: &[&str], forbidden: &[&str], plan: &str| {
+            check(&mut misses, backend, query, indexes, plan);
+            // A lookup searches its index; a scan, even through an index,
+            // walks every row.
+            for shown in forbidden {
+                if plan.contains(shown) {
+                    misses.push(format!("on {backend}, {query} shows {shown}:\n{plan}"));
+                }
+            }
+        };
+    let sqlite = common::sqlite().await;
+    let mut connection = SqliteConnection::connect(&sqlite.url).await.unwrap();
+    for (query, statement, indexes, forbidden) in scim_statements() {
+        let plan = sqlite_plan(&mut connection, &statement).await;
+        check_all("SQLite", query, indexes, forbidden, &plan);
+    }
+    connection.close().await.unwrap();
+    sqlite.drop_database().await;
+
+    if let Some(admin_url) = common::postgres_admin_url() {
+        let postgres = common::postgres(&admin_url).await;
+        let mut connection = PgConnection::connect(&postgres.url).await.unwrap();
+        for (query, statement, indexes, forbidden) in scim_statements() {
+            let plan = postgres_plan(&mut connection, &statement).await;
+            check_all("PostgreSQL", query, indexes, forbidden, &plan);
+        }
+        connection.close().await.unwrap();
+        postgres.drop_database().await;
+    }
+    assert!(misses.is_empty(), "{}", misses.join("\n\n"));
+}

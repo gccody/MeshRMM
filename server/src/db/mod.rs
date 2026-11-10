@@ -272,6 +272,12 @@ impl Database {
         self.counters.counts()
     }
 
+    /// The rows the pool's reads have returned since it opened, so tests can
+    /// tell a read of a few rows from a read of a whole table.
+    pub fn rows(&self) -> u64 {
+        self.counters.rows()
+    }
+
     pub fn backend(&self) -> Backend {
         match self.pool {
             Pool::Sqlite { .. } => Backend::Sqlite,
@@ -315,26 +321,32 @@ impl Database {
 
     pub async fn fetch_all<T: Row, S: Statement>(&self, statement: &S) -> Result<Vec<T>> {
         self.counters.read();
-        dispatch!(self.pool.route::<S>(), pool, builder => {
+        let rows = dispatch!(self.pool.route::<S>(), pool, builder => {
             let (sql, values) = render(statement, builder);
             sqlx::query_as_with(sql, values).fetch_all(pool).await
-        })
+        })?;
+        self.counters.returned(rows.len());
+        Ok(rows)
     }
 
     pub async fn fetch_optional<T: Row, S: Statement>(&self, statement: &S) -> Result<Option<T>> {
         self.counters.read();
-        dispatch!(self.pool.route::<S>(), pool, builder => {
+        let row = dispatch!(self.pool.route::<S>(), pool, builder => {
             let (sql, values) = render(statement, builder);
             sqlx::query_as_with(sql, values).fetch_optional(pool).await
-        })
+        })?;
+        self.counters.returned(usize::from(row.is_some()));
+        Ok(row)
     }
 
     pub async fn fetch_one<T: Row, S: Statement>(&self, statement: &S) -> Result<T> {
         self.counters.read();
-        dispatch!(self.pool.route::<S>(), pool, builder => {
+        let row = dispatch!(self.pool.route::<S>(), pool, builder => {
             let (sql, values) = render(statement, builder);
             sqlx::query_as_with(sql, values).fetch_one(pool).await
-        })
+        })?;
+        self.counters.returned(1);
+        Ok(row)
     }
 
     /// Starts a transaction. Dropping it without [`Transaction::commit`]
@@ -430,10 +442,12 @@ impl Transaction {
 
     pub async fn fetch_all<T: Row, S: Statement>(&mut self, statement: &S) -> Result<Vec<T>> {
         self.counters.read();
-        dispatch_transaction!(&mut self.inner, connection, builder => {
+        let rows = dispatch_transaction!(&mut self.inner, connection, builder => {
             let (sql, values) = render(statement, builder);
             sqlx::query_as_with(sql, values).fetch_all(&mut **connection).await
-        })
+        })?;
+        self.counters.returned(rows.len());
+        Ok(rows)
     }
 
     pub async fn fetch_optional<T: Row, S: Statement>(
@@ -441,18 +455,22 @@ impl Transaction {
         statement: &S,
     ) -> Result<Option<T>> {
         self.counters.read();
-        dispatch_transaction!(&mut self.inner, connection, builder => {
+        let row = dispatch_transaction!(&mut self.inner, connection, builder => {
             let (sql, values) = render(statement, builder);
             sqlx::query_as_with(sql, values).fetch_optional(&mut **connection).await
-        })
+        })?;
+        self.counters.returned(usize::from(row.is_some()));
+        Ok(row)
     }
 
     pub async fn fetch_one<T: Row, S: Statement>(&mut self, statement: &S) -> Result<T> {
         self.counters.read();
-        dispatch_transaction!(&mut self.inner, connection, builder => {
+        let row = dispatch_transaction!(&mut self.inner, connection, builder => {
             let (sql, values) = render(statement, builder);
             sqlx::query_as_with(sql, values).fetch_one(&mut **connection).await
-        })
+        })?;
+        self.counters.returned(1);
+        Ok(row)
     }
 
     pub async fn commit(self) -> Result<()> {

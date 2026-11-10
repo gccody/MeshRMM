@@ -6,9 +6,9 @@
 //! A user's `userName` is their email address, which is how MeshRMM
 //! identifies people.
 pub mod filter;
-mod groups;
+pub mod groups;
 pub mod patch;
-mod users;
+pub mod users;
 
 use axum::{
     Json, Router,
@@ -329,19 +329,22 @@ fn names(list: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-/// Drops top-level attributes the client didn't ask for. `id` and
-/// `schemas` are always returned.
+/// Whether the top-level attribute `key` (lowercase) is returned. `id` and
+/// `schemas` always are.
+fn returned(key: &str, wanted: &[String], excluded: &[String]) -> bool {
+    if key == "id" || key == "schemas" {
+        return true;
+    }
+    (wanted.is_empty() || wanted.iter().any(|name| name == key))
+        && !excluded.iter().any(|name| name == key)
+}
+
+/// Drops top-level attributes the client didn't ask for.
 fn project(mut resource: Value, attributes: Option<&str>, excluded: Option<&str>) -> Value {
     let wanted = names(attributes);
     let excluded = names(excluded);
     if let Some(object) = resource.as_object_mut() {
-        object.retain(|key, _| {
-            let key = key.to_ascii_lowercase();
-            if key == "id" || key == "schemas" {
-                return true;
-            }
-            (wanted.is_empty() || wanted.contains(&key)) && !excluded.contains(&key)
-        });
+        object.retain(|key, _| returned(&key.to_ascii_lowercase(), &wanted, &excluded));
     }
     resource
 }
@@ -354,18 +357,118 @@ impl Projection {
             self.excluded_attributes.as_deref(),
         )
     }
+
+    /// Whether the response has the top-level attribute `key` (lowercase),
+    /// so whether it must be read.
+    fn returns(&self, key: &str) -> bool {
+        returned(
+            key,
+            &names(self.attributes.as_deref()),
+            &names(self.excluded_attributes.as_deref()),
+        )
+    }
+}
+
+/// The matching resources a list returns: from `startIndex`, which counts
+/// from 1, at most `count` of them (RFC 7644 section 3.4.2.4).
+#[derive(Debug, Clone, Copy)]
+struct Page {
+    start_index: i64,
+    count: usize,
+}
+
+impl Page {
+    /// How many matching resources come before the page.
+    fn offset(self) -> u64 {
+        u64::try_from(self.start_index - 1).unwrap_or(u64::MAX)
+    }
+
+    fn limit(self) -> u64 {
+        u64::try_from(self.count).unwrap_or(u64::MAX)
+    }
+
+    /// `totalResults`, when the page read shows it: a page with fewer than
+    /// `count` resources holds the last of them, unless it starts past the
+    /// end. Otherwise it takes a count.
+    fn total(self, read: usize) -> Option<usize> {
+        let before = usize::try_from(self.offset()).ok()?;
+        (read < self.count && (read > 0 || before == 0)).then(|| before + read)
+    }
+
+    /// Cuts the page from every matching resource.
+    fn cut<T>(self, matching: impl IntoIterator<Item = T>) -> Vec<T> {
+        matching
+            .into_iter()
+            .skip(usize::try_from(self.offset()).unwrap_or(usize::MAX))
+            .take(self.count)
+            .collect()
+    }
+}
+
+impl ListQuery {
+    fn filter(&self) -> Result<Option<filter::Filter>, ScimError> {
+        self.filter
+            .as_deref()
+            .map(str::trim)
+            .filter(|filter| !filter.is_empty())
+            .map(filter::parse)
+            .transpose()
+            .map_err(|error| ScimError::bad_request("invalidFilter", error))
+    }
+
+    /// Without `count`, a page of [`DEFAULT_PAGE`]; never more than
+    /// [`MAX_PAGE`]. A negative `count` is 0, which returns only
+    /// `totalResults`.
+    fn page(&self) -> Page {
+        Page {
+            start_index: Ord::max(self.start_index.unwrap_or(1), 1),
+            count: self
+                .count
+                .map_or(DEFAULT_PAGE, |count| usize::try_from(count).unwrap_or(0))
+                .min(MAX_PAGE),
+        }
+    }
+
+    fn projection(&self) -> Projection {
+        Projection {
+            attributes: self.attributes.clone(),
+            excluded_attributes: self.excluded_attributes.clone(),
+        }
+    }
+}
+
+/// Whose memberships to read: a user's groups, or a group's members.
+#[derive(Debug, Clone, Copy)]
+pub enum Whose<'a, K> {
+    /// These resources', by ID.
+    Ids(&'a [String]),
+    /// Those of every resource the conditions select.
+    Matching(&'a [K]),
+}
+
+/// A list response of `total` matching resources, of which `page` are
+/// returned, projected as the query asks.
+fn list_page(total: usize, page: Page, resources: Vec<Value>, query: &ListQuery) -> Response {
+    let projection = query.projection();
+    let resources = resources
+        .into_iter()
+        .map(|resource| projection.apply(resource))
+        .collect::<Vec<_>>();
+    scim_json(
+        StatusCode::OK,
+        json!({
+            "schemas": [LIST_SCHEMA],
+            "totalResults": total,
+            "startIndex": page.start_index,
+            "itemsPerPage": resources.len(),
+            "Resources": resources,
+        }),
+    )
 }
 
 /// Filters, pages and projects `resources` into a list response.
 fn list_response(resources: Vec<Value>, query: &ListQuery) -> Result<Response, ScimError> {
-    let filter = query
-        .filter
-        .as_deref()
-        .map(str::trim)
-        .filter(|filter| !filter.is_empty())
-        .map(filter::parse)
-        .transpose()
-        .map_err(|error| ScimError::bad_request("invalidFilter", error))?;
+    let filter = query.filter()?;
     let matching = resources
         .into_iter()
         .filter(|resource| {
@@ -374,34 +477,8 @@ fn list_response(resources: Vec<Value>, query: &ListQuery) -> Result<Response, S
                 .is_none_or(|filter| filter::matches(resource, filter))
         })
         .collect::<Vec<_>>();
-    let total = matching.len();
-    let start_index = Ord::max(query.start_index.unwrap_or(1), 1);
-    let count = query
-        .count
-        .map_or(DEFAULT_PAGE, |count| usize::try_from(count).unwrap_or(0))
-        .min(MAX_PAGE);
-    let page = matching
-        .into_iter()
-        .skip(usize::try_from(start_index - 1).unwrap_or(usize::MAX))
-        .take(count)
-        .map(|resource| {
-            project(
-                resource,
-                query.attributes.as_deref(),
-                query.excluded_attributes.as_deref(),
-            )
-        })
-        .collect::<Vec<_>>();
-    Ok(scim_json(
-        StatusCode::OK,
-        json!({
-            "schemas": [LIST_SCHEMA],
-            "totalResults": total,
-            "startIndex": start_index,
-            "itemsPerPage": page.len(),
-            "Resources": page,
-        }),
-    ))
+    let page = query.page();
+    Ok(list_page(matching.len(), page, page.cut(matching), query))
 }
 
 /// Unix milliseconds as an RFC 3339 time.

@@ -122,7 +122,11 @@ input.
   header-read timeout and HTTP/2 pings, TLS session tickets, and certificate
   file reloads. See [connections](self-hosting.md#connections).
 - `auth`: passwords (Argon2id), TOTP and recovery codes, passkeys, OIDC and
-  server-side sessions. `scim`: SCIM 2.0 users and groups. `rbac`: the
+  server-side sessions. `scim`: SCIM 2.0 users and groups; the lookups an
+  identity provider sends for each user and group on every sync (`userName`,
+  `externalId`, `id`, `displayName` or a member equal to a value) run and
+  page in the database, and any other filter is evaluated on the rows they
+  select. `rbac`: the
   permission list and roles. `audit`, `mail`.
 - `api`: the `/v1` handlers, one file per area.
 - `realtime`: see below.

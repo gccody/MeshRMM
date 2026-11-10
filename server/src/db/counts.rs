@@ -1,5 +1,5 @@
 //! What a pool has run, so tests can measure an operation's work rather than
-//! its time. Counting costs an atomic increment per statement.
+//! its time. Counting costs an atomic increment or two per statement.
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// What a pool has run since it opened.
@@ -30,6 +30,7 @@ pub(super) struct Counters {
     statements: AtomicU64,
     writes: AtomicU64,
     transactions: AtomicU64,
+    rows: AtomicU64,
 }
 
 impl Counters {
@@ -42,6 +43,11 @@ impl Counters {
         self.writes.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(super) fn returned(&self, rows: usize) {
+        self.rows
+            .fetch_add(u64::try_from(rows).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
     pub(super) fn transaction(&self) {
         self.transactions.fetch_add(1, Ordering::Relaxed);
     }
@@ -52,5 +58,9 @@ impl Counters {
             writes: self.writes.load(Ordering::Relaxed),
             transactions: self.transactions.load(Ordering::Relaxed),
         }
+    }
+
+    pub(super) fn rows(&self) -> u64 {
+        self.rows.load(Ordering::Relaxed)
     }
 }

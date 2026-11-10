@@ -6,12 +6,16 @@ use axum::{
     http::{HeaderValue, StatusCode, header},
     response::Response,
 };
-use sea_query::{Expr, ExprTrait, LockType, Order, Query as Sql};
+use std::collections::HashMap;
+
+use sea_query::{Expr, ExprTrait, Func, LockType, Order, Query as Sql, SelectStatement};
 use serde_json::{Map, Value, json};
 
 use super::{
-    ListQuery, Projection, ScimBody, ScimClient, ScimError, USER_SCHEMA, base_url, boolean,
-    ensure_administrator_remains, filter, list_response, meta,
+    ListQuery, Projection, ScimBody, ScimClient, ScimError, USER_SCHEMA, Whose, base_url, boolean,
+    ensure_administrator_remains,
+    filter::{self, Filter},
+    list_page, meta,
     patch::{Operation, PatchRequest},
     scim_json, text,
 };
@@ -75,11 +79,103 @@ impl UserInput {
     }
 }
 
-/// The groups each user belongs to, as `(user ID, group ID, group name)`.
-async fn memberships(
-    executor: &mut impl Executor,
-    user_id: Option<&str>,
-) -> crate::db::Result<Vec<(String, String, String)>> {
+/// A condition on users that SQL tests exactly as [`filter::matches`] would
+/// on their resources.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserKey {
+    Id(String),
+    /// `userName`, or the one email: the account's email, which is stored
+    /// lowercased, so this is the value lowercased the same way.
+    Email(String),
+    ExternalId(String),
+}
+
+impl UserKey {
+    /// `filter` as a condition SQL tests, if it is one: the ID, the
+    /// external ID, `userName` or the email equals a string.
+    fn from_filter(filter: &Filter) -> Option<Self> {
+        if let Some(id) = filter::equals(filter, &["id"]) {
+            return Some(Self::Id(id.to_owned()));
+        }
+        if let Some(external_id) = filter::equals(filter, &["externalid"]) {
+            return Some(Self::ExternalId(external_id.to_owned()));
+        }
+        filter::equals(filter, &["username"])
+            .or_else(|| filter::equals(filter, &["emails", "value"]))
+            .or_else(|| work_email(filter))
+            .map(|email| Self::Email(email.to_lowercase()))
+    }
+
+    fn condition(&self) -> Expr {
+        match self {
+            Self::Id(id) => Expr::col((Users::Table, Users::Id)).eq(id.as_str()),
+            Self::Email(email) => Expr::col((Users::Table, Users::Email)).eq(email.as_str()),
+            Self::ExternalId(external_id) => {
+                Expr::col((Users::Table, Users::ScimExternalId)).eq(external_id.as_str())
+            }
+        }
+    }
+}
+
+/// `emails[type eq "work" and value eq "…"]`: the one email is the work one.
+fn work_email(filter: &Filter) -> Option<&str> {
+    let Filter::ValuePath { attribute, filter } = filter else {
+        return None;
+    };
+    let Filter::And(left, right) = &**filter else {
+        return None;
+    };
+    if attribute != "emails" {
+        return None;
+    }
+    [(left, right), (right, left)]
+        .into_iter()
+        .find_map(|(kind, value)| {
+            let work = filter::equals(kind, &["type"])?.to_lowercase() == "work";
+            work.then(|| filter::equals(value, &["value"])).flatten()
+        })
+}
+
+/// Splits a list's filter into the conditions SQL tests and the rest, which
+/// is evaluated on the users SQL found.
+pub fn plan(filter: Option<Filter>) -> (Vec<UserKey>, Option<Filter>) {
+    filter.map_or_else(Default::default, |filter| {
+        filter::split(filter, UserKey::from_filter)
+    })
+}
+
+/// Every user `keys` select, in the order lists return them.
+pub fn matching_query(keys: &[UserKey]) -> SelectStatement {
+    let mut select = users::select();
+    for key in keys {
+        select.and_where(key.condition());
+    }
+    select
+        .order_by((Users::Table, Users::CreatedAt), Order::Asc)
+        .order_by((Users::Table, Users::Id), Order::Asc)
+        .to_owned()
+}
+
+/// A page of the users `keys` select.
+pub fn page_query(keys: &[UserKey], offset: u64, limit: u64) -> SelectStatement {
+    matching_query(keys).limit(limit).offset(offset).to_owned()
+}
+
+/// How many users `keys` select.
+pub fn count_query(keys: &[UserKey]) -> SelectStatement {
+    let mut select = Sql::select();
+    select
+        .expr(Func::count(Expr::col((Users::Table, Users::Id))))
+        .from(Users::Table);
+    for key in keys {
+        select.and_where(key.condition());
+    }
+    select
+}
+
+/// The groups of the users `whose` names, as `(user ID, group ID, group
+/// name)` in name order.
+pub fn memberships_query(whose: Whose<'_, UserKey>) -> SelectStatement {
     let mut select = Sql::select();
     select
         .column((ScimGroupMembers::Table, ScimGroupMembers::UserId))
@@ -92,14 +188,43 @@ async fn memberships(
                 .equals((ScimGroupMembers::Table, ScimGroupMembers::GroupId)),
         )
         .order_by((ScimGroups::Table, ScimGroups::DisplayName), Order::Asc);
-    if let Some(user_id) = user_id {
-        select
-            .and_where(Expr::col((ScimGroupMembers::Table, ScimGroupMembers::UserId)).eq(user_id));
+    let user = Expr::col((ScimGroupMembers::Table, ScimGroupMembers::UserId));
+    match whose {
+        Whose::Ids(ids) => {
+            select.and_where(user.is_in(ids.iter().map(String::as_str)));
+        }
+        Whose::Matching([]) => {}
+        Whose::Matching(keys) => {
+            let mut users = Sql::select();
+            users.column((Users::Table, Users::Id)).from(Users::Table);
+            for key in keys {
+                users.and_where(key.condition());
+            }
+            select.and_where(user.in_subquery(users));
+        }
     }
-    executor.fetch_all(&select).await
+    select
 }
 
-fn resource(state: &AppState, user: &User, groups: &[(String, String, String)]) -> Value {
+/// Each user's groups, as `(group ID, group name)` in name order.
+type Groups = HashMap<String, Vec<(String, String)>>;
+
+async fn memberships(
+    executor: &mut impl Executor,
+    whose: Whose<'_, UserKey>,
+) -> crate::db::Result<Groups> {
+    if matches!(whose, Whose::Ids([])) {
+        return Ok(Groups::new());
+    }
+    let rows: Vec<(String, String, String)> = executor.fetch_all(&memberships_query(whose)).await?;
+    let mut groups = Groups::new();
+    for (user_id, group_id, name) in rows {
+        groups.entry(user_id).or_default().push((group_id, name));
+    }
+    Ok(groups)
+}
+
+fn resource(state: &AppState, user: &User, groups: &Groups) -> Value {
     let mut resource = json!({
         "schemas": [USER_SCHEMA],
         "id": user.id,
@@ -109,9 +234,10 @@ fn resource(state: &AppState, user: &User, groups: &[(String, String, String)]) 
         "emails": [{ "value": user.email, "type": "work", "primary": true }],
         "active": !user.disabled,
         "groups": groups
-            .iter()
-            .filter(|(member, _, _)| *member == user.id)
-            .map(|(_, id, name)| json!({
+            .get(&user.id)
+            .into_iter()
+            .flatten()
+            .map(|(id, name)| json!({
                 "value": id,
                 "display": name,
                 "$ref": format!("{}/Groups/{id}", base_url(state)),
@@ -125,16 +251,34 @@ fn resource(state: &AppState, user: &User, groups: &[(String, String, String)]) 
     resource
 }
 
+fn ids<'a>(users: impl IntoIterator<Item = &'a User>) -> Vec<String> {
+    users.into_iter().map(|user| user.id.clone()).collect()
+}
+
+/// The user `id`, with their groups if `with_groups`.
+async fn find(
+    executor: &mut impl Executor,
+    state: &AppState,
+    id: &str,
+    with_groups: bool,
+) -> Result<Value, ScimError> {
+    let user = users::by_id(executor, id)
+        .await?
+        .ok_or_else(|| ScimError::not_found("no such user"))?;
+    let groups = if with_groups {
+        memberships(executor, Whose::Ids(&ids([&user]))).await?
+    } else {
+        Groups::new()
+    };
+    Ok(resource(state, &user, &groups))
+}
+
 async fn load(
     executor: &mut impl Executor,
     state: &AppState,
     id: &str,
 ) -> Result<Value, ScimError> {
-    let user = users::by_id(executor, id)
-        .await?
-        .ok_or_else(|| ScimError::not_found("no such user"))?;
-    let groups = memberships(executor, Some(&user.id)).await?;
-    Ok(resource(state, &user, &groups))
+    find(executor, state, id, true).await
 }
 
 fn with_location(state: &AppState, status: StatusCode, resource: Value) -> Response {
@@ -150,27 +294,65 @@ fn with_location(state: &AppState, status: StatusCode, resource: Value) -> Respo
     response
 }
 
-/// `GET /scim/v2/Users`
+/// `GET /scim/v2/Users`. The conditions identity providers look users up by
+/// run in SQL, which pages them too; the rest of a filter is evaluated on
+/// the users those conditions select. Groups are read for the page only.
 pub async fn list(
     State(state): State<AppState>,
     _client: ScimClient,
     Query(query): Query<ListQuery>,
 ) -> Result<Response, ScimError> {
+    let (keys, rest) = plan(query.filter()?);
+    let page = query.page();
+    let with_groups = query.projection().returns("groups");
     let mut database = &state.database;
-    let all: Vec<User> = database
-        .fetch_all(
-            &users::select()
-                .order_by(Users::CreatedAt, Order::Asc)
-                .to_owned(),
-        )
-        .await?;
-    let groups = memberships(&mut database, None).await?;
-    list_response(
-        all.iter()
+    let Some(rest) = rest else {
+        let users: Vec<User> = if page.count == 0 {
+            Vec::new()
+        } else {
+            database
+                .fetch_all(&page_query(&keys, page.offset(), page.limit()))
+                .await?
+        };
+        let total = match page.total(users.len()) {
+            Some(total) => total,
+            None => {
+                let (count,): (i64,) = database.fetch_one(&count_query(&keys)).await?;
+                usize::try_from(count).unwrap_or_default()
+            }
+        };
+        let groups = if with_groups {
+            memberships(&mut database, Whose::Ids(&ids(&users))).await?
+        } else {
+            Groups::new()
+        };
+        let resources = users
+            .iter()
             .map(|user| resource(&state, user, &groups))
-            .collect(),
-        &query,
-    )
+            .collect();
+        return Ok(list_page(total, page, resources, &query));
+    };
+    let users: Vec<User> = database.fetch_all(&matching_query(&keys)).await?;
+    let filtered_by_groups = filter::mentions(&rest, "groups");
+    let mut groups = if filtered_by_groups {
+        memberships(&mut database, Whose::Matching(&keys)).await?
+    } else {
+        Groups::new()
+    };
+    let matching = users
+        .iter()
+        .filter(|user| filter::matches(&resource(&state, user, &groups), &rest))
+        .collect::<Vec<_>>();
+    let total = matching.len();
+    let users = page.cut(matching);
+    if with_groups && !filtered_by_groups {
+        groups = memberships(&mut database, Whose::Ids(&ids(users.iter().copied()))).await?;
+    }
+    let resources = users
+        .iter()
+        .map(|user| resource(&state, user, &groups))
+        .collect();
+    Ok(list_page(total, page, resources, &query))
 }
 
 /// `GET /scim/v2/Users/{id}`
@@ -180,7 +362,13 @@ pub async fn get(
     Path(id): Path<String>,
     Query(projection): Query<Projection>,
 ) -> Result<Response, ScimError> {
-    let resource = load(&mut &state.database, &state, &id).await?;
+    let resource = find(
+        &mut &state.database,
+        &state,
+        &id,
+        projection.returns("groups"),
+    )
+    .await?;
     Ok(scim_json(StatusCode::OK, projection.apply(resource)))
 }
 
@@ -423,6 +611,61 @@ pub async fn delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn keys(text: &str) -> (Vec<UserKey>, Option<Filter>) {
+        plan(Some(filter::parse(text).unwrap()))
+    }
+
+    #[test]
+    fn lookups_by_name_email_and_ids_run_in_sql() {
+        let email = || UserKey::Email("ada@example.com".into());
+        for text in [
+            r#"userName eq "Ada@Example.com""#,
+            r#"urn:ietf:params:scim:schemas:core:2.0:User:userName eq "ADA@example.com""#,
+            r#"emails.value eq "ada@EXAMPLE.com""#,
+            r#"emails[value eq "ada@example.com"]"#,
+            r#"emails[type eq "Work" and value eq "ada@example.com"]"#,
+            r#"emails[value eq "ada@example.com" and type eq "work"]"#,
+        ] {
+            assert_eq!(keys(text), (vec![email()], None), "{text}");
+        }
+        assert_eq!(
+            keys(r#"externalId eq "Ext-1" and id eq "AbC""#),
+            (
+                vec![
+                    UserKey::ExternalId("Ext-1".into()),
+                    UserKey::Id("AbC".into())
+                ],
+                None
+            )
+        );
+        assert_eq!(
+            keys(r#"userName eq "ada@example.com" and active eq true"#),
+            (
+                vec![email()],
+                Some(filter::parse("active eq true").unwrap())
+            )
+        );
+    }
+
+    #[test]
+    fn other_filters_are_evaluated_on_the_resources() {
+        for text in [
+            r#"userName sw "ada""#,
+            r#"userName eq "a" or externalId eq "b""#,
+            r#"not (id eq "a")"#,
+            r#"displayName eq "Ada""#,
+            r#"emails[type eq "home" and value eq "ada@example.com"]"#,
+            r#"emails[type eq "work"]"#,
+            r#"groups[value eq "g"]"#,
+            r#"externalId eq null"#,
+            "userName pr",
+        ] {
+            let (keys, rest) = keys(text);
+            assert!(keys.is_empty(), "{text}");
+            assert_eq!(rest, Some(filter::parse(text).unwrap()), "{text}");
+        }
+    }
 
     #[test]
     fn user_input_reads_names_and_entra_booleans() {

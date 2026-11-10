@@ -1,19 +1,21 @@
 //! `/scim/v2/Groups`. Groups come from the identity provider; an
 //! administrator maps a group to a role on the Authentication page, and its
 //! members hold that role while they stay in the group.
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderValue, StatusCode, header},
     response::Response,
 };
-use sea_query::{Expr, ExprTrait, Func, LockType, Order, Query as Sql};
+use sea_query::{Expr, ExprTrait, Func, LockType, Order, Query as Sql, SelectStatement};
 use serde_json::{Map, Value, json};
 
 use super::{
-    GROUP_SCHEMA, ListQuery, Projection, ScimBody, ScimClient, ScimError, base_url,
-    ensure_administrator_remains, filter, list_response, meta,
+    GROUP_SCHEMA, ListQuery, Projection, ScimBody, ScimClient, ScimError, Whose, base_url,
+    ensure_administrator_remains,
+    filter::{self, Filter},
+    list_page, meta,
     patch::{Operation, PatchRequest},
     scim_json, text,
 };
@@ -118,11 +120,101 @@ fn select() -> sea_query::SelectStatement {
         .to_owned()
 }
 
-/// Members as `(group ID, user ID, email)`.
-async fn members(
-    executor: &mut impl Executor,
-    group_id: Option<&str>,
-) -> crate::db::Result<Vec<(String, String, String)>> {
+/// A condition on groups that SQL tests exactly as [`filter::matches`]
+/// would on their resources.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupKey {
+    Id(String),
+    /// `displayName`, lowercased as `display_name_key` is.
+    Name(String),
+    ExternalId(String),
+    /// The group has this user as a member.
+    Member(String),
+}
+
+impl GroupKey {
+    /// `filter` as a condition SQL tests, if it is one: the ID, the
+    /// external ID, `displayName` or a member's ID equals a string.
+    fn from_filter(filter: &Filter) -> Option<Self> {
+        if let Some(id) = filter::equals(filter, &["id"]) {
+            return Some(Self::Id(id.to_owned()));
+        }
+        if let Some(external_id) = filter::equals(filter, &["externalid"]) {
+            return Some(Self::ExternalId(external_id.to_owned()));
+        }
+        if let Some(user_id) = filter::equals(filter, &["members", "value"]) {
+            return Some(Self::Member(user_id.to_owned()));
+        }
+        filter::equals(filter, &["displayname"]).map(|name| Self::Name(name_key(name)))
+    }
+
+    fn condition(&self) -> Expr {
+        match self {
+            Self::Id(id) => Expr::col((ScimGroups::Table, ScimGroups::Id)).eq(id.as_str()),
+            Self::Name(key) => {
+                Expr::col((ScimGroups::Table, ScimGroups::DisplayNameKey)).eq(key.as_str())
+            }
+            Self::ExternalId(external_id) => {
+                Expr::col((ScimGroups::Table, ScimGroups::ExternalId)).eq(external_id.as_str())
+            }
+            Self::Member(user_id) => Expr::col((ScimGroups::Table, ScimGroups::Id)).in_subquery(
+                Sql::select()
+                    .column((ScimGroupMembers::Table, ScimGroupMembers::GroupId))
+                    .from(ScimGroupMembers::Table)
+                    .and_where(
+                        Expr::col((ScimGroupMembers::Table, ScimGroupMembers::UserId))
+                            .eq(user_id.as_str()),
+                    )
+                    .to_owned(),
+            ),
+        }
+    }
+}
+
+/// A display name as filters compare it, kept in `display_name_key`.
+fn name_key(display_name: &str) -> String {
+    display_name.to_lowercase()
+}
+
+/// Splits a list's filter into the conditions SQL tests and the rest, which
+/// is evaluated on the groups SQL found.
+pub fn plan(filter: Option<Filter>) -> (Vec<GroupKey>, Option<Filter>) {
+    filter.map_or_else(Default::default, |filter| {
+        filter::split(filter, GroupKey::from_filter)
+    })
+}
+
+/// Every group `keys` select, in the order lists return them.
+pub fn matching_query(keys: &[GroupKey]) -> SelectStatement {
+    let mut matching = select();
+    for key in keys {
+        matching.and_where(key.condition());
+    }
+    matching
+        .order_by((ScimGroups::Table, ScimGroups::DisplayName), Order::Asc)
+        .to_owned()
+}
+
+/// A page of the groups `keys` select.
+pub fn page_query(keys: &[GroupKey], offset: u64, limit: u64) -> SelectStatement {
+    matching_query(keys).limit(limit).offset(offset).to_owned()
+}
+
+/// How many groups `keys` select.
+pub fn count_query(keys: &[GroupKey]) -> SelectStatement {
+    let mut select = Sql::select();
+    select
+        .expr(Func::count(Expr::col((ScimGroups::Table, ScimGroups::Id))))
+        .from(ScimGroups::Table);
+    for key in keys {
+        select.and_where(key.condition());
+    }
+    select
+}
+
+/// The members of the groups `whose` names, as `(group ID, user ID,
+/// email)` in email order.
+pub fn members_query(whose: Whose<'_, GroupKey>) -> SelectStatement {
     let mut select = Sql::select();
     select
         .column((ScimGroupMembers::Table, ScimGroupMembers::GroupId))
@@ -135,23 +227,54 @@ async fn members(
                 .equals((ScimGroupMembers::Table, ScimGroupMembers::UserId)),
         )
         .order_by((Users::Table, Users::Email), Order::Asc);
-    if let Some(group_id) = group_id {
-        select.and_where(
-            Expr::col((ScimGroupMembers::Table, ScimGroupMembers::GroupId)).eq(group_id),
-        );
+    let group = Expr::col((ScimGroupMembers::Table, ScimGroupMembers::GroupId));
+    match whose {
+        Whose::Ids(ids) => {
+            select.and_where(group.is_in(ids.iter().map(String::as_str)));
+        }
+        Whose::Matching([]) => {}
+        Whose::Matching(keys) => {
+            let mut groups = Sql::select();
+            groups
+                .column((ScimGroups::Table, ScimGroups::Id))
+                .from(ScimGroups::Table);
+            for key in keys {
+                groups.and_where(key.condition());
+            }
+            select.and_where(group.in_subquery(groups));
+        }
     }
-    executor.fetch_all(&select).await
+    select
 }
 
-fn resource(state: &AppState, group: &GroupRow, members: &[(String, String, String)]) -> Value {
+/// Each group's members, as `(user ID, email)` in email order.
+type Members = HashMap<String, Vec<(String, String)>>;
+
+async fn members_of(
+    executor: &mut impl Executor,
+    whose: Whose<'_, GroupKey>,
+) -> crate::db::Result<Members> {
+    if matches!(whose, Whose::Ids([])) {
+        return Ok(Members::new());
+    }
+    let rows: Vec<(String, String, String)> = executor.fetch_all(&members_query(whose)).await?;
+    let mut members = Members::new();
+    for (group_id, user_id, email) in rows {
+        members.entry(group_id).or_default().push((user_id, email));
+    }
+    Ok(members)
+}
+
+fn resource(state: &AppState, group: &GroupRow, members: &Members) -> Value {
     let mut resource = json!({
         "schemas": [GROUP_SCHEMA],
         "id": group.id,
         "displayName": group.display_name,
         "members": members
-            .iter()
-            .filter(|(group_id, _, _)| *group_id == group.id)
-            .map(|(_, user_id, email)| json!({
+            .get(&group.id)
+            .into_iter()
+            .flatten()
+            .map(|(user_id, email)| json!({
                 "value": user_id,
                 "display": email,
                 "type": "User",
@@ -177,38 +300,94 @@ async fn row(executor: &mut impl Executor, id: &str) -> Result<GroupRow, ScimErr
         .ok_or_else(|| ScimError::not_found("no such group"))
 }
 
+fn ids<'a>(groups: impl IntoIterator<Item = &'a GroupRow>) -> Vec<String> {
+    groups.into_iter().map(|group| group.id.clone()).collect()
+}
+
+/// The group `id`, with its members if `with_members`.
+async fn find(
+    executor: &mut impl Executor,
+    state: &AppState,
+    id: &str,
+    with_members: bool,
+) -> Result<Value, ScimError> {
+    let group = row(executor, id).await?;
+    let members = if with_members {
+        members_of(executor, Whose::Ids(&ids([&group]))).await?
+    } else {
+        Members::new()
+    };
+    Ok(resource(state, &group, &members))
+}
+
 async fn load(
     executor: &mut impl Executor,
     state: &AppState,
     id: &str,
 ) -> Result<Value, ScimError> {
-    let group = row(executor, id).await?;
-    let members = members(executor, Some(id)).await?;
-    Ok(resource(state, &group, &members))
+    find(executor, state, id, true).await
 }
 
-/// `GET /scim/v2/Groups`
+/// `GET /scim/v2/Groups`. The conditions identity providers look groups up
+/// by run in SQL, which pages them too; the rest of a filter is evaluated on
+/// the groups those conditions select. Members are read for the page only,
+/// and not at all when the response leaves them out.
 pub async fn list(
     State(state): State<AppState>,
     _client: ScimClient,
     Query(query): Query<ListQuery>,
 ) -> Result<Response, ScimError> {
+    let (keys, rest) = plan(query.filter()?);
+    let page = query.page();
+    let with_members = query.projection().returns("members");
     let mut database = &state.database;
-    let groups: Vec<GroupRow> = database
-        .fetch_all(
-            &select()
-                .order_by(ScimGroups::DisplayName, Order::Asc)
-                .to_owned(),
-        )
-        .await?;
-    let members = members(&mut database, None).await?;
-    list_response(
-        groups
+    let Some(rest) = rest else {
+        let groups: Vec<GroupRow> = if page.count == 0 {
+            Vec::new()
+        } else {
+            database
+                .fetch_all(&page_query(&keys, page.offset(), page.limit()))
+                .await?
+        };
+        let total = match page.total(groups.len()) {
+            Some(total) => total,
+            None => {
+                let (count,): (i64,) = database.fetch_one(&count_query(&keys)).await?;
+                usize::try_from(count).unwrap_or_default()
+            }
+        };
+        let members = if with_members {
+            members_of(&mut database, Whose::Ids(&ids(&groups))).await?
+        } else {
+            Members::new()
+        };
+        let resources = groups
             .iter()
             .map(|group| resource(&state, group, &members))
-            .collect(),
-        &query,
-    )
+            .collect();
+        return Ok(list_page(total, page, resources, &query));
+    };
+    let groups: Vec<GroupRow> = database.fetch_all(&matching_query(&keys)).await?;
+    let filtered_by_members = filter::mentions(&rest, "members");
+    let mut members = if filtered_by_members {
+        members_of(&mut database, Whose::Matching(&keys)).await?
+    } else {
+        Members::new()
+    };
+    let matching = groups
+        .iter()
+        .filter(|group| filter::matches(&resource(&state, group, &members), &rest))
+        .collect::<Vec<_>>();
+    let total = matching.len();
+    let groups = page.cut(matching);
+    if with_members && !filtered_by_members {
+        members = members_of(&mut database, Whose::Ids(&ids(groups.iter().copied()))).await?;
+    }
+    let resources = groups
+        .iter()
+        .map(|group| resource(&state, group, &members))
+        .collect();
+    Ok(list_page(total, page, resources, &query))
 }
 
 /// `GET /scim/v2/Groups/{id}`
@@ -218,7 +397,13 @@ pub async fn get(
     Path(id): Path<String>,
     Query(projection): Query<Projection>,
 ) -> Result<Response, ScimError> {
-    let resource = load(&mut &state.database, &state, &id).await?;
+    let resource = find(
+        &mut &state.database,
+        &state,
+        &id,
+        projection.returns("members"),
+    )
+    .await?;
     Ok(scim_json(StatusCode::OK, projection.apply(resource)))
 }
 
@@ -327,6 +512,7 @@ pub async fn create(
                 .columns([
                     ScimGroups::Id,
                     ScimGroups::DisplayName,
+                    ScimGroups::DisplayNameKey,
                     ScimGroups::ExternalId,
                     ScimGroups::CreatedAt,
                     ScimGroups::UpdatedAt,
@@ -334,6 +520,7 @@ pub async fn create(
                 .values_panic([
                     id.as_str().into(),
                     input.display_name.as_str().into(),
+                    name_key(&input.display_name).into(),
                     input.external_id.clone().into(),
                     now.into(),
                     now.into(),
@@ -402,10 +589,12 @@ async fn update(
     };
     let group = row(&mut transaction, id).await?;
     check(&mut transaction, &input, Some(id)).await?;
-    let current: BTreeSet<String> = members(&mut transaction, Some(id))
+    let current: BTreeSet<String> = members_of(&mut transaction, Whose::Ids(&[id.to_owned()]))
         .await?
+        .remove(id)
         .into_iter()
-        .map(|(_, user_id, _)| user_id)
+        .flatten()
+        .map(|(user_id, _)| user_id)
         .collect();
     let added = input.members.difference(&current).collect::<Vec<_>>();
     let removed = current.difference(&input.members).collect::<Vec<_>>();
@@ -433,6 +622,10 @@ async fn update(
                 .table(ScimGroups::Table)
                 .values([
                     (ScimGroups::DisplayName, input.display_name.as_str().into()),
+                    (
+                        ScimGroups::DisplayNameKey,
+                        name_key(&input.display_name).into(),
+                    ),
                     (ScimGroups::ExternalId, input.external_id.clone().into()),
                     (ScimGroups::UpdatedAt, now_ms().into()),
                 ])
@@ -533,4 +726,62 @@ pub async fn delete(
         state.presence.recheck_access();
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys(text: &str) -> (Vec<GroupKey>, Option<Filter>) {
+        plan(Some(filter::parse(text).unwrap()))
+    }
+
+    #[test]
+    fn lookups_by_name_ids_and_member_run_in_sql() {
+        assert_eq!(
+            keys(r#"displayName eq "Équipe IT""#),
+            (vec![GroupKey::Name("équipe it".into())], None)
+        );
+        // Entra checks a membership with the group's ID and the user's.
+        assert_eq!(
+            keys(r#"id eq "G1" and members[value eq "U1"]"#),
+            (
+                vec![GroupKey::Id("G1".into()), GroupKey::Member("U1".into())],
+                None
+            )
+        );
+        assert_eq!(
+            keys(r#"members.value eq "U1" and externalId eq "Ext""#),
+            (
+                vec![
+                    GroupKey::Member("U1".into()),
+                    GroupKey::ExternalId("Ext".into())
+                ],
+                None
+            )
+        );
+        assert_eq!(
+            keys(r#"displayName eq "IT" and displayName co "i""#),
+            (
+                vec![GroupKey::Name("it".into())],
+                Some(filter::parse(r#"displayName co "i""#).unwrap())
+            )
+        );
+    }
+
+    #[test]
+    fn other_filters_are_evaluated_on_the_resources() {
+        for text in [
+            r#"displayName sw "IT""#,
+            r#"displayName eq "a" or displayName eq "b""#,
+            r#"not (members[value eq "U1"])"#,
+            r#"members[value eq "U1" and display eq "a@example.com"]"#,
+            r#"members[display eq "a@example.com"]"#,
+            "members pr",
+        ] {
+            let (keys, rest) = keys(text);
+            assert!(keys.is_empty(), "{text}");
+            assert_eq!(rest, Some(filter::parse(text).unwrap()), "{text}");
+        }
+    }
 }
