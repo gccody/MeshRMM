@@ -206,8 +206,26 @@ how relays are chosen and what the sleeping computer needs.
 
 ## Agent updates
 
-The service checks the server's update manifest when it starts and every six
-hours after. For a newer release it:
+The service checks the server's update manifest about every six hours. Every
+Agent of a server gets the same release, so the checks are spread out:
+
+- The first start of a newly installed or updated build checks 30 to 90
+  seconds after it starts, since its installer may be older than the
+  server's release. A build counts as started before once one of its checks
+  has succeeded (`updates/checked-version` in the Agent's configuration
+  directory).
+- An ordinary restart first checks at the device's own point in the six
+  hours, derived from its device ID, so it may wait up to six hours. Devices
+  that restart together, as when a site's power returns, still check apart.
+- Each later interval is lengthened or shortened by up to 10 percent at
+  random, so devices do not stay in step.
+- A check that fails is retried after about 2 minutes, then 4, 8 and so on
+  up to about an hour, each shortened by up to half at random, until one
+  succeeds; then the six-hour schedule resumes.
+- A check that falls due during a remote session waits for it to end,
+  checking again every 5 minutes, for at most 24 hours.
+
+For a newer release it:
 
 1. checks the manifest entry's release signature and downloads the build;
 2. checks the build's SHA-256;
@@ -216,7 +234,12 @@ hours after. For a newer release it:
 4. restores and starts the previous binary if the new service does not reach
    `Running`.
 
-A check that fails is logged and does not disconnect the Agent. The version
+A check that fails is logged and does not disconnect the Agent. A release is
+tried at most three times in 24 hours, so one that installs and then rolls
+back is not reinstalled in a loop. An attempt counts once the build has
+downloaded in full: a download cut short is retried on the failed-check
+backoff without using one, while a build that fails its checks uses one
+each time. Attempts are kept in `updates/update-attempts.json`. The version
 compared is the one compiled in from `release.json`, not Cargo's package
 version. See [releases](releases.md#release-signatures) for what the
 signature covers.

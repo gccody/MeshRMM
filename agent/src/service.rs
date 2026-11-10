@@ -25,7 +25,7 @@ use windows_service::{define_windows_service, service_dispatcher};
 
 use crate::remote::config::Config;
 use crate::remote::service_link::{SESSION_ACTIVE, SESSION_IDLE, UPDATING_PREFIX};
-use crate::update_policy::UpdateSchedule;
+use crate::update_policy::{UpdateSchedule, random_bits};
 use crate::win32::{OwnedHandle, wide};
 
 /// Covers the coordinator's session close helpers, which may each take 10 seconds.
@@ -125,7 +125,16 @@ fn run_service() -> anyhow::Result<()> {
 
     let mut worker: Option<Coordinator> = None;
     let mut trays = trays::Trays::default();
-    let mut updates = UpdateSchedule::new(Instant::now());
+    let first_start = config
+        .config_path
+        .parent()
+        .is_some_and(|directory| !crate::updater::has_checked(directory));
+    let mut updates = UpdateSchedule::new(
+        Instant::now(),
+        &config.device_id,
+        first_start,
+        random_bits(),
+    );
     // Whether the coordinator gets to end its remote sessions and run their close actions.
     let graceful = loop {
         // The authenticated coordinator deliberately remains in the service's
@@ -168,9 +177,10 @@ fn run_service() -> anyhow::Result<()> {
                     }
                     break true;
                 }
-                Ok(None) => {}
+                Ok(None) => updates.checked(Instant::now(), true, random_bits()),
                 Err(error) => {
                     tracing::warn!(error = ?error, "automatic Agent update check failed");
+                    updates.checked(Instant::now(), false, random_bits());
                 }
             }
         }

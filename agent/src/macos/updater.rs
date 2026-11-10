@@ -21,9 +21,11 @@ use meshrmm_self_update::{AGENT_MACOS, CURRENT_VERSION, UpdateManifest, macos};
 use super::installer::{APP, BUNDLE_IDENTIFIER, DAEMON_LABEL, HELPER_LABEL, SUPPORT_DIRECTORY};
 use crate::remote::config::Config;
 use crate::remote::service_link::ServiceLink;
-use crate::update_policy::{UpdateAttempts, UpdateSchedule, read_attempts};
+use crate::update_policy::{
+    CHECKED_VERSION_FILE, UpdateAttempts, UpdateSchedule, checked_before, random_bits,
+    read_attempts, record_check,
+};
 
-const FIRST_CHECK_DELAY: Duration = Duration::from_secs(60);
 const SCHEDULE_TICK: Duration = Duration::from_secs(30);
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_UPDATE_BYTES: u64 = 256 * 1024 * 1024;
@@ -36,21 +38,34 @@ const ATTEMPTS_FILE: &str = "update-attempts.json";
 /// Checks for updates until one is staged, then stops the coordinator so the
 /// new Agent can replace it.
 pub(crate) async fn run(config: Config, link: Arc<ServiceLink>) {
-    tokio::time::sleep(FIRST_CHECK_DELAY).await;
-    let mut schedule = UpdateSchedule::new(Instant::now());
+    let first_start = updates_directory()
+        .is_ok_and(|updates| !checked_before(&updates.join(CHECKED_VERSION_FILE)));
+    let mut schedule = UpdateSchedule::new(
+        Instant::now(),
+        &config.device_id,
+        first_start,
+        random_bits(),
+    );
     loop {
         if schedule.due(Instant::now(), link.session_active()) {
             let check_config = config.clone();
-            match tokio::task::spawn_blocking(move || stage(&check_config)).await {
+            let succeeded = match tokio::task::spawn_blocking(move || stage(&check_config)).await {
                 Ok(Ok(Some(version))) => {
                     tracing::info!(%version, "stopping the Agent to install an update");
                     link.stop_for_update(version);
                     return;
                 }
-                Ok(Ok(None)) => {}
-                Ok(Err(error)) => tracing::warn!(error = ?error, "Agent update check failed"),
-                Err(error) => tracing::warn!(%error, "Agent update check stopped"),
-            }
+                Ok(Ok(None)) => true,
+                Ok(Err(error)) => {
+                    tracing::warn!(error = ?error, "Agent update check failed");
+                    false
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Agent update check stopped");
+                    false
+                }
+            };
+            schedule.checked(Instant::now(), succeeded, random_bits());
         }
         tokio::time::sleep(SCHEDULE_TICK).await;
     }
@@ -87,10 +102,14 @@ fn stage(config: &Config) -> anyhow::Result<Option<String>> {
         Some(_) => manifest.newer_developer_id_release(AGENT_MACOS, CURRENT_VERSION)?,
         None => manifest.newer_release(AGENT_MACOS, CURRENT_VERSION)?,
     };
+    let updates = updates_directory()?;
     let Some(release) = release else {
+        record_check(
+            &updates.join(CHECKED_VERSION_FILE),
+            super::installer::replace_file,
+        );
         return Ok(None);
     };
-    let updates = updates_directory()?;
     let attempts_path = updates.join(ATTEMPTS_FILE);
     let Some(attempt) = UpdateAttempts::next(
         read_attempts(&attempts_path).as_ref(),
@@ -98,9 +117,12 @@ fn stage(config: &Config) -> anyhow::Result<Option<String>> {
         unix_seconds(),
     ) else {
         tracing::warn!(version = %release.version, "skipping an Agent update that already failed repeatedly");
+        record_check(
+            &updates.join(CHECKED_VERSION_FILE),
+            super::installer::replace_file,
+        );
         return Ok(None);
     };
-    super::installer::replace_file(&attempts_path, &serde_json::to_vec(&attempt)?)?;
     tracing::info!(version = %release.version, "downloading an Agent update");
     let archive = read_limited(
         http.get(&release.url)
@@ -110,6 +132,8 @@ fn stage(config: &Config) -> anyhow::Result<Option<String>> {
             .into_reader(),
         MAX_UPDATE_BYTES,
     )?;
+    // Only a complete download uses an attempt, so one cut short is retried on the backoff.
+    super::installer::replace_file(&attempts_path, &serde_json::to_vec(&attempt)?)?;
     release.verify(&archive)?;
     let staging = updates.join(format!("agent-{}-{}", release.version, std::process::id()));
     let _ = std::fs::remove_dir_all(&staging);

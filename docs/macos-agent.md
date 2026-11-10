@@ -76,8 +76,9 @@ them again. Operators avoid this by having their server
 
 ## Updates
 
-The coordinator updates the Agent as the Windows service does: every six
-hours, and postponed while a remote session is live, it stages a newer
+The coordinator updates the Agent as the Windows service does: on the
+[spread-out six-hour schedule](devices.md#agent-updates), and postponed while
+a remote session is live, it stages a newer
 `agent-macos` release once its SHA-256 and signature check out.
 
 - An Agent signed with a Developer ID takes only builds signed by the same

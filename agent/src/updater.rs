@@ -18,7 +18,10 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use crate::private_directory;
 use crate::remote::config::Config;
 use crate::service::service_name_for_path;
-use crate::update_policy::{MAX_ATTEMPTS_PER_VERSION, UpdateAttempts, read_attempts};
+use crate::update_policy::{
+    CHECKED_VERSION_FILE, MAX_ATTEMPTS_PER_VERSION, UpdateAttempts, checked_before, read_attempts,
+    record_check,
+};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
@@ -46,17 +49,17 @@ pub fn check_and_schedule(config: &Config) -> anyhow::Result<Option<String>> {
     let manifest_bytes = download(&http, &config.update_manifest_url, MAX_MANIFEST_BYTES)
         .context("failed to download the Agent update manifest")?;
     let manifest = UpdateManifest::parse(&manifest_bytes)?;
+    let config_directory = config
+        .config_path
+        .parent()
+        .context("Agent configuration has no parent directory")?;
     let Some(release) = manifest.newer_release(TARGET, CURRENT_VERSION)? else {
+        record_completed_check(config_directory);
         return Ok(None);
     };
 
-    let update_directory = prepare_update_directory(
-        config
-            .config_path
-            .parent()
-            .context("Agent configuration has no parent directory")?,
-    )
-    .context("failed to prepare a private Agent update directory")?;
+    let update_directory = prepare_update_directory(config_directory)
+        .context("failed to prepare a private Agent update directory")?;
     let attempts_path = update_directory.join(ATTEMPTS_FILE);
     let previous = read_attempts(&attempts_path);
     let Some(attempt) = UpdateAttempts::next(previous.as_ref(), &release.version, unix_seconds())
@@ -67,6 +70,7 @@ pub fn check_and_schedule(config: &Config) -> anyhow::Result<Option<String>> {
             attempts = MAX_ATTEMPTS_PER_VERSION,
             "skipping an automatic Agent update that already failed repeatedly; it is retried after 24 hours"
         );
+        record_completed_check(config_directory);
         return Ok(None);
     };
 
@@ -78,6 +82,9 @@ pub fn check_and_schedule(config: &Config) -> anyhow::Result<Option<String>> {
     );
     let executable = download(&http, &release.url, MAX_UPDATE_BYTES)
         .context("failed to download the Agent update")?;
+    // Only a complete download uses an attempt, so one cut short is retried on the backoff.
+    crate::installer::replace_file(&attempts_path, &serde_json::to_vec(&attempt)?)
+        .context("failed to record the Agent update attempt")?;
     release.verify(&executable)?;
     if !executable.starts_with(b"MZ") {
         bail!("downloaded Agent update is not a Windows executable");
@@ -94,10 +101,6 @@ pub fn check_and_schedule(config: &Config) -> anyhow::Result<Option<String>> {
             })
         })
         .and_then(|_| {
-            crate::installer::replace_file(&attempts_path, &serde_json::to_vec(&attempt)?)
-                .context("failed to record the Agent update attempt")
-        })
-        .and_then(|()| {
             let mut command = Command::new(&helper);
             command
                 .arg("--apply-agent-update")
@@ -128,6 +131,23 @@ pub fn check_and_schedule(config: &Config) -> anyhow::Result<Option<String>> {
         "started the Agent update helper"
     );
     Ok(Some(release.version))
+}
+
+/// Whether this build has completed an update check before, which tells an ordinary restart from
+/// the first start after an install or update.
+pub fn has_checked(config_directory: &Path) -> bool {
+    checked_before(&config_directory.join("updates").join(CHECKED_VERSION_FILE))
+}
+
+fn record_completed_check(config_directory: &Path) {
+    let path = config_directory.join("updates").join(CHECKED_VERSION_FILE);
+    if checked_before(&path) {
+        return;
+    }
+    match prepare_update_directory(config_directory) {
+        Ok(_) => record_check(&path, crate::installer::replace_file),
+        Err(error) => tracing::warn!(error = ?error, "could not record the Agent update check"),
+    }
 }
 
 /// Runs as a copy of the previous Agent after the service that staged the update stops. Whatever
