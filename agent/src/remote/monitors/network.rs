@@ -1,20 +1,49 @@
 //! Checks of other computers, from the device: ping, a TCP port, an HTTP(S)
 //! address, and when a TLS certificate expires.
-use std::io::Read;
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+//!
+//! A check's name lookup and connection share its one deadline. A lookup
+//! runs on a thread of its own, so a DNS server that doesn't answer costs
+//! the check its timeout and no more, and a host's addresses are tried
+//! side by side, a moment apart, so one whose packets are dropped (as IPv6
+//! often is) doesn't keep the others from being tried.
+use std::io::{self, Read, Write};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
+use ureq::http::Uri;
+use ureq::unversioned::resolver::{ResolvedSocketAddrs, Resolver};
+use ureq::unversioned::transport::{
+    Buffers, ConnectProxyConnector, ConnectionDetails, Connector, Either, LazyBuffers, NextTimeout,
+    RustlsConnector, Transport,
+};
 
 use super::{Outcome, parse, platform};
 
 /// The most of a page searched for a keyword.
 const MAX_BODY_BYTES: u64 = 1024 * 1024;
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+/// How long an attempt to connect has to itself before the host's next
+/// address is tried alongside it, as browsers do.
+const HEAD_START: Duration = Duration::from_millis(250);
+/// The most of a host's addresses tried, and the most tried at once.
+const MAX_ADDRESSES: usize = 8;
+const MAX_ATTEMPTS_AT_ONCE: usize = 4;
+/// The most name lookups running at once, those a check stopped waiting
+/// for included. A lookup can't be stopped, so one stuck on a DNS server
+/// that doesn't answer keeps its thread until the system gives up on it;
+/// past this, checks fail at once instead of starting more. Twice the
+/// checks the scheduler runs at once, so they keep room for their own
+/// lookups while as many are stuck.
+const MAX_LOOKUPS: usize = 16;
+
+/// Name lookups running now.
+static LOOKUPS: AtomicUsize = AtomicUsize::new(0);
 
 fn millis(elapsed: Duration) -> f64 {
     (elapsed.as_secs_f64() * 10_000.0).round() / 10.0
@@ -29,33 +58,207 @@ fn shown(host: &str, port: u16) -> String {
     }
 }
 
-fn resolve(host: &str, port: u16) -> anyhow::Result<Vec<SocketAddr>> {
-    let addresses = (host, port)
-        .to_socket_addrs()
-        .map_err(|error| anyhow::anyhow!("could not look up “{host}”: {error}"))?
-        .collect::<Vec<_>>();
+type Lookup = fn(&str, u16) -> io::Result<Vec<SocketAddr>>;
+
+fn system_lookup(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    Ok((host, port).to_socket_addrs()?.collect())
+}
+
+/// The host's addresses, looked up by `deadline`.
+pub(super) fn resolve(host: &str, port: u16, deadline: Instant) -> anyhow::Result<Vec<SocketAddr>> {
+    resolve_with(host, port, deadline, &LOOKUPS, system_lookup)
+}
+
+/// A lookup's place among those running, given back when its thread ends,
+/// however it ends.
+struct LookupPlace(&'static AtomicUsize);
+
+impl Drop for LookupPlace {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn resolve_with(
+    host: &str,
+    port: u16,
+    deadline: Instant,
+    running: &'static AtomicUsize,
+    lookup: Lookup,
+) -> anyhow::Result<Vec<SocketAddr>> {
+    // An address needs no lookup.
+    if let Ok(address) = host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(address, port)]);
+    }
+    let left = deadline.saturating_duration_since(Instant::now());
+    anyhow::ensure!(!left.is_zero(), "could not look up “{host}” in time");
+    running
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            (count < MAX_LOOKUPS).then_some(count + 1)
+        })
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "could not look up “{host}”: {MAX_LOOKUPS} lookups are already waiting for an answer"
+            )
+        })?;
+    let place = LookupPlace(running);
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let name = host.to_owned();
+    std::thread::Builder::new()
+        .name("monitor lookup".to_owned())
+        .spawn(move || {
+            let found = lookup(&name, port);
+            drop(place);
+            let _ = sender.send(found);
+        })
+        .map_err(|error| anyhow::anyhow!("could not look up “{host}”: {error}"))?;
+    let addresses = match receiver.recv_timeout(left) {
+        Ok(found) => {
+            found.map_err(|error| anyhow::anyhow!("could not look up “{host}”: {error}"))?
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            anyhow::bail!("could not look up “{host}” in time")
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => anyhow::bail!("could not look up “{host}”"),
+    };
     anyhow::ensure!(!addresses.is_empty(), "“{host}” has no address");
     Ok(addresses)
 }
 
-/// A connection to the first of the host's addresses that answers.
-fn connect(host: &str, port: u16, timeout: Duration) -> anyhow::Result<TcpStream> {
-    let deadline = Instant::now() + timeout;
-    let mut last = None;
-    for address in resolve(host, port)? {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            break;
-        }
-        match TcpStream::connect_timeout(&address, left) {
-            Ok(stream) => return Ok(stream),
-            Err(error) => last = Some(error),
+/// The addresses to try, at most [`MAX_ADDRESSES`] of them: the families
+/// taking turns, starting with the system's first, each in the system's
+/// order.
+fn order(addresses: impl IntoIterator<Item = SocketAddr>) -> Vec<SocketAddr> {
+    let (mut first, mut other) = (Vec::new(), Vec::new());
+    let mut first_family = None;
+    for address in addresses {
+        let family = *first_family.get_or_insert(address.is_ipv6());
+        let list = if address.is_ipv6() == family {
+            &mut first
+        } else {
+            &mut other
+        };
+        if !list.contains(&address) {
+            list.push(address);
         }
     }
-    Err(match last {
-        Some(error) => anyhow::anyhow!("{error}"),
-        None => anyhow::anyhow!("timed out"),
+    let (mut first, mut other) = (first.into_iter(), other.into_iter());
+    let mut ordered = Vec::new();
+    while ordered.len() < MAX_ADDRESSES {
+        match (first.next(), other.next()) {
+            (None, None) => break,
+            (one, two) => ordered.extend(one.into_iter().chain(two)),
+        }
+    }
+    ordered.truncate(MAX_ADDRESSES);
+    ordered
+}
+
+type Attempt = fn(&SocketAddr, Duration) -> io::Result<TcpStream>;
+
+/// How far an attempt that failed got: the host refusing is news of it,
+/// a timeout may be its packets being dropped, and the rest (no route, for
+/// one) usually means the device can't reach that kind of address at all.
+fn reach(error: &io::Error) -> u8 {
+    match error.kind() {
+        io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted => 2,
+        io::ErrorKind::TimedOut => 1,
+        _ => 0,
+    }
+}
+
+/// A connection to the first of `addresses` that answers by `deadline`.
+/// Each attempt has `head_start` to itself, or until it fails, before the
+/// next starts alongside it. The attempts that lose end by the deadline,
+/// and a connection one of them makes anyway is closed.
+fn connect_to(
+    addresses: &[SocketAddr],
+    deadline: Instant,
+    head_start: Duration,
+    attempt: Attempt,
+) -> io::Result<TcpStream> {
+    let (sender, receiver) = mpsc::channel();
+    let mut next = 0;
+    let mut running = 0;
+    let mut next_start = Instant::now();
+    // The failure of the address that got furthest, and how far.
+    let mut furthest: Option<(u8, SocketAddr, io::Error)> = None;
+    let mut failed = |address, error: io::Error| {
+        if furthest
+            .as_ref()
+            .is_none_or(|(far, _, _)| reach(&error) > *far)
+        {
+            furthest = Some((reach(&error), address, error));
+        }
+    };
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let more = next < addresses.len() && running < MAX_ATTEMPTS_AT_ONCE;
+        if more && (running == 0 || now >= next_start) {
+            let address = addresses[next];
+            next += 1;
+            next_start = now + head_start;
+            let sender = sender.clone();
+            let left = deadline - now;
+            let started = std::thread::Builder::new()
+                .name("monitor connect".to_owned())
+                // A connection made after another won is dropped, so
+                // closed, when it can't be sent.
+                .spawn(move || drop(sender.send((address, attempt(&address, left)))));
+            match started {
+                Ok(_) => running += 1,
+                Err(error) => failed(address, error),
+            }
+            continue;
+        }
+        if running == 0 {
+            break;
+        }
+        let until = if more {
+            next_start.min(deadline)
+        } else {
+            deadline
+        };
+        if let Ok((address, result)) = receiver.recv_timeout(until.saturating_duration_since(now)) {
+            running -= 1;
+            match result {
+                Ok(stream) => return Ok(stream),
+                // The next address needn't wait.
+                Err(error) => {
+                    failed(address, error);
+                    next_start = Instant::now();
+                }
+            }
+        }
+    }
+    // Attempts still running, or never started, ran out of time.
+    let unfinished = running > 0 || next < addresses.len();
+    Err(match furthest {
+        Some((far, address, error)) if far == 2 || (far == 0 && !unfinished) => {
+            if addresses.len() > 1 {
+                io::Error::new(error.kind(), format!("{error}, at {address}"))
+            } else {
+                error
+            }
+        }
+        _ => io::Error::new(io::ErrorKind::TimedOut, "timed out"),
     })
+}
+
+/// A connection to `host:port` by `deadline`, its lookup included.
+fn connect(host: &str, port: u16, deadline: Instant) -> anyhow::Result<TcpStream> {
+    let addresses = order(resolve(host, port, deadline)?);
+    Ok(connect_to(
+        &addresses,
+        deadline,
+        HEAD_START,
+        TcpStream::connect_timeout,
+    )?)
 }
 
 pub(super) fn ping(host: &str, timeout: Duration) -> Outcome {
@@ -73,7 +276,7 @@ pub(super) fn ping(host: &str, timeout: Duration) -> Outcome {
 
 pub(super) fn tcp(host: &str, port: u16, timeout: Duration) -> Outcome {
     let started = Instant::now();
-    match connect(host, port, timeout) {
+    match connect(host, port, started + timeout) {
         Ok(_) => {
             let elapsed = millis(started.elapsed());
             Outcome::passing(format!(
@@ -139,6 +342,121 @@ fn crypto_provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
+/// ureq's name lookups for a check, as the other checks make them.
+#[derive(Debug)]
+struct CheckResolver {
+    deadline: Instant,
+}
+
+impl Resolver for CheckResolver {
+    fn resolve(
+        &self,
+        uri: &Uri,
+        _config: &ureq::config::Config,
+        _timeout: NextTimeout,
+    ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+        let host = uri
+            .host()
+            .ok_or_else(|| ureq::Error::BadUri(format!("{uri} has no host")))?;
+        let port = match (uri.port_u16(), uri.scheme_str()) {
+            (Some(port), _) => port,
+            (None, Some("http")) => 80,
+            (None, Some("https")) => 443,
+            _ => return Err(ureq::Error::BadUri(format!("{uri} has no port"))),
+        };
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        let found = resolve(host, port, self.deadline)
+            .map_err(|error| ureq::Error::Io(io::Error::other(format!("{error:#}"))))?;
+        let mut addresses = self.empty();
+        for address in order(found) {
+            addresses.push(address);
+        }
+        Ok(addresses)
+    }
+}
+
+/// ureq's connections for a check, as the other checks make them.
+#[derive(Debug)]
+struct CheckConnector {
+    deadline: Instant,
+}
+
+impl<In: Transport> Connector<In> for CheckConnector {
+    type Out = Either<In, CheckTransport>;
+
+    fn connect(
+        &self,
+        details: &ConnectionDetails,
+        chained: Option<In>,
+    ) -> Result<Option<Self::Out>, ureq::Error> {
+        // A proxy's connection, already made.
+        if let Some(chained) = chained {
+            return Ok(Some(Either::A(chained)));
+        }
+        let addresses = order(details.addrs.iter().copied());
+        let stream = connect_to(
+            &addresses,
+            self.deadline,
+            HEAD_START,
+            TcpStream::connect_timeout,
+        )
+        .map_err(|error| transport_error(error, details.timeout))?;
+        if details.config.no_delay() {
+            stream.set_nodelay(true)?;
+        }
+        let buffers = LazyBuffers::new(
+            details.config.input_buffer_size(),
+            details.config.output_buffer_size(),
+        );
+        Ok(Some(Either::B(CheckTransport { stream, buffers })))
+    }
+}
+
+fn transport_error(error: io::Error, timeout: NextTimeout) -> ureq::Error {
+    match error.kind() {
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => ureq::Error::Timeout(timeout.reason),
+        _ => ureq::Error::Io(error),
+    }
+}
+
+/// A plain TCP connection for ureq, as its own is.
+#[derive(Debug)]
+struct CheckTransport {
+    stream: TcpStream,
+    buffers: LazyBuffers,
+}
+
+impl Transport for CheckTransport {
+    fn buffers(&mut self) -> &mut dyn Buffers {
+        &mut self.buffers
+    }
+
+    fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
+        self.stream
+            .set_write_timeout(timeout.not_zero().map(|left| *left))?;
+        self.stream
+            .write_all(&self.buffers.output()[..amount])
+            .map_err(|error| transport_error(error, timeout))
+    }
+
+    fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
+        self.stream
+            .set_read_timeout(timeout.not_zero().map(|left| *left))?;
+        let read = self
+            .stream
+            .read(self.buffers.input_append_buf())
+            .map_err(|error| transport_error(error, timeout))?;
+        self.buffers.input_appended(read);
+        Ok(read > 0)
+    }
+
+    // A check's agent makes one request, so its connection is never
+    // reused.
+    fn is_open(&mut self) -> bool {
+        false
+    }
+}
+
 pub(super) fn http(
     url: &str,
     expected: u16,
@@ -151,16 +469,22 @@ pub(super) fn http(
         .unversioned_rustls_crypto_provider(crypto_provider())
         .disable_verification(!verify_tls)
         .build();
-    let agent = ureq::Agent::config_builder()
+    let config = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         .http_status_as_error(false)
         // A redirect's own status is what is checked.
         .max_redirects(0)
         .user_agent("MeshRMM-Agent")
         .tls_config(tls)
-        .build()
-        .new_agent();
+        .build();
     let started = Instant::now();
+    let deadline = started + timeout;
+    // ureq's own chain, less SOCKS proxies, which it isn't built for.
+    let connector =
+        ().chain(ConnectProxyConnector::default())
+            .chain(CheckConnector { deadline })
+            .chain(RustlsConnector::default());
+    let agent = ureq::Agent::with_parts(config, connector, CheckResolver { deadline });
     let mut response = match agent.get(url).call() {
         Ok(response) => response,
         Err(error) => {
@@ -278,7 +602,7 @@ fn server_certificate(host: &str, port: u16, timeout: Duration) -> anyhow::Resul
         .map_err(|_| anyhow::anyhow!("“{host}” isn't a host name or address"))?;
     let mut connection = rustls::ClientConnection::new(Arc::new(config), name)?;
     let deadline = Instant::now() + timeout;
-    let mut stream = connect(host, port, timeout)?;
+    let mut stream = connect(host, port, deadline)?;
     while connection.is_handshaking() {
         let left = deadline.saturating_duration_since(Instant::now());
         anyhow::ensure!(!left.is_zero(), "the TLS handshake timed out");
@@ -454,6 +778,7 @@ mod tests {
                 "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nall is well",
                 "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nall is well",
                 "HTTP/1.1 302 Found\r\nLocation: /elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nall is well",
             ] {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = [0; 1024];
@@ -478,6 +803,224 @@ mod tests {
             "{}",
             redirected.detail
         );
+        // Looked up as the other checks are; any IPv6 address of it refuses.
+        let named = http(
+            &format!("http://localhost:{port}/health"),
+            200,
+            "well",
+            true,
+            timeout,
+        );
+        assert!(named.passing, "{}", named.detail);
         server.join().unwrap();
+    }
+
+    const BLACK_HOLE: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
+    const REFUSING: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 2));
+
+    /// Connects for real, but to two made-up addresses as if one's packets
+    /// were dropped and the other refused at once.
+    fn attempt(address: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
+        match address.ip() {
+            ip if ip == BLACK_HOLE => {
+                std::thread::sleep(timeout);
+                Err(io::ErrorKind::TimedOut.into())
+            }
+            ip if ip == REFUSING => Err(io::ErrorKind::ConnectionRefused.into()),
+            _ => TcpStream::connect_timeout(address, timeout),
+        }
+    }
+
+    #[test]
+    fn an_address_whose_packets_are_dropped_does_not_hold_up_the_next() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let good = listener.local_addr().unwrap();
+        let started = Instant::now();
+        let stream = connect_to(
+            &[SocketAddr::new(BLACK_HOLE, good.port()), good],
+            started + Duration::from_secs(10),
+            Duration::from_millis(50),
+            attempt,
+        )
+        .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), good);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_refusal_moves_on_without_the_head_start() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let good = listener.local_addr().unwrap();
+        let started = Instant::now();
+        let stream = connect_to(
+            &[SocketAddr::new(REFUSING, good.port()), good],
+            started + Duration::from_secs(20),
+            Duration::from_secs(10),
+            attempt,
+        )
+        .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), good);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn addresses_share_one_deadline() {
+        let timeout = Duration::from_millis(100);
+        let addresses: Vec<_> = (1..=3)
+            .map(|port| SocketAddr::new(BLACK_HOLE, port))
+            .collect();
+        let started = Instant::now();
+        let error = connect_to(
+            &addresses,
+            started + timeout,
+            Duration::from_millis(20),
+            attempt,
+        )
+        .unwrap_err();
+        let took = started.elapsed();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(error.to_string(), "timed out");
+        assert!(took >= timeout && took < Duration::from_secs(1), "{took:?}");
+    }
+
+    #[test]
+    fn the_furthest_failure_is_told() {
+        let error = connect_to(
+            &[
+                SocketAddr::new(BLACK_HOLE, 443),
+                SocketAddr::new(REFUSING, 443),
+            ],
+            Instant::now() + Duration::from_millis(100),
+            Duration::from_millis(20),
+            attempt,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        assert!(error.to_string().ends_with(", at 192.0.2.2:443"), "{error}");
+    }
+
+    #[test]
+    fn only_a_few_attempts_run_at_once() {
+        static RUNNING: AtomicUsize = AtomicUsize::new(0);
+        static MOST: AtomicUsize = AtomicUsize::new(0);
+        fn counted(_: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
+            let running = RUNNING.fetch_add(1, Ordering::SeqCst) + 1;
+            MOST.fetch_max(running, Ordering::SeqCst);
+            std::thread::sleep(timeout);
+            RUNNING.fetch_sub(1, Ordering::SeqCst);
+            Err(io::ErrorKind::TimedOut.into())
+        }
+        let addresses: Vec<_> = (1..=8)
+            .map(|port| SocketAddr::new(BLACK_HOLE, port))
+            .collect();
+        let error = connect_to(
+            &addresses,
+            Instant::now() + Duration::from_millis(200),
+            Duration::from_millis(1),
+            counted,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "timed out");
+        assert_eq!(MOST.load(Ordering::SeqCst), MAX_ATTEMPTS_AT_ONCE);
+    }
+
+    #[test]
+    fn address_families_take_turns() {
+        let v6 = |n| {
+            SocketAddr::new(
+                IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, n)),
+                443,
+            )
+        };
+        let v4 = |n| SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, n)), 443);
+        assert_eq!(
+            order([v6(1), v6(2), v6(3), v4(1), v4(2), v6(1)]),
+            [v6(1), v4(1), v6(2), v4(2), v6(3)]
+        );
+        assert_eq!(order([v4(1), v6(1), v4(2)]), [v4(1), v6(1), v4(2)]);
+        let many = order((1..=20).map(v6).chain([v4(1)]));
+        assert_eq!(many.len(), MAX_ADDRESSES);
+        assert_eq!(many[1], v4(1));
+    }
+
+    #[test]
+    fn lookups_give_up_at_the_deadline() {
+        static RUNNING: AtomicUsize = AtomicUsize::new(0);
+        fn slow(_: &str, _: u16) -> io::Result<Vec<SocketAddr>> {
+            std::thread::sleep(Duration::from_secs(5));
+            Ok(Vec::new())
+        }
+        let started = Instant::now();
+        let error = resolve_with(
+            "stuck.example",
+            443,
+            started + Duration::from_millis(50),
+            &RUNNING,
+            slow,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "could not look up “stuck.example” in time"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(RUNNING.load(Ordering::SeqCst), 1, "still stuck");
+    }
+
+    #[test]
+    fn stuck_lookups_are_capped_until_they_end() {
+        static RUNNING: AtomicUsize = AtomicUsize::new(0);
+        static RELEASED: Mutex<bool> = Mutex::new(false);
+        static WAKE: std::sync::Condvar = std::sync::Condvar::new();
+        fn stuck(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+            if host == "stuck.example" {
+                let mut released = RELEASED.lock().unwrap();
+                while !*released {
+                    released = WAKE.wait(released).unwrap();
+                }
+            }
+            Ok(vec![SocketAddr::from(([127, 0, 0, 1], port))])
+        }
+        for _ in 0..MAX_LOOKUPS {
+            let soon = Instant::now() + Duration::from_millis(20);
+            let error = resolve_with("stuck.example", 443, soon, &RUNNING, stuck).unwrap_err();
+            assert!(error.to_string().ends_with("in time"), "{error}");
+        }
+        let started = Instant::now();
+        let later = started + Duration::from_secs(10);
+        let error = resolve_with("fine.example", 443, later, &RUNNING, stuck).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "could not look up “fine.example”: {MAX_LOOKUPS} lookups are already waiting for an answer"
+            )
+        );
+        *RELEASED.lock().unwrap() = true;
+        WAKE.notify_all();
+        while RUNNING.load(Ordering::SeqCst) > 0 {
+            assert!(Instant::now() < later, "the stuck lookups never ended");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let found = resolve_with("fine.example", 443, later, &RUNNING, stuck).unwrap();
+        assert_eq!(found, [SocketAddr::from(([127, 0, 0, 1], 443))]);
+    }
+
+    #[test]
+    fn addresses_are_not_looked_up() {
+        // Full, so a lookup would be refused.
+        static RUNNING: AtomicUsize = AtomicUsize::new(MAX_LOOKUPS);
+        fn unused(host: &str, _: u16) -> io::Result<Vec<SocketAddr>> {
+            panic!("{host} was looked up")
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for (host, address) in [
+            ("192.0.2.7", "192.0.2.7:80"),
+            ("2001:db8::7", "[2001:db8::7]:80"),
+        ] {
+            let found = resolve_with(host, 80, deadline, &RUNNING, unused).unwrap();
+            assert_eq!(found, [address.parse::<SocketAddr>().unwrap()]);
+        }
+        assert_eq!(RUNNING.load(Ordering::SeqCst), MAX_LOOKUPS);
     }
 }
