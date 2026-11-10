@@ -132,6 +132,8 @@ pub(super) fn events(
     since_ms: i64,
     _now_ms: i64,
     timeout: Duration,
+    // The journal is read by time.
+    _log_record: &mut Option<u64>,
 ) -> anyhow::Result<LogRead> {
     let arguments = journal_arguments(filter, since_ms);
     let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
@@ -141,7 +143,13 @@ pub(super) fn events(
     Ok(LogRead {
         // Stopped at the entry cap, or at the output cap before it.
         truncated: lines.len() >= MAX_JOURNAL_ENTRIES || finished.truncated,
-        events: lines.into_iter().filter_map(parse::journal_event).collect(),
+        events: lines
+            .into_iter()
+            .filter_map(parse::journal_event)
+            // `--since` counts whole seconds.
+            .filter(|event| event.at_ms >= since_ms)
+            .collect(),
+        out_of_time: false,
     })
 }
 
@@ -284,6 +292,7 @@ mod tests {
             now - 24 * 60 * 60 * 1000,
             now,
             Duration::from_secs(20),
+            &mut None,
         )
         .unwrap();
         assert!(ping("127.0.0.1", Duration::from_secs(2)).unwrap().is_some());

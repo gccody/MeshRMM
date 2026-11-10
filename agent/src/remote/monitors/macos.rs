@@ -122,6 +122,8 @@ pub(super) fn events(
     since_ms: i64,
     _now_ms: i64,
     timeout: Duration,
+    // The unified log is read by time.
+    _log_record: &mut Option<u64>,
 ) -> anyhow::Result<LogRead> {
     let start = format!(
         "{}+0000",
@@ -148,9 +150,12 @@ pub(super) fn events(
             .stdout
             .lines()
             .filter_map(parse::unified_log_event)
+            // `--start` counts whole seconds.
+            .filter(|event| event.at_ms >= since_ms)
             .collect(),
         // Only the output cap stops it.
         truncated: finished.truncated,
+        out_of_time: false,
     })
 }
 

@@ -45,7 +45,7 @@ alert shows the latest failure's sentence and output.
 |---|---|---|---|
 | Service | the Service Control Manager, by service name or display name; automatic means the Automatic start type (delayed or not) | `systemctl show`: running is `active`; automatic is `enabled`, `static`, `generated`, `indirect` or an alias | `launchctl print system/<label>`, launchd's system domain only; automatic means not disabled |
 | Process | a process snapshot, by file name with or without `.exe`, ignoring case | `/proc`: the command name or the program's file name | `ps`: the program's file name or path |
-| Event log | the named log through the Event Log API; the source matches the provider; event IDs and levels filter; at most 1,000 matching entries a check | the journal (`journalctl`), at most the newest 5,000 entries of the source and levels a check; the source matches the unit (with or without `.service`), syslog identifier or command exactly, as given or in lower case, and an entry shows the one that matched (else its syslog identifier); event IDs don't apply | the unified log (`log show`); the source matches the subsystem, process or sender; event IDs don't apply |
+| Event log | the named log through the Event Log API, newest first: the records it wrote since the previous check (on the first, those logged within the last interval); the source matches the provider; event IDs and levels filter; at most 1,000 matching entries a check | the journal (`journalctl`), at most the newest 5,000 entries of the source and levels a check; the source matches the unit (with or without `.service`), syslog identifier or command exactly, as given or in lower case, and an entry shows the one that matched (else its syslog identifier); event IDs don't apply | the unified log (`log show`); the source matches the subsystem, process or sender; event IDs don't apply |
 | Ping | the ICMP API, IPv4 and IPv6 | `ping` | `ping`, or `ping6` for an IPv6 address |
 
 The event log levels map onto the journal's priorities (critical is 0 to 2,
@@ -54,7 +54,13 @@ error, default and info). With no level chosen, every level but debug counts.
 An event log rule that names no Windows log isn't sent to Windows devices.
 A check that reads as many entries as it may says so in its result ("At
 least N matching events…"), since older entries since the last check went
-unread. A service monitor is sent to a Linux device only if its name is a
+unread. So does a Windows check that runs out of time, which happens on a
+busy log with a message to search for (each event's message is read from
+its publisher, about 0.15 ms an event): what it found by then raises the
+alert, the result names the log as too busy to search in the time limit
+and suggests a source or event IDs, and the next check reads on from the
+records written after this one started, rather than reading these again.
+A service monitor is sent to a Linux device only if its name is a
 systemd unit name (letters, digits and `:-_.@\`), and to a Mac only if it is
 a launchd label (letters, digits and `.-_`); the device's Monitors tab says
 why one isn't, and the Agent checks the same again.
