@@ -193,7 +193,7 @@ pub fn command(id: &str, kind: Kind, install: Option<&Install>) -> AgentCommand 
             },
         },
         _ => AgentCommand::ScanUpdates {
-            run_id: Some(id.to_owned()),
+            run_id: id.to_owned(),
         },
     }
 }

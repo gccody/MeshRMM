@@ -1,6 +1,6 @@
-//! Operating system updates: scans for pending updates and installs them
-//! when the server asks, then reports on the control connection. See
-//! docs/patch-management.md.
+//! Operating system updates: scans for pending updates on the schedule the
+//! server sets ([`schedule`]) and when it asks, installs them when it asks,
+//! and reports on the control connection. See docs/patch-management.md.
 //!
 //! The coordinator runs them as root or SYSTEM, like the system information
 //! collection. Each scan or install runs on its own thread, one at a time,
@@ -28,6 +28,7 @@ mod linux;
 mod macos;
 #[cfg(unix)]
 mod process;
+mod schedule;
 #[cfg(windows)]
 mod windows;
 
@@ -35,6 +36,7 @@ mod windows;
 use self::linux as platform;
 #[cfg(target_os = "macos")]
 use self::macos as platform;
+pub(crate) use self::schedule::Schedule;
 #[cfg(windows)]
 use self::windows as platform;
 
@@ -95,7 +97,7 @@ impl Updates {
         lock(&self.waiting)
     }
 
-    /// The server asked for a scan.
+    /// Scans: for the server's run `run_id`, or on the schedule (none).
     pub fn scan(&mut self, run_id: Option<String>) {
         let mut waiting = self.waiting();
         if let Some((_, runs)) = &mut waiting.install {

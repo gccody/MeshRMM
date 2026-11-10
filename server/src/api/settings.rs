@@ -343,11 +343,22 @@ pub async fn update(
     actor.require(Permission::SettingsManage)?;
     let values = request.columns()?;
     let metadata = serde_json::to_value(&request).unwrap_or_default();
-    Ok(Json(
-        save(&state, &actor, "settings.update", values, metadata)
-            .await?
-            .into(),
-    ))
+    let scan_interval = match request.update_scan_interval_hours {
+        Some(_) => Some(
+            state
+                .settings
+                .get(&state.database)
+                .await?
+                .update_scan_interval_hours,
+        ),
+        None => None,
+    };
+    let settings = save(&state, &actor, "settings.update", values, metadata).await?;
+    // Agents keep the schedule, so the connected ones hear of the change.
+    if scan_interval.is_some_and(|before| before != settings.update_scan_interval_hours) {
+        crate::updates::interval_changed(&state, settings.update_scan_interval_hours);
+    }
+    Ok(Json(settings.into()))
 }
 
 #[derive(Debug, Serialize)]

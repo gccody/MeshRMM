@@ -400,7 +400,8 @@ application history. A deleted device's packages go with it; its runs stay.
   are still held back from updates everywhere.
 - An existing device first lists its applications at its next update scan,
   or on **Scan now**. With the update scan interval at 0, devices list
-  applications only when asked or around a run.
+  applications only when asked, around a run, or in the scan after a restart
+  an update scan said was pending.
 - Alerts name the failed application, but don't link to its run; the
   device's **Applications** tab has the history.
 

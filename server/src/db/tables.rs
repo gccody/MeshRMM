@@ -731,7 +731,6 @@ pub enum DeviceUpdateStatus {
     ScanError,
     RebootPending,
     RebootPendingSince,
-    ScanRequestedAt,
     PendingHash,
 }
 

@@ -114,12 +114,18 @@ pub enum AgentCommand {
     },
     /// Collects a new [`crate::SystemInfo`] snapshot now.
     CollectSystemInfo,
-    /// Scans for pending operating system updates. `run_id` names the
-    /// server's record of a scan it is waiting for; a scan the server asks
-    /// for on its own schedule has none.
+    /// Scans for pending operating system updates, and the device's
+    /// applications, now. `run_id` names the server's record of the scan it
+    /// waits for: a user's **Scan now** or a scan job. Scans on the
+    /// schedule are the Agent's own ([`Self::SetUpdateScanSchedule`]).
     ScanUpdates {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        run_id: Option<String>,
+        run_id: String,
+    },
+    /// How often the Agent scans for updates on its own; see
+    /// [`crate::UpdateScanSchedule`]. Sent when the Agent connects and when
+    /// the interval changes.
+    SetUpdateScanSchedule {
+        schedule: crate::UpdateScanSchedule,
     },
     /// Installs pending operating system updates, then scans again.
     InstallUpdates {
@@ -456,8 +462,36 @@ mod tests {
     #[test]
     fn update_messages_use_tagged_json() {
         assert_eq!(
-            serde_json::to_string(&AgentCommand::ScanUpdates { run_id: None }).unwrap(),
-            r#"{"type":"scan_updates"}"#
+            serde_json::to_string(&AgentCommand::ScanUpdates {
+                run_id: "run-3".into()
+            })
+            .unwrap(),
+            r#"{"type":"scan_updates","run_id":"run-3"}"#
+        );
+        let schedule = AgentCommand::SetUpdateScanSchedule {
+            schedule: crate::UpdateScanSchedule {
+                interval_hours: Some(24),
+                last_scan: Some(crate::LastUpdateScan {
+                    received_ms_ago: 7,
+                    reboot_pending: true,
+                }),
+            },
+        };
+        let json = serde_json::to_string(&schedule).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"set_update_scan_schedule","schedule":{"interval_hours":24,"last_scan":{"received_ms_ago":7,"reboot_pending":true}}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentCommand>(&json).unwrap(),
+            schedule
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentCommand::SetUpdateScanSchedule {
+                schedule: crate::UpdateScanSchedule::default(),
+            })
+            .unwrap(),
+            r#"{"type":"set_update_scan_schedule","schedule":{}}"#
         );
         let install = AgentCommand::InstallUpdates {
             install: crate::UpdateInstallRequest {

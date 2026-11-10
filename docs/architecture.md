@@ -174,7 +174,8 @@ task.
 - **Coordinator**, one per connected Agent (`/v1/agents/{id}/connect`):
   authentication, superseding an older connection of the same Agent,
   revocation, commands (session requests, scripts, file deliveries,
-  uninstall, system information, update scans and installs, terminals,
+  uninstall, system information, the update scan schedule, update scans and
+  installs, terminals,
   wake packets, file requests and transfers, monitors and self-healing
   actions),
   credential rotation, the session lease and update grace.
@@ -247,9 +248,10 @@ restored, from every 2 minutes growing to once an hour
 On the server, connecting a device with nothing pending only reads: a dozen
 statements about that device, none of them a write, so a fleet reconnecting
 after a restart doesn't queue for SQLite's write lock. Each step that may
-record something (the device was woken, it connects from a new address, its
-update scan is old, an application run was interrupted) looks first and
-writes only then. The instance settings are kept in memory until they are
+record something (the device was woken, it connects from a new address, an
+application run was interrupted) looks first and writes only then. The update
+scan schedule the Agent is sent only reads the device's last scan: Agents
+keep the schedule themselves (see [patch management](patch-management.md)). The instance settings are kept in memory until they are
 saved (`settings::Cache` on `AppState`), the monitor rules for 15 seconds,
 and a device's update status is read only while a website listens for it.
 `Database::counts` counts statements, writes and transactions, which

@@ -33,14 +33,32 @@ stored list and, when a scan's updates (in any order) hash the same, writes
 only the scan's status (when it ran and arrived, the manager, the restart
 pending) and leaves the list alone.
 
-Agents scan when the server asks:
+Agents keep their own scan schedule, by the scan interval (**Settings →
+General**, 24 hours by default, 0 to scan only when asked). When an Agent
+connects, the server tells it the interval and the last scan it received from
+the device (how long ago, and whether it said to restart), and when the
+interval is saved changed, it tells every connected Agent the new one. The
+server does no periodic work for scheduled scans. The Agent
+(`agent/src/remote/updates/schedule.rs`) scans:
 
-- when the Agent connects and its last scan is older than the scan interval,
-  or a restart was pending (so the website sees it done);
-- every scan interval while it stays connected (**Settings → General**, 24
-  hours by default, 0 to scan only when asked). The server asks at most 50
-  devices a minute, so a fleet's package mirrors aren't hit at once;
-- when a user chooses **Scan now**, a scan job runs, or a scan policy fires.
+- an interval after its last scan, put off by up to a tenth of the interval
+  at random, so devices that scanned together drift apart. Any scan counts
+  as the last one, whoever asked for it;
+- when its last scan is older than the interval as it connects (or it never
+  scanned), as a whole fleet's is after the server was down: at a random
+  moment from one minute to an hour after connecting (or the interval, if
+  shorter), never at once, so 100,000 devices scan about 28 a second;
+- when its last scan said to restart and the computer has started since: one
+  to five minutes after connecting, so the website sees the restart done,
+  even with the interval at 0. A reconnect without a restart follows the
+  schedule;
+- at once when a user chooses **Scan now**, a scan job runs, or a scan
+  policy fires.
+
+Scheduled scans run only while the Agent is connected: one that comes due
+while it is offline runs by the schedule the next connection brings. A scan
+already running answers any asked for meanwhile. Each scan is also an
+application scan ([application deployment](application-deployment.md)).
 
 A scan the Agent hasn't reported 45 minutes after it was asked for is lost.
 
@@ -135,7 +153,8 @@ device page **Install** is refused (`409 install_running`).
   their IT administrator installed updates and to save their work. Desktop
   users on macOS and Linux see no window; that would need a notice in the
   session helpers, which isn't implemented. After the restart the Agent
-  reconnects and scans, and the website shows the restart done.
+  reconnects and scans within a few minutes, and the website shows the
+  restart done.
 
 ## The website
 
@@ -187,8 +206,8 @@ selection and restart) against the device, `job.start` for jobs, and
 
 ## Retention
 
-Installs, the update history, are kept for a year; scans the server asked
-for, like jobs, for 30 days. A deleted device's status and pending list go
+Installs, the update history, are kept for a year; scans users and jobs
+asked for, like jobs, for 30 days. A deleted device's status and pending list go
 with it.
 
 ## API
@@ -219,12 +238,16 @@ reboot_error, created_at, completed_at, items}`. The event socket sends
 ## How it's built
 
 - Wire: `crates/protocol-types/src/updates.rs`. The server sends
-  `scan_updates {run_id?}` and `install_updates {install}`; the Agent sends
+  `set_update_scan_schedule {schedule: {interval_hours?, last_scan?:
+  {received_ms_ago, reboot_pending}}}` (on connecting with the last scan, on
+  an interval change without), `scan_updates {run_id}` and `install_updates
+  {install}`; the Agent sends
   `update_scan {run_ids, scan}`, `update_progress` and `update_install
   {run_id, result}` on the control connection. Reports wait in a queue that
   outlives reconnects.
 - Agent: `agent/src/remote/updates.rs` (one operation at a time, choosing
-  what to install, the restart) with `windows.rs` (WUA COM), `macos.rs`,
+  what to install, the restart), `schedule.rs` (when to scan) with
+  `windows.rs` (WUA COM), `macos.rs`,
   `linux.rs` and `linux/` (`apt.rs`, `rpm.rs`, `pacman.rs`, `reboot.rs`),
   and `process.rs` (tools with time limits). Restarts are
   `power::schedule_restart`.
@@ -244,9 +267,13 @@ reboot_error, created_at, completed_at, items}`. The event socket sends
 - `cargo test -p meshrmm-server --test updates`, on SQLite and PostgreSQL:
   scans, pending lists and first-seen times, scans and installs from the
   website with progress and outcomes, pacman and unsupported devices, update
-  jobs and policies, the three alert conditions, lost runs and the setting.
+  jobs and policies, the three alert conditions, lost runs, the setting and
+  the schedule Agents are told (on connecting and when the interval
+  changes), and that the engine's pass does no work per device.
 - `cargo test -p meshrmm-agent updates` runs the parsers of every platform's
-  tool output. The ignored `real_scan_is_plausible` tests scan the computer
+  tool output and the schedule's arithmetic (`updates::schedule`: on time,
+  overdue, after a restart, off, changed, the jitter, and 10,000 overdue
+  devices spread over the hour). The ignored `real_scan_is_plausible` tests scan the computer
   they run on (as root or SYSTEM); `real_install_installs_the_chosen_updates`
   installs on a Linux test machine (`MESHRMM_TEST_INSTALL=ids|all`).
 - `npm test` in `dashboard` covers the updates model.

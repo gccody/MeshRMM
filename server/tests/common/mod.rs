@@ -867,13 +867,14 @@ pub enum Received {
 }
 
 /// Messages that only their own tests check: the alert counts the event
-/// socket sends after each snapshot, the requests for a system information
-/// snapshot and an update scan a newly enrolled Agent gets, and the update
-/// summaries the event socket sends as devices come and go.
+/// socket sends after each snapshot, the request for a system information
+/// snapshot a newly enrolled Agent gets, the update scan schedule every
+/// Agent gets when it connects, and the update summaries the event socket
+/// sends as devices come and go.
 fn incidental(value: &serde_json::Value) -> bool {
     value["type"] == "alert_counts"
         || value["type"] == "collect_system_info"
-        || (value["type"] == "scan_updates" && value.get("run_id").is_none())
+        || value["type"] == "set_update_scan_schedule"
         || value["type"] == "device_updates"
 }
 

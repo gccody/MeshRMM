@@ -197,8 +197,8 @@ async fn record_system_info(
 /// What a newly connected Agent is owed: the session it should be in, a
 /// rotated credential it hasn't used yet, a request for a system
 /// information snapshot if the server's is missing or old
-/// (`collect_system_info`), and one for an update scan if the last is old or
-/// the device had to restart. Returns the session it replayed.
+/// (`collect_system_info`), its update scan schedule and its monitors.
+/// Returns the session it replayed.
 async fn greet(
     state: &AppState,
     device_id: &str,
@@ -243,15 +243,14 @@ async fn greet(
             .await
             .map_err(drop)?;
     }
-    match updates::connected(state, device_id).await {
-        Ok(true) => {
-            let message = ToAgent::Command(AgentCommand::ScanUpdates { run_id: None }).to_json();
+    match updates::greeting(state, device_id).await {
+        Ok(command) => {
+            let message = ToAgent::Command(command).to_json();
             socket
                 .send(Message::Text(message.into()))
                 .await
                 .map_err(drop)?;
         }
-        Ok(false) => {}
         Err(error) => tracing::warn!(
             device_id,
             %error,
