@@ -218,6 +218,8 @@ async fn listings_and_changes_go_through_the_agent() {
         });
         let request = answer(&mut control, listing).await;
         assert_eq!(request["run_as"], "system", "{name}");
+        // How long the server waits, for the Agent to keep to.
+        assert_eq!(request["timeout_ms"], 5_000, "{name}");
         assert!(
             request.get("notification").is_none(),
             "{name}: no notice for SYSTEM by default"
@@ -293,6 +295,11 @@ async fn listings_and_changes_go_through_the_agent() {
         let batch = json!({ "reply": "batch", "done": ["/srv/a"], "failed": [{ "path": "/srv/b", "error": { "code": "already_exists", "message": "/srv/old/b already exists." } }] });
         let request = answer(&mut control, batch).await;
         assert_eq!(request["operation"]["destination"], "/srv/old");
+        assert_eq!(
+            request["timeout_ms"],
+            Timeouts::default().slow_request.as_millis() as u64,
+            "{name}: a move may take a while"
+        );
         let moved = call.await.unwrap();
         assert_eq!(
             moved.body["failed"][0]["error"]["code"], "already_exists",
@@ -379,6 +386,111 @@ async fn listings_and_changes_go_through_the_agent() {
         );
         app.finish().await;
     }
+}
+
+/// Moves and deletes the device must answer at once.
+fn impatient(state: &mut meshrmm_server::http::AppState) {
+    state.files = Files::new(Timeouts {
+        request: Duration::from_millis(1500),
+        slow_request: Duration::from_millis(300),
+        ..Timeouts::default()
+    });
+}
+
+#[tokio::test]
+async fn changes_the_device_never_confirms_are_recorded_as_asked() {
+    for app in apps_with(impatient).await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let (agent, mut control) = enrolled(&app, &mut admin, &server).await;
+        let base = format!("/v1/agents/{}/files", agent.device_id);
+
+        // Asked, and never answered.
+        let call = post(
+            &admin,
+            format!("{base}/move"),
+            json!({ "paths": ["/srv/a", "/srv/b"], "destination": "/mnt/other" }),
+        );
+        let command = receive_json(&mut control).await;
+        assert_eq!(command["request"]["timeout_ms"], 300, "{name}");
+        let moved = call.await.unwrap();
+        assert_eq!(moved.status, 504, "{name}: {:?}", moved.body);
+        assert_eq!(moved.code(), "device_timeout");
+        let call = post(
+            &admin,
+            format!("{base}/rename"),
+            json!({ "path": "/srv/c", "name": "d", "run_as": "user" }),
+        );
+        assert_eq!(command_type(&mut control).await, "file_request");
+        assert_eq!(call.await.unwrap().code(), "device_timeout", "{name}");
+
+        // The device said it didn't start it: nothing to record.
+        let call = post(
+            &admin,
+            format!("{base}/folders"),
+            json!({ "path": "/srv/new" }),
+        );
+        answer(
+            &mut control,
+            json!({ "reply": "failed", "error": { "code": "timed_out", "message": "The device didn't start this one in time." } }),
+        )
+        .await;
+        let refused = call.await.unwrap();
+        assert_eq!(refused.status, 504, "{name}");
+        assert_eq!(refused.code(), "timed_out");
+
+        // Asked, and the device went away before answering.
+        let call = post(
+            &admin,
+            format!("{base}/delete"),
+            json!({ "paths": ["/srv/e"], "trash": true, "run_as": "user" }),
+        );
+        assert_eq!(command_type(&mut control).await, "file_request");
+        drop(control);
+        // The server may give up first, which is as unconfirmed.
+        let gone = call.await.unwrap().code().to_owned();
+        assert!(
+            ["device_disconnected", "device_timeout"].contains(&gone.as_str()),
+            "{name}: {gone}"
+        );
+
+        let moved = audit_events(&app, "files.move").await;
+        assert_eq!(moved.len(), 1, "{name}");
+        assert_eq!(moved[0].target_id, agent.device_id);
+        assert_eq!(moved[0].actor_label, common::ADMIN_EMAIL, "{name}");
+        assert!(moved[0].actor_user_id.is_some());
+        assert_eq!(
+            moved[0].metadata,
+            json!({
+                "paths": ["/srv/a", "/srv/b"],
+                "count": 2,
+                "destination": "/mnt/other",
+                "run_as": "system",
+                "result": "unconfirmed",
+                "error": "device_timeout",
+            }),
+            "{name}"
+        );
+        let renamed = audit_events(&app, "files.rename").await;
+        assert_eq!(
+            renamed[0].metadata,
+            json!({ "path": "/srv/c", "new_name": "d", "run_as": "user", "result": "unconfirmed", "error": "device_timeout" }),
+            "{name}"
+        );
+        assert!(audit_events(&app, "files.create_folder").await.is_empty());
+        let deleted = audit_events(&app, "files.delete").await;
+        assert_eq!(
+            deleted[0].metadata,
+            json!({ "paths": ["/srv/e"], "count": 1, "trash": true, "run_as": "user", "result": "unconfirmed", "error": gone }),
+            "{name}"
+        );
+        app.finish().await;
+    }
+}
+
+async fn command_type(control: &mut Ws) -> Value {
+    receive_json(control).await["type"].clone()
 }
 
 #[tokio::test]

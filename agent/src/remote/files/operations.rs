@@ -1,8 +1,17 @@
 //! Changes to files: new folders, renames, moves and deletes, and the
 //! checks before a download. None replaces an existing entry, and none
 //! follows a link inside a folder it deletes or copies.
+//!
+//! A move or delete checks its [`Deadline`] before each entry, and a copy
+//! to another volume before each entry inside it and each piece of a file,
+//! and stops there: what it did is in its answer, the rest failed as
+//! `timed_out`. A copy that stops is removed and its original kept. Once a
+//! copy is whole, its original is deleted however long that takes, and one
+//! folder is deleted in one go (the standard library's removal, which a
+//! link swapped in can't redirect), so neither is left part done by the
+//! deadline.
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use meshrmm_file_transfer::rename_no_replace;
@@ -12,7 +21,20 @@ use meshrmm_protocol::{
 };
 
 use super::listing::entry_at;
-use super::{Account, io_error, paths, platform, unix_ms};
+use super::{Account, Deadline, io_error, paths, platform, timed_out, unix_ms};
+
+/// How much of a file a copy writes between looks at its deadline.
+const COPY_PIECE: u64 = 16 * 1024 * 1024;
+
+/// Fails each of `texts` as not reached before the deadline.
+fn not_reached(batch: &mut FileBatch, texts: &[String]) {
+    batch.failed.extend(texts.iter().map(|text| FileFailure {
+        path: text.clone(),
+        error: timed_out(
+            "The device ran out of time before it got to this one, so nothing was done with it.",
+        ),
+    }));
+}
 
 fn entry_reply(path: &Path) -> Result<FileReply, FileError> {
     Ok(FileReply::Entry {
@@ -107,6 +129,7 @@ pub(super) fn move_all(
     account: &Account,
     texts: &[String],
     destination: &str,
+    deadline: &Deadline,
 ) -> Result<FileBatch, FileError> {
     batch_paths(texts)?;
     let destination = paths::parse(destination)?;
@@ -121,8 +144,12 @@ pub(super) fn move_all(
         }
         let real_destination = fs::canonicalize(&destination).unwrap_or(destination.clone());
         let mut batch = FileBatch::default();
-        for text in texts {
-            match move_one(account, text, &destination, &real_destination) {
+        for (index, text) in texts.iter().enumerate() {
+            if deadline.passed() {
+                not_reached(&mut batch, &texts[index..]);
+                break;
+            }
+            match move_one(account, text, &destination, &real_destination, deadline) {
                 Ok(()) => batch.done.push(text.clone()),
                 Err(error) => batch.failed.push(FileFailure {
                     path: text.clone(),
@@ -139,6 +166,7 @@ fn move_one(
     text: &str,
     destination: &Path,
     real_destination: &Path,
+    deadline: &Deadline,
 ) -> Result<(), FileError> {
     let path = paths::parse(text)?;
     let Some(name) = path.file_name() else {
@@ -166,16 +194,7 @@ fn move_one(
     match rename_no_replace(&path, &target) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
-            // Another volume: copy, then delete the original once the copy
-            // is whole. A failed copy is removed and the original kept.
-            if target.symlink_metadata().is_ok() {
-                return Err(io_error(&io::ErrorKind::AlreadyExists.into(), &target));
-            }
-            if let Err(error) = copy_tree(account, &path, &target) {
-                let _ = delete_tree(&target);
-                return Err(error);
-            }
-            delete_tree(&path)
+            move_across(account, &path, &target, deadline)
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             Err(io_error(&error, &target))
@@ -184,9 +203,43 @@ fn move_one(
     }
 }
 
+/// Moves `path` to `target` on another volume: copies it, then deletes the
+/// original once the copy is whole. A failed copy, or one the deadline
+/// stops, is removed and the original kept.
+fn move_across(
+    account: &Account,
+    path: &Path,
+    target: &Path,
+    deadline: &Deadline,
+) -> Result<(), FileError> {
+    if target.symlink_metadata().is_ok() {
+        return Err(io_error(&io::ErrorKind::AlreadyExists.into(), target));
+    }
+    if let Err(error) = copy_tree(account, path, target, deadline) {
+        let _ = delete_tree(target);
+        if error.code == FileErrorCode::TimedOut {
+            return Err(timed_out(format!(
+                "The device ran out of time copying {} to the other volume, so it removed the partial copy and kept the original.",
+                path.display()
+            )));
+        }
+        return Err(error);
+    }
+    delete_tree(path)
+}
+
 /// Copies `source` to `target`, a folder with everything in it. Links are
-/// copied as links, never followed.
-fn copy_tree(account: &Account, source: &Path, target: &Path) -> Result<(), FileError> {
+/// copied as links, never followed. Stops at the deadline, before an entry
+/// or a piece of a file.
+fn copy_tree(
+    account: &Account,
+    source: &Path,
+    target: &Path,
+    deadline: &Deadline,
+) -> Result<(), FileError> {
+    if deadline.passed() {
+        return Err(timed_out("The device ran out of time."));
+    }
     let metadata = fs::symlink_metadata(source).map_err(|error| io_error(&error, source))?;
     if metadata.file_type().is_symlink() {
         return platform::copy_link(source, target);
@@ -196,7 +249,12 @@ fn copy_tree(account: &Account, source: &Path, target: &Path) -> Result<(), File
         platform::adopt_parent_owner(account, target);
         for item in fs::read_dir(source).map_err(|error| io_error(&error, source))? {
             let item = item.map_err(|error| io_error(&error, source))?;
-            copy_tree(account, &item.path(), &target.join(item.file_name()))?;
+            copy_tree(
+                account,
+                &item.path(),
+                &target.join(item.file_name()),
+                deadline,
+            )?;
         }
         return Ok(());
     }
@@ -207,7 +265,16 @@ fn copy_tree(account: &Account, source: &Path, target: &Path) -> Result<(), File
         .create_new(true)
         .open(target)
         .map_err(|error| io_error(&error, target))?;
-    io::copy(&mut from, &mut to).map_err(|error| io_error(&error, target))?;
+    loop {
+        let copied = io::copy(&mut from.by_ref().take(COPY_PIECE), &mut to)
+            .map_err(|error| io_error(&error, target))?;
+        if copied < COPY_PIECE {
+            break;
+        }
+        if deadline.passed() {
+            return Err(timed_out("The device ran out of time."));
+        }
+    }
     let _ = to.set_permissions(metadata.permissions());
     if let Ok(modified) = metadata.modified() {
         let _ = to.set_modified(modified);
@@ -220,6 +287,7 @@ pub(super) fn delete_all(
     account: &Account,
     texts: &[String],
     trash: bool,
+    deadline: &Deadline,
 ) -> Result<FileBatch, FileError> {
     batch_paths(texts)?;
     if trash && !account.is_user() {
@@ -230,7 +298,11 @@ pub(super) fn delete_all(
     }
     account.run(|| {
         let mut batch = FileBatch::default();
-        for text in texts {
+        for (index, text) in texts.iter().enumerate() {
+            if deadline.passed() {
+                not_reached(&mut batch, &texts[index..]);
+                break;
+            }
             let deleted = paths::parse(text).and_then(|path| {
                 if paths::parent(&path).is_none() {
                     return Err(FileError::new(
@@ -277,6 +349,7 @@ pub(super) fn prepare_download(
     account: &Account,
     texts: &[String],
     max_bytes: u64,
+    deadline: &Deadline,
 ) -> Result<FileDownloadInfo, FileError> {
     batch_paths(texts)?;
     let paths = texts
@@ -307,7 +380,7 @@ pub(super) fn prepare_download(
         }
         let mut totals = Totals::default();
         for path in &paths {
-            totals.add(path, max_bytes)?;
+            totals.add(path, max_bytes, deadline)?;
         }
         let name = match paths.as_slice() {
             [path] => paths::name(path),
@@ -335,8 +408,8 @@ struct Totals {
 impl Totals {
     /// Adds what an archive of `top` would hold. Entries inside it that
     /// can't be read are left out, as the archive leaves them; `top` itself
-    /// must be readable.
-    fn add(&mut self, top: &Path, max_bytes: u64) -> Result<(), FileError> {
+    /// must be readable. Stops at the deadline, before a folder.
+    fn add(&mut self, top: &Path, max_bytes: u64, deadline: &Deadline) -> Result<(), FileError> {
         let metadata = fs::metadata(top).map_err(|error| io_error(&error, top))?;
         if metadata.is_file() {
             self.files += 1;
@@ -346,6 +419,12 @@ impl Totals {
         fs::read_dir(top).map_err(|error| io_error(&error, top))?;
         let mut pending: Vec<PathBuf> = vec![top.to_path_buf()];
         while let Some(folder) = pending.pop() {
+            if deadline.passed() {
+                return Err(timed_out(format!(
+                    "The device ran out of time measuring {}; download fewer or smaller folders at once.",
+                    top.display()
+                )));
+            }
             let Ok(listing) = fs::read_dir(&folder) else {
                 continue;
             };
@@ -492,6 +571,7 @@ mod tests {
                 folder.text("ghost"),
             ],
             &folder.text("b"),
+            &Deadline::distant(),
         )
         .unwrap();
         assert_eq!(batch.done, [folder.text("a")]);
@@ -506,12 +586,23 @@ mod tests {
         );
         assert!(folder.0.join("b/a/inner").is_dir());
         assert_eq!(fs::read(folder.0.join("b/file.txt")).unwrap(), b"theirs");
-        let looped = move_all(&account, &[folder.text("b")], &folder.text("b/a/inner")).unwrap();
+        let looped = move_all(
+            &account,
+            &[folder.text("b")],
+            &folder.text("b/a/inner"),
+            &Deadline::distant(),
+        )
+        .unwrap();
         assert_eq!(looped.failed[0].error.code, FileErrorCode::InvalidMove);
         assert_eq!(
             code(
-                move_all(&account, &[folder.text("b")], &folder.text("file.txt"))
-                    .map(FileReply::Batch)
+                move_all(
+                    &account,
+                    &[folder.text("b")],
+                    &folder.text("file.txt"),
+                    &Deadline::distant()
+                )
+                .map(FileReply::Batch)
             ),
             FileErrorCode::NotADirectory
         );
@@ -531,15 +622,19 @@ mod tests {
         if cfg!(unix) {
             targets.push(folder.text("link"));
         }
-        let batch = delete_all(&account, &targets, false).unwrap();
+        let batch = delete_all(&account, &targets, false, &Deadline::distant()).unwrap();
         assert!(batch.failed.is_empty(), "{batch:?}");
         assert!(!folder.0.join("tree").exists());
         assert!(folder.0.join("kept/precious").exists());
         let root = if cfg!(windows) { "C:\\" } else { "/" };
-        let refused = delete_all(&account, &[root.to_owned()], false).unwrap();
+        let refused =
+            delete_all(&account, &[root.to_owned()], false, &Deadline::distant()).unwrap();
         assert_eq!(refused.failed[0].error.code, FileErrorCode::InvalidPath);
         assert_eq!(
-            code(delete_all(&account, &[folder.text("kept")], true).map(FileReply::Batch)),
+            code(
+                delete_all(&account, &[folder.text("kept")], true, &Deadline::distant())
+                    .map(FileReply::Batch)
+            ),
             FileErrorCode::TrashUnavailable,
             "the Agent's own account has no Trash"
         );
@@ -553,12 +648,19 @@ mod tests {
         fs::write(folder.0.join("dir/a"), vec![0; 100]).unwrap();
         fs::write(folder.0.join("dir/sub/b"), vec![0; 50]).unwrap();
         fs::write(folder.0.join("one.bin"), vec![0; 10]).unwrap();
-        let file = prepare_download(&account, &[folder.text("one.bin")], 1000).unwrap();
+        let file = prepare_download(
+            &account,
+            &[folder.text("one.bin")],
+            1000,
+            &Deadline::distant(),
+        )
+        .unwrap();
         assert_eq!(
             (file.kind, file.size, file.name.as_str()),
             (FileDownloadKind::File, 10, "one.bin")
         );
-        let archive = prepare_download(&account, &[folder.text("dir")], 1000).unwrap();
+        let archive =
+            prepare_download(&account, &[folder.text("dir")], 1000, &Deadline::distant()).unwrap();
         assert_eq!(
             (archive.kind, archive.size, archive.files),
             (FileDownloadKind::Archive, 150, 2)
@@ -568,22 +670,115 @@ mod tests {
             &account,
             &[folder.text("dir"), folder.text("one.bin")],
             1000,
+            &Deadline::distant(),
         )
         .unwrap();
         assert_eq!((both.size, both.files), (160, 3));
         assert_eq!(
-            prepare_download(&account, &[folder.text("dir")], 149)
+            prepare_download(&account, &[folder.text("dir")], 149, &Deadline::distant())
                 .unwrap_err()
                 .code,
             FileErrorCode::TooLarge
         );
         assert_eq!(
-            prepare_download(&account, &[folder.text("nothing")], 10)
-                .unwrap_err()
-                .code,
+            prepare_download(
+                &account,
+                &[folder.text("nothing")],
+                10,
+                &Deadline::distant()
+            )
+            .unwrap_err()
+            .code,
             FileErrorCode::NotFound
         );
         assert_eq!(format_bytes(4 * 1024 * 1024 * 1024), "4 GB");
         assert_eq!(format_bytes(1536), "1.5 KB");
+    }
+
+    fn timed_out_paths(batch: &FileBatch) -> Vec<&str> {
+        batch
+            .failed
+            .iter()
+            .filter(|failure| failure.error.code == FileErrorCode::TimedOut)
+            .map(|failure| failure.path.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn batches_stop_between_entries_at_their_deadline_and_say_what_they_did() {
+        let folder = Folder::new();
+        let account = own();
+        for name in ["a", "b", "c"] {
+            fs::write(folder.0.join(name), name).unwrap();
+        }
+        let names = [folder.text("a"), folder.text("b"), folder.text("c")];
+        // Time runs out after the first entry.
+        let batch = delete_all(&account, &names, false, &Deadline::after_checks(1)).unwrap();
+        assert_eq!(batch.done, [folder.text("a")]);
+        assert_eq!(timed_out_paths(&batch), [&*names[1], &*names[2]]);
+        assert!(!folder.0.join("a").exists());
+        assert!(folder.0.join("b").exists() && folder.0.join("c").exists());
+
+        fs::create_dir(folder.0.join("into")).unwrap();
+        let batch = move_all(
+            &account,
+            &names[1..],
+            &folder.text("into"),
+            &Deadline::after_checks(1),
+        )
+        .unwrap();
+        assert_eq!(batch.done, [folder.text("b")]);
+        assert_eq!(timed_out_paths(&batch), [&*names[2]]);
+        assert!(folder.0.join("into/b").exists());
+        assert_eq!(fs::read(folder.0.join("c")).unwrap(), b"c");
+
+        // Out of time before it began: nothing is done.
+        let batch = delete_all(&account, &names[2..], false, &Deadline::after_checks(0)).unwrap();
+        assert!(batch.done.is_empty());
+        assert_eq!(timed_out_paths(&batch), [&*names[2]]);
+        assert!(folder.0.join("c").exists());
+    }
+
+    #[test]
+    fn a_move_to_another_volume_stopped_part_way_keeps_the_original_and_no_copy() {
+        let folder = Folder::new();
+        let account = own();
+        let source = folder.0.join("source");
+        fs::create_dir_all(source.join("sub")).unwrap();
+        for name in ["one", "two", "sub/three"] {
+            fs::write(source.join(name), name).unwrap();
+        }
+        let target = folder.0.join("target");
+        // The checks: the folder, its first entry, then out of time before
+        // the second.
+        let error =
+            move_across(&account, &source, &target, &Deadline::after_checks(2)).unwrap_err();
+        assert_eq!(error.code, FileErrorCode::TimedOut, "{error:?}");
+        assert!(error.message.contains("kept the original"), "{error:?}");
+        assert!(!target.exists(), "the partial copy is removed");
+        for name in ["one", "two", "sub/three"] {
+            assert_eq!(fs::read(source.join(name)).unwrap(), name.as_bytes());
+        }
+
+        // In time, it moves.
+        move_across(&account, &source, &target, &Deadline::distant()).unwrap();
+        assert!(!source.exists());
+        assert_eq!(fs::read(target.join("sub/three")).unwrap(), b"sub/three");
+    }
+
+    #[test]
+    fn measuring_a_download_stops_at_its_deadline() {
+        let folder = Folder::new();
+        let account = own();
+        fs::create_dir_all(folder.0.join("dir/sub")).unwrap();
+        fs::write(folder.0.join("dir/sub/a"), b"a").unwrap();
+        let error = prepare_download(
+            &account,
+            &[folder.text("dir")],
+            1000,
+            &Deadline::after_checks(1),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, FileErrorCode::TimedOut);
     }
 }
