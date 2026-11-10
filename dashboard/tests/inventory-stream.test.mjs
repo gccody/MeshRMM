@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { ACCESS_REVOKED_CLOSE_CODE, STALE_GRACE_MS, eventsSocketUrl, inventoryStatus, inventoryStream } from '../features/agents/inventory-stream.ts';
+import { ACCESS_REVOKED_CLOSE_CODE, SILENT_SOCKET_MS, STALE_GRACE_MS, eventsSocketUrl, inventoryStatus, inventoryStream } from '../features/agents/inventory-stream.ts';
 
 class FakeSocket extends EventTarget {
   readyState = 0;
@@ -45,6 +45,9 @@ function fakeTimers() {
     },
     clearTimeout(timer) {
       pending.delete(timer);
+    },
+    advance(ms) {
+      clock += ms;
     },
     fire() {
       assert.equal(pending.size, 1, 'one reconnect is scheduled');
@@ -197,7 +200,7 @@ test('after the stream goes live, the next outage’s first refusal checks at on
   assert.deepEqual(state.refusedAt, [0, 1_500]);
 });
 
-test('wake() while waiting connects now and resets the step to 1 s', () => {
+test('wake() while waiting connects at once and keeps the backoff step', () => {
   const { stream, sockets, timers } = harness();
   refuse(sockets[0]);
   timers.fire();
@@ -205,19 +208,55 @@ test('wake() while waiting connects now and resets the step to 1 s', () => {
   assert.deepEqual(timers.delays, [750, 1_500]);
   stream.wake();
   assert.equal(sockets.length, 3);
-  assert.equal(timers.pending.size, 0);
+  assert.equal(timers.pending.size, 0, 'the wait is skipped');
   refuse(sockets[2]);
-  assert.deepEqual(timers.delays, [750, 1_500, 750]);
+  assert.deepEqual(timers.delays, [750, 1_500, 3_000], 'only going live restarts the step');
 });
 
-test('wake() on an open socket asks for a fresh snapshot', () => {
-  const { stream, sockets } = harness();
+test('wake() on a live socket asks for nothing', () => {
+  const { stream, sockets, timers, connections } = harness();
+  sockets[0].open();
+  sockets[0].receive({ type: 'snapshot', revision: 1, agents: [agent('a')], generated_at_unix_ms: 1 });
   stream.wake();
-  assert.deepEqual(sockets[0].sent, [], 'a connecting socket cannot send yet');
-  assert.equal(sockets.length, 1, 'a connecting socket is not replaced');
+  timers.advance(20_000);
+  sockets[0].receive({ type: 'metrics', readings: [] });
+  timers.advance(SILENT_SOCKET_MS);
+  stream.wake();
+  assert.deepEqual(sockets[0].sent, [], 'the socket kept the page current in the background');
+  assert.equal(sockets[0].closed, null);
+  assert.equal(sockets.length, 1);
+  assert.equal(timers.pending.size, 0);
+  assert.deepEqual(connections, ['connecting', 'live']);
+});
+
+test('wake() replaces a live socket that has been silent too long', () => {
+  const { stream, sockets, timers, connections, revision, state } = harness();
+  sockets[0].open();
+  sockets[0].receive({ type: 'snapshot', revision: 50, agents: [agent('a')], generated_at_unix_ms: 1 });
+  timers.advance(SILENT_SOCKET_MS + 1);
+  stream.wake();
+  assert.deepEqual(sockets[0].sent, [], 'a dead socket would deliver no snapshot');
+  assert.equal(sockets[0].closed?.code, 1000);
+  assert.equal(sockets.length, 2, 'a new socket opens at once');
+  assert.equal(timers.pending.size, 0);
+  assert.equal(revision.current, -1);
+  assert.deepEqual(connections, ['connecting', 'live', 'reconnecting']);
+  sockets[1].open();
+  sockets[1].receive({ type: 'snapshot', revision: 3, agents: [agent('a'), agent('b')], generated_at_unix_ms: 2 });
+  assert.deepEqual(state.agents.map(item => item.id), ['a', 'b']);
+  assert.deepEqual(connections, ['connecting', 'live', 'reconnecting', 'live']);
+});
+
+test('wake() before the first snapshot asks for nothing', () => {
+  const { stream, sockets, timers } = harness();
+  stream.wake();
   sockets[0].open();
   stream.wake();
-  assert.deepEqual(sockets[0].sent, ['refresh']);
+  timers.advance(SILENT_SOCKET_MS + 1);
+  stream.wake();
+  assert.deepEqual(sockets[0].sent, [], 'the snapshot is already on its way');
+  assert.equal(sockets[0].closed, null);
+  assert.equal(sockets.length, 1);
 });
 
 test('applies deltas buffered before the snapshot, then live deltas in order', () => {
