@@ -163,7 +163,12 @@ A device's tile or name opens its own page. Its **Usage** tab shows the latest r
 space, and charts of the last 15 minutes live, or the last hour, 24 hours or
 7 days. The server keeps the live readings in memory
 (`server/src/realtime/metrics.rs`) and averages each minute into the
-database, where history is kept for 7 days.
+database, where history is kept for 7 days. Finished minutes wait in memory
+and are stored together every 5 seconds, so a minute appears in the history
+up to 5 seconds after it ends; a graceful stop stores the ones waiting. While
+the database can't keep up, at most 250,000 minutes wait and the oldest are
+dropped. A minute the database refuses on its own is dropped without the
+others; a deleted device's waiting minutes are dropped with its history.
 
 ## Hardware and software
 

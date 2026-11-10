@@ -171,10 +171,7 @@ async fn device_state_rules_raise_and_resolve_alerts_and_notify() {
 
         let now = now_ms();
         observe(&app, &desk.device_id, now, 70, 95.0);
-        app.state
-            .metrics
-            .record(&desk.device_id, reading(95.0, 4))
-            .await;
+        app.state.metrics.record(&desk.device_id, reading(95.0, 4));
         alerts::evaluate(&app.state, now).await.unwrap();
         let open = alerts_of(&mut admin, "").await;
         assert_eq!(open.len(), 2, "{name}: {open:?}");
