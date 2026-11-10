@@ -1036,7 +1036,9 @@ async fn sweep_lost_runs(state: &AppState, now: i64) -> anyhow::Result<()> {
         {
             continue;
         }
-        let marked = database
+        // The run and its job device's outcome change together.
+        let mut transaction = database.begin().await?;
+        let marked = transaction
             .execute(
                 &Query::update()
                     .table(ScriptRuns::Table)
@@ -1047,6 +1049,16 @@ async fn sweep_lost_runs(state: &AppState, now: i64) -> anyhow::Result<()> {
                     .to_owned(),
             )
             .await?;
+        if marked == 1 {
+            crate::automation::jobs::runs_changed(
+                &mut transaction,
+                crate::automation::jobs::RunTable::Script,
+                crate::automation::jobs::Changed::Id(&id),
+                now,
+            )
+            .await?;
+        }
+        transaction.commit().await?;
         if marked == 1 {
             // A self-healing script's attempt is lost with it.
             crate::monitors::remediation::run_finished(state, &id).await;

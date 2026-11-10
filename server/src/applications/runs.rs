@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 
 use super::tables::{ApplicationRunItems, ApplicationRuns};
 use crate::{
+    automation::jobs::{self, Changed, RunTable},
     db::{
-        self, Executor,
+        self, Database, Executor,
         tables::{Agents, Users},
     },
     time::{MINUTE_MS, SECOND_MS},
@@ -196,7 +197,7 @@ pub async fn fail(executor: &mut impl Executor, id: &str, error: &str, now: i64)
                 .to_owned(),
         )
         .await?;
-    Ok(())
+    changed(executor, id, now).await
 }
 
 /// How one application of a run went, as the API shows it.
@@ -619,6 +620,7 @@ pub async fn finish(
     if updated != 1 {
         return Ok(false);
     }
+    changed(executor, run_id, now).await?;
     for (position, item) in result.items.iter().enumerate() {
         executor
             .execute(
@@ -668,10 +670,10 @@ pub async fn finish(
 /// Marks runs the Agent never reported as lost. Returns them, with their
 /// devices and actions.
 pub async fn sweep_lost(
-    executor: &mut impl Executor,
+    database: &Database,
     now: i64,
 ) -> db::Result<Vec<(String, String, Action)>> {
-    let pending: Vec<(String, String, String, i64)> = executor
+    let pending: Vec<(String, String, String, i64)> = database
         .fetch_all(
             &Query::select()
                 .columns([
@@ -693,11 +695,28 @@ pub async fn sweep_lost(
         if created_at + action.report_window_ms() >= now {
             continue;
         }
-        if mark_lost(executor, &id, "The device never reported how it went", now).await? {
+        // Each run with its job device's outcome, in a transaction of its own.
+        let mut transaction = database.begin().await?;
+        let marked = mark_lost(
+            &mut transaction,
+            &id,
+            "The device never reported how it went",
+            now,
+        )
+        .await?;
+        transaction.commit().await?;
+        if marked {
             lost.push((id, device_id, action));
         }
     }
     Ok(lost)
+}
+
+/// Writes how the run went into its job device's outcome, if it is a job's,
+/// in the transaction that changed its status.
+async fn changed(executor: &mut impl Executor, id: &str, now: i64) -> db::Result<()> {
+    jobs::runs_changed(executor, RunTable::Application, Changed::Id(id), now).await?;
+    Ok(())
 }
 
 /// Marks a pending run lost, with why; false if it isn't pending.
@@ -720,6 +739,9 @@ async fn mark_lost(
                 .to_owned(),
         )
         .await?;
+    if updated == 1 {
+        changed(executor, id, now).await?;
+    }
     Ok(updated == 1)
 }
 

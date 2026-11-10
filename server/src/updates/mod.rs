@@ -193,15 +193,20 @@ pub async fn scan_reported(
         }
     };
     tracing::info!(device_id, error, ?stored, "stored a device's update scan");
-    let finished = match runs::finish_scans(
-        &mut &state.database,
-        device_id,
-        &run_ids,
-        error.as_deref(),
-        now,
-    )
-    .await
-    {
+    // The scans and their job devices' outcomes change together. Most scans
+    // are the Agent's own and answer none.
+    let finish = async {
+        if run_ids.is_empty() {
+            return crate::db::Result::Ok(Vec::new());
+        }
+        let mut transaction = state.database.begin().await?;
+        let finished =
+            runs::finish_scans(&mut transaction, device_id, &run_ids, error.as_deref(), now)
+                .await?;
+        transaction.commit().await?;
+        Ok(finished)
+    };
+    let finished = match finish.await {
         Ok(finished) => finished,
         Err(error) => {
             tracing::warn!(device_id, %error, "could not finish a device's update scans");

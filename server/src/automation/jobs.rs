@@ -12,6 +12,14 @@
 //! job's ID, so its result, output and alerts work as for one started by
 //! hand. A wake job is the other way round: it skips online devices, and
 //! wakes each offline one through the devices on its network.
+//!
+//! What happened on each device is stored with it in `job_devices`: once
+//! it starts, how its run ended (`result`, NULL while it awaits a report)
+//! and when its report is due (`report_by`). Every change of a job run's
+//! status writes them in the same transaction ([`runs_changed`]), so a
+//! job's counts are an index read of its own devices ([`counts`]), however
+//! many devices it has, and a report that never comes turns into no result
+//! by the clock alone, with nothing to sweep.
 use std::collections::{HashMap, HashSet};
 
 use meshrmm_protocol_types::{
@@ -290,6 +298,21 @@ impl Outcome {
         matches!(self, Self::Failed | Self::TimedOut | Self::NoResult)
     }
 
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Waiting => "waiting",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+            Self::NoResult => "no_result",
+            Self::Skipped => "skipped",
+            Self::Missed => "missed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Queued => "Queued",
@@ -306,33 +329,279 @@ impl Outcome {
     }
 }
 
-/// A device's outcome from its state and its run's or delivery's status.
-/// `succeeded` is a run that exited with 0, or a delivered file; `overdue`
-/// a pending one the device should have reported long ago.
-pub fn outcome(
-    state: DeviceState,
-    status: Option<&str>,
-    succeeded: bool,
-    overdue: bool,
-) -> Outcome {
+/// A started device's outcome as `job_devices.result` stores it: how its
+/// run ended, or `None` while it awaits a report.
+fn parse_result(result: &str) -> Outcome {
+    match result {
+        "succeeded" => Outcome::Succeeded,
+        "failed" => Outcome::Failed,
+        "timed_out" => Outcome::TimedOut,
+        // None of the applications was for the device.
+        "skipped" => Outcome::Skipped,
+        // Lost: the device never reported.
+        _ => Outcome::NoResult,
+    }
+}
+
+/// A device's outcome from its state and, once started, its stored result:
+/// how its run ended, or `None` while it awaits a report. `overdue` is a
+/// report that was due before now, or a device with no run to report.
+pub fn outcome(state: DeviceState, result: Option<&str>, overdue: bool) -> Outcome {
     match state {
         DeviceState::Queued => Outcome::Queued,
         DeviceState::Waiting => Outcome::Waiting,
         DeviceState::Skipped => Outcome::Skipped,
         DeviceState::Missed => Outcome::Missed,
         DeviceState::Cancelled => Outcome::Cancelled,
-        DeviceState::Started => match status {
-            Some("pending") if overdue => Outcome::NoResult,
-            Some("pending") => Outcome::Running,
-            Some("completed" | "delivered" | "succeeded") if succeeded => Outcome::Succeeded,
-            Some("completed" | "failed" | "partial") => Outcome::Failed,
-            // None of the applications was for the device.
-            Some("skipped") => Outcome::Skipped,
-            Some("timed_out") => Outcome::TimedOut,
-            // Lost, or purged with the toolbox history.
-            _ => Outcome::NoResult,
+        DeviceState::Started => match result {
+            None if overdue => Outcome::NoResult,
+            None => Outcome::Running,
+            Some(result) => parse_result(result),
         },
     }
+}
+
+/// The table a job's device has its part in: the run, delivery, update run,
+/// application run or wake request carrying the job's ID. Each change of
+/// such a row's status calls [`runs_changed`] in the same transaction, which
+/// writes into `job_devices` the outcome that used to be worked out on every
+/// read by joining the five tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunTable {
+    Script,
+    Delivery,
+    Update,
+    Application,
+    Wake,
+}
+
+impl RunTable {
+    /// Where a job of `kind` keeps its devices' runs.
+    pub fn of(kind: Kind) -> Self {
+        match kind {
+            Kind::Script => Self::Script,
+            Kind::File => Self::Delivery,
+            Kind::UpdateScan | Kind::UpdateInstall => Self::Update,
+            Kind::Wake => Self::Wake,
+            Kind::AppInstall | Kind::AppUpdate | Kind::AppUninstall => Self::Application,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Script => "script_runs",
+            Self::Delivery => "file_deliveries",
+            Self::Update => "update_runs",
+            Self::Application => "application_runs",
+            Self::Wake => "wake_requests",
+        }
+    }
+
+    /// How a row ended, as `job_devices.result` stores it: NULL while it
+    /// awaits a report. A run that completed with exit code 0, a delivered
+    /// file, an update or application run that succeeded and a woken device
+    /// that came online succeeded; a wake whose relays all failed, or that
+    /// had none, failed; a run, update run or application run the device
+    /// never reported has no result.
+    fn result_sql(self) -> &'static str {
+        match self {
+            Self::Script => {
+                "CASE script_runs.status WHEN 'pending' THEN NULL \
+                 WHEN 'completed' THEN CASE WHEN script_runs.exit_code = 0 THEN 'succeeded' ELSE 'failed' END \
+                 WHEN 'failed' THEN 'failed' WHEN 'timed_out' THEN 'timed_out' ELSE 'no_result' END"
+            }
+            Self::Delivery => {
+                "CASE file_deliveries.status WHEN 'pending' THEN NULL \
+                 WHEN 'delivered' THEN 'succeeded' WHEN 'failed' THEN 'failed' ELSE 'no_result' END"
+            }
+            Self::Update => {
+                "CASE update_runs.status WHEN 'pending' THEN NULL \
+                 WHEN 'succeeded' THEN 'succeeded' WHEN 'partial' THEN 'failed' \
+                 WHEN 'failed' THEN 'failed' ELSE 'no_result' END"
+            }
+            Self::Application => {
+                "CASE application_runs.status WHEN 'pending' THEN NULL \
+                 WHEN 'succeeded' THEN 'succeeded' WHEN 'partial' THEN 'failed' \
+                 WHEN 'failed' THEN 'failed' WHEN 'skipped' THEN 'skipped' ELSE 'no_result' END"
+            }
+            Self::Wake => {
+                "CASE WHEN wake_requests.online_at IS NOT NULL THEN 'succeeded' \
+                 WHEN wake_requests.status IN ('sending', 'sent') THEN NULL ELSE 'failed' END"
+            }
+        }
+    }
+
+    /// When a row's report is due: past it, one still awaiting a report has
+    /// no result.
+    fn deadline_sql(self) -> String {
+        match self {
+            Self::Script => format!(
+                "script_runs.created_at + script_runs.timeout_seconds * {SECOND_MS} + {RUN_REPORT_GRACE_MS}"
+            ),
+            Self::Delivery => format!("file_deliveries.created_at + {DELIVERY_WINDOW_MS}"),
+            Self::Update => format!(
+                "update_runs.created_at + CASE update_runs.kind WHEN 'scan' THEN {SCAN_REPORT_WINDOW_MS} \
+                 ELSE {INSTALL_REPORT_WINDOW_MS} END"
+            ),
+            Self::Application => format!(
+                "application_runs.created_at + CASE application_runs.action WHEN 'scan' THEN {} \
+                 ELSE {} END",
+                crate::applications::runs::SCAN_REPORT_WINDOW_MS,
+                crate::applications::runs::RUN_REPORT_WINDOW_MS
+            ),
+            Self::Wake => format!(
+                "wake_requests.created_at + {}",
+                crate::wake::ONLINE_WINDOW_MS
+            ),
+        }
+    }
+
+    /// `expression` of the row of this table that `which` picks.
+    fn read(self, expression: String, which: sea_query::Condition) -> sea_query::SelectStatement {
+        Query::select()
+            .expr(Expr::cust(expression))
+            .from(self.name())
+            .cond_where(which)
+            .to_owned()
+    }
+
+    fn column(self, column: &'static str) -> Expr {
+        Expr::col((self.name(), column))
+    }
+
+    /// The row with ID `id`.
+    fn by_id(self, id: &str) -> sea_query::Condition {
+        sea_query::Cond::all().add(self.column("id").eq(id))
+    }
+
+    /// The row of the `job_devices` row being written, by its job and device.
+    fn of_part(self) -> sea_query::Condition {
+        sea_query::Cond::all()
+            .add(
+                self.column("job_id")
+                    .equals((JobDevices::Table, JobDevices::JobId)),
+            )
+            .add(
+                self.column("device_id")
+                    .equals((JobDevices::Table, JobDevices::DeviceId)),
+            )
+    }
+
+    /// Sets a started part's result and report deadline from the row that
+    /// `which` picks.
+    fn set_from(self, update: &mut sea_query::UpdateStatement, which: sea_query::Condition) {
+        // A device has one row of a job at a time (one that never reached
+        // its Agent is removed), but a value must be one row whatever.
+        let latest = |expression: String| {
+            self.read(expression, which.clone())
+                .order_by_expr(
+                    Expr::cust(format!("{}.created_at", self.name())),
+                    Order::Desc,
+                )
+                .limit(1)
+                .to_owned()
+        };
+        update
+            .value(JobDevices::Result, latest(self.result_sql().to_owned()))
+            .value(JobDevices::ReportBy, latest(self.deadline_sql()));
+    }
+}
+
+/// Which rows of a [`RunTable`] changed.
+#[derive(Debug, Clone, Copy)]
+pub enum Changed<'a> {
+    /// The row with this ID.
+    Id(&'a str),
+    /// The device's rows, such as its wake requests when it came online.
+    Device(&'a str),
+}
+
+/// Writes into each started job device whose row of `table` changed, as
+/// `changed` says, how that row ended and when its report is due. Callers run
+/// it in the transaction that changed the row's status, so a job's counts
+/// never see one without the other. A row that belongs to no job changes
+/// nothing. Returns how many devices it wrote.
+pub async fn runs_changed(
+    executor: &mut impl Executor,
+    table: RunTable,
+    changed: Changed<'_>,
+    now: i64,
+) -> db::Result<u64> {
+    executor
+        .execute(&runs_changed_statement(table, changed, now))
+        .await
+}
+
+/// The statement [`runs_changed`] runs: a lookup of the changed rows' job
+/// devices by their primary key, or by their device.
+pub fn runs_changed_statement(
+    table: RunTable,
+    changed: Changed<'_>,
+    now: i64,
+) -> sea_query::UpdateStatement {
+    let mut update = Query::update();
+    update
+        .table(JobDevices::Table)
+        .value(JobDevices::UpdatedAt, now)
+        .and_where(
+            Expr::col((JobDevices::Table, JobDevices::State)).eq(DeviceState::Started.as_str()),
+        );
+    match changed {
+        Changed::Id(id) => {
+            table.set_from(&mut update, table.by_id(id));
+            // Looked up by the job's primary key; a row without a job matches
+            // nothing.
+            update
+                .and_where(
+                    Expr::col((JobDevices::Table, JobDevices::JobId))
+                        .eq(table.read(format!("{}.job_id", table.name()), table.by_id(id))),
+                )
+                .and_where(
+                    Expr::col((JobDevices::Table, JobDevices::DeviceId))
+                        .eq(table.read(format!("{}.device_id", table.name()), table.by_id(id))),
+                );
+        }
+        Changed::Device(device_id) => {
+            table.set_from(&mut update, table.of_part());
+            update
+                .and_where(Expr::col((JobDevices::Table, JobDevices::DeviceId)).eq(device_id))
+                .and_where(
+                    Expr::col((JobDevices::Table, JobDevices::JobId)).in_subquery(
+                        table.read(
+                            format!("{}.job_id", table.name()),
+                            sea_query::Cond::all()
+                                .add(table.column("device_id").eq(device_id))
+                                .add(table.column("job_id").is_not_null()),
+                        ),
+                    ),
+                );
+        }
+    }
+    update
+}
+
+/// Claims a queued device for the run `run_id` of `table`, recorded in the
+/// same transaction: the device is started, with the run's result (it may
+/// have failed already, such as a file deleted from the library) and its
+/// report deadline. Returns whether it was still queued.
+pub(crate) async fn claim(
+    executor: &mut impl Executor,
+    job_id: &str,
+    device_id: &str,
+    table: RunTable,
+    run_id: &str,
+    now: i64,
+) -> db::Result<bool> {
+    let mut update = Query::update();
+    update
+        .table(JobDevices::Table)
+        .value(JobDevices::State, DeviceState::Started.as_str())
+        .value(JobDevices::UpdatedAt, now)
+        .and_where(Expr::col(JobDevices::JobId).eq(job_id))
+        .and_where(Expr::col(JobDevices::DeviceId).eq(device_id))
+        .and_where(Expr::col(JobDevices::State).eq(DeviceState::Queued.as_str()));
+    table.set_from(&mut update, table.by_id(run_id));
+    Ok(executor.execute(&update).await? == 1)
 }
 
 /// How many devices of a job have each outcome.
@@ -1256,119 +1525,138 @@ async fn with_counts(
         .collect())
 }
 
-/// The columns that join a job's device to its run, delivery or update run:
-/// the status, whether it succeeded, and whether it's overdue at `now`.
-fn outcome_columns(select: &mut sea_query::SelectStatement, now: i64) {
-    let run_deadline = format!(
-        "script_runs.created_at + script_runs.timeout_seconds * {SECOND_MS} + {RUN_REPORT_GRACE_MS}"
-    );
-    let delivery_deadline = format!("file_deliveries.created_at + {DELIVERY_WINDOW_MS}");
-    let wake_deadline = format!(
-        "wake_requests.created_at + {}",
-        crate::wake::ONLINE_WINDOW_MS
-    );
-    let update_deadline = format!(
-        "update_runs.created_at + CASE update_runs.kind WHEN 'scan' THEN {SCAN_REPORT_WINDOW_MS} \
-         ELSE {INSTALL_REPORT_WINDOW_MS} END"
-    );
-    let application_deadline = format!(
-        "application_runs.created_at + CASE application_runs.action WHEN 'scan' THEN {} \
-         ELSE {} END",
-        crate::applications::runs::SCAN_REPORT_WINDOW_MS,
-        crate::applications::runs::RUN_REPORT_WINDOW_MS
-    );
+/// Joins a job's device to its run, delivery, update run, application run or
+/// wake request, for what the job's page shows of it. The device's outcome
+/// doesn't need them: it is stored with the device.
+fn join_runs(select: &mut sea_query::SelectStatement) {
+    let part = |job_id: Expr, device_id: Expr| {
+        job_id
+            .equals((JobDevices::Table, JobDevices::JobId))
+            .and(device_id.equals((JobDevices::Table, JobDevices::DeviceId)))
+    };
     select
-        .expr_as(
-            Expr::cust(
-                "COALESCE(script_runs.status, file_deliveries.status, update_runs.status, \
-                 application_runs.status, \
-                 CASE WHEN wake_requests.id IS NULL THEN NULL \
-                 WHEN wake_requests.online_at IS NOT NULL THEN 'succeeded' \
-                 WHEN wake_requests.status IN ('sending', 'sent') THEN 'pending' \
-                 ELSE 'failed' END)",
-            ),
-            "status",
-        )
-        .expr_as(
-            Expr::cust(
-                "CAST(CASE WHEN script_runs.status = 'completed' AND script_runs.exit_code = 0 THEN 1 \
-                 WHEN file_deliveries.status = 'delivered' THEN 1 \
-                 WHEN update_runs.status = 'succeeded' THEN 1 \
-                 WHEN application_runs.status = 'succeeded' THEN 1 \
-                 WHEN wake_requests.online_at IS NOT NULL THEN 1 ELSE 0 END AS BIGINT)",
-            ),
-            "succeeded",
-        )
-        .expr_as(
-            Expr::cust(format!(
-                "CAST(CASE WHEN script_runs.status = 'pending' AND {run_deadline} < {now} THEN 1 \
-                 WHEN file_deliveries.status = 'pending' AND {delivery_deadline} < {now} THEN 1 \
-                 WHEN update_runs.status = 'pending' AND {update_deadline} < {now} THEN 1 \
-                 WHEN application_runs.status = 'pending' AND {application_deadline} < {now} THEN 1 \
-                 WHEN wake_requests.online_at IS NULL AND wake_requests.status IN ('sending', 'sent') \
-                 AND {wake_deadline} < {now} THEN 1 \
-                 ELSE 0 END AS BIGINT)"
-            )),
-            "overdue",
-        )
         .left_join(
             ScriptRuns::Table,
-            Expr::col((ScriptRuns::Table, ScriptRuns::JobId))
-                .equals((JobDevices::Table, JobDevices::JobId))
-                .and(
-                    Expr::col((ScriptRuns::Table, ScriptRuns::DeviceId))
-                        .equals((JobDevices::Table, JobDevices::DeviceId)),
-                ),
+            part(
+                Expr::col((ScriptRuns::Table, ScriptRuns::JobId)),
+                Expr::col((ScriptRuns::Table, ScriptRuns::DeviceId)),
+            ),
         )
         .left_join(
             FileDeliveries::Table,
-            Expr::col((FileDeliveries::Table, FileDeliveries::JobId))
-                .equals((JobDevices::Table, JobDevices::JobId))
-                .and(
-                    Expr::col((FileDeliveries::Table, FileDeliveries::DeviceId))
-                        .equals((JobDevices::Table, JobDevices::DeviceId)),
-                ),
+            part(
+                Expr::col((FileDeliveries::Table, FileDeliveries::JobId)),
+                Expr::col((FileDeliveries::Table, FileDeliveries::DeviceId)),
+            ),
         )
         .left_join(
             UpdateRuns::Table,
-            Expr::col((UpdateRuns::Table, UpdateRuns::JobId))
-                .equals((JobDevices::Table, JobDevices::JobId))
-                .and(
-                    Expr::col((UpdateRuns::Table, UpdateRuns::DeviceId))
-                        .equals((JobDevices::Table, JobDevices::DeviceId)),
-                ),
+            part(
+                Expr::col((UpdateRuns::Table, UpdateRuns::JobId)),
+                Expr::col((UpdateRuns::Table, UpdateRuns::DeviceId)),
+            ),
         )
         .left_join(
             WakeRequests::Table,
-            Expr::col((WakeRequests::Table, WakeRequests::JobId))
-                .equals((JobDevices::Table, JobDevices::JobId))
-                .and(
-                    Expr::col((WakeRequests::Table, WakeRequests::DeviceId))
-                        .equals((JobDevices::Table, JobDevices::DeviceId)),
-                ),
+            part(
+                Expr::col((WakeRequests::Table, WakeRequests::JobId)),
+                Expr::col((WakeRequests::Table, WakeRequests::DeviceId)),
+            ),
         )
         .left_join(
             ApplicationRuns::Table,
-            Expr::col((ApplicationRuns::Table, ApplicationRuns::JobId))
-                .equals((JobDevices::Table, JobDevices::JobId))
-                .and(
-                    Expr::col((ApplicationRuns::Table, ApplicationRuns::DeviceId))
-                        .equals((JobDevices::Table, JobDevices::DeviceId)),
-                ),
+            part(
+                Expr::col((ApplicationRuns::Table, ApplicationRuns::JobId)),
+                Expr::col((ApplicationRuns::Table, ApplicationRuns::DeviceId)),
+            ),
         );
+}
+
+/// SQL that is 1 for a started device's report that was due before `now`,
+/// or that it has no run to report, and 0 otherwise.
+fn overdue_sql(now: i64) -> String {
+    format!(
+        "CASE WHEN job_devices.report_by IS NULL OR job_devices.report_by < {now} THEN 1 ELSE 0 END"
+    )
+}
+
+/// The statement [`counts`] reads the counts of up to 200 jobs with: a
+/// row per job and state, from `idx_job_devices_job` alone, with the started
+/// devices' results summed in columns, so the rows come grouped in the
+/// index's order without sorting a job's devices.
+pub fn counts_query(ids: &[String], now: i64) -> sea_query::SelectStatement {
+    let sum = |condition: String| {
+        Expr::cust(format!(
+            "CAST(SUM(CASE WHEN {condition} THEN 1 ELSE 0 END) AS BIGINT)"
+        ))
+    };
+    let result = |outcome: Outcome| sum(format!("job_devices.result = '{}'", outcome.as_str()));
+    Query::select()
+        .columns([
+            (JobDevices::Table, JobDevices::JobId),
+            (JobDevices::Table, JobDevices::State),
+        ])
+        .expr_as(Expr::cust("CAST(COUNT(*) AS BIGINT)"), "devices")
+        .expr_as(result(Outcome::Succeeded), "succeeded")
+        .expr_as(result(Outcome::Failed), "failed")
+        .expr_as(result(Outcome::TimedOut), "timed_out")
+        .expr_as(result(Outcome::Skipped), "skipped")
+        .expr_as(
+            sum(format!(
+                "job_devices.result IS NULL AND {} = 0",
+                overdue_sql(now)
+            )),
+            "running",
+        )
+        .from(JobDevices::Table)
+        .and_where(Expr::col((JobDevices::Table, JobDevices::JobId)).is_in(ids.iter().cloned()))
+        .group_by_col((JobDevices::Table, JobDevices::JobId))
+        .group_by_col((JobDevices::Table, JobDevices::State))
+        .to_owned()
 }
 
 #[derive(sqlx::FromRow)]
 struct CountRow {
     job_id: String,
     state: String,
-    status: Option<String>,
-    succeeded: i64,
-    overdue: i64,
     devices: i64,
+    succeeded: Option<i64>,
+    failed: Option<i64>,
+    timed_out: Option<i64>,
+    skipped: Option<i64>,
+    running: Option<i64>,
 }
 
-/// Each job's counts.
+impl CountRow {
+    /// Adds the row's devices to `counts`: those of a state that isn't
+    /// started by their state, and started ones by their result; the rest of
+    /// those are lost or overdue, with no result.
+    fn add_to(&self, counts: &mut Counts) {
+        let Some(state) = DeviceState::parse(&self.state) else {
+            return;
+        };
+        if state != DeviceState::Started {
+            counts.add(outcome(state, None, false), self.devices);
+            return;
+        }
+        let mut rest = self.devices;
+        for (outcome, devices) in [
+            (Outcome::Succeeded, self.succeeded),
+            (Outcome::Failed, self.failed),
+            (Outcome::TimedOut, self.timed_out),
+            (Outcome::Skipped, self.skipped),
+            (Outcome::Running, self.running),
+        ] {
+            let devices = devices.unwrap_or(0);
+            counts.add(outcome, devices);
+            rest -= devices;
+        }
+        counts.add(Outcome::NoResult, rest);
+    }
+}
+
+/// Each job's counts: an index read of each job's devices, joined to
+/// nothing.
 pub async fn counts(
     executor: &mut impl Executor,
     ids: &[String],
@@ -1376,39 +1664,9 @@ pub async fn counts(
 ) -> db::Result<HashMap<String, Counts>> {
     let mut counts: HashMap<String, Counts> = HashMap::new();
     for chunk in ids.chunks(200) {
-        let mut select = Query::select();
-        select.columns([
-            (JobDevices::Table, JobDevices::JobId),
-            (JobDevices::Table, JobDevices::State),
-        ]);
-        outcome_columns(&mut select, now);
-        select
-            .expr_as(Expr::cust("CAST(COUNT(*) AS BIGINT)"), "devices")
-            .from(JobDevices::Table)
-            .and_where(
-                Expr::col((JobDevices::Table, JobDevices::JobId)).is_in(chunk.iter().cloned()),
-            )
-            .add_group_by([
-                Expr::col((JobDevices::Table, JobDevices::JobId)),
-                Expr::col((JobDevices::Table, JobDevices::State)),
-                Expr::cust("3"),
-                Expr::cust("4"),
-                Expr::cust("5"),
-            ]);
-        let rows: Vec<CountRow> = executor.fetch_all(&select).await?;
+        let rows: Vec<CountRow> = executor.fetch_all(&counts_query(chunk, now)).await?;
         for row in rows {
-            let Some(state) = DeviceState::parse(&row.state) else {
-                continue;
-            };
-            counts.entry(row.job_id).or_default().add(
-                outcome(
-                    state,
-                    row.status.as_deref(),
-                    row.succeeded != 0,
-                    row.overdue != 0,
-                ),
-                row.devices,
-            );
+            row.add_to(counts.entry(row.job_id.clone()).or_default());
         }
     }
     Ok(counts)
@@ -1474,8 +1732,7 @@ struct JobDeviceRow {
     path: Option<String>,
     started_at: Option<i64>,
     completed_at: Option<i64>,
-    status: Option<String>,
-    succeeded: i64,
+    result: Option<String>,
     overdue: i64,
 }
 
@@ -1539,8 +1796,13 @@ pub async fn devices(
                  application_runs.completed_at, wake_requests.online_at)",
             ),
             "completed_at",
+        )
+        .column((JobDevices::Table, JobDevices::Result))
+        .expr_as(
+            Expr::cust(format!("CAST({} AS BIGINT)", overdue_sql(now))),
+            "overdue",
         );
-    outcome_columns(&mut select, now);
+    join_runs(&mut select);
     select
         .from(JobDevices::Table)
         .left_join(
@@ -1554,12 +1816,7 @@ pub async fn devices(
         .into_iter()
         .filter_map(|row| {
             let state = DeviceState::parse(&row.state)?;
-            let outcome = outcome(
-                state,
-                row.status.as_deref(),
-                row.succeeded != 0,
-                row.overdue != 0,
-            );
+            let outcome = outcome(state, row.result.as_deref(), row.overdue != 0);
             // An install that went partly wrong says how much.
             let installs = match (row.updates_installed, row.updates_failed) {
                 (Some(installed), Some(failed)) if failed > 0 => Some(format!(
@@ -1709,58 +1966,27 @@ mod tests {
     #[test]
     fn outcomes_follow_the_device_and_its_run() {
         use DeviceState::*;
-        assert_eq!(outcome(Queued, None, false, false), Outcome::Queued);
-        assert_eq!(outcome(Waiting, None, false, false), Outcome::Waiting);
-        assert_eq!(outcome(Skipped, None, false, false), Outcome::Skipped);
-        assert_eq!(outcome(Missed, None, false, false), Outcome::Missed);
-        assert_eq!(outcome(Cancelled, None, false, false), Outcome::Cancelled);
+        assert_eq!(outcome(Queued, None, false), Outcome::Queued);
+        assert_eq!(outcome(Waiting, None, false), Outcome::Waiting);
+        assert_eq!(outcome(Skipped, None, false), Outcome::Skipped);
+        assert_eq!(outcome(Missed, None, false), Outcome::Missed);
+        assert_eq!(outcome(Cancelled, None, false), Outcome::Cancelled);
+        assert_eq!(outcome(Started, None, false), Outcome::Running);
         assert_eq!(
-            outcome(Started, Some("pending"), false, false),
-            Outcome::Running
+            outcome(Started, None, true),
+            Outcome::NoResult,
+            "an overdue report"
         );
-        assert_eq!(
-            outcome(Started, Some("pending"), false, true),
-            Outcome::NoResult
-        );
-        assert_eq!(
-            outcome(Started, Some("completed"), true, false),
-            Outcome::Succeeded
-        );
-        assert_eq!(
-            outcome(Started, Some("completed"), false, false),
+        for result in [
+            Outcome::Succeeded,
             Outcome::Failed,
-            "a non-zero exit code fails"
-        );
-        assert_eq!(
-            outcome(Started, Some("failed"), false, false),
-            Outcome::Failed
-        );
-        assert_eq!(
-            outcome(Started, Some("timed_out"), false, false),
-            Outcome::TimedOut
-        );
-        assert_eq!(
-            outcome(Started, Some("lost"), false, false),
-            Outcome::NoResult
-        );
-        assert_eq!(
-            outcome(Started, Some("delivered"), true, false),
-            Outcome::Succeeded
-        );
-        assert_eq!(outcome(Started, None, false, false), Outcome::NoResult);
-        // Update runs.
-        assert_eq!(
-            outcome(Started, Some("succeeded"), true, false),
-            Outcome::Succeeded
-        );
-        assert_eq!(
-            outcome(Started, Some("skipped"), false, false),
-            Outcome::Skipped
-        );
-        assert_eq!(
-            outcome(Started, Some("partial"), false, false),
-            Outcome::Failed
-        );
+            Outcome::TimedOut,
+            Outcome::NoResult,
+            Outcome::Skipped,
+        ] {
+            assert_eq!(outcome(Started, Some(result.as_str()), false), result);
+            assert_eq!(outcome(Started, Some(result.as_str()), true), result);
+        }
     }
 
     #[test]

@@ -657,6 +657,8 @@ pub enum JobDevices {
     DeviceId,
     State,
     Detail,
+    Result,
+    ReportBy,
     UpdatedAt,
 }
 
