@@ -1,27 +1,29 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { AuthenticationRequired } from '../lib/http.ts';
-import { THUMBNAIL_INTERVAL_MS, ThumbnailStore, nextCheckAt } from '../features/agents/thumbnails.ts';
+import { RECENT_THUMBNAILS, THUMBNAIL_INTERVAL_MS, THUMBNAIL_REQUESTS, ThumbnailStore, nextCheckAt } from '../features/agents/thumbnails.ts';
 
 const MINUTE = 60_000;
 
 function harness(responses) {
   const requests = [];
+  const signals = [];
   const created = [];
   const revoked = [];
   let clock = 1_000_000_000;
   const store = new ThumbnailStore({
     fetch: async (path, init) => {
       requests.push({ path, ifNoneMatch: init.headers['If-None-Match'] ?? null, cache: init.cache });
+      signals.push(init.signal);
       const next = responses.shift();
       if (next instanceof Error) throw next;
-      return typeof next === 'function' ? next() : next;
+      return typeof next === 'function' ? next(init.signal) : next;
     },
     createUrl: (blob) => { const url = `blob:${created.length}`; created.push({ url, blob }); return url; },
     revokeUrl: (url) => revoked.push(url),
     now: () => clock,
   });
-  return { store, requests, created, revoked, advance: (ms) => { clock += ms; }, now: () => clock };
+  return { store, requests, signals, created, revoked, advance: (ms) => { clock += ms; }, now: () => clock };
 }
 
 const image = (etag, lastModified, bytes = 'jpeg') => new Response(bytes, {
@@ -143,4 +145,131 @@ test('devices that left the inventory are forgotten unless a row still shows the
   unsubscribe();
   h.store.retain(new Set());
   assert.deepEqual(h.revoked, ['blob:0', 'blob:1']);
+});
+
+
+const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+// A response that comes when the test says, or an abort error, like a real
+// fetch, once its signal is aborted.
+function later() {
+  const pending = [];
+  const respond = (signal) => new Promise((resolve, reject) => {
+    pending.push(resolve);
+    signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+  });
+  return { respond, pending };
+}
+
+test('only the most recently hidden images are kept, and every other one is released once', async () => {
+  const count = RECENT_THUMBNAILS + 50;
+  const h = harness(Array.from({ length: count + 2 }, (_, index) => image(`"${index}"`, 1_000_000_000)));
+  const shown = h.store.subscribe('pc-0', () => {});
+  await h.store.refresh('pc-0', true);
+  for (let index = 1; index < count; index++) {
+    const unsubscribe = h.store.subscribe(`pc-${index}`, () => {});
+    await h.store.refresh(`pc-${index}`, true);
+    unsubscribe();
+  }
+  const kept = Array.from({ length: count }, (_, index) => h.store.snapshot(`pc-${index}`)).filter(Boolean);
+  assert.equal(kept.length, RECENT_THUMBNAILS + 1, 'the shown tile and the most recently hidden ones');
+  assert.equal(h.store.snapshot('pc-0').url, 'blob:0', 'a tile still shown keeps its image');
+  assert.equal(h.store.snapshot('pc-1'), null, 'the longest hidden is forgotten');
+  assert.equal(h.store.snapshot(`pc-${count - 1}`).url, `blob:${count - 1}`);
+  const dropped = Array.from({ length: count - 1 - RECENT_THUMBNAILS }, (_, index) => `blob:${index + 1}`);
+  assert.deepEqual(h.revoked, dropped, 'every forgotten image is released, once');
+
+  // A recent one is drawn at once and not loaded again.
+  const back = h.store.subscribe(`pc-${count - 1}`, () => {});
+  assert.equal(await h.store.refresh(`pc-${count - 1}`, true), THUMBNAIL_INTERVAL_MS);
+  assert.equal(h.requests.length, count);
+  back();
+
+  // A forgotten one loads again, from the start: its ETag would bring no image.
+  const again = h.store.subscribe('pc-1', () => {});
+  await h.store.refresh('pc-1', true);
+  assert.equal(h.requests.length, count + 1);
+  assert.equal(h.requests[count].ifNoneMatch, null);
+  assert.equal(h.store.snapshot('pc-1').url, `blob:${count}`);
+  again();
+  shown();
+
+  h.store.clear();
+  assert.equal(new Set(h.revoked).size, h.revoked.length, 'no image is released twice');
+  assert.equal(h.revoked.length, h.created.length, 'and none is left');
+});
+
+test("a hidden tile's load is stopped, and its response publishes nothing", async () => {
+  let release;
+  const h = harness([
+    () => new Promise((resolve) => { release = () => resolve(image('"v1"', 1_000_000_000)); }),
+    image('"v2"', 1_000_000_000, 'second'),
+  ]);
+  const heard = [];
+  const unsubscribe = h.store.subscribe('pc-1', () => heard.push('pc-1'));
+  const loading = h.store.refresh('pc-1', true);
+  await settle();
+  assert.equal(h.signals[0].aborted, false);
+  unsubscribe();
+  assert.equal(h.signals[0].aborted, true, 'the request is aborted');
+  release();
+  assert.equal(await loading, null);
+  assert.equal(h.store.snapshot('pc-1'), null, 'a response that ignored the abort is dropped');
+  assert.equal(h.created.length, 0, 'and makes no object URL');
+  assert.deepEqual(heard, []);
+
+  h.store.subscribe('pc-1', () => {});
+  assert.notEqual(await h.store.refresh('pc-1', true), null, 'shown again, it loads');
+  assert.equal(h.requests.length, 2);
+  assert.equal(h.store.snapshot('pc-1').url, 'blob:0');
+  assert.deepEqual(h.revoked, []);
+});
+
+test('a tile shown again while its stopped load ends loads again', async () => {
+  const { respond, pending } = later();
+  const h = harness([respond, image('"v1"', 1_000_000_000)]);
+  const unsubscribe = h.store.subscribe('pc-1', () => {});
+  const stopped = h.store.refresh('pc-1', true);
+  await settle();
+  unsubscribe();
+  h.store.subscribe('pc-1', () => {});
+  const shown = h.store.refresh('pc-1', true);
+  await stopped;
+  assert.notEqual(await shown, null);
+  assert.equal(h.requests.length, 2);
+  assert.equal(pending.length, 1);
+  assert.equal(h.store.snapshot('pc-1').url, 'blob:0');
+});
+
+test('a few images load at once, and a hidden tile waiting for its turn asks for nothing', async () => {
+  const { respond, pending } = later();
+  const count = THUMBNAIL_REQUESTS + 3;
+  const h = harness(Array.from({ length: count }, () => respond));
+  const unsubscribe = [];
+  const loads = [];
+  for (let index = 0; index < count; index++) {
+    unsubscribe.push(h.store.subscribe(`pc-${index}`, () => {}));
+    loads.push(h.store.refresh(`pc-${index}`, true));
+  }
+  await settle();
+  assert.equal(h.requests.length, THUMBNAIL_REQUESTS);
+
+  // Hidden while waiting: never sent.
+  unsubscribe[THUMBNAIL_REQUESTS]();
+  // Hidden while loading: its request is aborted and frees its place.
+  unsubscribe[0]();
+  await settle();
+  assert.deepEqual(h.requests.map((request) => request.path).slice(THUMBNAIL_REQUESTS), [`/v1/agents/pc-${THUMBNAIL_REQUESTS + 1}/thumbnail`]);
+
+  pending[1](image('"v1"', 1_000_000_000));
+  await settle();
+  assert.equal(h.requests.at(-1).path, `/v1/agents/pc-${THUMBNAIL_REQUESTS + 2}/thumbnail`);
+  assert.equal(h.requests.length, THUMBNAIL_REQUESTS + 2);
+  assert.ok(!h.requests.some((request) => request.path === `/v1/agents/pc-${THUMBNAIL_REQUESTS}/thumbnail`));
+
+  for (const resolve of pending.slice(2)) resolve(image('"v1"', 1_000_000_000));
+  await Promise.all(loads);
+  assert.equal(h.store.snapshot('pc-0'), null);
+  assert.equal(h.store.snapshot(`pc-${THUMBNAIL_REQUESTS}`), null);
+  assert.equal(h.created.length, count - 2);
 });
