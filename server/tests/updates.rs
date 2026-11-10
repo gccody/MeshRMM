@@ -795,9 +795,10 @@ async fn update_jobs_and_policies_run_on_each_device() {
                 .unwrap()["outcome"]
                 .clone()
         };
-        assert_eq!(outcome(&started.body, "SUSE"), "skipped", "{name}");
-        assert_eq!(outcome(&started.body, "Away"), "missed");
-        assert_eq!(outcome(&started.body, "Desk"), "queued");
+        let created = common::job_with_devices(&mut admin, &job_id).await;
+        assert_eq!(outcome(&created, "SUSE"), "skipped", "{name}");
+        assert_eq!(outcome(&created, "Away"), "missed");
+        assert_eq!(outcome(&created, "Desk"), "queued");
 
         automation::pass(&app.state, now_ms()).await.unwrap();
         let command = receive_json(&mut control).await;
@@ -807,7 +808,7 @@ async fn update_jobs_and_policies_run_on_each_device() {
             json!(["security", "critical"])
         );
         let run_id = command["install"]["run_id"].as_str().unwrap().to_owned();
-        let job = admin.get(&format!("/v1/jobs/{job_id}")).await.body;
+        let job = common::job_with_devices(&mut admin, &job_id).await;
         assert_eq!(outcome(&job, "Desk"), "running", "{name}");
         send_json(
             &mut control,
@@ -819,7 +820,7 @@ async fn update_jobs_and_policies_run_on_each_device() {
         .await;
         run_where(&mut admin, &run_id, |run| run["status"] == "succeeded").await;
         automation::pass(&app.state, now_ms()).await.unwrap();
-        let job = admin.get(&format!("/v1/jobs/{job_id}")).await.body;
+        let job = common::job_with_devices(&mut admin, &job_id).await;
         assert_eq!(outcome(&job, "Desk"), "succeeded", "{name}");
         let desk_entry = job["devices"]
             .as_array()

@@ -5,7 +5,9 @@ mod common;
 use std::time::Duration;
 
 use axum::http::{HeaderMap, StatusCode};
-use common::{App, Browser, apps, audit_events, receive_any_json, set_up, user_with};
+use common::{
+    App, Browser, apps, audit_events, job_with_devices, receive_any_json, set_up, user_with,
+};
 use meshrmm_protocol_types::{AgentCommand, FileDeliveryDestination, RunAs};
 use meshrmm_server::{
     automation,
@@ -28,16 +30,27 @@ async fn create_script(browser: &mut Browser, name: &str, language: &str, shared
     created.body["id"].as_str().unwrap().to_owned()
 }
 
+/// Starts a job, and returns it with its devices.
 async fn start_job(browser: &mut Browser, body: Value) -> Value {
     let started = browser.post("/v1/jobs", body).await;
     assert_eq!(started.status, StatusCode::CREATED, "{:?}", started.body);
-    started.body
+    assert!(started.body.get("devices").is_none(), "{:?}", started.body);
+    job(browser, started.body["id"].as_str().unwrap()).await
 }
 
+/// The job with its devices, by name.
 async fn job(browser: &mut Browser, id: &str) -> Value {
-    let job = browser.get(&format!("/v1/jobs/{id}")).await;
-    assert_eq!(job.status, StatusCode::OK, "{:?}", job.body);
-    job.body
+    let mut job = job_with_devices(browser, id).await;
+    job["devices"]
+        .as_array_mut()
+        .unwrap()
+        .sort_by_key(|device| {
+            device["device_name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        });
+    job
 }
 
 /// Each device's outcome, by device name.
@@ -313,7 +326,12 @@ async fn offline_devices_are_skipped_waited_for_or_cancelled() {
             .post(&format!("/v1/jobs/{cancelling_id}/cancel"), json!({}))
             .await;
         assert_eq!(cancelled.status, StatusCode::OK, "{:?}", cancelled.body);
-        assert_eq!(cancelled.body["devices"][0]["outcome"], "cancelled");
+        assert_eq!(cancelled.body["counts"]["cancelled"], 1, "{name}");
+        assert!(cancelled.body.get("devices").is_none(), "{name}");
+        assert_eq!(
+            job(&mut admin, cancelling_id).await["devices"][0]["outcome"],
+            "cancelled"
+        );
         let mut connection = app.state.agents.connect(&agent.device_id);
         pass(&app, now_ms()).await;
         assert!(runs(&mut connection).is_empty(), "{name}");
@@ -1246,7 +1264,11 @@ async fn agents_that_reconnect_together_start_without_full_passes() {
         assert_eq!(job(&mut admin, &id).await["counts"]["running"], 10);
 
         // The job finishes on the first recount after its last device reports.
-        let ran = automation::jobs::devices(&mut app.db(), &id, now_ms())
+        let every = automation::jobs::DevicePage {
+            limit: 100,
+            ..Default::default()
+        };
+        let ran = automation::jobs::devices(&mut app.db(), &id, &every, now_ms())
             .await
             .unwrap();
         for device in &ran {
@@ -1866,6 +1888,44 @@ async fn counts_and_the_next_batch_cost_the_same_however_large_the_job() {
         }
         assert_eq!(costs[0], costs[1], "{name}: {costs:?}");
         assert_eq!(costs[0].0, 1, "{name}: one grouped read counts a job");
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn a_page_of_a_jobs_devices_costs_the_same_however_large_the_job() {
+    use automation::jobs::Target;
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let mut costs = Vec::new();
+        let mut connections = Vec::new();
+        for size in [20, 2_000] {
+            let devices = fleet(&app, &format!("PAGE{size}"), size).await;
+            connections.extend(devices.iter().map(|id| app.state.agents.connect(id)));
+            let id = create_job(&app, Target::Devices(devices)).await;
+            let path = |query: &str| format!("/v1/jobs/{id}/devices?limit=10{query}");
+            // Once first, so what the request's signing in reads is known.
+            assert_eq!(admin.get(&path("")).await.status, StatusCode::OK);
+            let mut cost = Vec::new();
+            for query in ["", "&outcome=queued", "&outcome=failed", "&offset=10"] {
+                let before = app.db().counts();
+                let page = admin.get(&path(query)).await;
+                cost.push((app.db().counts() - before).statements);
+                assert_eq!(page.status, StatusCode::OK, "{name}: {:?}", page.body);
+                if query.is_empty() {
+                    assert_eq!(page.body["devices"].as_array().unwrap().len(), 10);
+                    assert_eq!(page.body["matching"], size, "{name}");
+                }
+            }
+            let before = app.db().counts();
+            let job = admin.get(&format!("/v1/jobs/{id}")).await;
+            cost.push((app.db().counts() - before).statements);
+            assert!(job.body.get("devices").is_none(), "{name}");
+            costs.push(cost);
+        }
+        assert_eq!(costs[0], costs[1], "{name}: {costs:?}");
+        drop(connections);
         app.finish().await;
     }
 }

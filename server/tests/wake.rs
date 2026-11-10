@@ -513,7 +513,7 @@ async fn policies_wake_offline_devices_and_jobs_report_whether_they_came_online(
         )
         .await;
         automation::pass(&app.state, now + SECOND_MS).await.unwrap();
-        let job = admin.get(&format!("/v1/jobs/{job_id}")).await.body;
+        let job = common::job_with_devices(&mut admin, &job_id).await;
         assert_eq!(job["kind"], "wake", "{name}");
         assert_eq!(job["item_name"], "Wake devices");
         assert_eq!(job["offline"], "skip", "{name}: wake jobs never wait");
@@ -555,7 +555,7 @@ async fn policies_wake_offline_devices_and_jobs_report_whether_they_came_online(
         automation::pass(&app.state, now + 2 * SECOND_MS)
             .await
             .unwrap();
-        let job = admin.get(&format!("/v1/jobs/{job_id}")).await.body;
+        let job = common::job_with_devices(&mut admin, &job_id).await;
         assert_eq!(outcome(&job, "ASLEEP").0, "succeeded", "{name}");
         assert!(job["finished_at_unix_ms"].is_i64(), "{name}: {job}");
 
@@ -612,7 +612,7 @@ async fn policies_wake_offline_devices_and_jobs_report_whether_they_came_online(
             .await
             .unwrap();
         automation::pass(&app.state, now_ms()).await.unwrap();
-        let job = admin.get(&format!("/v1/jobs/{job_id}")).await.body;
+        let job = common::job_with_devices(&mut admin, &job_id).await;
         let (outcome, detail) = outcome(&job, "ASLEEP");
         assert_eq!(outcome, "no_result", "{name}");
         assert_eq!(

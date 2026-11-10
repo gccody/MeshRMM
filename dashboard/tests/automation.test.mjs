@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  applyJobDevicesAnswer,
   applyJobUpdate,
   countsSummary,
+  devicesRefreshDelay,
+  jobChanged,
+  jobDevicesKey,
+  jobDevicesPath,
+  moreJobDevices,
   coveredAgents,
   describeSchedule,
   describeTarget,
@@ -219,4 +225,77 @@ test("a job device names the applications that failed or were skipped", () => {
     applicationProblems({ applications: [{ name: "Firefox", outcome: "failed", error: "winget exited with 1" }, { name: "Zoom", outcome: "skipped", error: null }] }),
     ["Firefox failed: winget exited with 1", "Zoom skipped"],
   );
+});
+
+const part = (id, outcome = "running") => ({
+  device_id: id, device_name: id, platform: "linux", outcome, detail: null, run_id: null, delivery_id: null,
+  exit_code: null, path: null, started_at_unix_ms: null, completed_at_unix_ms: null,
+});
+const start = (key, ticket, ids, matching, end = false, outcome = "running") =>
+  ({ kind: "start", key, ticket, devices: ids.map((id) => part(id, outcome)), matching, end });
+const more = (key, ticket, after, ids, matching, end = false) =>
+  ({ kind: "more", key, ticket, after, devices: ids.map((id) => part(id)), matching, end });
+const shown = (list) => list.devices.map((device) => device.device_id);
+
+test("a job's devices are asked for a page at a time, by outcome", () => {
+  assert.equal(jobDevicesPath("j 1", null, null), "/v1/jobs/j%201/devices?limit=100");
+  assert.equal(jobDevicesPath("j", "failed", "d9", 200), "/v1/jobs/j/devices?outcome=failed&after=d9&limit=200");
+  assert.equal(jobDevicesKey(null), "all");
+  assert.equal(jobDevicesKey("no_result"), "no_result");
+});
+
+test("show more appends the next page after the last row, without repeats", () => {
+  const first = applyJobDevicesAnswer(null, start("all", 1, ["a", "b"], 5), "all");
+  assert.deepEqual(shown(first), ["a", "b"]);
+  assert.equal(moreJobDevices(first), 3);
+  // "b" moved between the pages and comes again: it stays where it was.
+  const second = applyJobDevicesAnswer(first, more("all", 2, "b", ["b", "c", "d"], 5), "all");
+  assert.deepEqual(shown(second), ["a", "b", "c", "d"]);
+  const last = applyJobDevicesAnswer(second, more("all", 3, "d", ["e"], 5, true), "all");
+  assert.deepEqual(shown(last), ["a", "b", "c", "d", "e"]);
+  assert.equal(moreJobDevices(last), 0, "the end was reached");
+  // A page asked after a row that is no longer the last can't be placed.
+  assert.equal(applyJobDevicesAnswer(second, more("all", 4, "b", ["x"], 5), "all"), second);
+  // Nor one of another chip.
+  assert.equal(applyJobDevicesAnswer(second, more("failed", 4, "d", ["x"], 5), "all"), second);
+});
+
+test("out-of-order answers are dropped", () => {
+  // The chip changed while the first answer was on its way.
+  assert.equal(applyJobDevicesAnswer(null, start("all", 1, ["a"], 1), "failed"), null);
+  const failed = applyJobDevicesAnswer(null, start("failed", 2, ["c"], 1, true, "failed"), "failed");
+  assert.equal(applyJobDevicesAnswer(failed, start("all", 1, ["a"], 1), "failed"), failed);
+  // Two loads of the same chip: the older, arriving last, is dropped.
+  const newer = applyJobDevicesAnswer(failed, start("failed", 4, ["d"], 1, true, "failed"), "failed");
+  assert.equal(applyJobDevicesAnswer(newer, start("failed", 3, ["c"], 1, true, "failed"), "failed"), newer);
+  // A new chip starts a new list.
+  const all = applyJobDevicesAnswer(newer, start("all", 5, ["a", "b"], 2, true), "all");
+  assert.deepEqual(shown(all), ["a", "b"]);
+});
+
+test("a refresh of the loaded rows keeps their places", () => {
+  let list = applyJobDevicesAnswer(null, start("running", 1, ["a", "b", "c"], 6), "running");
+  list = applyJobDevicesAnswer(list, more("running", 2, "c", ["d", "e"], 6), "running");
+  // "b" finished and left the chip; the refresh reads as many rows as
+  // were loaded, which now reach "f".
+  const refreshed = applyJobDevicesAnswer(list, start("running", 3, ["a", "c", "d", "e", "f"], 5, true), "running");
+  assert.deepEqual(shown(refreshed), ["a", "c", "d", "e", "f"]);
+  assert.equal(refreshed.matching, 5);
+  // A refresh that covers fewer rows than are loaded, since a page was
+  // added while it was on its way, keeps the rows after it.
+  const longer = applyJobDevicesAnswer(list, more("running", 4, "e", ["f", "g"], 7), "running");
+  const partly = applyJobDevicesAnswer(longer, start("running", 5, ["a", "b", "c"], 7, false, "succeeded"), "running");
+  assert.deepEqual(shown(partly), ["a", "b", "c", "d", "e", "f", "g"]);
+  assert.equal(partly.devices[1].outcome, "succeeded", "the refreshed rows are the new ones");
+  assert.equal(partly.devices[4].outcome, "running", "the rest stay until asked");
+  assert.equal(new Set(shown(partly)).size, partly.devices.length, "no row twice");
+});
+
+test("the loaded rows are read again at most every few seconds, and only on a change", () => {
+  assert.equal(devicesRefreshDelay(10_000, 11_000, 5_000), 4_000);
+  assert.equal(devicesRefreshDelay(10_000, 20_000, 5_000), 0);
+  const running = job("j");
+  assert.equal(jobChanged(running, job("j")), false);
+  assert.equal(jobChanged(running, job("j", { counts: counts({ total: 1, succeeded: 1 }) })), true);
+  assert.equal(jobChanged(running, job("j", { finished_at_unix_ms: 9 })), true);
 });

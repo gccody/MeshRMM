@@ -842,6 +842,10 @@ CREATE INDEX idx_job_devices_state ON job_devices (state, device_id);
 -- A job's devices by state: its counts read this index alone, and the
 -- dispatcher takes a job's next queued devices from it in device ID order.
 CREATE INDEX idx_job_devices_job ON job_devices (job_id, state, device_id, result, report_by);
+-- A job's devices that reported, by result, in device ID order, for a page
+-- of those that succeeded, failed or timed out. Only those with a result,
+-- so a job's counts and the dispatcher keep to idx_job_devices_job.
+CREATE INDEX idx_job_devices_result ON job_devices (job_id, state, result, device_id) WHERE result IS NOT NULL;
 
 -- Scripts and update scans and installs the server runs by itself: on a
 -- schedule, or on each device that enrolls. Each time it fires it starts a job.

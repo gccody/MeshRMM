@@ -7,7 +7,7 @@
 //! device's part goes through, on both databases.
 mod common;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use axum::http::StatusCode;
 use common::{App, Browser, apps, set_up};
@@ -143,13 +143,18 @@ async fn same(app: &App, job_id: &str, nows: &[i64]) -> BTreeMap<String, Outcome
                 (device_id, outcome)
             })
             .collect::<BTreeMap<_, _>>();
-        let stored = jobs::devices(&mut app.db(), job_id, now)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|device| (device.device_id, device.outcome))
+        let every = paged(app, job_id, None, now).await;
+        let stored = every
+            .iter()
+            .map(|device| (device.device_id.clone(), device.outcome))
             .collect::<BTreeMap<_, _>>();
         assert_eq!(stored, old, "{}: job {job_id} at {now}", app.name);
+        assert_eq!(
+            stored.len(),
+            every.len(),
+            "{}: job {job_id} at {now}: pages repeat a device",
+            app.name
+        );
         let mut counts = Counts::default();
         for outcome in old.values() {
             counts.add(*outcome, 1);
@@ -160,9 +165,96 @@ async fn same(app: &App, job_id: &str, nows: &[i64]) -> BTreeMap<String, Outcome
             .remove(job_id)
             .unwrap_or_default();
         assert_eq!(counted, counts, "{}: job {job_id} at {now}", app.name);
+        // Each outcome's pages hold exactly the devices the counts put in
+        // it, so the filter and the counts can't drift apart.
+        for outcome in OUTCOMES {
+            let filtered = paged(app, job_id, Some(outcome), now).await;
+            let ids = filtered
+                .iter()
+                .map(|device| device.device_id.clone())
+                .collect::<Vec<_>>();
+            let expected = old
+                .iter()
+                .filter(|(_, had)| **had == outcome)
+                .map(|(id, _)| id.clone())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                ids.iter().cloned().collect::<BTreeSet<_>>(),
+                expected,
+                "{}: job {job_id} at {now}: {outcome:?}",
+                app.name
+            );
+            assert_eq!(
+                ids.len(),
+                expected.len(),
+                "{}: {outcome:?} repeats",
+                app.name
+            );
+            assert_eq!(
+                counted.of(Some(outcome)),
+                ids.len() as i64,
+                "{}: job {job_id} at {now}: {outcome:?}",
+                app.name
+            );
+        }
         first.get_or_insert(old);
     }
     first.unwrap_or_default()
+}
+
+/// Every outcome a page can be asked for.
+const OUTCOMES: [Outcome; 10] = [
+    Outcome::Queued,
+    Outcome::Waiting,
+    Outcome::Running,
+    Outcome::Succeeded,
+    Outcome::Failed,
+    Outcome::TimedOut,
+    Outcome::NoResult,
+    Outcome::Skipped,
+    Outcome::Missed,
+    Outcome::Cancelled,
+];
+
+/// A page's size here, smaller than the jobs.
+const PAGE: u64 = 3;
+
+/// The job's devices with `outcome`, or every one, at `now`, read a page at
+/// a time, each after the last device of the one before; and checked
+/// against the same pages by offset.
+async fn paged(
+    app: &App,
+    job_id: &str,
+    outcome: Option<Outcome>,
+    now: i64,
+) -> Vec<jobs::JobDevice> {
+    let mut devices: Vec<jobs::JobDevice> = Vec::new();
+    loop {
+        let page = jobs::DevicePage {
+            outcome,
+            after: devices.last().map(|device| device.device_id.clone()),
+            offset: 0,
+            limit: PAGE,
+        };
+        let rows = jobs::devices(&mut app.db(), job_id, &page, now)
+            .await
+            .unwrap();
+        let by_offset = jobs::DevicePage {
+            outcome,
+            after: None,
+            offset: devices.len() as u64,
+            limit: PAGE,
+        };
+        let skipped = jobs::devices(&mut app.db(), job_id, &by_offset, now)
+            .await
+            .unwrap();
+        assert_eq!(rows, skipped, "{}: by offset", app.name);
+        let done = rows.len() < PAGE as usize;
+        devices.extend(rows);
+        if done {
+            return devices;
+        }
+    }
 }
 
 /// Every moment worth looking at after `now`: before and after each kind's
@@ -196,12 +288,127 @@ fn drain(connections: &mut [&mut AgentConnection]) {
 
 /// The device's part, as the job's page reads it now.
 async fn part(app: &App, job_id: &str, device_id: &str) -> jobs::JobDevice {
-    jobs::devices(&mut app.db(), job_id, now_ms())
+    paged(app, job_id, None, now_ms())
         .await
-        .unwrap()
         .into_iter()
         .find(|device| device.device_id == device_id)
         .unwrap()
+}
+
+/// The job's devices with `outcome`, or every one, from
+/// `GET /v1/jobs/{id}/devices` a page at a time, each after the last device
+/// of the one before, and how many it said match.
+async fn api_pages(
+    browser: &mut Browser,
+    job_id: &str,
+    outcome: Option<&str>,
+) -> (Vec<Value>, i64) {
+    let mut devices: Vec<Value> = Vec::new();
+    loop {
+        let mut path = format!("/v1/jobs/{job_id}/devices?limit={PAGE}");
+        if let Some(outcome) = outcome {
+            path.push_str(&format!("&outcome={outcome}"));
+        }
+        if let Some(last) = devices.last() {
+            path.push_str(&format!("&after={}", last["device_id"].as_str().unwrap()));
+        }
+        let page = browser.get(&path).await;
+        assert_eq!(page.status, StatusCode::OK, "{path}: {:?}", page.body);
+        let rows = page.body["devices"].as_array().unwrap().clone();
+        let done = rows.len() < PAGE as usize;
+        devices.extend(rows);
+        if done {
+            return (devices, page.body["matching"].as_i64().unwrap());
+        }
+    }
+}
+
+/// The job's answer has its counts and no devices, its devices come a page
+/// at a time, never repeating or missing one, and each outcome's pages hold
+/// the devices the counts put there, as many as they say, deleted
+/// `deleted` among them. Others may not read them.
+async fn pages_from_the_api(app: &App, admin: &mut Browser, job_id: &str, deleted: &str) {
+    let name = app.name;
+    let job = admin.get(&format!("/v1/jobs/{job_id}")).await;
+    assert_eq!(job.status, StatusCode::OK, "{name}: {:?}", job.body);
+    assert!(job.body.get("devices").is_none(), "{name}: {:?}", job.body);
+    let counts = job.body["counts"].as_object().unwrap().clone();
+    let total = counts["total"].as_i64().unwrap();
+    assert!(total > 2 * PAGE as i64, "{name}: more than a page");
+
+    let (every, matching) = api_pages(admin, job_id, None).await;
+    assert_eq!(matching, total, "{name}");
+    let outcomes = every
+        .iter()
+        .map(|device| {
+            (
+                device["device_id"].as_str().unwrap().to_owned(),
+                device["outcome"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(outcomes.len() as i64, total, "{name}: {every:?}");
+    assert_eq!(every.len() as i64, total, "{name}: no device twice");
+    let gone = every
+        .iter()
+        .find(|device| device["device_id"] == deleted)
+        .unwrap();
+    assert_eq!(gone["outcome"], "missed", "{name}");
+    // By offset, the same pages.
+    let mut by_offset = Vec::new();
+    while by_offset.len() < every.len() {
+        let page = admin
+            .get(&format!(
+                "/v1/jobs/{job_id}/devices?limit={PAGE}&offset={}",
+                by_offset.len()
+            ))
+            .await;
+        let rows = page.body["devices"].as_array().unwrap().clone();
+        assert!(!rows.is_empty(), "{name}: {:?}", page.body);
+        by_offset.extend(rows);
+    }
+    assert_eq!(by_offset, every, "{name}");
+
+    let mut seen = 0;
+    for (outcome, count) in &counts {
+        if outcome == "total" {
+            continue;
+        }
+        let (devices, matching) = api_pages(admin, job_id, Some(outcome)).await;
+        let count = count.as_i64().unwrap();
+        assert_eq!(matching, count, "{name}: {outcome}");
+        assert_eq!(devices.len() as i64, count, "{name}: {outcome}");
+        let expected = outcomes
+            .iter()
+            .filter(|(_, had)| *had == outcome)
+            .map(|(id, _)| id.as_str())
+            .collect::<BTreeSet<_>>();
+        let ids = devices
+            .iter()
+            .map(|device| device["device_id"].as_str().unwrap())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids, expected, "{name}: {outcome}");
+        if count > 0 {
+            seen += 1;
+        }
+    }
+    assert!(seen >= 6, "{name}: {counts:?}");
+
+    let wrong = admin
+        .get(&format!("/v1/jobs/{job_id}/devices?outcome=lost"))
+        .await;
+    assert_eq!(wrong.status, StatusCode::BAD_REQUEST, "{name}");
+    let (mut other, _) = common::user_with(app, admin, "other@example.com", &["scripts.run"]).await;
+    for path in [
+        format!("/v1/jobs/{job_id}"),
+        format!("/v1/jobs/{job_id}/devices"),
+    ] {
+        assert_eq!(
+            other.get(&path).await.status,
+            StatusCode::NOT_FOUND,
+            "{name}: {path}"
+        );
+    }
 }
 
 fn expect(outcomes: &BTreeMap<String, Outcome>, expected: &[(&str, Outcome)], what: &str) {
@@ -339,6 +546,9 @@ async fn script_and_file_jobs_store_what_the_old_reading_said() {
         drain(&mut [&mut late]);
         let outcomes = same(&app, &job, &clocks(now + SECOND_MS)).await;
         expect(&outcomes, &[(&id("LATE"), Outcome::Running)], name);
+        // Every outcome but queued and cancelled is here now, on more
+        // devices than a page, a deleted one among them.
+        pages_from_the_api(&app, &mut admin, &job, &id("DELETED")).await;
         let cancelled = admin
             .post(&format!("/v1/jobs/{job}/cancel"), json!({}))
             .await;
@@ -763,7 +973,7 @@ async fn wake_jobs_store_what_the_old_reading_said() {
             name,
         );
         // The relay sends two and fails the third.
-        let parts = jobs::devices(&mut app.db(), &job, now).await.unwrap();
+        let parts = paged(&app, &job, None, now).await;
         let device_of = |wake_id: &str| {
             parts
                 .iter()

@@ -72,10 +72,15 @@ waiting or running.
 sends, its devices, who or which policy started it, a progress bar and its
 counts. `?policy=<id>` lists one policy's jobs. A job's page
 (`/job?id=<id>`) shows the counts, which filter the device list when chosen,
-every device's outcome and detail, and **View output** for a device's run.
-Both pages update live from the website's event socket, and the job page
-re-reads itself every 10 seconds while the job runs in case an update was
-missed.
+each device's outcome and detail, and **View output** for a device's run.
+The server filters the devices by outcome and sends them 100 at a time, in
+device ID order (not by name, which a job of tens of thousands of devices
+couldn't be sorted by on every read); **Show more** loads the next 100 after
+the last one shown. Both pages update live from the website's event socket:
+a job's counts change at once, and the rows loaded are read again at most
+every 5 seconds while they change, from the start, as many as are loaded.
+While the job runs the page also re-reads it every 10 seconds in case an
+update was missed; a finished job that doesn't change isn't read again.
 
 **Cancel the rest** cancels the devices that haven't started. Scripts already
 running on a device finish; the Agent can't stop them early.
@@ -354,10 +359,11 @@ All routes need a signed-in user.
 
 | Route | |
 |---|---|
-| `POST /v1/jobs` | `{script_id, run_as}`, `{file_id, destination}` or `{updates: {action: "scan"}}` / `{updates: {action: "install", categories, reboot, reboot_delay_minutes}}` or `{applications: {action, application_ids, packages, mode, inventory}}` (see [application deployment](application-deployment.md#api)), with `target` (`devices`, `companies`, `tags` or `all`), `device_ids`, `company_ids` or `tag_ids` with `tag_match` (`any`, the default, or `all`), `offline` (`skip` or `wait`) and `wait_hours`. Returns the job with its devices. `400 no_devices` if the target covers none. |
+| `POST /v1/jobs` | `{script_id, run_as}`, `{file_id, destination}` or `{updates: {action: "scan"}}` / `{updates: {action: "install", categories, reboot, reboot_delay_minutes}}` or `{applications: {action, application_ids, packages, mode, inventory}}` (see [application deployment](application-deployment.md#api)), with `target` (`devices`, `companies`, `tags` or `all`), `device_ids`, `company_ids` or `tag_ids` with `tag_match` (`any`, the default, or `all`), `offline` (`skip` or `wait`) and `wait_hours`. Returns the job with its counts. `400 no_devices` if the target covers none. |
 | `GET /v1/jobs?policy_id=&limit=` | Jobs the user may see, newest first, with counts (50 by default, at most 200). |
-| `GET /v1/jobs/{id}` | A job with `devices`: each one's `outcome`, `detail`, `run_id`, `delivery_id`, `update_run_id`, `application_run_id` or `wake_id`, exit code, saved path and times, and for an application job `applications`: `[{name, outcome, error}]` for those that failed or were skipped. |
-| `POST /v1/jobs/{id}/cancel` | Cancels the devices that haven't started. |
+| `GET /v1/jobs/{id}` | The job with its counts. |
+| `GET /v1/jobs/{id}/devices?outcome=&after=&offset=&limit=` | `{devices, matching}`: a page of the job's devices in device ID order, those with `outcome` (one of the counts' names) or every one, from after the device ID `after` and past `offset` more (100 by default, at most 200; `limit=0` for `matching` alone). `matching` is how many have the outcome, or the job's total, on the page or not. Each device has its `outcome`, `detail`, `run_id`, `delivery_id`, `update_run_id`, `application_run_id` or `wake_id`, exit code, saved path and times, and for an application job `applications`: `[{name, outcome, error}]` for those that failed or were skipped. 404 for a job the user may not see. |
+| `POST /v1/jobs/{id}/cancel` | Cancels the devices that haven't started; returns the job with its counts. |
 | `GET /v1/automation-policies` | Policies with their latest job (`automation.manage`). |
 | `POST /v1/automation-policies`, `PUT /v1/automation-policies/{id}` | A whole policy: `name`, `enabled`, `action` (`script`, `update_scan`, `update_install`, `wake`, `app_install` or `app_update`), `script_id` and `run_as` for a script, `update_categories`, `reboot` and `reboot_delay_minutes` for an install, `applications` (`{application_ids, packages, mode}`) for an application policy, `target` with `device_ids`, `company_ids` or `tag_ids` and `tag_match`, `trigger` (`interval`, `daily`, `weekly`, `once`, `enroll`) with `interval_minutes`, `time` (`HH:MM`), `weekdays` (1 = Monday to 7), `run_at` (`YYYY-MM-DDTHH:MM`) and `time_zone` as it needs, `offline`, `catch_up_hours` and `channel_ids`. |
 | `DELETE /v1/automation-policies/{id}` | |
@@ -463,16 +469,23 @@ should read the lists again.
   and that creating a job plans it without the writer and then only
   inserts, leaves out devices deleted in between, and starts nothing from a
   policy changed between planning its firing and claiming it. A job's
-  counts and the dispatcher's next batch cost the same statements for a
-  job of 20 devices and one of 2,000, and a large job's queued devices
+  counts, the dispatcher's next batch and a page of its devices cost the
+  same statements for a job of 20 devices and one of 2,000, and a large job's queued devices
   don't keep a small job's from the front of the batch.
 - `cargo test -p meshrmm-server --test job_outcomes` keeps the old way of
   working out each device's outcome, by joining it to its run, and checks
   that the stored outcomes and the counts say the same for a job of each
   kind through every change: starting, each kind of report, timeouts,
   reports that never come (with the clock moved), lost runs, cancelling,
-  missed and skipped devices, deleted devices and purged history.
+  missed and skipped devices, deleted devices and purged history. At every
+  step, each outcome's pages of devices, a few at a time, hold exactly the
+  devices the counts put in it, and pages by `after` and by `offset`
+  neither repeat nor miss one; through the API too, where a user who may
+  not see the job gets 404.
 - `cargo test -p meshrmm-server --test query_plans` checks that a job's
   counts, the dispatcher's reads and the write of a report into its job
-  device find the job's devices by index, never the run tables.
+  device find the job's devices by index, never the run tables, and that a
+  page of a job's devices (every one, queued, waiting, succeeded, failed or
+  running) is cut from an index in order, without a sort or reading the
+  whole job, before only its rows are joined to their runs.
 - `npm test` in `dashboard` covers the job and policy models.

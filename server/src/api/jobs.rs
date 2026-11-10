@@ -4,7 +4,7 @@
 //! policies' jobs; users who may read the audit log see everyone's.
 use axum::{
     Json,
-    extract::{Path, Query as QueryParameters, State},
+    extract::{Path, Query as QueryParameters, State, rejection::QueryRejection},
     http::StatusCode,
 };
 use meshrmm_protocol_types::{
@@ -19,8 +19,8 @@ use crate::{
     audit::{self, Target as AuditTarget},
     auth::Authorized,
     automation::jobs::{
-        self, DEFAULT_WAIT_HOURS, Job, JobDevice, MAX_WAIT_HOURS, NewJob, Offline, Payload, Target,
-        TargetKind, Viewer,
+        self, DEFAULT_WAIT_HOURS, DevicePage, Job, JobDevice, MAX_WAIT_HOURS, NewJob, Offline,
+        Outcome, Payload, Target, TargetKind, Viewer,
     },
     http::{ApiError, AppState, JsonBody},
     rbac::Permission,
@@ -106,7 +106,7 @@ pub async fn start(
     State(state): State<AppState>,
     actor: Authorized,
     JsonBody(request): JsonBody<StartJob>,
-) -> Result<(StatusCode, Json<JobDetail>), ApiError> {
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let user = toolbox_user(&actor);
     let target = Target::from_request(
         request.target,
@@ -262,37 +262,98 @@ pub async fn list(
     Ok(Json(json!({ "jobs": views })))
 }
 
-/// A job with each of its devices.
-#[derive(Debug, Serialize)]
-pub struct JobDetail {
-    #[serde(flatten)]
-    job: serde_json::Value,
-    devices: Vec<JobDevice>,
+async fn detail(
+    state: &AppState,
+    actor: &Authorized,
+    id: &str,
+) -> Result<serde_json::Value, ApiError> {
+    let (viewer, job) = visible(state, actor, id).await?;
+    Ok(json!(viewer.view(&job)))
 }
 
-async fn detail(state: &AppState, actor: &Authorized, id: &str) -> Result<JobDetail, ApiError> {
+/// The job, with its counts, if the user may see it.
+async fn visible(
+    state: &AppState,
+    actor: &Authorized,
+    id: &str,
+) -> Result<(Viewer, Job), ApiError> {
     let viewer = viewer(actor)?;
-    let now = now_ms();
-    let mut database = &state.database;
-    let job = jobs::get(&mut database, id, now)
+    let job = jobs::get(&mut &state.database, id, now_ms())
         .await?
         .filter(|job| viewer.sees(job))
         .ok_or_else(|| ApiError::not_found("Job not found"))?;
-    let devices = jobs::devices(&mut database, id, now).await?;
-    Ok(JobDetail {
-        job: json!(viewer.view(&job)),
-        devices,
-    })
+    Ok((viewer, job))
 }
 
-/// `GET /v1/jobs/{id}`, with its devices.
+/// `GET /v1/jobs/{id}`: the job and its counts. Its devices are read a
+/// page at a time from `GET /v1/jobs/{id}/devices`.
 pub async fn get(
     State(state): State<AppState>,
     actor: Authorized,
     Path(id): Path<String>,
-) -> Result<Json<JobDetail>, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let id = parse_id(&id, "job")?;
     Ok(Json(detail(&state, &actor, &id).await?))
+}
+
+const DEFAULT_DEVICES_LIMIT: u64 = 100;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DevicesParameters {
+    /// Only the devices with this outcome, as the counts name it.
+    outcome: Option<Outcome>,
+    /// Only the devices after this one in the page's order: the last one
+    /// of the page before.
+    after: Option<String>,
+    offset: Option<u64>,
+    /// 0 for only how many match.
+    limit: Option<u64>,
+}
+
+/// A page of a job's devices.
+#[derive(Debug, Serialize)]
+pub struct DevicesPage {
+    devices: Vec<JobDevice>,
+    /// Devices of the job with the outcome asked for, or all of them, on
+    /// this page or not.
+    matching: i64,
+}
+
+/// `GET /v1/jobs/{id}/devices?outcome=&after=&offset=&limit=`: a page of
+/// the job's devices, those with an outcome or every one, in device ID
+/// order, with how many match.
+pub async fn devices(
+    State(state): State<AppState>,
+    actor: Authorized,
+    Path(id): Path<String>,
+    parameters: Result<QueryParameters<DevicesParameters>, QueryRejection>,
+) -> Result<Json<DevicesPage>, ApiError> {
+    let id = parse_id(&id, "job")?;
+    // Refused, like any other mistake, as an error the website can show.
+    let QueryParameters(parameters) =
+        parameters.map_err(|rejection| ApiError::bad_request(rejection.body_text()))?;
+    let (_, job) = visible(&state, &actor, &id).await?;
+    let page = DevicePage {
+        outcome: parameters.outcome,
+        after: parameters
+            .after
+            .as_deref()
+            .map(|after| parse_id(after, "device"))
+            .transpose()?,
+        offset: parameters.offset.unwrap_or(0),
+        limit: parameters
+            .limit
+            .unwrap_or(DEFAULT_DEVICES_LIMIT)
+            .min(MAX_LIMIT),
+    };
+    let devices = jobs::devices(&mut &state.database, &id, &page, now_ms()).await?;
+    Ok(Json(DevicesPage {
+        devices,
+        // The counts the job was just read with: no second read of its
+        // devices.
+        matching: job.counts.of(page.outcome),
+    }))
 }
 
 /// `POST /v1/jobs/{id}/cancel`: devices that haven't started don't. Runs
@@ -301,7 +362,7 @@ pub async fn cancel(
     State(state): State<AppState>,
     actor: Authorized,
     Path(id): Path<String>,
-) -> Result<Json<JobDetail>, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let id = parse_id(&id, "job")?;
     let viewer = viewer(&actor)?;
     let now = now_ms();

@@ -32,7 +32,7 @@ use sea_query::{Expr, ExprTrait, Query};
 use serde_json::{Map, Value};
 use tokio::sync::{Notify, broadcast};
 
-use self::jobs::{Counts, Job};
+use self::jobs::{Counts, Job, Outcome};
 use crate::{
     db::tables::{AutomationPolicyChannels, Jobs},
     http::AppState,
@@ -490,7 +490,21 @@ async fn notify_failures(state: &AppState, job: &Job, now: i64) -> anyhow::Resul
     if channels.is_empty() {
         return Ok(());
     }
-    let devices = jobs::devices(&mut database, &job.id, now).await?;
+    // Only the devices the notification names, a page of each failing
+    // outcome, however many devices failed.
+    let mut devices = Vec::new();
+    for outcome in [Outcome::Failed, Outcome::TimedOut, Outcome::NoResult] {
+        let limit = NOTIFIED_DEVICES.saturating_sub(devices.len());
+        if limit == 0 {
+            break;
+        }
+        let page = jobs::DevicePage {
+            outcome: Some(outcome),
+            limit: limit as u64,
+            ..Default::default()
+        };
+        devices.extend(jobs::devices(&mut database, &job.id, &page, now).await?);
+    }
     let settings = settings::load(&mut database).await?;
     notifications::dispatch(
         state,
@@ -505,7 +519,8 @@ async fn notify_failures(state: &AppState, job: &Job, now: i64) -> anyhow::Resul
     Ok(())
 }
 
-/// The email and webhook for a policy's job that finished with failures.
+/// The email and webhook for a policy's job that finished with failures,
+/// naming the failed ones of `devices`; the counts say how many more failed.
 fn failure_notification(
     job: &Job,
     devices: &[jobs::JobDevice],
@@ -545,8 +560,9 @@ fn failure_notification(
         };
         body.push_str(&format!("- {name}: {why}\n"));
     }
-    if failed.len() > NOTIFIED_DEVICES {
-        body.push_str(&format!("- and {} more\n", failed.len() - NOTIFIED_DEVICES));
+    let named = failed.len().min(NOTIFIED_DEVICES) as i64;
+    if counts.failures() > named {
+        body.push_str(&format!("- and {} more\n", counts.failures() - named));
     }
     body.push_str(&format!("\nSee the job: {origin}/job?id={}\n", job.id));
     let mut data = Map::new();
@@ -673,5 +689,29 @@ mod tests {
                 .contains("https://rmm.example.com/job?id=j")
         );
         assert_eq!(notification.data["job"]["counts"]["failed"], 1);
+    }
+
+    #[test]
+    fn failure_notifications_count_the_failed_devices_they_dont_name() {
+        let mut counts = Counts::default();
+        counts.add(Outcome::Failed, 30);
+        counts.add(Outcome::NoResult, 5);
+        let named = (0..NOTIFIED_DEVICES)
+            .map(|index| device(&format!("D{index}"), Outcome::Failed, Some(1)))
+            .collect::<Vec<_>>();
+        let notification =
+            failure_notification(&job(counts), &named, "Acme RMM", "https://rmm.example.com");
+        assert!(notification.body.contains(
+            "- D19: exit code 1
+"
+        ));
+        assert!(
+            notification.body.contains(
+                "- and 15 more
+"
+            ),
+            "{}",
+            notification.body
+        );
     }
 }

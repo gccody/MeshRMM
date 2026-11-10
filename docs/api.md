@@ -226,8 +226,11 @@ JOB=$(curl -fsS -H "Authorization: Bearer $MESHRMM_TOKEN" -H "Content-Type: appl
   "$MESHRMM/v1/jobs" | jq -r .id)
 
 # Poll until finished_at_unix_ms is set, then read each device's output.
+# Devices come 100 at a time; for more, add &after=<the last device_id>.
 curl -fsS -H "Authorization: Bearer $MESHRMM_TOKEN" "$MESHRMM/v1/jobs/$JOB" |
-  jq '{finished_at_unix_ms, counts, devices: [.devices[] | {device_name, outcome, detail, exit_code, run_id}]}'
+  jq '{finished_at_unix_ms, counts}'
+curl -fsS -H "Authorization: Bearer $MESHRMM_TOKEN" "$MESHRMM/v1/jobs/$JOB/devices" |
+  jq '{matching, devices: [.devices[] | {device_name, outcome, detail, exit_code, run_id}]}'
 curl -fsS -H "Authorization: Bearer $MESHRMM_TOKEN" "$MESHRMM/v1/script-runs/<run id>" |
   jq '{status, exit_code, stdout, stderr}'
 ```
@@ -235,7 +238,10 @@ curl -fsS -H "Authorization: Bearer $MESHRMM_TOKEN" "$MESHRMM/v1/script-runs/<ru
 ```json
 {
   "finished_at_unix_ms": 1761100058964,
-  "counts": { "total": 2, "succeeded": 2, "failed": 0, "skipped": 0, "…": 0 },
+  "counts": { "total": 2, "succeeded": 2, "failed": 0, "skipped": 0, "…": 0 }
+}
+{
+  "matching": 2,
   "devices": [
     { "device_name": "Ada’s MacBook Air", "outcome": "succeeded", "detail": null, "exit_code": 0, "run_id": "50b9…" },
     { "device_name": "ubuntu-server", "outcome": "succeeded", "detail": null, "exit_code": 0, "run_id": "7759…" }

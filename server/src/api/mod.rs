@@ -399,6 +399,7 @@ fn automation_routes() -> Router<AppState> {
     Router::new()
         .route("/jobs", get(jobs::list).post(jobs::start))
         .route("/jobs/{id}", get(jobs::get))
+        .route("/jobs/{id}/devices", get(jobs::devices))
         .route("/jobs/{id}/cancel", post(jobs::cancel))
         .route(
             "/automation-policies",

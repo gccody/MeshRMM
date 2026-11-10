@@ -623,7 +623,19 @@ pub struct Counts {
 impl Counts {
     pub fn add(&mut self, outcome: Outcome, count: i64) {
         self.total += count;
-        let slot = match outcome {
+        *self.slot(outcome) += count;
+    }
+
+    /// How many devices have `outcome`, or how many there are.
+    pub fn of(mut self, outcome: Option<Outcome>) -> i64 {
+        match outcome {
+            Some(outcome) => *self.slot(outcome),
+            None => self.total,
+        }
+    }
+
+    fn slot(&mut self, outcome: Outcome) -> &mut i64 {
+        match outcome {
             Outcome::Queued => &mut self.queued,
             Outcome::Waiting => &mut self.waiting,
             Outcome::Running => &mut self.running,
@@ -634,8 +646,7 @@ impl Counts {
             Outcome::Skipped => &mut self.skipped,
             Outcome::Missed => &mut self.missed,
             Outcome::Cancelled => &mut self.cancelled,
-        };
-        *slot += count;
+        }
     }
 
     /// Devices that may still do something.
@@ -1736,12 +1747,91 @@ struct JobDeviceRow {
     overdue: i64,
 }
 
-/// The job's devices, by name.
-pub async fn devices(
-    executor: &mut impl Executor,
-    job_id: &str,
-    now: i64,
-) -> db::Result<Vec<JobDevice>> {
+/// Which of a job's devices a page holds: those with `outcome`, or every
+/// one, in device ID order, from after the device `after` (if any), less the
+/// first `offset`, at most `limit`.
+#[derive(Debug, Clone, Default)]
+pub struct DevicePage {
+    pub outcome: Option<Outcome>,
+    pub after: Option<String>,
+    pub offset: u64,
+    pub limit: u64,
+}
+
+/// Whether a job's device has `outcome` at `now`, from its row of
+/// `job_devices` alone: [`outcome`] as SQL, bucketing the rows as
+/// [`counts_query`] does.
+pub fn has_outcome(outcome: Outcome, now: i64) -> sea_query::Condition {
+    use sea_query::Cond;
+    let column = |column: JobDevices| Expr::col((JobDevices::Table, column));
+    let state = |state: DeviceState| Cond::all().add(column(JobDevices::State).eq(state.as_str()));
+    let ended = |result: Outcome| {
+        state(DeviceState::Started).add(column(JobDevices::Result).eq(result.as_str()))
+    };
+    match outcome {
+        Outcome::Queued => state(DeviceState::Queued),
+        Outcome::Waiting => state(DeviceState::Waiting),
+        Outcome::Missed => state(DeviceState::Missed),
+        Outcome::Cancelled => state(DeviceState::Cancelled),
+        // Not run for the device's platform, or none of the applications
+        // was for it.
+        Outcome::Skipped => Cond::any()
+            .add(state(DeviceState::Skipped))
+            .add(ended(Outcome::Skipped)),
+        Outcome::Succeeded | Outcome::Failed | Outcome::TimedOut => ended(outcome),
+        // Awaiting a report that isn't due yet.
+        Outcome::Running => state(DeviceState::Started)
+            .add(column(JobDevices::Result).is_null())
+            .add(column(JobDevices::ReportBy).gte(now)),
+        // Lost, or awaiting a report that was due, or with no run to report.
+        Outcome::NoResult => state(DeviceState::Started).add(
+            Cond::any()
+                .add(column(JobDevices::Result).eq(Outcome::NoResult.as_str()))
+                .add(
+                    Cond::all().add(column(JobDevices::Result).is_null()).add(
+                        Cond::any()
+                            .add(column(JobDevices::ReportBy).is_null())
+                            .add(column(JobDevices::ReportBy).lt(now)),
+                    ),
+                ),
+        ),
+    }
+}
+
+/// The page of a job's rows of `job_devices` that [`devices_query`] joins:
+/// cut in device ID order from the job's key, `idx_job_devices_job` or
+/// `idx_job_devices_result`, so it reads about as many index entries as the
+/// page holds, past `offset`. Those that need more say so in
+/// `docs/automation.md`.
+pub fn page_query(job_id: &str, page: &DevicePage, now: i64) -> sea_query::SelectStatement {
+    let mut rows = Query::select();
+    rows.columns([
+        (JobDevices::Table, JobDevices::JobId),
+        (JobDevices::Table, JobDevices::DeviceId),
+        (JobDevices::Table, JobDevices::State),
+        (JobDevices::Table, JobDevices::Detail),
+        (JobDevices::Table, JobDevices::Result),
+        (JobDevices::Table, JobDevices::ReportBy),
+    ])
+    .from(JobDevices::Table)
+    .and_where(Expr::col((JobDevices::Table, JobDevices::JobId)).eq(job_id));
+    if let Some(outcome) = page.outcome {
+        rows.cond_where(has_outcome(outcome, now));
+    }
+    if let Some(after) = &page.after {
+        rows.and_where(Expr::col((JobDevices::Table, JobDevices::DeviceId)).gt(after.as_str()));
+    }
+    rows.order_by((JobDevices::Table, JobDevices::DeviceId), Order::Asc)
+        .limit(page.limit)
+        .offset(page.offset)
+        .to_owned()
+}
+
+/// The statement [`devices`] reads a page of a job's devices with: the
+/// page is cut first ([`page_query`]), then only its rows are joined to
+/// their devices and runs, and put back in order. The page is named as the
+/// table it is cut from, so the joins and columns read as on the table.
+pub fn devices_query(job_id: &str, page: &DevicePage, now: i64) -> sea_query::SelectStatement {
     let mut select = Query::select();
     select
         .column((JobDevices::Table, JobDevices::DeviceId))
@@ -1801,17 +1891,35 @@ pub async fn devices(
         .expr_as(
             Expr::cust(format!("CAST({} AS BIGINT)", overdue_sql(now))),
             "overdue",
-        );
-    join_runs(&mut select);
-    select
-        .from(JobDevices::Table)
+        )
+        .from_subquery(page_query(job_id, page, now), JobDevices::Table)
         .left_join(
             Agents::Table,
             Expr::col((Agents::Table, Agents::Id))
                 .equals((JobDevices::Table, JobDevices::DeviceId)),
-        )
-        .and_where(Expr::col((JobDevices::Table, JobDevices::JobId)).eq(job_id));
-    let rows: Vec<JobDeviceRow> = executor.fetch_all(&select).await?;
+        );
+    join_runs(&mut select);
+    // The database's order, which `after` follows: its collation may not
+    // order IDs as Rust would.
+    select.order_by((JobDevices::Table, JobDevices::DeviceId), Order::Asc);
+    select
+}
+
+/// A page of the job's devices, in device ID order. It reads as many rows
+/// as the page holds, and runs the same statements for a job of any size:
+/// one for the page, and one for the problems of its application runs.
+pub async fn devices(
+    executor: &mut impl Executor,
+    job_id: &str,
+    page: &DevicePage,
+    now: i64,
+) -> db::Result<Vec<JobDevice>> {
+    if page.limit == 0 {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<JobDeviceRow> = executor
+        .fetch_all(&devices_query(job_id, page, now))
+        .await?;
     let mut devices = rows
         .into_iter()
         .filter_map(|row| {
@@ -1861,40 +1969,27 @@ pub async fn devices(
             })
         })
         .collect::<Vec<_>>();
-    devices.sort_by_cached_key(|device| {
-        (
-            device
-                .device_name
-                .as_deref()
-                .unwrap_or_default()
-                .to_lowercase(),
-            device.device_id.clone(),
-        )
-    });
+    let runs = devices
+        .iter()
+        .filter_map(|device| device.application_run_id.clone())
+        .collect::<Vec<_>>();
+    if runs.is_empty() {
+        return Ok(devices);
+    }
     let problems: Vec<ApplicationProblem> = executor
         .fetch_all(
             &Query::select()
                 .columns([
-                    (ApplicationRunItems::Table, ApplicationRunItems::RunId),
-                    (ApplicationRunItems::Table, ApplicationRunItems::Name),
-                    (ApplicationRunItems::Table, ApplicationRunItems::Outcome),
-                    (ApplicationRunItems::Table, ApplicationRunItems::Error),
+                    ApplicationRunItems::RunId,
+                    ApplicationRunItems::Name,
+                    ApplicationRunItems::Outcome,
+                    ApplicationRunItems::Error,
                 ])
                 .from(ApplicationRunItems::Table)
-                .inner_join(
-                    ApplicationRuns::Table,
-                    Expr::col((ApplicationRuns::Table, ApplicationRuns::Id))
-                        .equals((ApplicationRunItems::Table, ApplicationRunItems::RunId)),
-                )
-                .and_where(Expr::col((ApplicationRuns::Table, ApplicationRuns::JobId)).eq(job_id))
-                .and_where(
-                    Expr::col((ApplicationRunItems::Table, ApplicationRunItems::Outcome))
-                        .is_in(["failed", "skipped"]),
-                )
-                .order_by(
-                    (ApplicationRunItems::Table, ApplicationRunItems::Position),
-                    Order::Asc,
-                )
+                .and_where(Expr::col(ApplicationRunItems::RunId).is_in(runs))
+                .and_where(Expr::col(ApplicationRunItems::Outcome).is_in(["failed", "skipped"]))
+                .order_by(ApplicationRunItems::RunId, Order::Asc)
+                .order_by(ApplicationRunItems::Position, Order::Asc)
                 .to_owned(),
         )
         .await?;
