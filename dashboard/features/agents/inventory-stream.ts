@@ -10,6 +10,9 @@ import type { AgentDelta, AgentEvent, AgentSnapshot, Inventory } from "./types";
 
 const FIRST_RECONNECT_DELAY_MS = 1_000;
 const MAX_RECONNECT_DELAY_MS = 30_000;
+// While the server stays unreachable, refused sockets ask for a session
+// check no more often than this; each check is two HTTP requests per tab.
+const SESSION_CHECK_INTERVAL_MS = 60_000;
 const MAX_PENDING_EVENTS = 1_000;
 // A short gap, such as a server restart, must not mark the inventory stale.
 export const STALE_GRACE_MS = 5_000;
@@ -30,11 +33,13 @@ export type SocketLike = EventTarget & {
 type Timers = {
   setTimeout: (callback: () => void, ms: number) => unknown;
   clearTimeout: (timer: unknown) => void;
+  now: () => number;
 };
 
 const globalTimers: Timers = {
   setTimeout: (callback, ms) => setTimeout(callback, ms),
   clearTimeout: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
+  now: () => Date.now(),
 };
 
 type Options = {
@@ -55,10 +60,13 @@ type Options = {
   onUpdates?: (event: UpdateEvent) => void;
   onConnection: (connection: InventoryConnection) => void;
   // The server refused the socket or closed it for lost access. A browser
-  // can't see why a handshake failed, so the caller checks the session.
+  // can't see why a handshake failed, so the caller checks the session. Kept
+  // to about once a minute while the server stays unreachable.
   onRefused: () => void;
   online?: boolean;
   timers?: Timers;
+  // In [0, 1), for the reconnect jitter.
+  random?: () => number;
 };
 
 // Reports the connection state, or "offline" while the browser is, once per
@@ -90,10 +98,15 @@ function connectionReporter(
   };
 }
 
-// Waits before each reconnect, doubling the delay up to the maximum.
-function reconnectBackoff(timers: Timers, stopped: () => boolean, connect: () => void) {
+// Waits before each reconnect, doubling the step up to the maximum. Every
+// tab loses its socket at once when the server restarts, so each wait is
+// drawn between half the step and the whole of it: the tabs spread out
+// instead of all asking for their snapshot together, and the floor keeps a
+// tab from retrying straight after a failure as full jitter's near-zero
+// draws would.
+function reconnectBackoff(timers: Timers, random: () => number, stopped: () => boolean, connect: () => void) {
   let timer: unknown;
-  let delay = FIRST_RECONNECT_DELAY_MS;
+  let step = FIRST_RECONNECT_DELAY_MS;
   return {
     cancel() {
       if (timer === undefined) return;
@@ -101,15 +114,15 @@ function reconnectBackoff(timers: Timers, stopped: () => boolean, connect: () =>
       timer = undefined;
     },
     reset() {
-      delay = FIRST_RECONNECT_DELAY_MS;
+      step = FIRST_RECONNECT_DELAY_MS;
     },
     schedule() {
       if (stopped() || timer !== undefined) return;
       timer = timers.setTimeout(() => {
         timer = undefined;
         connect();
-      }, delay);
-      delay = Math.min(delay * 2, MAX_RECONNECT_DELAY_MS);
+      }, step / 2 + (step / 2) * random());
+      step = Math.min(step * 2, MAX_RECONNECT_DELAY_MS);
     },
   };
 }
@@ -190,9 +203,12 @@ function eventSequencer({ revision, onInventory, requestSnapshot, overflow }: {
   };
 }
 
+// How a socket ended: the server refused it, closed it for lost access, or
+// dropped it for any other reason.
+type SocketEnd = "refused" | "revoked" | "dropped";
+
 // Handles one socket's events while it is the stream's current socket.
-// `onClose` learns whether the server refused the socket or revoked access.
-function watchSocket(socket: SocketLike, { revision, onInventory, onMetrics, onAlerts, onJobs, onUpdates, current, onOpen, onLive, onClose }: {
+function watchSocket(socket: SocketLike, { revision, onInventory, onMetrics, onAlerts, onJobs, onUpdates, current, onLive, onClose }: {
   revision: { current: number };
   onInventory: (update: (current: Inventory) => Inventory) => void;
   onMetrics?: (readings: MetricsReading[]) => void;
@@ -200,9 +216,8 @@ function watchSocket(socket: SocketLike, { revision, onInventory, onMetrics, onA
   onJobs?: (event: JobEvent) => void;
   onUpdates?: (event: UpdateEvent) => void;
   current: () => boolean;
-  onOpen: () => void;
   onLive: () => void;
-  onClose: (refused: boolean) => void;
+  onClose: (end: SocketEnd) => void;
 }) {
   let opened = false;
   const requestSnapshot = () => {
@@ -218,7 +233,6 @@ function watchSocket(socket: SocketLike, { revision, onInventory, onMetrics, onA
   socket.addEventListener("open", () => {
     if (!current()) return;
     opened = true;
-    onOpen();
   });
   socket.addEventListener("message", (message) => {
     const data = (message as MessageEvent).data;
@@ -241,7 +255,8 @@ function watchSocket(socket: SocketLike, { revision, onInventory, onMetrics, onA
   socket.addEventListener("error", () => socket.close());
   socket.addEventListener("close", (event) => {
     if (!current()) return;
-    onClose(!opened || (event as CloseEvent).code === ACCESS_REVOKED_CLOSE_CODE);
+    if (!opened) onClose("refused");
+    else onClose((event as CloseEvent).code === ACCESS_REVOKED_CLOSE_CODE ? "revoked" : "dropped");
   });
 }
 
@@ -257,11 +272,24 @@ export function inventoryStream({
   onRefused,
   online = true,
   timers = globalTimers,
+  random = Math.random,
 }: Options) {
   let stopped = false;
   let socket: SocketLike | null = null;
+  // When a refused socket last asked for a session check; null once the
+  // stream is live, so the next outage's first refusal checks at once.
+  let sessionCheckedAt: number | null = null;
   const connection = connectionReporter(onConnection, online, () => stopped);
-  const reconnect = reconnectBackoff(timers, () => stopped, () => connect());
+  const reconnect = reconnectBackoff(timers, random, () => stopped, () => connect());
+
+  // A revoked socket always checks: the server said access changed. A
+  // refusal may only mean the server is down, which the last check covers.
+  const checkSession = (end: Exclude<SocketEnd, "dropped">) => {
+    const now = timers.now();
+    if (end === "refused" && sessionCheckedAt !== null && now - sessionCheckedAt < SESSION_CHECK_INTERVAL_MS) return;
+    sessionCheckedAt = now;
+    onRefused();
+  };
 
   const listen = (nextSocket: SocketLike) => watchSocket(nextSocket, {
     revision,
@@ -271,15 +299,21 @@ export function inventoryStream({
     onJobs,
     onUpdates,
     current: () => !stopped && socket === nextSocket,
-    onOpen: () => reconnect.reset(),
-    onLive: () => connection.setState("live"),
-    onClose: (refused) => {
+    // Only a socket that delivered its snapshot resets the backoff; one the
+    // server accepts and then fails, before or while sending it, keeps
+    // backing off.
+    onLive: () => {
+      reconnect.reset();
+      sessionCheckedAt = null;
+      connection.setState("live");
+    },
+    onClose: (end) => {
       socket = null;
       // The server may have restarted its revisions; an HTTP load until the
       // next socket must not be measured against the lost one's.
       revision.current = -1;
       connection.setState("reconnecting");
-      if (refused) onRefused();
+      if (end !== "dropped") checkSession(end);
       reconnect.schedule();
     },
   });
@@ -302,7 +336,7 @@ export function inventoryStream({
 
   return {
     // Resynchronizes now: asks an open socket for a fresh snapshot, or skips
-    // the backoff wait and reconnects with the delay reset to 1 s.
+    // the backoff wait and reconnects with the step reset to 1 s.
     wake() {
       if (stopped) return;
       if (socket) {

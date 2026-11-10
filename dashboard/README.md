@@ -30,6 +30,12 @@ origin as its API. Nothing runs on Node in production.
   sends a snapshot, then revision-numbered changes (`features/agents/inventory-stream.ts`).
   Revisions restart with the server, so the page compares them only within one
   socket: each new socket's first snapshot applies whatever its revision.
+  A lost socket reconnects after a random wait between half and all of a step
+  that doubles from 1 s to 30 s, so tabs that lost a restarted server together
+  don't all ask for their snapshot at once; the step restarts only once a
+  socket delivers its snapshot. A refused socket checks whether the user is
+  still signed in at once, then at most about once a minute while the server
+  stays unreachable; a socket closed for lost access (4001) always checks.
 - **One bundle, one lazy chunk.** Every page hydrates from a single entry
   script (kept under 800 kB by `tests/prerender.test.mjs`). Only the
   [terminal](../docs/terminal.md)'s xterm.js is split out, loaded with
