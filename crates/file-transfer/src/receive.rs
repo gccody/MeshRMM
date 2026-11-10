@@ -8,7 +8,8 @@ use std::{
 };
 
 use crate::{
-    FREE_SPACE_RESERVE_BYTES, TRANSFER_FOLDER, check_limit, mebibytes, native, valid_path,
+    FREE_SPACE_RESERVE_BYTES, TRANSFER_FOLDER, check_limit, mebibytes, native, rename_no_replace,
+    valid_path,
 };
 
 /// Tags a received file or folder the way browsers tag downloads (the
@@ -19,21 +20,6 @@ use crate::{
 fn mark_received(path: &Path) {
     if let Err(error) = native::mark_received(path) {
         tracing::warn!(%error, path = %path.display(), "could not mark a received file as downloaded");
-    }
-}
-
-/// Moves `from` to `to`, failing with [`io::ErrorKind::AlreadyExists`]
-/// instead of replacing an existing file or folder.
-pub(super) fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
-    match native::rename_no_replace(from, to) {
-        // Some network volumes lack an atomic no-replace rename.
-        Err(error) if error.kind() == io::ErrorKind::Unsupported => {
-            if to.try_exists()? {
-                return Err(io::ErrorKind::AlreadyExists.into());
-            }
-            fs::rename(from, to)
-        }
-        result => result,
     }
 }
 

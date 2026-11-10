@@ -3,7 +3,6 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::Context;
-use meshrmm_protocol::VolumeUsage;
 
 use super::{CpuTime, Interface, Memory};
 
@@ -112,29 +111,18 @@ pub(super) fn uptime_seconds() -> anyhow::Result<u64> {
     Ok(seconds as u64)
 }
 
-/// File systems on local block devices, each device once: Btrfs subvolumes
-/// and bind mounts show the same device under several mount points.
-pub(super) fn volumes() -> anyhow::Result<Vec<VolumeUsage>> {
+/// The mount points of file systems on local block devices, each device
+/// once: Btrfs subvolumes and bind mounts show the same device under several
+/// mount points.
+pub(super) fn volume_mounts() -> anyhow::Result<Vec<String>> {
     let mounts = std::fs::read_to_string("/proc/self/mounts").context("/proc/self/mounts")?;
     let mut devices = HashSet::new();
-    let mut volumes = Vec::new();
-    for (device, mount_point, file_system) in parse_mounts(&mounts) {
-        if !local_disk(device, file_system) || !devices.insert(device.to_owned()) {
-            continue;
-        }
-        let Ok((total_bytes, free_bytes)) = usage(&mount_point) else {
-            continue;
-        };
-        if total_bytes == 0 {
-            continue;
-        }
-        volumes.push(VolumeUsage {
-            name: mount_point.to_owned(),
-            total_bytes,
-            free_bytes,
-        });
-    }
-    Ok(volumes)
+    Ok(parse_mounts(&mounts)
+        .filter(|(device, _, file_system)| {
+            local_disk(device, file_system) && devices.insert(device.to_owned())
+        })
+        .map(|(_, mount_point, _)| mount_point)
+        .collect())
 }
 
 /// Each mount's device, mount point and file system type. Mount points
@@ -177,7 +165,8 @@ fn local_disk(device: &str, file_system: &str) -> bool {
         && !matches!(file_system, "squashfs" | "iso9660" | "udf" | "erofs")
 }
 
-fn usage(mount_point: &str) -> anyhow::Result<(u64, u64)> {
+/// A volume's size and the space free to the Agent's user, in bytes.
+pub(super) fn volume_usage(mount_point: &str) -> anyhow::Result<(u64, u64)> {
     use std::os::unix::ffi::OsStrExt;
 
     let path = std::ffi::CString::new(Path::new(mount_point).as_os_str().as_bytes())?;
@@ -249,11 +238,9 @@ mod tests {
     fn real_readings_are_plausible() {
         assert!(memory().unwrap().total > 0);
         assert!(uptime_seconds().unwrap() > 0);
-        let volumes = volumes().unwrap();
-        assert!(
-            volumes.iter().any(|volume| volume.name == "/"),
-            "{volumes:?}"
-        );
+        let mounts = volume_mounts().unwrap();
+        assert!(mounts.iter().any(|mount| mount == "/"), "{mounts:?}");
+        assert!(volume_usage("/").unwrap().0 > 0);
         cpu_ticks().unwrap();
         interfaces().unwrap();
     }

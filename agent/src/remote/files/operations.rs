@@ -5,6 +5,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use meshrmm_file_transfer::rename_no_replace;
 use meshrmm_protocol::{
     FileBatch, FileDownloadInfo, FileDownloadKind, FileError, FileErrorCode, FileFailure,
     FileReply, MAX_FILE_BATCH,
@@ -28,20 +29,6 @@ fn batch_paths(texts: &[String]) -> Result<(), FileError> {
         ));
     }
     Ok(())
-}
-
-/// Moves `from` to `to` unless something is there already.
-fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
-    match meshrmm_file_transfer::rename_no_replace(from, to) {
-        // Some network volumes lack an atomic no-replace rename.
-        Err(error) if error.kind() == io::ErrorKind::Unsupported => {
-            if to.try_exists()? {
-                return Err(io::ErrorKind::AlreadyExists.into());
-            }
-            fs::rename(from, to)
-        }
-        result => result,
-    }
 }
 
 pub(super) fn create_folder(account: &Account, text: &str) -> Result<FileReply, FileError> {
