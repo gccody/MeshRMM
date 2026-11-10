@@ -45,7 +45,7 @@ use crate::{
     audit::{self, Target},
     auth::{Authorized, accounts::ACCESS_RECHECK, session},
     http::AppState,
-    realtime::SEND_TIMEOUT,
+    realtime::{SEND_TIMEOUT, Unsent},
     settings,
     terminals::Timeouts,
 };
@@ -64,6 +64,8 @@ enum End {
     /// The browser sent something a terminal doesn't take.
     BrowserProtocol,
     DeviceOffline,
+    /// The Agent is connected, but too far behind to take the request now.
+    DeviceBusy,
     DeviceTimeout,
     /// The Agent's socket ended, stalled or sent something unexpected.
     DeviceDisconnected,
@@ -84,6 +86,7 @@ impl End {
             Self::BrowserQuiet => "browser_quiet",
             Self::BrowserProtocol => "protocol_error",
             Self::DeviceOffline => "device_offline",
+            Self::DeviceBusy => "device_busy",
             Self::DeviceTimeout => "device_timeout",
             Self::DeviceDisconnected => "device_disconnected",
             Self::DeviceQuiet => "device_quiet",
@@ -102,6 +105,10 @@ impl End {
             Self::BrowserLeft | Self::BrowserQuiet => return None,
             Self::BrowserProtocol => (1003, "unsupported terminal message".into()),
             Self::DeviceOffline => (4004, "the device is offline".into()),
+            Self::DeviceBusy => (
+                4503,
+                "the device is connected but busy; try again in a moment".into(),
+            ),
             Self::DeviceTimeout => (4004, "the device didn't open the terminal".into()),
             Self::DeviceDisconnected => (4009, "the device disconnected".into()),
             Self::DeviceQuiet => (4009, "the device stopped answering".into()),
@@ -196,8 +203,12 @@ pub async fn serve(
             notification: requested.notification.clone(),
         },
     };
-    if !state.agents.send(&requested.device_id, command) {
-        let (code, reason) = End::DeviceOffline.browser_close().expect("a close frame");
+    if let Err(unsent) = state.agents.send(&requested.device_id, command) {
+        let end = match unsent {
+            Unsent::Offline => End::DeviceOffline,
+            Unsent::Full => End::DeviceBusy,
+        };
+        let (code, reason) = end.browser_close().expect("a close frame");
         close(&mut browser, code, &reason).await;
         return;
     }
@@ -636,6 +647,7 @@ mod tests {
             End::Failed,
             End::BrowserProtocol,
             End::DeviceOffline,
+            End::DeviceBusy,
             End::DeviceTimeout,
             End::DeviceDisconnected,
             End::DeviceQuiet,

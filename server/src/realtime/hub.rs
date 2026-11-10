@@ -2,7 +2,9 @@
 //!
 //! An Agent holds one control connection. Its socket ([`super::coordinator`])
 //! registers with [`AgentHub::connect`] and forwards what it receives; the API
-//! sends commands and session requests with [`AgentHub::send`]. A new
+//! sends commands and session requests with [`AgentHub::send`], or holds a
+//! place with [`AgentHub::reserve`] first when it records what it sends. A
+//! connection whose backlog is full is behind, not offline. A new
 //! connection from the same device replaces the old one, whose stream then
 //! ends.
 use std::{
@@ -16,8 +18,11 @@ use std::{
 use meshrmm_protocol_types::{AgentCommand, AgentSessionRequest};
 use tokio::sync::mpsc;
 
-/// Messages waiting for a slow connection. A connection this far behind is
-/// stuck, and further messages report the Agent as unreachable.
+use crate::http::ApiError;
+
+/// Messages waiting for a slow connection. Further messages for a
+/// connection this far behind are refused as [`Unsent::Full`] until it
+/// catches up.
 const COMMAND_BACKLOG: usize = 32;
 
 /// Something for a connected Agent.
@@ -71,6 +76,18 @@ pub enum Unsent {
     Offline,
     /// It is connected, but so far behind that its backlog is full.
     Full,
+}
+
+impl Unsent {
+    /// The answer for a person who asked for the message: `offline` for a
+    /// device that isn't connected, and [`ApiError::device_busy`] for one
+    /// that is but can't take more yet.
+    pub fn answer(self, offline: ApiError) -> ApiError {
+        match self {
+            Self::Offline => offline,
+            Self::Full => ApiError::device_busy(),
+        }
+    }
 }
 
 /// A place held in a connected Agent's backlog by [`AgentHub::reserve`].
@@ -162,20 +179,22 @@ impl AgentHub {
         self.lock().len()
     }
 
-    /// Queues `message` for the device's connection. Returns whether there
-    /// is one that accepted it; an Agent that is offline, or so far behind
-    /// that its backlog is full, did not.
-    pub fn send(&self, device_id: &str, message: impl Into<ToAgent>) -> bool {
+    /// Queues `message` for the device's connection, or says why it
+    /// couldn't: the device isn't connected, or it is but so far behind that
+    /// its backlog is full. Only the first means it is offline.
+    pub fn send(&self, device_id: &str, message: impl Into<ToAgent>) -> Result<(), Unsent> {
         let connections = self.lock();
-        let Some(registered) = connections.get(device_id) else {
-            return false;
-        };
+        let registered = connections.get(device_id).ok_or(Unsent::Offline)?;
         match registered.sender.try_send(message.into()) {
-            Ok(()) => true,
-            Err(error) => {
-                tracing::warn!(device_id, %error, "could not queue a message for an Agent");
-                false
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    device_id,
+                    "an Agent's backlog is full, so a message for it was not queued"
+                );
+                Err(Unsent::Full)
             }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(Unsent::Offline),
         }
     }
 
@@ -238,19 +257,22 @@ mod tests {
     async fn commands_reach_the_newest_connection_only() {
         let hub = AgentHub::default();
         assert!(!hub.is_connected("device-1"));
-        assert!(!hub.send("device-1", AgentCommand::Uninstall));
+        assert_eq!(
+            hub.send("device-1", AgentCommand::Uninstall),
+            Err(Unsent::Offline)
+        );
 
         let mut first = hub.connect("device-1");
         assert!(hub.is_connected("device-1"));
         assert!(hub.is_current("device-1", first.id));
-        assert!(hub.send("device-1", AgentCommand::Uninstall));
+        assert_eq!(hub.send("device-1", AgentCommand::Uninstall), Ok(()));
         assert_eq!(first.commands.recv().await, uninstall());
 
         let mut second = hub.connect("device-1");
         assert_ne!(first.id, second.id);
         assert!(!hub.is_current("device-1", first.id));
         assert_eq!(first.commands.recv().await, None, "the old stream ends");
-        assert!(hub.send("device-1", AgentCommand::Uninstall));
+        assert_eq!(hub.send("device-1", AgentCommand::Uninstall), Ok(()));
         assert_eq!(second.commands.recv().await, uninstall());
 
         drop(first);
@@ -269,11 +291,19 @@ mod tests {
         let hub = AgentHub::default();
         let mut connection = hub.connect("device-1");
         for _ in 0..COMMAND_BACKLOG {
-            assert!(hub.send("device-1", AgentCommand::Uninstall));
+            assert_eq!(hub.send("device-1", AgentCommand::Uninstall), Ok(()));
         }
-        assert!(!hub.send("device-1", AgentCommand::Uninstall));
+        assert_eq!(
+            hub.send("device-1", AgentCommand::Uninstall),
+            Err(Unsent::Full),
+            "a full backlog is not an offline device"
+        );
         hub.disconnect("device-1");
         assert!(!hub.is_connected("device-1"));
+        assert_eq!(
+            hub.send("device-1", AgentCommand::Uninstall),
+            Err(Unsent::Offline)
+        );
         for _ in 0..COMMAND_BACKLOG {
             assert!(connection.commands.recv().await.is_some());
         }
@@ -287,10 +317,11 @@ mod tests {
         let mut connection = hub.connect("device-1");
         let held = hub.reserve("device-1").unwrap();
         for _ in 1..COMMAND_BACKLOG {
-            assert!(hub.send("device-1", AgentCommand::Uninstall));
+            assert_eq!(hub.send("device-1", AgentCommand::Uninstall), Ok(()));
         }
-        assert!(
-            !hub.send("device-1", AgentCommand::Uninstall),
+        assert_eq!(
+            hub.send("device-1", AgentCommand::Uninstall),
+            Err(Unsent::Full),
             "the held place is taken"
         );
         assert_eq!(hub.reserve("device-1").unwrap_err(), Unsent::Full);

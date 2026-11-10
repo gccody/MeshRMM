@@ -172,6 +172,28 @@ async fn devices_list_online_first_and_deleting_one_uninstalls_its_agent() {
     }
 }
 
+#[tokio::test]
+async fn deleting_a_device_too_far_behind_reconnects_it_to_hear_the_uninstall() {
+    for app in common::apps().await {
+        let name = app.name;
+        let mut admin = common::set_up(&app).await;
+        let agent = app.enroll(&mut admin, "DESKTOP-1").await;
+        let mut connection = app.state.agents.connect(&agent.device_id);
+        let queued = common::fill_backlog(&app, &agent.device_id);
+        let deleted = admin
+            .delete(&format!("/v1/agents/{}", agent.device_id))
+            .await;
+        assert_eq!(deleted.status, StatusCode::NO_CONTENT, "{name}");
+        // Its connection ends after what it was sent, so the Agent connects
+        // again and is told to uninstall then.
+        assert!(!app.state.agents.is_connected(&agent.device_id), "{name}");
+        common::drain_backlog(&mut connection, queued).await;
+        assert_eq!(common::next_command(&mut connection).await, None, "{name}");
+        assert!(authenticates(&agent).await, "{name}");
+        app.finish().await;
+    }
+}
+
 async fn delete_mid_rotation(
     name: &str,
     app: &App,
@@ -301,25 +323,19 @@ async fn rotation_resends_the_pending_credential_until_the_agent_uses_it() {
         };
         assert_ne!(second, first);
 
-        // A rotation that can't be queued stays pending, and the next one
-        // sends it; the current credential keeps working meanwhile.
+        // An Agent too far behind to take a rotation now is busy, not
+        // offline, and nothing is staged for it; the current credential
+        // keeps working, and once it catches up the rotation goes through.
         assert!(authenticates(&agent.with_token(&second)).await);
-        while app
-            .state
-            .agents
-            .send(&agent.device_id, AgentCommand::Uninstall)
-        {}
-        let refused = admin.post(&path, json!({})).await;
+        let queued = common::fill_backlog(&app, &agent.device_id);
+        common::assert_device_busy(&admin.post(&path, json!({})).await, name);
         assert_eq!(
-            refused.status,
-            StatusCode::CONFLICT,
-            "{name}: {:?}",
-            refused.body
+            credential_hashes(&app, &agent.device_id).await,
+            (hash(&second), None),
+            "{name}: nothing was staged"
         );
-        let (current, pending) = credential_hashes(&app, &agent.device_id).await;
-        assert_eq!(current, hash(&second), "{name}");
-        let pending = pending.expect("the unsent credential stays pending");
-        while connection.commands.try_recv().is_ok() {}
+        assert_eq!(audit_events(&app, "agent.rotate_credential").await.len(), 3);
+        common::drain_backlog(&mut connection, queued).await;
         assert_eq!(
             admin.post(&path, json!({})).await.status,
             StatusCode::ACCEPTED
@@ -329,7 +345,11 @@ async fn rotation_resends_the_pending_credential_until_the_agent_uses_it() {
         else {
             panic!("expected a rotation");
         };
-        assert_eq!(hash(&third), pending, "{name}: the same credential is sent");
+        assert_ne!(third, second);
+        assert_eq!(
+            credential_hashes(&app, &agent.device_id).await,
+            (hash(&second), Some(hash(&third)))
+        );
         assert!(authenticates(&agent.with_token(&second)).await);
 
         // Deleting the device mid-rotation leaves the Agent able to use the

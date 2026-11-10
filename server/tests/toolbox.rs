@@ -632,6 +632,63 @@ async fn script_runs_reach_the_agent_and_record_its_report() {
 }
 
 #[tokio::test]
+async fn a_device_too_far_behind_records_no_run_or_delivery() {
+    for app in common::apps().await {
+        let name = app.name;
+        let mut admin = common::set_up(&app).await;
+        let agent = app.enroll(&mut admin, "DESKTOP-1").await;
+        let (mut ada, _) = common::user_with(&app, &mut admin, "ada@example.com", RUNNER).await;
+        let script_id = create_script(&mut ada, "Who am I").await;
+        let content = b"report contents".to_vec();
+        let file_id = upload(&ada, "report.txt", &content, false, &sha256(&content))
+            .await
+            .body["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let runs_path = format!("/v1/agents/{}/script-runs", agent.device_id);
+        let deliveries_path = format!("/v1/agents/{}/file-deliveries", agent.device_id);
+        let run = json!({ "script_id": script_id, "run_as": "system" });
+        let delivery = json!({ "file_id": file_id, "destination": "public" });
+
+        let mut connection = app.state.agents.connect(&agent.device_id);
+        let queued = common::fill_backlog(&app, &agent.device_id);
+        common::assert_device_busy(&ada.post(&runs_path, run.clone()).await, name);
+        common::assert_device_busy(&ada.post(&deliveries_path, delivery.clone()).await, name);
+        let runs = ada.get("/v1/script-runs").await.body;
+        assert_eq!(runs["runs"], json!([]), "{name}: nothing was recorded");
+        let deliveries = ada.get("/v1/file-deliveries").await.body;
+        assert_eq!(deliveries["deliveries"], json!([]), "{name}");
+        assert!(audit_events(&app, "script.run").await.is_empty(), "{name}");
+        assert!(
+            audit_events(&app, "file.deliver").await.is_empty(),
+            "{name}"
+        );
+
+        // Once the Agent catches up, the same requests go through.
+        common::drain_backlog(&mut connection, queued).await;
+        let started = ada.post(&runs_path, run).await;
+        assert_eq!(started.status, StatusCode::CREATED, "{name}");
+        let Some(AgentCommand::RunScript { run }) = common::next_command(&mut connection).await
+        else {
+            panic!("expected a script run");
+        };
+        assert_eq!(run.run_id, started.body["id"].as_str().unwrap());
+        let sent = ada.post(&deliveries_path, delivery).await;
+        assert_eq!(sent.status, StatusCode::CREATED, "{name}");
+        assert!(matches!(
+            common::next_command(&mut connection).await,
+            Some(AgentCommand::DeliverFile { .. })
+        ));
+        let runs = ada.get("/v1/script-runs").await.body;
+        assert_eq!(runs["runs"][0]["status"], "pending", "{name}");
+        assert_eq!(runs["runs"].as_array().unwrap().len(), 1, "{name}");
+        drop(connection);
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
 async fn unreported_runs_are_shown_as_lost() {
     for app in common::apps().await {
         let mut admin = common::set_up(&app).await;

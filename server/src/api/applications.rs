@@ -30,6 +30,7 @@ use crate::{
     auth::Authorized,
     http::{ApiError, AppState, JsonBody},
     rbac::Permission,
+    realtime::Reserved,
     time::now_ms,
     users::new_id,
 };
@@ -297,6 +298,15 @@ fn offline() -> ApiError {
         .with_code("device_offline")
 }
 
+/// Holds a place in the online Agent's backlog for a run before it is
+/// recorded, so a device too far behind to take it records nothing.
+fn hold_place(state: &AppState, device_id: &str) -> Result<Reserved, ApiError> {
+    state
+        .agents
+        .reserve(device_id)
+        .map_err(|unsent| unsent.answer(offline()))
+}
+
 #[derive(Debug, Serialize)]
 pub struct DevicePackages {
     device_id: String,
@@ -352,9 +362,7 @@ pub async fn scan(
 ) -> Result<(StatusCode, Json<Run>), ApiError> {
     actor.require(Permission::ApplicationsView)?;
     let id = device(&state, &id).await?;
-    if !state.agents.is_connected(&id) {
-        return Err(offline());
-    }
+    let place = hold_place(&state, &id)?;
     let mut database = &state.database;
     if let Some(run_id) = runs::pending(&mut database, &id, true).await?
         && let Some(run) = runs::get(&mut database, &run_id, false).await?
@@ -401,24 +409,22 @@ pub async fn scan(
     )
     .await?;
     transaction.commit().await?;
-    send(&state, &id, &run_id, None).await?;
+    send(&state, place, &run_id, None).await?;
     let run = runs::get(&mut &state.database, &run_id, false)
         .await?
         .ok_or_else(ApiError::internal)?;
     Ok((StatusCode::ACCEPTED, Json(run)))
 }
 
-/// Hands a recorded run to the online Agent; a run it never got is removed.
+/// Hands a recorded run to the Agent in the place held for it; a run it
+/// never got, because it went offline since, is removed.
 async fn send(
     state: &AppState,
-    device_id: &str,
+    place: Reserved,
     run_id: &str,
     operation: Option<&ApplicationOperation>,
 ) -> Result<(), ApiError> {
-    if state
-        .agents
-        .send(device_id, runs::command(run_id, operation))
-    {
+    if place.send(runs::command(run_id, operation)) {
         return Ok(());
     }
     runs::discard(&mut &state.database, run_id).await?;
@@ -435,9 +441,7 @@ pub async fn start_run(
 ) -> Result<(StatusCode, Json<Run>), ApiError> {
     actor.require(Permission::ApplicationsDeploy)?;
     let id = device(&state, &id).await?;
-    if !state.agents.is_connected(&id) {
-        return Err(offline());
-    }
+    let place = hold_place(&state, &id)?;
     let mut transaction = state.database.begin().await?;
     if applications::busy(&mut transaction, &id).await? {
         return Err(running());
@@ -490,7 +494,7 @@ pub async fn start_run(
     .await?;
     transaction.commit().await?;
     if command.is_some() {
-        send(&state, &id, &run_id, Some(&operation)).await?;
+        send(&state, place, &run_id, Some(&operation)).await?;
     }
     let run = runs::get(&mut &state.database, &run_id, true)
         .await?

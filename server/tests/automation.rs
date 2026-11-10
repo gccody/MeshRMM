@@ -2421,6 +2421,7 @@ async fn a_connected_device_with_a_full_backlog_waits_its_turn_rather_than_being
             .state
             .agents
             .send(&busy.device_id, AgentCommand::CollectSystemInfo)
+            .is_ok()
         {}
         drop(away_connection);
         let now = now_ms();

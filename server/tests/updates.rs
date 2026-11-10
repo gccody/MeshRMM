@@ -1681,3 +1681,34 @@ async fn fleet_pages_cost_the_same_for_any_fleet_and_miss_no_device() {
         app.finish().await;
     }
 }
+
+#[tokio::test]
+async fn a_scan_for_a_device_too_far_behind_is_busy_and_records_nothing() {
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let desk = app.enroll(&mut admin, "Desk").await;
+        let scan_path = format!("/v1/agents/{}/updates/scan", desk.device_id);
+        let mut connection = app.state.agents.connect(&desk.device_id);
+        let queued = common::fill_backlog(&app, &desk.device_id);
+        common::assert_device_busy(&admin.post(&scan_path, json!({})).await, name);
+        assert_eq!(
+            admin.get("/v1/update-runs").await.body["runs"],
+            json!([]),
+            "{name}"
+        );
+        assert!(audit_events(&app, "update.scan").await.is_empty(), "{name}");
+
+        common::drain_backlog(&mut connection, queued).await;
+        let started = admin.post(&scan_path, json!({})).await;
+        assert_eq!(started.status, StatusCode::ACCEPTED, "{name}");
+        assert_eq!(
+            common::next_command(&mut connection).await,
+            Some(meshrmm_protocol_types::AgentCommand::ScanUpdates {
+                run_id: started.body["id"].as_str().unwrap().to_owned()
+            })
+        );
+        drop(connection);
+        app.finish().await;
+    }
+}

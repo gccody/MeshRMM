@@ -899,3 +899,61 @@ async fn sessions_relay_through_the_built_in_turn_server() {
         app.finish().await;
     }
 }
+
+/// The session request queued for a stand-in Agent connection.
+async fn next_session(
+    connection: &mut meshrmm_server::realtime::AgentConnection,
+) -> meshrmm_protocol_types::AgentSessionRequest {
+    match connection.commands.recv().await {
+        Some(meshrmm_server::realtime::ToAgent::Session(request)) => request,
+        other => panic!("expected a session request, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_device_too_far_behind_is_busy_and_its_session_stays_as_it_was() {
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let agent = app.enroll(&mut admin, "Desk").await;
+        let mut connection = app.state.agents.connect(&agent.device_id);
+
+        // Starting is busy, not offline, and records no session.
+        let queued = common::fill_backlog(&app, &agent.device_id);
+        let token = handoff(&mut admin, &agent.device_id, false).await;
+        common::assert_device_busy(&redeem(&app, &token).await, name);
+        assert!(audit_events(&app, "remote.session_create").await.is_empty());
+        common::drain_backlog(&mut connection, queued).await;
+        let token = handoff(&mut admin, &agent.device_id, false).await;
+        let redeemed = redeem(&app, &token).await;
+        assert_eq!(redeemed.status, 200, "{name}: {:?}", redeemed.body);
+        let request = next_session(&mut connection).await;
+        let session_id = redeemed.body["session_id"].as_str().unwrap();
+        assert_eq!(request.session_id.as_str(), session_id);
+
+        // Resuming is busy too, and leaves the Agent's side as it was.
+        let mut viewer_http = app.browser();
+        let resume = |browser: &mut Browser| {
+            let path = format!("/v1/remote/sessions/{session_id}/resume");
+            let token = redeemed.body["signaling_token"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let mut browser = browser.clone();
+            async move { viewer(&mut browser, Method::POST, &path, &token, None).await }
+        };
+        let queued = common::fill_backlog(&app, &agent.device_id);
+        common::assert_device_busy(&resume(&mut viewer_http).await, name);
+        common::drain_backlog(&mut connection, queued).await;
+        let resumed = resume(&mut viewer_http).await;
+        assert_eq!(resumed.status, 200, "{name}: {:?}", resumed.body);
+        let refreshed = next_session(&mut connection).await;
+        assert_eq!(refreshed.session_id.as_str(), session_id);
+        assert_ne!(
+            refreshed.signaling_token, request.signaling_token,
+            "{name}: only the resume that went through replaced the Agent's side"
+        );
+        drop(connection);
+        app.finish().await;
+    }
+}

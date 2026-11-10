@@ -711,3 +711,48 @@ async fn idle_time_is_a_setting() {
         app.finish().await;
     }
 }
+
+#[tokio::test]
+async fn a_terminal_for_a_device_too_far_behind_closes_as_busy() {
+    for app in apps().await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let agent = app.enroll_on(&mut admin, "web-01", "linux").await;
+        let mut connection = app.state.agents.connect(&agent.device_id);
+        let queued = common::fill_backlog(&app, &agent.device_id);
+        let opened = open(&mut admin, &agent, request("bash", "system")).await;
+        assert_eq!(opened.status, 201, "{name}: {:?}", opened.body);
+        let mut browser = browser_socket(&server, &admin, opened.body["id"].as_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            closed(&mut browser).await,
+            (
+                4503,
+                "the device is connected but busy; try again in a moment".to_owned()
+            ),
+            "{name}"
+        );
+        assert!(audit_events(&app, "terminal.open").await.is_empty());
+
+        // Once it caught up, a terminal opens.
+        common::drain_backlog(&mut connection, queued).await;
+        let opened = open(&mut admin, &agent, request("bash", "system")).await;
+        let _browser = browser_socket(&server, &admin, opened.body["id"].as_str().unwrap())
+            .await
+            .unwrap();
+        let command = tokio::time::timeout(SOCKET_WAIT, common::next_command(&mut connection))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                command,
+                Some(meshrmm_protocol_types::AgentCommand::OpenTerminal { .. })
+            ),
+            "{name}: {command:?}"
+        );
+        drop(connection);
+        app.finish().await;
+    }
+}

@@ -128,6 +128,7 @@ test("statuses and close codes read as sentences", () => {
   assert.equal(isEnded({ state: "exited", code: 0 }), true);
   assert.equal(closeReason(4008, "closed after 30 minutes without input"), "Closed after 30 minutes without input");
   assert.equal(closeReason(4009, ""), "The device disconnected");
+  assert.equal(closeReason(4503, ""), "The device is connected but busy; try again in a moment");
   assert.equal(closeReason(4001, ""), "Sign in again");
   assert.equal(closeReason(1006, ""), "The connection to the server was lost");
 });

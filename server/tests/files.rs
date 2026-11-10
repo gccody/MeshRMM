@@ -382,6 +382,38 @@ async fn listings_and_changes_go_through_the_agent() {
 }
 
 #[tokio::test]
+async fn a_device_too_far_behind_is_busy_not_offline() {
+    for app in apps_with(quick).await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let agent = app.enroll_on(&mut admin, "files-01", "linux").await;
+        let path = format!("/v1/agents/{}/files?path=/", agent.device_id);
+        let mut connection = app.state.agents.connect(&agent.device_id);
+        let queued = common::fill_backlog(&app, &agent.device_id);
+        common::assert_device_busy(&admin.get(&path).await, name);
+
+        // Once it caught up, the same request reaches it.
+        common::drain_backlog(&mut connection, queued).await;
+        let call = get(&admin, path.clone());
+        let request =
+            tokio::time::timeout(common::SOCKET_WAIT, common::next_command(&mut connection))
+                .await
+                .unwrap();
+        assert!(
+            matches!(
+                request,
+                Some(meshrmm_protocol_types::AgentCommand::FileRequest { .. })
+            ),
+            "{name}: {request:?}"
+        );
+        call.abort();
+        drop(connection);
+        assert_eq!(admin.get(&path).await.code(), "device_offline", "{name}");
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
 async fn permissions_decide_what_and_as_whom() {
     for app in apps_with(quick).await {
         let name = app.name;

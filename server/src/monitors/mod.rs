@@ -55,7 +55,7 @@ use crate::{
     },
     http::AppState,
     rbac::{self, Permission},
-    realtime::presence::PresenceEvent,
+    realtime::{Unsent, presence::PresenceEvent},
     targets,
     time::now_ms,
     users,
@@ -365,9 +365,20 @@ fn offer(state: &AppState, catalog: &Catalog, device_id: &str, forced: bool) {
         monitors,
         known: None,
     };
-    if state.agents.send(device_id, command) {
-        tracing::info!(device_id, monitors = count, "sent the device its monitors");
-        lock(&state.monitors.inner.sent).insert(device_id.to_owned(), offer);
+    match state.agents.send(device_id, command) {
+        Ok(()) => {
+            tracing::info!(device_id, monitors = count, "sent the device its monitors");
+            lock(&state.monitors.inner.sent).insert(device_id.to_owned(), offer);
+        }
+        // Too far behind to take them now: they stay unsent, and the next
+        // pass, at the latest the next resync, sends them again. Nothing
+        // wakes the engine for it, so a device that stays behind is tried
+        // once a pass.
+        Err(Unsent::Full) => {
+            lock(&state.monitors.inner.forced).insert(device_id.to_owned());
+        }
+        // It went offline: it gets its monitors when it connects.
+        Err(Unsent::Offline) => {}
     }
 }
 
@@ -877,8 +888,8 @@ async fn judge(
 }
 
 /// Asks the device to run the monitors (all of them when `rule_ids` is
-/// empty) now. Returns whether its Agent is connected.
-pub fn check_now(state: &AppState, device_id: &str, rule_ids: Vec<String>) -> bool {
+/// empty) now, or says why it can't be asked.
+pub fn check_now(state: &AppState, device_id: &str, rule_ids: Vec<String>) -> Result<(), Unsent> {
     state.agents.send(
         device_id,
         AgentCommand::CheckMonitors {

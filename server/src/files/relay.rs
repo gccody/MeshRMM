@@ -143,8 +143,8 @@ async fn connect_agent(
             transfer,
         },
     };
-    if !state.agents.send(device_id, command) {
-        return Err(device_offline());
+    if let Err(unsent) = state.agents.send(device_id, command) {
+        return Err(unsent.answer(device_offline()));
     }
     let arrived = claim.agent.take().expect("a new claim waits for the Agent");
     let offline = claim.offline.clone();

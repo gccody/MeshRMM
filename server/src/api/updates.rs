@@ -91,8 +91,10 @@ fn offline() -> ApiError {
         .with_code("device_offline")
 }
 
-/// Records a run and asks the online Agent for it. A run the Agent never
-/// got is removed again.
+/// Records a run and asks the online Agent for it. A place in the Agent's
+/// backlog is held first, so a device too far behind to take the run
+/// records nothing; a run the Agent never got, because it went offline
+/// since, is removed again.
 async fn start(
     state: &AppState,
     actor: &Authorized,
@@ -100,6 +102,10 @@ async fn start(
     kind: Kind,
     install: Option<&Install>,
 ) -> Result<Run, ApiError> {
+    let place = state
+        .agents
+        .reserve(device_id)
+        .map_err(|unsent| unsent.answer(offline()))?;
     let id = new_id();
     let now = now_ms();
     let mut transaction = state.database.begin().await?;
@@ -137,10 +143,7 @@ async fn start(
     )
     .await?;
     transaction.commit().await?;
-    if !state
-        .agents
-        .send(device_id, runs::command(&id, kind, install))
-    {
+    if !place.send(runs::command(&id, kind, install)) {
         let mut transaction = state.database.begin().await?;
         runs::discard(&mut transaction, &id).await?;
         transaction.commit().await?;

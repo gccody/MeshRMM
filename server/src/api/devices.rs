@@ -18,6 +18,7 @@ use crate::{
     db::tables::Agents,
     http::{ApiError, AppState},
     rbac::Permission,
+    realtime::Unsent,
     secrets::{new_token, token_hash},
     storage,
     time::now_ms,
@@ -94,13 +95,22 @@ pub async fn delete(
     crate::automation::device_removed(&state, &id).await;
     crate::updates::device_removed(&state, &id).await;
     crate::applications::device_removed(&state, &id).await;
-    state.agents.send(&id, AgentCommand::Uninstall);
+    // An offline Agent is told to uninstall when it next connects. One too
+    // far behind to take the command now is disconnected, so it reconnects
+    // and is told then.
+    if state.agents.send(&id, AgentCommand::Uninstall) == Err(Unsent::Full) {
+        state.agents.disconnect(&id);
+    }
     state.presence.refresh(&id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
-const OFFLINE_FOR_ROTATION: &str =
-    "the Agent must be online to receive its new credential; its current credential still works";
+fn offline_for_rotation() -> ApiError {
+    ApiError::conflict(
+        "the Agent must be online to receive its new credential; its current credential still works",
+    )
+    .with_code("device_offline")
+}
 
 /// `POST /v1/agents/{id}/rotate-credential`: sends the online Agent a new
 /// credential. The current one keeps working until the Agent uses the new
@@ -118,9 +128,12 @@ pub async fn rotate_credential(
     let pending = agents::pending_credential(&mut transaction, &id)
         .await?
         .ok_or_else(|| ApiError::not_found("Device not found"))?;
-    if !state.agents.is_connected(&id) {
-        return Err(ApiError::conflict(OFFLINE_FOR_ROTATION).with_code("device_offline"));
-    }
+    // A place for the credential is held before it is staged, so an Agent
+    // too far behind to take it now is not left with one it never got.
+    let place = state
+        .agents
+        .reserve(&id)
+        .map_err(|unsent| unsent.answer(offline_for_rotation()))?;
     let staged = pending.token(&state.instance_key, &id)?;
     let redelivered = staged.is_some();
     let token = match staged {
@@ -155,10 +168,11 @@ pub async fn rotate_credential(
         }
     };
     transaction.commit().await?;
-    // A credential the Agent didn't get stays pending, and the next rotation
-    // sends it again. Withdrawing it could race a rotation that did deliver it.
-    if !state.agents.send(&id, AgentCommand::RotateToken { token }) {
-        return Err(ApiError::conflict(OFFLINE_FOR_ROTATION).with_code("device_offline"));
+    // A credential the Agent didn't get, because it went offline since,
+    // stays pending, and the next rotation sends it again. Withdrawing it
+    // could race a rotation that did deliver it.
+    if !place.send(AgentCommand::RotateToken { token }) {
+        return Err(offline_for_rotation());
     }
     audit::record(
         &mut &state.database,

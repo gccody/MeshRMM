@@ -949,6 +949,58 @@ pub async fn next_command(
     }
 }
 
+/// Fills the backlog of the device's connection, as an Agent far behind on
+/// what it was sent leaves it, and returns how many messages it holds.
+pub fn fill_backlog(app: &App, device_id: &str) -> usize {
+    use meshrmm_server::realtime::Unsent;
+    let mut filled = 0;
+    loop {
+        match app.state.agents.send(
+            device_id,
+            meshrmm_protocol_types::AgentCommand::CollectSystemInfo,
+        ) {
+            Ok(()) => filled += 1,
+            Err(Unsent::Full) => return filled,
+            Err(Unsent::Offline) => panic!("the device has no connection"),
+        }
+        assert!(filled <= 1024, "the backlog never filled");
+    }
+}
+
+/// Takes the `count` messages [`fill_backlog`] queued off the connection.
+pub async fn drain_backlog(
+    connection: &mut meshrmm_server::realtime::AgentConnection,
+    count: usize,
+) {
+    for _ in 0..count {
+        assert_eq!(
+            next_command(connection).await,
+            Some(meshrmm_protocol_types::AgentCommand::CollectSystemInfo)
+        );
+    }
+}
+
+/// Asserts `response` is the answer for a device that is connected but too
+/// far behind to take more: not `device_offline`.
+pub fn assert_device_busy(response: &Response, name: &str) {
+    assert_eq!(
+        response.status,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "{name}: {:?}",
+        response.body
+    );
+    assert_eq!(response.code(), "device_busy", "{name}");
+    assert!(
+        response.headers["retry-after"]
+            .to_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            >= 1,
+        "{name}"
+    );
+}
+
 pub type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 

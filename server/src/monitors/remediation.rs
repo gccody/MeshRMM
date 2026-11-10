@@ -52,7 +52,8 @@ use crate::{
         tables::{AlertRemediations, Alerts, ScriptRuns, ToolboxScripts},
     },
     http::AppState,
-    time::{DAY_MS, MINUTE_MS, now_ms},
+    realtime::Unsent,
+    time::{DAY_MS, MINUTE_MS, SECOND_MS, now_ms},
     toolbox::{self, NewRun, Source},
     users::new_id,
 };
@@ -74,6 +75,9 @@ const HEALED_SLACK_MS: i64 = MINUTE_MS;
 /// An attempt due while the device is offline waits this long and looks
 /// again; it doesn't count as an attempt.
 const OFFLINE_RETRY_MS: i64 = MINUTE_MS;
+/// An attempt due while the device is connected but too far behind to take
+/// it waits for the next evaluation, and doesn't count as an attempt either.
+const BUSY_RETRY_MS: i64 = 15 * SECOND_MS;
 const OFFLINE: &str = "The device went offline before it could act";
 /// A restart or an end for a rule whose monitor has no service or process.
 const NOTHING_TO_ACT_ON: &str = "Its monitor has no service or process to act on";
@@ -523,21 +527,31 @@ async fn due(state: &AppState, alert_id: &str, now: i64) -> anyhow::Result<()> {
             .await;
         }
     };
-    if !state.agents.is_connected(&alert.device_id) {
-        set_state(
-            &mut database,
-            alert_id,
-            Some(RemediationState::Waiting),
-            Some(now + OFFLINE_RETRY_MS),
-            Some(RemediationState::Waiting),
-        )
-        .await?;
-        return Ok(());
-    }
+    // A place for the attempt is held before it is claimed and recorded, so
+    // a device that can't take it now is tried again later and isn't
+    // charged an attempt.
+    let place = match state.agents.reserve(&alert.device_id) {
+        Ok(place) => place,
+        Err(unsent) => {
+            let wait = match unsent {
+                Unsent::Offline => OFFLINE_RETRY_MS,
+                Unsent::Full => BUSY_RETRY_MS,
+            };
+            set_state(
+                &mut database,
+                alert_id,
+                Some(RemediationState::Waiting),
+                Some(now + wait),
+                Some(RemediationState::Waiting),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
     let Some(started) = start_attempt(state, &rule, &alert, &remediation, start, now).await? else {
         return Ok(());
     };
-    if !state.agents.send(&alert.device_id, started.command) {
+    if !place.send(started.command) {
         settle(
             state,
             &started.attempt_id,
@@ -1256,7 +1270,9 @@ fn check_again(state: &AppState, alert: &Alert, rule: &Rule) {
         return;
     }
     if rule.monitor.is_some() {
-        super::check_now(state, &alert.device_id, vec![rule.id.clone()]);
+        // Only sooner than the device's own schedule, which checks the
+        // monitor again anyway, so one that can't be asked now isn't.
+        let _ = super::check_now(state, &alert.device_id, vec![rule.id.clone()]);
     } else {
         state.alerts.wake();
     }

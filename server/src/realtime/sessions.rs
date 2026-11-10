@@ -667,9 +667,13 @@ impl Sessions {
         state: &AppState,
         new: NewSession<'_>,
     ) -> Result<SessionBootstrap, ApiError> {
-        if !state.agents.is_connected(new.device_id) {
-            return Err(device_offline());
-        }
+        // A place for the request is held before the session claims the
+        // device, so one the Agent is too far behind to take now neither
+        // replaces the device's session nor is recorded.
+        let place = state
+            .agents
+            .reserve(new.device_id)
+            .map_err(|unsent| unsent.answer(device_offline()))?;
         let policy = settings::load(&mut &state.database).await?;
         let session_id = new_id();
         let now = now_ms();
@@ -711,7 +715,7 @@ impl Sessions {
             actors.insert(session_id.clone(), entry);
             handle
         };
-        if !state.agents.send(new.device_id, ToAgent::Session(request)) {
+        if !place.send(ToAgent::Session(request)) {
             handle.expire("the device went offline").await;
             return Err(device_offline());
         }
