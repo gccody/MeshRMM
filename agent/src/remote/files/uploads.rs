@@ -2,24 +2,38 @@
 //! goes, `.meshrmm-upload-<id>`, across as many transfers as it takes. An
 //! interrupted upload goes on from the partial file's length. Finishing
 //! checks the whole file's SHA-256 against the browser's, then renames it
-//! into place, so a file appears whole or not at all. The Agent remembers
-//! its partial files on disk and deletes those untouched for a day.
+//! into place, so a file appears whole or not at all.
+//!
+//! The Agent keeps a record of its partial files in its configuration
+//! directory and deletes those untouched for a day. Only the Agent's own
+//! account can reach that directory, so the record always changes as the
+//! Agent, outside [`Account::run`], and a partial file is recorded before it
+//! is made: one the Agent can't record isn't made. An entry remembers the
+//! signed-in user a partial file was made as, for the sweep to reach it as
+//! them when the Agent's own account can't, as on a user's network drive.
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use meshrmm_protocol::{FileError, FileErrorCode, FileReply, valid_sha256_hex};
+use meshrmm_protocol::{FileError, FileErrorCode, FileReply, RunAs, valid_sha256_hex};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::listing::entry_at;
 use super::operations::{create_parents, format_bytes};
 use super::{Account, io_error, paths, platform};
+use crate::remote::config::ExecutionMode;
 
 /// Partial files untouched this long are deleted.
 const ABANDONED_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+/// A recorded partial file the sweep can't examine this long, as on a
+/// network drive that's gone, is forgotten.
+const UNREACHABLE_FOR: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// Most partial files the record holds; uploads beyond them don't start.
+const MAX_PARTIALS: usize = 1000;
 /// Space a volume keeps free after an upload.
 const FREE_SPACE_RESERVE_BYTES: u64 = 64 * 1024 * 1024;
 const RECORD_FILE: &str = "file-uploads.json";
@@ -74,7 +88,10 @@ pub(super) fn prepare(
 ) -> Result<FileReply, FileError> {
     let (partial_path, path) = partial(id, text)?;
     let folder = paths::parent(&path).expect("checked by partial");
-    account.run(|| {
+    // Recorded first, as the Agent, so the partial file is never there
+    // unrecorded; settling forgets it again if it isn't made.
+    remember(&partial_path, account.user_id())?;
+    settle(account, &partial_path, || {
         create_parents(account, folder)?;
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_dir() => {
@@ -120,7 +137,6 @@ pub(super) fn prepare(
         }
         platform::hide(&partial_path);
         platform::adopt_parent_owner(account, &partial_path);
-        remember(&partial_path);
         Ok(FileReply::Upload { received })
     })
 }
@@ -183,13 +199,16 @@ pub(super) fn finish(
         ));
     }
     let (partial_path, path) = partial(id, text)?;
-    account.run(|| {
+    settle(account, &partial_path, || {
         let mut file = match open_partial(OpenOptions::new().read(true), &partial_path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(gone(&path)),
             Err(error) => return Err(io_error(&error, &path)),
         };
-        let received = file.metadata().map_err(|error| io_error(&error, &path))?.len();
+        let received = file
+            .metadata()
+            .map_err(|error| io_error(&error, &path))?
+            .len();
         if received != size {
             return Err(FileError::new(
                 FileErrorCode::OffsetMismatch,
@@ -200,7 +219,6 @@ pub(super) fn finish(
         drop(file);
         if digest != sha256 {
             let _ = fs::remove_file(&partial_path);
-            forget(&partial_path);
             return Err(FileError::new(
                 FileErrorCode::ChecksumMismatch,
                 format!(
@@ -221,7 +239,6 @@ pub(super) fn finish(
             meshrmm_file_transfer::rename_no_replace(&partial_path, &path)
         };
         placed.map_err(|error| io_error(&error, &path))?;
-        forget(&partial_path);
         platform::unhide(&path);
         if let Err(error) = meshrmm_file_transfer::mark_received(&path) {
             tracing::debug!(%error, "could not mark an uploaded file as downloaded");
@@ -235,15 +252,33 @@ pub(super) fn finish(
 
 pub(super) fn cancel(account: &Account, id: &str, text: &str) -> Result<FileReply, FileError> {
     let (partial_path, path) = partial(id, text)?;
-    account.run(|| {
+    settle(account, &partial_path, || {
         match fs::remove_file(&partial_path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(io_error(&error, &path)),
         }
-        forget(&partial_path);
         Ok(FileReply::Upload { received: 0 })
     })
+}
+
+/// Runs `work` on an upload as the account, then, as the Agent, forgets its
+/// partial file if it's no longer there: placed, discarded or never made.
+fn settle<T: Send>(
+    account: &Account,
+    partial: &Path,
+    work: impl FnOnce() -> Result<T, FileError> + Send,
+) -> Result<T, FileError> {
+    let (result, there) = account.run(|| {
+        let result = work();
+        let there = !fs::symlink_metadata(partial)
+            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound);
+        Ok((result, there))
+    })?;
+    if !there {
+        forget(partial);
+    }
+    result
 }
 
 /// Opens an upload's partial file, which must be a plain file of its own:
@@ -281,90 +316,312 @@ pub(super) fn hex(bytes: &[u8]) -> String {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Record {
-    partials: Vec<PathBuf>,
+    partials: Vec<Partial>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Partial {
+    path: PathBuf,
+    /// The signed-in user it was made as ([`Account::user_id`]); none for
+    /// the Agent's own account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
+    /// When it was last known to be in use, in seconds since the Unix
+    /// epoch: when it was recorded, or found recently written to.
+    seen: u64,
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
 }
 
 fn record_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    return tests::RECORD_AT.with_borrow(Clone::clone);
+    #[cfg(not(test))]
     crate::installer::config_directory()
         .ok()
         .map(|folder| folder.join(RECORD_FILE))
 }
 
-fn change_record(change: impl FnOnce(&mut Record)) {
-    let Some(file) = record_path() else { return };
-    let _guard = RECORD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut record = fs::read(&file)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Record>(&bytes).ok())
-        .unwrap_or_default();
-    change(&mut record);
-    let written = serde_json::to_vec(&record)
-        .map_err(io::Error::other)
-        .and_then(|bytes| fs::write(&file, bytes));
-    if let Err(error) = written {
-        tracing::debug!(%error, "could not record the device's partial uploads");
+/// Changes the record, as the Agent. A record that can't be read is left
+/// as it is; one that isn't a record is started again.
+fn change_record<T>(change: impl FnOnce(&mut Record) -> io::Result<T>) -> io::Result<T> {
+    let changed = (|| {
+        #[cfg(test)]
+        if super::account::working::now() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the record isn't the account's to change",
+            ));
+        }
+        let file = record_path()
+            .ok_or_else(|| io::Error::other("the Agent has no configuration directory"))?;
+        let _guard = RECORD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut record = match fs::read(&file) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+                tracing::warn!(%error, "the record of partial uploads was unreadable; starting it again");
+                Record::default()
+            }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Record::default(),
+            Err(error) => return Err(error),
+        };
+        let result = change(&mut record)?;
+        // Written whole, then renamed into place, so stopping halfway
+        // loses nothing.
+        let mut staged = file.clone().into_os_string();
+        staged.push(".new");
+        let staged = PathBuf::from(staged);
+        fs::write(
+            &staged,
+            serde_json::to_vec(&record).map_err(io::Error::other)?,
+        )?;
+        fs::rename(&staged, &file)?;
+        Ok(result)
+    })();
+    if let Err(error) = &changed {
+        tracing::warn!(%error, "could not change the record of partial uploads");
     }
+    changed
 }
 
-fn remember(partial: &Path) {
+/// Records the partial file `partial`, made as `user`, before it's made.
+/// An upload whose partial file can't be recorded doesn't start, since the
+/// file would stay on the disk for good if the upload were abandoned. The
+/// record is in the Agent's own configuration directory, so wherever the
+/// Agent runs it can be written but for a full or failing disk.
+fn remember(partial: &Path, user: Option<String>) -> Result<(), FileError> {
     change_record(|record| {
-        if !record.partials.iter().any(|known| known == partial) {
-            record.partials.push(partial.to_path_buf());
+        let entry = Partial {
+            path: partial.to_path_buf(),
+            user,
+            seen: now(),
+        };
+        let full = record.partials.len() >= MAX_PARTIALS;
+        match record.partials.iter_mut().find(|known| known.path == partial) {
+            Some(known) => *known = entry,
+            None if full => return Err(io::Error::new(io::ErrorKind::QuotaExceeded, "full")),
+            None => record.partials.push(entry),
         }
+        Ok(())
+    })
+    .map_err(|error| {
+        let message = if error.kind() == io::ErrorKind::QuotaExceeded {
+            format!(
+                "The device has {MAX_PARTIALS} unfinished uploads already. Finish or cancel some first; the device removes those abandoned for a day."
+            )
+        } else {
+            "The Agent could not record the upload's partial file, so it didn't start it.".into()
+        };
+        FileError::new(FileErrorCode::Failed, message)
+    })
+}
+
+/// Forgets a partial file that's gone. One that can't be forgotten now
+/// is forgotten by the sweep, which finds it gone.
+fn forget(partial: &Path) {
+    let _ = change_record(|record| {
+        record.partials.retain(|known| known.path != partial);
+        Ok(())
     });
 }
 
-fn forget(partial: &Path) {
-    change_record(|record| record.partials.retain(|known| known != partial));
+/// What the sweep found of a recorded partial file.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Found {
+    /// Written to within a day.
+    InUse,
+    /// Untouched for a day, and deleted.
+    Deleted,
+    /// Not there.
+    Gone,
+    /// Something other than a plain file, which someone else put there:
+    /// left as it is.
+    Replaced,
+    /// Couldn't be examined or deleted now.
+    Unreachable,
+}
+
+/// Looks at a recorded partial file, and deletes it if it's untouched for
+/// a day. Nothing is followed: the partial file is examined and deleted
+/// itself, and anything but a plain file in its place is left alone:
+/// neither a link put there nor what it points to is deleted. Its folder
+/// may be a user's, who could swap the folder for a link to another one,
+/// but only a file with this upload's partial file's name could be deleted
+/// there, and only the Agent makes those.
+fn examine(partial: &Path) -> Found {
+    let metadata = match look(partial) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Found::Gone,
+        Err(error) => {
+            tracing::info!(%error, path = %partial.display(), "could not examine a partial upload; keeping it");
+            return Found::Unreachable;
+        }
+    };
+    if !metadata.is_file() {
+        tracing::warn!(path = %partial.display(), "a partial upload was replaced by something else; leaving it");
+        return Found::Replaced;
+    }
+    let idle = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .unwrap_or_default();
+    if idle < ABANDONED_AFTER {
+        return Found::InUse;
+    }
+    match fs::remove_file(partial) {
+        Ok(()) => {
+            tracing::info!(path = %partial.display(), "deleted an abandoned upload");
+            Found::Deleted
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Found::Gone,
+        Err(error) => {
+            tracing::warn!(%error, path = %partial.display(), "could not delete an abandoned upload");
+            Found::Unreachable
+        }
+    }
+}
+
+/// The partial file's own metadata, not what a link there points to.
+fn look(partial: &Path) -> io::Result<fs::Metadata> {
+    #[cfg(test)]
+    if tests::UNREACHABLE.with_borrow(|unreachable| unreachable.iter().any(|path| path == partial))
+    {
+        return Err(io::ErrorKind::PermissionDenied.into());
+    }
+    fs::symlink_metadata(partial)
 }
 
 /// Deletes partial files nobody has written to for a day, and forgets
-/// those already gone.
-pub(super) fn sweep() {
-    change_record(|record| {
-        record.partials.retain(|partial| {
-            let Ok(metadata) = fs::symlink_metadata(partial) else {
-                return false;
+/// those gone. One made as the signed-in user is examined as them while
+/// they're signed in, since it may be where only they reach (their network
+/// drive, a home folder root can't read), and as the Agent otherwise. One
+/// that can't be examined is kept until it has been out of reach for 30
+/// days. `mode` is the Agent's, once a file request has told it.
+pub(super) fn sweep(mode: Option<ExecutionMode>) {
+    let Ok(partials) = change_record(|record| Ok(record.partials.clone())) else {
+        return;
+    };
+    if partials.is_empty() {
+        return;
+    }
+    let signed_in = mode
+        .and_then(|mode| Account::resolve(mode, RunAs::User).ok())
+        .filter(Account::is_user);
+    let user = signed_in.as_ref().and_then(Account::user_id);
+    let (theirs, ours): (Vec<&Partial>, Vec<&Partial>) = partials
+        .iter()
+        .partition(|partial| partial.user.is_some() && partial.user == user);
+    let mut found = ours
+        .iter()
+        .map(|partial| (&partial.path, (partial.seen, examine(&partial.path))))
+        .collect::<HashMap<_, _>>();
+    if let Some(account) = signed_in.filter(|_| !theirs.is_empty()) {
+        let examined = account
+            .run(|| {
+                Ok(theirs
+                    .iter()
+                    .map(|partial| examine(&partial.path))
+                    .collect())
+            })
+            .unwrap_or_else(|_| vec![Found::Unreachable; theirs.len()]);
+        for (partial, examined) in theirs.iter().zip(examined) {
+            found.insert(&partial.path, (partial.seen, examined));
+        }
+    }
+    let now = now();
+    let since = |seen: u64| Duration::from_secs(now.saturating_sub(seen));
+    let _ = change_record(|record| {
+        record.partials.retain_mut(|partial| {
+            // An entry recorded again since it was examined stays as it is.
+            let Some(&(seen, examined)) = found.get(&partial.path) else {
+                return true;
             };
-            let idle = metadata
-                .modified()
-                .ok()
-                .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-                .unwrap_or_default();
-            if idle < ABANDONED_AFTER {
+            if partial.seen != seen {
                 return true;
             }
-            match fs::remove_file(partial) {
-                Ok(()) => {
-                    tracing::info!(path = %partial.display(), "deleted an abandoned upload");
-                    false
-                }
-                Err(error) => {
-                    tracing::warn!(%error, path = %partial.display(), "could not delete an abandoned upload");
+            match examined {
+                Found::InUse => {
+                    partial.seen = now;
                     true
+                }
+                Found::Deleted | Found::Replaced => false,
+                // One not there yet may be one an upload is making.
+                Found::Gone => since(seen) < ABANDONED_AFTER,
+                Found::Unreachable if since(seen) < UNREACHABLE_FOR => true,
+                Found::Unreachable => {
+                    tracing::warn!(path = %partial.path.display(), "forgot a partial upload out of reach for 30 days");
+                    false
                 }
             }
         });
+        Ok(())
     });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::remote::config::ExecutionMode;
-    use meshrmm_protocol::RunAs;
+    use std::cell::RefCell;
     use std::io::Write;
+
+    thread_local! {
+        /// Where the test's record of partial files is kept.
+        pub(super) static RECORD_AT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+        /// Partial files the test's sweep can't examine, as on a network
+        /// drive that's gone.
+        pub(super) static UNREACHABLE: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+    }
 
     fn own() -> Account {
         Account::resolve(ExecutionMode::Console, RunAs::System).unwrap()
     }
 
-    #[test]
-    fn uploads_resume_verify_and_land_whole() {
+    /// A folder of the test's own, which keeps its record.
+    fn scratch() -> PathBuf {
         let folder = std::env::temp_dir().join(format!("meshrmm-up-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&folder).unwrap();
+        RECORD_AT.set(Some(folder.join(RECORD_FILE)));
+        folder
+    }
+
+    fn recorded() -> Vec<PathBuf> {
+        change_record(|record| Ok(record.partials.iter().map(|p| p.path.clone()).collect()))
+            .unwrap()
+    }
+
+    /// Moves when the record last knew `partial` in use to `ago`.
+    fn seen_ago(partial: &Path, ago: Duration) {
+        change_record(|record| {
+            for known in &mut record.partials {
+                if known.path == partial {
+                    known.seen = now() - ago.as_secs();
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    fn untouched_for(path: &Path, ago: Duration) {
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - ago)
+            .unwrap();
+    }
+
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+    #[test]
+    fn uploads_resume_verify_and_land_whole() {
+        let folder = scratch();
         let account = own();
         let target = paths::text(&folder.join("new/sub/data.bin"));
         let id = "0195f3a2-7c1d-7e4b-9a3f-2b8c4d5e6f70";
@@ -456,8 +713,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn partial_files_swapped_for_links_are_refused() {
-        let folder = std::env::temp_dir().join(format!("meshrmm-up-{}", uuid::Uuid::new_v4()));
-        fs::create_dir(&folder).unwrap();
+        let folder = scratch();
         let account = own();
         let target = paths::text(&folder.join("data.bin"));
         let id = "0195f3a2-7c1d-7e4b-9a3f-2b8c4d5e6f71";
@@ -473,6 +729,182 @@ mod tests {
         fs::hard_link(&victim, &partial_path).unwrap();
         assert!(open(&account, id, &target, 0, 4).is_err());
         assert_eq!(fs::read(&victim).unwrap(), b"keep");
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    /// The record changes as the Agent, never as the account: as the
+    /// signed-in user, the Agent's configuration directory is out of reach,
+    /// which `account::working` stands for here.
+    #[test]
+    fn uploads_are_recorded_and_forgotten_as_the_agent() {
+        let folder = scratch();
+        let account = own();
+        let target = paths::text(&folder.join("data.bin"));
+        let id = "0195f3a2-7c1d-7e4b-9a3f-2b8c4d5e6f72";
+        let (partial_path, _) = partial(id, &target).unwrap();
+        let digest = hex(&Sha256::digest(b"abc"));
+
+        prepare(&account, id, &target, 3, false).unwrap();
+        assert_eq!(recorded(), [partial_path.as_path()]);
+        // A failure that keeps the partial file keeps its entry.
+        open(&account, id, &target, 0, 3)
+            .unwrap()
+            .write_all(b"a")
+            .unwrap();
+        finish(&account, id, &target, 3, &digest, false).unwrap_err();
+        assert_eq!(recorded(), [partial_path.as_path()]);
+        open(&account, id, &target, 1, 3)
+            .unwrap()
+            .write_all(b"bc")
+            .unwrap();
+        finish(&account, id, &target, 3, &digest, false).unwrap();
+        assert!(recorded().is_empty(), "finishing forgets it");
+
+        prepare(&account, id, &target, 3, true).unwrap();
+        assert_eq!(recorded(), [partial_path.as_path()]);
+        cancel(&account, id, &target).unwrap();
+        assert!(recorded().is_empty(), "cancelling forgets it");
+
+        prepare(&account, id, &target, 3, true).unwrap();
+        open(&account, id, &target, 0, 3)
+            .unwrap()
+            .write_all(b"xyz")
+            .unwrap();
+        finish(&account, id, &target, 3, &digest, true).unwrap_err();
+        assert!(recorded().is_empty(), "a discarded upload is forgotten");
+
+        // Recorded before it's made, and forgotten when it isn't made.
+        assert_eq!(
+            prepare(&account, id, &target, 3, false).unwrap_err().code,
+            FileErrorCode::AlreadyExists
+        );
+        assert!(recorded().is_empty());
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn the_sweep_deletes_abandoned_partial_files_and_keeps_the_rest() {
+        let folder = scratch();
+        let account = own();
+        let start = |id: &str| {
+            let target = paths::text(&folder.join(format!("{id}.bin")));
+            prepare(&account, id, &target, 3, false).unwrap();
+            partial(id, &target).unwrap().0
+        };
+        let abandoned = start("0195f3a2-7c1d-7e4b-9a3f-2b8c4d5e6f73");
+        let in_use = start("0195f3a2-7c1d-7e4b-9a3f-2b8c4d5e6f74");
+        let out_of_reach = start("0195f3a2-7c1d-7e4b-9a3f-2b8c4d5e6f75");
+        untouched_for(&abandoned, DAY + Duration::from_secs(60));
+        untouched_for(&out_of_reach, 2 * DAY);
+        UNREACHABLE.with_borrow_mut(|unreachable| unreachable.push(out_of_reach.clone()));
+
+        sweep(None);
+        assert!(!abandoned.exists(), "untouched for a day, it's deleted");
+        assert!(in_use.exists());
+        assert!(out_of_reach.exists());
+        assert_eq!(recorded(), [in_use.as_path(), out_of_reach.as_path()]);
+
+        // Out of reach for 30 days, it's forgotten.
+        seen_ago(&out_of_reach, UNREACHABLE_FOR - Duration::from_secs(60));
+        sweep(None);
+        assert_eq!(recorded(), [in_use.as_path(), out_of_reach.as_path()]);
+        seen_ago(&out_of_reach, UNREACHABLE_FOR + Duration::from_secs(60));
+        sweep(None);
+        assert_eq!(recorded(), [in_use.as_path()]);
+
+        // One gone is forgotten once it can't be one an upload is making.
+        fs::remove_file(&in_use).unwrap();
+        sweep(None);
+        assert_eq!(recorded(), [in_use.as_path()]);
+        seen_ago(&in_use, DAY + Duration::from_secs(60));
+        sweep(None);
+        assert!(recorded().is_empty());
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    /// A link put in a partial file's place is left alone, and so is what
+    /// it points to, however long untouched.
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_leaves_a_link_in_a_partial_files_place_alone() {
+        use std::os::unix::ffi::OsStrExt;
+        let folder = scratch();
+        let account = own();
+        let target = paths::text(&folder.join("data.bin"));
+        let id = "0195f3a2-7c1d-7e4b-9a3f-2b8c4d5e6f76";
+        prepare(&account, id, &target, 3, false).unwrap();
+        let (partial_path, _) = partial(id, &target).unwrap();
+        let victim = folder.join("victim");
+        fs::write(&victim, b"keep").unwrap();
+        untouched_for(&victim, 2 * DAY);
+        fs::remove_file(&partial_path).unwrap();
+        std::os::unix::fs::symlink(&victim, &partial_path).unwrap();
+        let name = std::ffi::CString::new(partial_path.as_os_str().as_bytes()).unwrap();
+        let old = libc::timespec {
+            tv_sec: (now() - 2 * DAY.as_secs()) as libc::time_t,
+            tv_nsec: 0,
+        };
+        // SAFETY: the name is NUL-terminated and there are two times.
+        let aged = unsafe {
+            libc::utimensat(
+                libc::AT_FDCWD,
+                name.as_ptr(),
+                [old, old].as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        assert_eq!(aged, 0);
+
+        sweep(None);
+        assert!(fs::symlink_metadata(&partial_path).unwrap().is_symlink());
+        assert_eq!(fs::read(&victim).unwrap(), b"keep");
+        assert!(recorded().is_empty(), "it's no longer the Agent's");
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    /// An upload whose partial file can't be recorded doesn't start: not
+    /// beyond the record's cap, nor when the record can't be written.
+    #[test]
+    fn uploads_the_record_cant_hold_dont_start() {
+        let folder = scratch();
+        let account = own();
+        change_record(|record| {
+            record.partials = (0..MAX_PARTIALS)
+                .map(|index| Partial {
+                    path: folder.join(format!(".meshrmm-upload-{index}")),
+                    user: None,
+                    seen: now(),
+                })
+                .collect();
+            Ok(())
+        })
+        .unwrap();
+        let target = paths::text(&folder.join("data.bin"));
+        let id = "0195f3a2-7c1d-7e4b-9a3f-2b8c4d5e6f77";
+        let (partial_path, _) = partial(id, &target).unwrap();
+        assert_eq!(
+            prepare(&account, id, &target, 3, false).unwrap_err().code,
+            FileErrorCode::Failed
+        );
+        assert!(!partial_path.exists());
+        assert_eq!(recorded().len(), MAX_PARTIALS);
+        // One recorded already goes on.
+        prepare(
+            &account,
+            "0",
+            &paths::text(&folder.join("zero.bin")),
+            3,
+            false,
+        )
+        .unwrap();
+        assert_eq!(recorded().len(), MAX_PARTIALS);
+
+        RECORD_AT.set(Some(folder.join("missing").join(RECORD_FILE)));
+        assert_eq!(
+            prepare(&account, id, &target, 3, false).unwrap_err().code,
+            FileErrorCode::Failed
+        );
+        assert!(!partial_path.exists());
         let _ = fs::remove_dir_all(&folder);
     }
 }

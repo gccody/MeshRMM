@@ -151,9 +151,17 @@ An upload never replaces a file by itself: one whose name is taken waits
 with **Replace** and **Skip**. A dropped connection goes on from what the
 device has, by itself up to three times; a device that goes offline pauses
 its uploads, and they go on when it's back (or with **Resume**). **Cancel**
-removes the partial file. The device deletes partial files nobody has added
-to for a day. Closing or leaving the page while files are uploading asks
-first, since it stops them.
+removes the partial file. Closing or leaving the page while files are
+uploading asks first, since it stops them.
+
+The Agent records each partial file, as itself, before making it (an
+upload whose partial file it can't record doesn't start), and every hour
+deletes those nobody has added to for a day, whichever account made them.
+One made as the signed-in user is looked at as them while they're signed
+in, since it may be where only they reach, such as their network drive;
+otherwise as SYSTEM or root. It deletes only a plain file there: a link or
+anything else put in a partial file's place is left alone. One it can't
+reach is kept, and forgotten once out of reach for 30 days.
 
 ## Limits
 
@@ -169,6 +177,8 @@ first, since it stops them.
   use, and an unfinished upload resumed for 24 hours; both are kept in the
   server's memory, so a server restart forgets them.
 - Paths up to 32 KB; 1,000 entries per move, delete or download.
+- 1,000 unfinished uploads per device; another doesn't start until one is
+  finished, cancelled or deleted as abandoned.
 
 Transfers stream through the server without being stored there, a piece at
 a time. A reverse proxy in front of the server must allow request bodies of

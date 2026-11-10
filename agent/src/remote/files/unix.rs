@@ -30,6 +30,11 @@ impl User {
     pub(super) fn uid(&self) -> u32 {
         self.uid
     }
+
+    /// The user's ID.
+    pub(super) fn id(&self) -> String {
+        self.uid.to_string()
+    }
 }
 
 fn effective_uid() -> u32 {
