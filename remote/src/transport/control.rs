@@ -13,10 +13,11 @@ use meshrmm_protocol::{
 use meshrmm_session_transport::ServiceChannel;
 use tokio::sync::{Notify, mpsc};
 
+use super::keyframe::KeyframeRequests;
 use super::services::ServiceInbox;
 use super::{ActivePresenter, ViewerResumeState};
 use crate::debug::DebugInfo;
-use crate::platform::{ControlSink, ControlSinkParts, Presenter};
+use crate::platform::{ControlSink, ControlSinkParts, Presenter, monotonic_timestamp_us};
 
 const POINTER_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(8);
 
@@ -35,6 +36,7 @@ pub(super) struct ViewerControlQueue {
     pub(super) service_senders: Arc<Mutex<HashMap<&'static str, mpsc::Sender<SessionMessage>>>>,
     input: Arc<Mutex<ViewerInputState>>,
     pointer_changed: Arc<Notify>,
+    keyframes: Arc<Mutex<KeyframeRequests>>,
     pub(super) resume_state: ViewerResumeState,
 }
 
@@ -67,11 +69,16 @@ impl ViewerControlQueue {
                 pending_pointer: None,
             })),
             pointer_changed: Arc::new(Notify::new()),
+            keyframes: Default::default(),
             resume_state,
         }
     }
 
     pub(super) fn send(&self, message: SessionMessage) {
+        if let SessionMessage::RequestKeyframe { stream_id } = message {
+            self.request_keyframe(stream_id, monotonic_timestamp_us());
+            return;
+        }
         if let SessionMessage::SelectDisplay { display_id } = &message
             && let Ok(mut selected) = self.resume_state.display_id.lock()
         {
@@ -128,6 +135,50 @@ impl ViewerControlQueue {
         } else {
             let _ = self.outgoing.send(message);
         }
+    }
+
+    /// Asks the device for a keyframe of `stream_id` unless one was just
+    /// asked for: every request the viewer makes comes through here.
+    fn request_keyframe(&self, stream_id: VideoStreamId, now_us: u64) {
+        let due = self
+            .keyframes
+            .lock()
+            .is_ok_and(|mut requests| requests.request(stream_id, now_us));
+        if due {
+            self.send_keyframe_request(stream_id);
+        } else {
+            tracing::trace!(
+                stream_id = stream_id.0,
+                "a keyframe was asked for recently; waiting for it"
+            );
+        }
+    }
+
+    /// Sends a keyframe request that had to wait, or one that went
+    /// unanswered, once it is due.
+    pub(super) fn poll_keyframe_request(&self, now_us: u64) {
+        let due = self
+            .keyframes
+            .lock()
+            .ok()
+            .and_then(|mut requests| requests.poll(now_us));
+        if let Some(stream_id) = due {
+            self.send_keyframe_request(stream_id);
+        }
+    }
+
+    /// A keyframe of `stream_id` arrived, which answers its requests.
+    pub(super) fn keyframe_arrived(&self, stream_id: VideoStreamId) {
+        if let Ok(mut requests) = self.keyframes.lock() {
+            requests.keyframe_arrived(stream_id);
+        }
+    }
+
+    fn send_keyframe_request(&self, stream_id: VideoStreamId) {
+        tracing::info!(stream_id = stream_id.0, "requesting a video keyframe");
+        let _ = self
+            .outgoing
+            .send(SessionMessage::RequestKeyframe { stream_id });
     }
 
     fn flush_pointer(&self) {
@@ -680,6 +731,35 @@ mod tests {
         let queue = ViewerControlQueue::new(tx, ViewerResumeState::default());
         queue.set_input_enabled(true);
         (queue, rx)
+    }
+
+    #[test]
+    fn keyframe_requests_from_every_sender_share_one_limit() {
+        let (queue, mut rx) = active_queue();
+        let stream_id = VideoStreamId(5);
+        let request = SessionMessage::RequestKeyframe { stream_id };
+        // The presenter, the video channel's loss detection and a recording
+        // that starts all ask through the same queue, here within 250 ms.
+        let control_sink = queue.clone();
+        let recording = queue.clone();
+        queue.send(request.clone());
+        control_sink.send(request.clone());
+        recording.send(request.clone());
+        queue.send(request.clone());
+        assert_eq!(rx.try_recv().unwrap(), request);
+        assert!(rx.try_recv().is_err());
+
+        // Unanswered, it goes once more after the retry time.
+        let now_us = monotonic_timestamp_us();
+        queue.poll_keyframe_request(now_us);
+        assert!(rx.try_recv().is_err());
+        queue.poll_keyframe_request(now_us + super::super::keyframe::RETRY_AFTER_US);
+        assert_eq!(rx.try_recv().unwrap(), request);
+
+        // A keyframe answers it, and nothing is retried after that.
+        queue.keyframe_arrived(stream_id);
+        queue.poll_keyframe_request(now_us + 3 * super::super::keyframe::RETRY_AFTER_US);
+        assert!(rx.try_recv().is_err());
     }
 
     #[cfg(target_os = "macos")]

@@ -1,5 +1,6 @@
 //! The video channel: reassembles frames from packets and asks for a
-//! keyframe when frames are lost.
+//! keyframe when frames are lost. [`ViewerControlQueue`] decides when the
+//! request goes.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,14 +16,15 @@ use super::{ActivePresenter, ReceiverLifecycle};
 use crate::debug::DebugInfo;
 use crate::platform::monotonic_timestamp_us;
 
-const KEYFRAME_RETRY_INTERVAL_US: u64 = 250_000;
+/// How often the channel expires incomplete frames, and sends keyframe
+/// requests that had to wait or went unanswered.
+const RECOVERY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 struct VideoReceiveState {
     reassembler: FrameReassembler,
     stream_id: Option<VideoStreamId>,
     last_accepted_frame_id: Option<u64>,
     waiting_for_keyframe: bool,
-    last_keyframe_request_us: u64,
     statistics_log: crate::debug::StatisticsLog,
 }
 
@@ -33,7 +35,6 @@ impl VideoReceiveState {
             stream_id: None,
             last_accepted_frame_id: None,
             waiting_for_keyframe: true,
-            last_keyframe_request_us: 0,
             statistics_log: Default::default(),
         }
     }
@@ -42,18 +43,16 @@ impl VideoReceiveState {
         self.waiting_for_keyframe = true;
     }
 
+    /// The stream to ask a keyframe for, when an incomplete frame expired.
     fn poll_recovery(&mut self, now_us: u64) -> Option<VideoStreamId> {
         // The last packet of a burst can be lost on a static desktop. Expire
         // its incomplete frame even when no subsequent packets arrive.
         if self.reassembler.expire_stale(now_us) {
             self.mark_loss();
             tracing::warn!("incomplete video frame expired while waiting for more packets");
+            return self.stream_id;
         }
-        if self.waiting_for_keyframe && self.keyframe_request_due(now_us) {
-            self.stream_id
-        } else {
-            None
-        }
+        None
     }
 
     fn observe_stream(&mut self, stream_id: VideoStreamId) {
@@ -61,26 +60,12 @@ impl VideoReceiveState {
             self.stream_id = Some(stream_id);
             self.last_accepted_frame_id = None;
             self.waiting_for_keyframe = true;
-            self.last_keyframe_request_us = 0;
         }
     }
 
-    fn keyframe_request_due(&mut self, now_us: u64) -> bool {
-        if self.last_keyframe_request_us == 0
-            || now_us.saturating_sub(self.last_keyframe_request_us) >= KEYFRAME_RETRY_INTERVAL_US
-        {
-            self.last_keyframe_request_us = now_us.max(1);
-            true
-        } else {
-            false
-        }
-    }
-
-    fn accept_completed(
-        &mut self,
-        frame: EncodedFrame,
-        now_us: u64,
-    ) -> (Option<EncodedFrame>, bool) {
+    /// Returns the frame to present, if it can be decoded, and whether the
+    /// stream needs a keyframe.
+    fn accept_completed(&mut self, frame: EncodedFrame) -> (Option<EncodedFrame>, bool) {
         self.observe_stream(frame.stream_id);
 
         let gap = self
@@ -98,12 +83,11 @@ impl VideoReceiveState {
 
         if frame.keyframe {
             self.waiting_for_keyframe = false;
-            self.last_keyframe_request_us = 0;
             self.last_accepted_frame_id = Some(frame.frame_id);
             return (Some(frame), false);
         }
         if self.waiting_for_keyframe {
-            return (None, self.keyframe_request_due(now_us));
+            return (None, true);
         }
 
         self.last_accepted_frame_id = Some(frame.frame_id);
@@ -144,8 +128,7 @@ pub(super) fn install_video_handler(
         let receive_state = Arc::clone(&receive_state);
         let viewer_control = viewer_control.clone();
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_micros(KEYFRAME_RETRY_INTERVAL_US));
+            let mut interval = tokio::time::interval(RECOVERY_POLL_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             interval.tick().await;
             while !closed.load(Ordering::Acquire) {
@@ -157,11 +140,8 @@ pub(super) fn install_video_handler(
                 };
                 if let Some(stream_id) = stream_id {
                     viewer_control.send(SessionMessage::RequestKeyframe { stream_id });
-                    tracing::debug!(
-                        stream_id = stream_id.0,
-                        "retrying a video recovery keyframe while no decodable frames arrive"
-                    );
                 }
+                viewer_control.poll_keyframe_request(now_us);
             }
         });
     }
@@ -188,10 +168,10 @@ pub(super) fn install_video_handler(
             let mut request_keyframe = false;
             if stats.incomplete_frames_dropped > incomplete_before {
                 receive_state.mark_loss();
-                request_keyframe = receive_state.keyframe_request_due(received_at_us);
+                request_keyframe = true;
             }
             let completed = if let ReassemblyOutcome::Completed(frame) = outcome {
-                let (frame, request) = receive_state.accept_completed(frame, received_at_us);
+                let (frame, request) = receive_state.accept_completed(frame);
                 request_keyframe |= request;
                 frame
             } else {
@@ -203,12 +183,11 @@ pub(super) fn install_video_handler(
                 viewer_control.send(SessionMessage::RequestKeyframe {
                     stream_id: packet_stream_id,
                 });
-                tracing::warn!(
-                    stream_id = packet_stream_id.0,
-                    "requested a video recovery keyframe"
-                );
             }
             if let Some(frame) = completed {
+                if frame.keyframe {
+                    viewer_control.keyframe_arrived(frame.stream_id);
+                }
                 let encode_us = frame
                     .encode_complete_timestamp_us
                     .saturating_sub(frame.capture_timestamp_us);
@@ -264,59 +243,37 @@ mod tests {
     fn video_recovery_suppresses_deltas_across_a_frame_gap() {
         let mut state = VideoReceiveState::new();
 
-        let (frame, request) = state.accept_completed(encoded_frame(10, false), 1_000);
+        let (frame, request) = state.accept_completed(encoded_frame(10, false));
         assert!(frame.is_none());
         assert!(request);
 
-        let (frame, request) = state.accept_completed(encoded_frame(11, true), 2_000);
+        let (frame, request) = state.accept_completed(encoded_frame(11, true));
         assert_eq!(frame.unwrap().frame_id, 11);
         assert!(!request);
 
-        let (frame, request) = state.accept_completed(encoded_frame(12, false), 3_000);
+        let (frame, request) = state.accept_completed(encoded_frame(12, false));
         assert_eq!(frame.unwrap().frame_id, 12);
         assert!(!request);
 
-        let (frame, request) = state.accept_completed(encoded_frame(14, false), 4_000);
+        let (frame, request) = state.accept_completed(encoded_frame(14, false));
         assert!(frame.is_none());
         assert!(request);
 
-        let (frame, request) = state.accept_completed(encoded_frame(15, false), 5_000);
+        // Still waiting: the control queue's limiter keeps this from
+        // becoming a second request.
+        let (frame, request) = state.accept_completed(encoded_frame(15, false));
         assert!(frame.is_none());
-        assert!(!request, "recovery requests are rate limited");
+        assert!(request);
 
-        let (frame, request) = state.accept_completed(encoded_frame(16, true), 6_000);
+        let (frame, request) = state.accept_completed(encoded_frame(16, true));
         assert_eq!(frame.unwrap().frame_id, 16);
         assert!(!request);
     }
 
     #[test]
-    fn video_recovery_retries_a_missing_keyframe() {
-        let mut state = VideoReceiveState::new();
-        let (_, first_request) = state.accept_completed(encoded_frame(1, false), 1_000);
-        let (_, retry) =
-            state.accept_completed(encoded_frame(2, false), 1_000 + KEYFRAME_RETRY_INTERVAL_US);
-        assert!(first_request);
-        assert!(retry);
-    }
-
-    #[test]
-    fn video_recovery_can_retry_when_only_packet_fragments_arrive() {
-        let mut state = VideoReceiveState::new();
-        let stream_id = VideoStreamId(7);
-        state.observe_stream(stream_id);
-        state.mark_loss();
-
-        assert_eq!(state.stream_id, Some(stream_id));
-        assert!(state.waiting_for_keyframe);
-        assert!(state.keyframe_request_due(1_000));
-        assert!(!state.keyframe_request_due(1_001));
-        assert!(state.keyframe_request_due(1_000 + KEYFRAME_RETRY_INTERVAL_US));
-    }
-
-    #[test]
     fn video_recovery_expires_a_trailing_fragment_without_new_packets() {
         let mut state = VideoReceiveState::new();
-        state.accept_completed(encoded_frame(1, true), 1_000);
+        state.accept_completed(encoded_frame(1, true));
         let mut frame = encoded_frame(2, false);
         frame.data = vec![1; 6];
         let packet = meshrmm_protocol::fragment_frame(&frame, 3)
@@ -331,25 +288,17 @@ mod tests {
         let expired_at = 2_000 + ReassemblyConfig::default().stale_after.as_micros() as u64;
         assert_eq!(state.poll_recovery(expired_at), Some(VideoStreamId(7)));
         assert_eq!(state.reassembler.stats().incomplete_frames_dropped, 1);
+        assert!(state.waiting_for_keyframe);
+        // The control queue retries the request; the frame expired once.
         assert_eq!(state.poll_recovery(expired_at + 1), None);
-        assert_eq!(
-            state.poll_recovery(expired_at + KEYFRAME_RETRY_INTERVAL_US),
-            Some(VideoStreamId(7))
-        );
-        state.accept_completed(
-            encoded_frame(3, true),
-            expired_at + KEYFRAME_RETRY_INTERVAL_US + 1,
-        );
-        assert_eq!(
-            state.poll_recovery(expired_at + 2 * KEYFRAME_RETRY_INTERVAL_US),
-            None
-        );
+        state.accept_completed(encoded_frame(3, true));
+        assert!(!state.waiting_for_keyframe);
     }
 
     #[test]
     fn video_recovery_does_not_treat_a_static_desktop_as_packet_loss() {
         let mut state = VideoReceiveState::new();
-        state.accept_completed(encoded_frame(1, true), 1_000);
+        state.accept_completed(encoded_frame(1, true));
         assert_eq!(state.poll_recovery(60_000_000), None);
         assert!(!state.waiting_for_keyframe);
     }

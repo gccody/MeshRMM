@@ -13,7 +13,8 @@ use meshrmm_protocol::{
     RemoteInput, SessionCloseAction, SessionMessage, VideoFormat, VideoProfile,
 };
 use windows::Win32::Foundation::{
-    ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+    CloseHandle, ERROR_CLASS_ALREADY_EXISTS, HANDLE, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT,
+    RECT, WPARAM,
 };
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP,
@@ -31,6 +32,7 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+use windows::Win32::System::Threading::{CreateEventW, SetEvent};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, ReleaseCapture, SetCapture, SetFocus,
 };
@@ -41,6 +43,7 @@ use super::ControlSink;
 use crate::debug::DebugInfo;
 use crate::reconnect::{ReconnectStatus, ReconnectText};
 
+mod frame_schedule;
 mod keyboard_hook;
 mod launch_window;
 mod pipeline;
@@ -53,15 +56,16 @@ mod reset_probe;
 mod toolbar_probe;
 mod window;
 
+use frame_schedule::FrameSchedule;
 pub use launch_window::{close_launch_status, show_launch_status};
 use pipeline::WorkerPipeline;
 use renderer::D3d11Renderer;
 use window::{create_window, pump_window_messages, set_window_cursor};
 
 const MAX_DECODER_PENDING_FRAMES: usize = 16;
-// Moonlight's depacketizer permits 15 queued decode units. This is large
-// enough for short delivery/decoder bursts without treating normal jitter as
-// reference loss; the worker still presents only the newest decoded surface.
+// Moonlight's depacketizer permits 15 queued decode units. The worker
+// decodes everything queued on each pass, so the queue only fills while the
+// decoder refuses input or the worker's thread is held, as by a window drag.
 const MAX_PRESENTER_QUEUE_FRAMES: usize = 15;
 const DECODER_INPUT_STALL_TIMEOUT: Duration = Duration::from_secs(3);
 /// How often the worker redraws the reconnect overlay's elapsed time and
@@ -85,8 +89,51 @@ struct PendingReset {
     reply: std::sync::mpsc::SyncSender<anyhow::Result<()>>,
 }
 
+/// An auto-reset Win32 event, which the worker can wait on together with
+/// the swap chain.
+struct WakeEvent(HANDLE);
+
+// SAFETY: an event handle may be signalled and waited on from any thread.
+unsafe impl Send for WakeEvent {}
+unsafe impl Sync for WakeEvent {}
+
+impl WakeEvent {
+    fn new() -> Self {
+        // Without an event the worker only wakes on its timeouts.
+        let handle = unsafe { CreateEventW(None, false, false, None) }.unwrap_or_else(|error| {
+            tracing::warn!(error = %error, "could not create the presenter's wake event");
+            HANDLE::default()
+        });
+        Self(handle)
+    }
+
+    fn handle(&self) -> HANDLE {
+        self.0
+    }
+
+    fn signal(&self) {
+        if !self.0.is_invalid() {
+            let _ = unsafe { SetEvent(self.0) };
+        }
+    }
+}
+
+impl Drop for WakeEvent {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+}
+
 struct Shared {
     queued: Mutex<VecDeque<QueuedFrame>>,
+    /// The stream the worker should ask a keyframe for, after the queue
+    /// overflowed.
+    keyframe_wanted: Mutex<Option<meshrmm_protocol::VideoStreamId>>,
+    /// Signalled with `ready` when a frame is queued, so the worker also
+    /// wakes while it waits for the swap chain.
+    frame_queued: WakeEvent,
     first_presented: Arc<OnceLock<std::time::Instant>>,
     cursor_shape: Mutex<Option<CursorShape>>,
     agent_pointer_display: Mutex<Option<Option<meshrmm_protocol::DisplayId>>>,
@@ -108,6 +155,8 @@ impl Shared {
     fn new(control: ControlSink, debug: DebugInfo) -> Self {
         Self {
             queued: Mutex::new(VecDeque::with_capacity(MAX_PRESENTER_QUEUE_FRAMES)),
+            keyframe_wanted: Mutex::new(None),
+            frame_queued: WakeEvent::new(),
             first_presented: Default::default(),
             cursor_shape: Mutex::new(None),
             agent_pointer_display: Mutex::new(None),
@@ -124,6 +173,12 @@ impl Shared {
             control,
             debug,
         }
+    }
+
+    /// Wakes the worker for a queued frame.
+    fn wake(&self) {
+        self.ready.notify_one();
+        self.frame_queued.signal();
     }
 
     fn reset_pending(&self) -> bool {
@@ -238,33 +293,42 @@ impl Presenter {
                 .fetch_add(queued.len() as u64 + 1, Ordering::Relaxed);
             queued.clear();
             let first_loss = !self.shared.recovering.swap(true, Ordering::AcqRel);
-            drop(queued);
             if first_loss {
-                self.shared
-                    .control
-                    .send(SessionMessage::RequestKeyframe { stream_id });
+                // The worker asks once it runs: while its thread is held,
+                // the keyframe would only overflow the queue again.
+                if let Ok(mut wanted) = self.shared.keyframe_wanted.lock() {
+                    *wanted = Some(stream_id);
+                }
                 tracing::warn!(
                     stream_id = stream_id.0,
-                    "decoder could not keep up; requesting a recovery keyframe"
+                    "video frames queued faster than they were decoded; dropped them"
                 );
             }
+            drop(queued);
+            self.shared.wake();
             return false;
         }
-        if frame.keyframe
-            && (self.shared.recovering.load(Ordering::Acquire)
-                || queued.len() >= MAX_PRESENTER_QUEUE_FRAMES)
-        {
-            self.shared
-                .replaced_frames
-                .fetch_add(queued.len() as u64, Ordering::Relaxed);
-            queued.clear();
+        if frame.keyframe {
+            if self.shared.recovering.load(Ordering::Acquire)
+                || queued.len() >= MAX_PRESENTER_QUEUE_FRAMES
+            {
+                self.shared
+                    .replaced_frames
+                    .fetch_add(queued.len() as u64, Ordering::Relaxed);
+                queued.clear();
+            }
+            // It answers any keyframe the worker has yet to ask for.
+            if let Ok(mut wanted) = self.shared.keyframe_wanted.lock() {
+                wanted.take();
+            }
         }
         queued.push_back(QueuedFrame {
             frame,
             received_at_us,
         });
         self.shared.recovering.store(false, Ordering::Release);
-        self.shared.ready.notify_one();
+        drop(queued);
+        self.shared.wake();
         true
     }
 
@@ -434,13 +498,16 @@ fn run_worker(
 
     let mut decoder_blocked_since = None::<std::time::Instant>;
     let mut reconnect_overlay = ReconnectOverlay::new();
+    let mut schedule = FrameSchedule::new();
     while !shared.stopping.load(Ordering::Acquire) {
         if unsafe { pump_window_messages(pipeline.window()) } {
             break;
         }
         if unsafe { apply_pending_reset(&shared, &mut pipeline) } {
-            // The new decoder has not been offered any input yet.
+            // The new decoder has not been offered any input yet, and a
+            // picture still waiting belongs to the old stream.
             decoder_blocked_since = None;
+            schedule.clear();
         }
         unsafe { reconnect_overlay.refresh(pipeline.window(), &shared) };
         if let Some(layout) = unsafe { window::take_resize(pipeline.window()) }
@@ -451,12 +518,14 @@ fn run_worker(
             break;
         }
         unsafe { apply_pending_pointer_state(&shared, &pipeline) };
-        if let Err(error) = unsafe { pipeline.poll(shared.replaced_frames.load(Ordering::Relaxed)) }
+        if let Err(error) =
+            unsafe { schedule.run(&shared, &mut pipeline, monotonic_timestamp_us()) }
         {
-            tracing::error!(error = %error, "video decoder polling failed");
-            shared.record_failure(error.to_string());
+            tracing::error!(error = %format!("{error:#}"), "video decode/presentation failed");
+            shared.record_failure(format!("{error:#}"));
             break;
         }
+        pipeline.update_statistics(shared.replaced_frames.load(Ordering::Relaxed));
         if !pipeline.wants_input() {
             if let Some(message) = decoder_input_stall(&shared, &mut decoder_blocked_since) {
                 shared.record_failure(message);
@@ -464,31 +533,35 @@ fn run_worker(
             }
             // Keep the native window responsive while an asynchronous
             // Media Foundation decoder is between NeedInput events.
-            std::thread::sleep(Duration::from_millis(1));
+            if schedule.picture_waiting() {
+                unsafe { pipeline.wait_until_ready_to_present(None, 1) };
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+            }
             continue;
         }
         decoder_blocked_since = None;
-        let queued = {
-            let Ok(queued) = shared.queued.lock() else {
-                break;
-            };
-            let Ok((mut queued, _)) =
-                shared
-                    .ready
-                    .wait_timeout_while(queued, Duration::from_millis(4), |queue| {
-                        queue.is_empty()
-                            && !shared.stopping.load(Ordering::Acquire)
-                            && !shared.reset_pending()
-                    })
-            else {
-                break;
-            };
-            queued.pop_front()
-        };
-        let Some(queued) = queued else {
+        if schedule.picture_waiting() {
+            // Until the display takes the picture, or a newer frame arrives.
+            if shared.queued.lock().is_ok_and(|queued| queued.is_empty()) {
+                unsafe {
+                    pipeline.wait_until_ready_to_present(Some(shared.frame_queued.handle()), 4)
+                };
+            }
             continue;
+        }
+        let Ok(queued) = shared.queued.lock() else {
+            break;
         };
-        if !unsafe { process_frame(&shared, &mut pipeline, queued) } {
+        if shared
+            .ready
+            .wait_timeout_while(queued, Duration::from_millis(4), |queue| {
+                queue.is_empty()
+                    && !shared.stopping.load(Ordering::Acquire)
+                    && !shared.reset_pending()
+            })
+            .is_err()
+        {
             break;
         }
     }
@@ -563,33 +636,6 @@ fn decoder_input_stall(
     );
     tracing::error!(message, "video decoder input watchdog expired");
     Some(message)
-}
-
-/// Decodes and presents one frame. Returns false when the worker must stop.
-unsafe fn process_frame(
-    shared: &Shared,
-    pipeline: &mut WorkerPipeline,
-    queued: QueuedFrame,
-) -> bool {
-    let frame_id = queued.frame.frame_id;
-    match unsafe { pipeline.process(queued, shared.replaced_frames.load(Ordering::Relaxed)) } {
-        Ok(None) => {}
-        Ok(Some(queued)) => {
-            tracing::warn!(
-                frame_id,
-                "video decoder readiness changed before frame submission"
-            );
-            if let Ok(mut pending) = shared.queued.lock() {
-                pending.push_front(queued);
-            }
-        }
-        Err(error) => {
-            tracing::error!(error = %error, frame_id, "video decode/presentation failed");
-            shared.record_failure(error.to_string());
-            return false;
-        }
-    }
-    true
 }
 
 /// Opts the viewer into per-monitor DPI awareness so Windows does not
