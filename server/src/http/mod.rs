@@ -8,15 +8,15 @@ use std::{borrow::Cow, sync::Arc};
 use axum::{
     Json, Router,
     extract::{FromRequest, Request, State, rejection::JsonRejection},
-    http::{HeaderValue, StatusCode, header},
+    http::{Extensions, HeaderMap, HeaderValue, StatusCode, Version, header},
     response::{IntoResponse, Response},
     routing::get,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use tower_http::{
     compression::{
-        CompressionLayer,
-        predicate::{DefaultPredicate, NotForContentType, Predicate},
+        CompressionLayer, CompressionLevel,
+        predicate::{DefaultPredicate, NotForContentType, Predicate, SizeAbove},
     },
     trace::TraceLayer,
 };
@@ -38,6 +38,10 @@ use crate::{
 
 /// How long a client told the server is busy waits before trying again.
 const BUSY_RETRY_SECONDS: u64 = 5;
+
+/// API responses smaller than this are sent as they are: they fit in a
+/// packet or two, so compressing them would save next to nothing.
+const API_COMPRESSION_FLOOR: u64 = 1024;
 
 /// What every request handler can reach.
 #[derive(Debug, Clone)]
@@ -77,14 +81,44 @@ pub fn router(state: AppState) -> Router {
         .fallback(website)
         .layer(CompressionLayer::new().compress_when(compress))
         .with_state(state.clone());
+    // Fleet-wide lists are megabytes of repetitive JSON, so API responses
+    // are compressed when they are JSON; sockets, images and file downloads
+    // pass as they are. Level 1 makes a 5,000-device list a sixth of its
+    // size with brotli and a quarter with gzip, at a few milliseconds a
+    // megabyte; higher levels save little more for several times the time.
+    let api_compression = CompressionLayer::new()
+        .quality(CompressionLevel::Precise(1))
+        .compress_when(SizeAbove::new(API_COMPRESSION_FLOOR).and(json_response));
     let router = Router::new()
         .route("/healthz", get(health::healthz))
-        .nest("/v1", api::router(state.clone()))
-        .nest("/scim/v2", scim::router())
+        .nest(
+            "/v1",
+            api::router(state.clone()).layer(api_compression.clone()),
+        )
+        .nest("/scim/v2", scim::router().layer(api_compression))
         .route("/downloads/{*file}", get(downloads::serve))
         .fallback_service(website)
         .with_state(state);
     headers::apply(router, hsts).layer(TraceLayer::new_for_http())
+}
+
+/// Whether a response is JSON: `application/json`, or a `+json` type such
+/// as SCIM's `application/scim+json`.
+fn json_response(_: StatusCode, _: Version, headers: &HeaderMap, _: &Extensions) -> bool {
+    let Some(content_type) = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let essence = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    essence == "application/json"
+        || (essence.starts_with("application/") && essence.ends_with("+json"))
 }
 
 /// Every path the routes above don't take: a website page, or a JSON 404

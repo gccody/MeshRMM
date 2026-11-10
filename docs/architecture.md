@@ -112,8 +112,11 @@ input.
   reads them all before a transaction that only inserts). A pool that
   stays exhausted for its acquire timeout fails the request with `503` and
   `Retry-After`.
-- `http`: the router, client IP resolution, same-origin checks and security
-  headers. `website`: the embedded pages.
+- `http`: the router, client IP resolution, same-origin checks, security
+  headers and compression. The website's pages and the `/v1` and SCIM
+  responses that are JSON of 1 KiB or more are compressed (brotli or gzip, at
+  level 1 for the API); sockets, images and file downloads are sent as they
+  are. `website`: the embedded pages.
 - `serve`: the listener, on axum-server, in each TLS mode: socket options,
   the timeouts for a TLS handshake and for HTTP to start, hyper's
   header-read timeout and HTTP/2 pings, TLS session tickets, and certificate
