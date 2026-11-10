@@ -236,16 +236,27 @@ that wrote it), so a restart keeps its place in the schedule:
   up to about an hour, each shortened by up to half at random, until one
   succeeds; then the six-hour schedule resumes. A retry is not recorded, so
   a restart during one finds the check overdue.
-- A check that falls due during a remote session waits for it to end,
-  checking again every 5 minutes, for at most 24 hours.
+- A check that falls due while the Agent is busy waits, checking again every
+  5 minutes, for at most 24 hours. The Agent is busy while a remote session,
+  terminal or file transfer is open, and while an update install or scan, an
+  application run or scan, a toolbox script or file, or a self-healing
+  action runs, until its result is on the connection. A result the Agent
+  can't send, because it is offline, holds the update for at most 10 minutes
+  after its job ends: results are kept only in memory, so waiting longer
+  would not save it.
 
 For a newer release it:
 
 1. checks the manifest entry's release signature and downloads the build;
 2. checks the build's SHA-256;
-3. stops cleanly and has an independent LocalSystem helper replace the
+3. waits, if work started while it downloaded, until the Agent is not busy,
+   looking every few seconds, but no longer than the 24 hours counted from
+   when its check was first postponed. Work that arrives meanwhile is
+   accepted as usual, so a device kept busy around the clock updates in the
+   first gap between jobs, or at the 24 hours;
+4. stops cleanly and has an independent LocalSystem helper replace the
    installed binary and restart the service;
-4. restores and starts the previous binary if the new service does not reach
+5. restores and starts the previous binary if the new service does not reach
    `Running`.
 
 A check that fails is logged and does not disconnect the Agent. A release is

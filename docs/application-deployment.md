@@ -268,11 +268,15 @@ already up to date"). The job's page lists, under each device, the
 applications that failed or were skipped and why, the first three inline
 and the rest behind **N more**. A run that needs a restart says so. MeshRMM
 doesn't restart for applications; use [patch management](patch-management.md)
-or a script for that. A result that finishes while the device is offline is
-reported when it reconnects. A run that hasn't reported five hours and 15
-minutes after it started is lost. So is one whose report three connections
-in a row fail to send: the Agent drops it, and leaves it out of what it says
-it still owes on the next connection.
+or a script for that. An [Agent update](devices.md#agent-updates) waits for
+a scan or run, and for its result to reach the server; on Linux the package
+managers run in a systemd scope of their own, so even an Agent that stops
+anyway doesn't cut one off. A result that finishes while the device is
+offline is reported when it reconnects, unless the Agent restarts first. A
+run that hasn't reported five hours and 15 minutes after it started is lost.
+So is one whose report three connections in a row fail to send: the Agent
+drops it, and leaves it out of what it says it still owes on the next
+connection.
 
 Each application keeps the last 16,384 characters of its output, and a run
 1 MiB of output in all, shared evenly between its applications, so a result

@@ -140,13 +140,25 @@ to its user's `~/.local/state/meshrmm/agent-session-helper.log`.
 
 The coordinator updates the Agent as the other platforms do: on the
 [spread-out six-hour schedule](devices.md#agent-updates), and postponed while
-a remote session is live, it downloads a newer
+a remote session or a job is running, it downloads a newer
 `agent-linux-x64` or `agent-linux-arm64` release and checks its SHA-256 and
 [release signature](releases.md#release-signatures). It stages the release
 beside the installed executable and starts its `--apply-update` in a
 transient systemd unit, which outlives the service: the new Agent waits for
 the coordinator to stop, swaps the executable, restarts the service, and puts
 the previous executable back if the new coordinator does not keep running.
+
+Package managers the Agent runs for update and application scans, installs
+and uninstalls start in a transient systemd scope of their own (`systemd-run
+--scope`), outside the service's control group, and write to unnamed files
+rather than pipes. So when the Agent stops anyway, by a crash, a
+`systemctl restart` or an update past its 24 hours, an `apt-get` or `dnf`
+transaction runs to its end instead of being killed halfway; its result is
+lost with the Agent. The Agent still stops it at its time limit, and systemd
+a minute after that if the Agent is gone. This needs systemd recent enough to
+stop a scope at a time limit (`RuntimeMaxSec=` on scopes); without it, or
+without systemd, they stop with the service as before. Session helpers,
+terminals and toolbox scripts stay in the service and stop with it.
 
 ## Development
 

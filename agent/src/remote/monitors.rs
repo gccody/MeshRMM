@@ -38,6 +38,7 @@ use meshrmm_protocol::{
 };
 
 use super::config::ExecutionMode;
+use super::service_link::ActivityGuard;
 
 mod checks;
 #[cfg(unix)]
@@ -185,6 +186,8 @@ struct Pending {
     /// Monitors whose latest result goes at once.
     changed: BTreeSet<String>,
     actions: Vec<MonitorActionResult>,
+    /// Keep the Agent from updating until the actions' results go.
+    holds: Vec<ActivityGuard>,
     /// When the latest results of monitors that kept passing go next; none
     /// until the Agent connects.
     refresh_at: Option<Instant>,
@@ -259,8 +262,16 @@ impl Outbox {
         }
     }
 
-    fn action(&self, result: MonitorActionResult) {
-        self.lock().actions.push(result);
+    /// Keeps a self-healing action's result to send, holding `activity`
+    /// until it goes.
+    fn action(&self, result: MonitorActionResult, activity: Option<ActivityGuard>) {
+        let mut pending = self.lock();
+        pending.actions.push(result);
+        if let Some(activity) = activity {
+            activity.finished();
+            pending.holds.push(activity);
+        }
+        drop(pending);
         self.ready.notify_one();
     }
 
@@ -392,8 +403,9 @@ impl Monitors {
         let _ = self.commands.send(Command::CheckNow(ids));
     }
 
-    /// Runs a self-healing action on its own thread.
-    pub(crate) fn act(&self, action: MonitorAction) {
+    /// Runs a self-healing action on its own thread. `activity` keeps the
+    /// Agent from updating until its result goes to the connection.
+    pub(crate) fn act(&self, action: MonitorAction, activity: ActivityGuard) {
         use std::sync::atomic::Ordering;
         let outbox = Arc::clone(&self.outbox);
         let running = Arc::clone(&self.actions);
@@ -404,13 +416,16 @@ impl Monitors {
             })
             .is_err()
         {
-            outbox.action(MonitorActionResult {
-                action_id,
-                succeeded: false,
-                detail: format!(
-                    "The device is already running {MAX_RUNNING_ACTIONS} self-healing actions."
-                ),
-            });
+            outbox.action(
+                MonitorActionResult {
+                    action_id,
+                    succeeded: false,
+                    detail: format!(
+                        "The device is already running {MAX_RUNNING_ACTIONS} self-healing actions."
+                    ),
+                },
+                Some(activity),
+            );
             return;
         }
         let spawned = std::thread::Builder::new()
@@ -429,19 +444,25 @@ impl Monitors {
                     detail,
                     "self-healing action finished"
                 );
-                outbox.action(MonitorActionResult {
-                    action_id: action.action_id,
-                    succeeded,
-                    detail: truncate_text(&detail, MAX_MONITOR_DETAIL_CHARS).to_owned(),
-                });
+                outbox.action(
+                    MonitorActionResult {
+                        action_id: action.action_id,
+                        succeeded,
+                        detail: truncate_text(&detail, MAX_MONITOR_DETAIL_CHARS).to_owned(),
+                    },
+                    Some(activity),
+                );
             });
         if let Err(error) = spawned {
             self.actions.fetch_sub(1, Ordering::AcqRel);
-            self.outbox.action(MonitorActionResult {
-                action_id,
-                succeeded: false,
-                detail: format!("Could not start the action: {error}"),
-            });
+            self.outbox.action(
+                MonitorActionResult {
+                    action_id,
+                    succeeded: false,
+                    detail: format!("Could not start the action: {error}"),
+                },
+                None,
+            );
         }
     }
 
@@ -523,6 +544,9 @@ fn take(pending: &mut Pending) -> Vec<AgentStatusMessage> {
             .into_iter()
             .map(|result| AgentStatusMessage::MonitorActionDone { result }),
     );
+    // They go to the connection now. One it refuses goes again, but no
+    // longer holds an update (see `Monitors::unsent`).
+    pending.holds.clear();
     messages
 }
 
@@ -1629,5 +1653,35 @@ mod tests {
         let now = Instant::now();
         assert!(sent_at(&monitors.outbox, now).is_empty());
         assert_eq!(sent_at(&monitors.outbox, now + RETRY_WAIT), ["one"]);
+    }
+
+    #[tokio::test]
+    async fn self_healing_keeps_the_agent_busy_until_its_result_goes() {
+        let link = crate::remote::service_link::ServiceLink::new(false);
+        let monitors = Monitors::new(ExecutionMode::Console);
+        // The Agent refuses to restart its own service, so this ends at once.
+        #[cfg(windows)]
+        let name = crate::service::SERVICE_NAME;
+        #[cfg(target_os = "linux")]
+        let name = crate::installer::SERVICE;
+        #[cfg(target_os = "macos")]
+        let name = crate::installer::DAEMON_LABEL;
+        monitors.act(
+            meshrmm_protocol::MonitorAction {
+                action_id: "action".into(),
+                monitor_id: "monitor".into(),
+                action: meshrmm_protocol::RemediationAction::RestartService { name: name.into() },
+            },
+            link.activity(),
+        );
+        assert!(link.busy(), "acting");
+        let messages = tokio::time::timeout(Duration::from_secs(30), monitors.next())
+            .await
+            .unwrap();
+        assert!(matches!(
+            messages.as_slice(),
+            [AgentStatusMessage::MonitorActionDone { result }] if !result.succeeded
+        ));
+        assert!(!link.busy(), "its result went to the connection");
     }
 }

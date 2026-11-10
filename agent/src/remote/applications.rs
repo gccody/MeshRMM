@@ -30,6 +30,7 @@ use tokio::sync::mpsc;
 
 use crate::remote::config::{Config, ExecutionMode};
 use crate::remote::process;
+use crate::remote::service_link::ActivityGuard;
 use crate::remote::unsent::{ATTEMPTS, Report, Unsent};
 
 mod download;
@@ -158,17 +159,19 @@ impl Verdict {
 /// Tells the server how far a run has got.
 struct Progress {
     run_id: String,
-    sender: mpsc::UnboundedSender<AgentStatusMessage>,
+    sender: mpsc::UnboundedSender<Report>,
 }
 
 impl Progress {
     fn report(&self, message: impl Into<String>) {
         let message = meshrmm_protocol::clean_text(&message.into());
         tracing::info!(run_id = %self.run_id, message, "application run progress");
-        let _ = self.sender.send(AgentStatusMessage::ApplicationProgress {
-            run_id: self.run_id.clone(),
-            message,
-        });
+        let _ = self
+            .sender
+            .send(Report::new(AgentStatusMessage::ApplicationProgress {
+                run_id: self.run_id.clone(),
+                message,
+            }));
     }
 }
 
@@ -181,11 +184,32 @@ struct Waiting {
     run: Option<(String, Vec<String>)>,
 }
 
+/// What scans and runs: the device's package managers and installers, or a
+/// stand-in in tests.
+#[derive(Clone, Copy)]
+struct Work {
+    scan: fn() -> ApplicationScan,
+    run: fn(
+        &Config,
+        ExecutionMode,
+        &ApplicationRunRequest,
+        &Progress,
+    ) -> (ApplicationRunResult, ApplicationScan),
+}
+
+impl Work {
+    const DEVICE: Self = Self {
+        scan: scan_now,
+        run: run_now,
+    };
+}
+
 /// The coordinator's handle on application scans and runs. Created once per
 /// Agent process, so results outlive reconnects.
 pub struct Applications {
-    sender: mpsc::UnboundedSender<AgentStatusMessage>,
-    receiver: mpsc::UnboundedReceiver<AgentStatusMessage>,
+    work: Work,
+    sender: mpsc::UnboundedSender<Report>,
+    receiver: mpsc::UnboundedReceiver<Report>,
     /// A report the connection failed to send, sent first on the next one.
     unsent: Unsent,
     waiting: Arc<Mutex<Waiting>>,
@@ -199,8 +223,13 @@ pub struct Applications {
 
 impl Applications {
     pub fn new() -> Self {
+        Self::with(Work::DEVICE)
+    }
+
+    fn with(work: Work) -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
         Self {
+            work,
             sender,
             receiver,
             unsent: Unsent::default(),
@@ -232,8 +261,10 @@ impl Applications {
     }
 
     /// The server asked for a scan, or for an update scan, which brings an
-    /// application scan along.
-    pub fn scan(&mut self, run_id: Option<String>) {
+    /// application scan along. `activity` keeps the Agent from updating
+    /// until the scan is reported; a scan or run already going on holds its
+    /// own.
+    pub fn scan(&mut self, run_id: Option<String>, activity: ActivityGuard) {
         self.owed.extend(run_id.clone());
         let mut waiting = lock(&self.waiting);
         if let Some((_, runs)) = &mut waiting.run {
@@ -248,6 +279,7 @@ impl Applications {
         drop(waiting);
         let sender = self.sender.clone();
         let shared = Arc::clone(&self.waiting);
+        let scan_now = self.work.scan;
         let spawned = std::thread::Builder::new()
             .name("meshrmm-application-scan".into())
             .spawn(move || {
@@ -256,10 +288,13 @@ impl Applications {
                     scan_now()
                 };
                 let run_ids = lock(&shared).scan.take().unwrap_or_default();
-                let _ = sender.send(AgentStatusMessage::ApplicationScan {
-                    run_ids,
-                    scan: Box::new(scan),
-                });
+                let _ = sender.send(Report::answering(
+                    AgentStatusMessage::ApplicationScan {
+                        run_ids,
+                        scan: Box::new(scan),
+                    },
+                    Some(activity),
+                ));
             });
         if let Err(error) = spawned {
             tracing::error!(%error, "could not start a thread for an application scan");
@@ -268,18 +303,28 @@ impl Applications {
         }
     }
 
-    /// The server asked for a run.
-    pub fn run(&mut self, config: &Config, mode: ExecutionMode, request: ApplicationRunRequest) {
+    /// The server asked for a run. `activity` keeps the Agent from updating
+    /// until its result is reported.
+    pub fn run(
+        &mut self,
+        config: &Config,
+        mode: ExecutionMode,
+        request: ApplicationRunRequest,
+        activity: ActivityGuard,
+    ) {
         self.owed.push(request.run_id.clone());
         let mut waiting = lock(&self.waiting);
         if let Some((running, _)) = &waiting.run {
             let result = ApplicationRunResult::failed(format!(
                 "The device is already installing applications (run {running}). Try again when it finishes."
             ));
-            let _ = self.sender.send(AgentStatusMessage::ApplicationResult {
-                run_id: request.run_id,
-                result: Box::new(result),
-            });
+            let _ = self.sender.send(Report::answering(
+                AgentStatusMessage::ApplicationResult {
+                    run_id: request.run_id,
+                    result: Box::new(result),
+                },
+                Some(activity),
+            ));
             return;
         }
         waiting.run = Some((request.run_id.clone(), Vec::new()));
@@ -288,6 +333,7 @@ impl Applications {
         let shared = Arc::clone(&self.waiting);
         let run_id = request.run_id.clone();
         let config = config.clone();
+        let run_now = self.work.run;
         let spawned = std::thread::Builder::new()
             .name("meshrmm-application-run".into())
             .spawn(move || {
@@ -312,24 +358,29 @@ impl Applications {
                     .take()
                     .map(|(_, runs)| runs)
                     .unwrap_or_default();
-                let _ = sender.send(AgentStatusMessage::ApplicationResult {
-                    run_id: request.run_id.clone(),
-                    result: Box::new(result.sanitized()),
-                });
-                let _ = sender.send(AgentStatusMessage::ApplicationScan {
+                let _ = sender.send(Report::answering(
+                    AgentStatusMessage::ApplicationResult {
+                        run_id: request.run_id.clone(),
+                        result: Box::new(result.sanitized()),
+                    },
+                    Some(activity),
+                ));
+                let _ = sender.send(Report::new(AgentStatusMessage::ApplicationScan {
                     run_ids,
                     scan: Box::new(scan),
-                });
+                }));
             });
         if let Err(error) = spawned {
             tracing::error!(%error, "could not start a thread for an application run");
             lock(&self.waiting).run = None;
-            let _ = self.sender.send(AgentStatusMessage::ApplicationResult {
-                run_id,
-                result: Box::new(ApplicationRunResult::failed(
-                    "The Agent could not start the run.",
-                )),
-            });
+            let _ = self
+                .sender
+                .send(Report::new(AgentStatusMessage::ApplicationResult {
+                    run_id,
+                    result: Box::new(ApplicationRunResult::failed(
+                        "The Agent could not start the run.",
+                    )),
+                }));
         }
     }
 
@@ -339,12 +390,10 @@ impl Applications {
             return unsent;
         }
         // The sender lives in `self`, so the channel never closes.
-        Report::new(
-            self.receiver
-                .recv()
-                .await
-                .expect("the application channel stays open"),
-        )
+        self.receiver
+            .recv()
+            .await
+            .expect("the application channel stays open")
     }
 
     /// The connection couldn't send `report`; the next one sends it first,
@@ -1001,10 +1050,10 @@ mod tests {
         applications.unsent(report);
         let _ = applications
             .sender
-            .send(AgentStatusMessage::ApplicationScan {
+            .send(Report::new(AgentStatusMessage::ApplicationScan {
                 run_ids: vec!["other".into()],
                 scan: Box::default(),
-            });
+            }));
         assert!(
             matches!(
                 applications.next().now_or_never().unwrap().message,
@@ -1019,6 +1068,93 @@ mod tests {
                 run_ids: vec!["other".into()]
             }
         );
+    }
+
+    /// Lets the stand-in scans and runs below return.
+    static LET_GO: Mutex<bool> = Mutex::new(false);
+    static GOING: std::sync::Condvar = std::sync::Condvar::new();
+
+    fn wait_to_go() {
+        let mut go = lock(&LET_GO);
+        while !*go {
+            go = GOING.wait(go).unwrap();
+        }
+    }
+
+    fn waiting_scan() -> ApplicationScan {
+        wait_to_go();
+        ApplicationScan::default()
+    }
+
+    fn waiting_run(
+        _: &Config,
+        _: ExecutionMode,
+        _: &ApplicationRunRequest,
+        _: &Progress,
+    ) -> (ApplicationRunResult, ApplicationScan) {
+        wait_to_go();
+        (
+            ApplicationRunResult::failed("a stand-in"),
+            ApplicationScan::default(),
+        )
+    }
+
+    #[test]
+    fn runs_and_scans_keep_the_agent_busy_until_their_report_is_handed_over() {
+        let link = crate::remote::service_link::ServiceLink::new(false);
+        let mut applications = Applications::with(Work {
+            scan: waiting_scan,
+            run: waiting_run,
+        });
+        let config = Config {
+            config_path: PathBuf::new(),
+            server: "https://rmm.example.com".into(),
+            device_id: "device".into(),
+            agent_token: String::new(),
+            update_manifest_url: String::new(),
+            frames_per_second: 30,
+            bitrate_bits_per_second: 1_000_000,
+            json_logs: false,
+        };
+        let request = ApplicationRunRequest {
+            run_id: "run".into(),
+            operation: ApplicationOperation::Uninstall { items: vec![] },
+        };
+        let next = |applications: &mut Applications| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(30), applications.next()).await
+                })
+                .expect("a report")
+        };
+
+        applications.run(&config, ExecutionMode::Console, request, link.activity());
+        // A scan asked for meanwhile is answered by the run's.
+        applications.scan(Some("scan".into()), link.activity());
+        assert!(link.busy(), "running");
+        *lock(&LET_GO) = true;
+        GOING.notify_all();
+        let result = next(&mut applications);
+        assert!(matches!(
+            result.message,
+            AgentStatusMessage::ApplicationResult { .. }
+        ));
+        assert!(link.busy(), "the result is not on the connection yet");
+        // The connection couldn't send it: it waits for the next one.
+        applications.unsent(result);
+        assert!(link.busy());
+        drop(next(&mut applications));
+        assert!(!link.busy());
+        drop(next(&mut applications));
+
+        applications.scan(None, link.activity());
+        let scan = next(&mut applications);
+        assert!(link.busy(), "the scan is not on the connection yet");
+        drop(scan);
+        assert!(!link.busy());
     }
 
     fn package(id: &str, version: &str, available: Option<&str>) -> ScannedPackage {

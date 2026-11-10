@@ -32,6 +32,7 @@ use meshrmm_protocol::{
 };
 use tokio::sync::mpsc;
 
+use crate::remote::service_link::ActivityGuard;
 use crate::remote::unsent::{ATTEMPTS, Report, Unsent};
 
 #[cfg(target_os = "linux")]
@@ -165,7 +166,7 @@ struct Waiting {
 #[derive(Clone)]
 pub(crate) struct Progress {
     run_id: String,
-    sender: mpsc::UnboundedSender<AgentStatusMessage>,
+    sender: mpsc::UnboundedSender<Report>,
     /// The install was given up on and reported, so it says nothing more.
     given_up: Arc<AtomicBool>,
 }
@@ -177,17 +178,19 @@ impl Progress {
         }
         let message = meshrmm_protocol::clean_text(&message.into());
         tracing::info!(run_id = %self.run_id, message, ?percent, "update install progress");
-        let _ = self.sender.send(AgentStatusMessage::UpdateProgress {
-            run_id: self.run_id.clone(),
-            message,
-            percent: percent.map(|percent| percent.min(100)),
-        });
+        let _ = self
+            .sender
+            .send(Report::new(AgentStatusMessage::UpdateProgress {
+                run_id: self.run_id.clone(),
+                message,
+                percent: percent.map(|percent| percent.min(100)),
+            }));
     }
 }
 
 /// What the coordinator's handle and the scan and install threads share.
 struct Shared {
-    sender: mpsc::UnboundedSender<AgentStatusMessage>,
+    sender: mpsc::UnboundedSender<Report>,
     waiting: Mutex<Waiting>,
     gate: Mutex<Gate>,
     /// Signalled when a turn is let go of or a stray returns.
@@ -199,7 +202,7 @@ struct Shared {
 /// The coordinator's handle on update scans and installs. Created once per
 /// Agent process, so results outlive reconnects.
 pub struct Updates {
-    receiver: mpsc::UnboundedReceiver<AgentStatusMessage>,
+    receiver: mpsc::UnboundedReceiver<Report>,
     /// A report the connection failed to send, sent first on the next one.
     unsent: Unsent,
     shared: Arc<Shared>,
@@ -227,7 +230,9 @@ impl Updates {
     }
 
     /// Scans: for the server's run `run_id`, or on the schedule (none).
-    pub fn scan(&mut self, run_id: Option<String>) {
+    /// `activity` keeps the Agent from updating until the scan is reported;
+    /// a scan or install already running holds its own.
+    pub fn scan(&mut self, run_id: Option<String>, activity: ActivityGuard) {
         let mut waiting = lock(&self.shared.waiting);
         if let Some((_, runs)) = &mut waiting.install {
             runs.extend(run_id);
@@ -239,21 +244,25 @@ impl Updates {
         }
         waiting.scan = Some(run_id.into_iter().collect());
         drop(waiting);
-        self.shared.start_scan();
+        self.shared.start_scan(Some(activity));
     }
 
-    /// The server asked for an install.
-    pub fn install(&mut self, request: UpdateInstallRequest) {
+    /// The server asked for an install. `activity` keeps the Agent from
+    /// updating until its result is reported.
+    pub fn install(&mut self, request: UpdateInstallRequest, activity: ActivityGuard) {
         let shared = &self.shared;
         let mut waiting = lock(&shared.waiting);
         if let Some((running, _)) = &waiting.install {
             let result = UpdateInstallResult::failed(format!(
                 "The device is already installing updates (run {running}). Try again when it finishes."
             ));
-            let _ = shared.sender.send(AgentStatusMessage::UpdateInstall {
-                run_id: request.run_id,
-                result: Box::new(result),
-            });
+            let _ = shared.sender.send(Report::answering(
+                AgentStatusMessage::UpdateInstall {
+                    run_id: request.run_id,
+                    result: Box::new(result),
+                },
+                Some(activity),
+            ));
             return;
         }
         waiting.install = Some((request.run_id.clone(), Vec::new()));
@@ -267,16 +276,18 @@ impl Updates {
         let thread = Arc::clone(shared);
         let spawned = std::thread::Builder::new()
             .name("meshrmm-update-install".into())
-            .spawn(move || thread.install(request, progress));
+            .spawn(move || thread.install(request, progress, activity));
         if let Err(error) = spawned {
             tracing::error!(%error, "could not start a thread for an update install");
             lock(&shared.waiting).install = None;
-            let _ = shared.sender.send(AgentStatusMessage::UpdateInstall {
-                run_id,
-                result: Box::new(UpdateInstallResult::failed(
-                    "The Agent could not start the install.",
-                )),
-            });
+            let _ = shared
+                .sender
+                .send(Report::new(AgentStatusMessage::UpdateInstall {
+                    run_id,
+                    result: Box::new(UpdateInstallResult::failed(
+                        "The Agent could not start the install.",
+                    )),
+                }));
         }
     }
 
@@ -286,12 +297,10 @@ impl Updates {
             return unsent;
         }
         // The sender lives in `self`, so the channel never closes.
-        Report::new(
-            self.receiver
-                .recv()
-                .await
-                .expect("the update channel stays open"),
-        )
+        self.receiver
+            .recv()
+            .await
+            .expect("the update channel stays open")
     }
 
     /// The connection couldn't send `report`; the next one sends it first,
@@ -317,8 +326,9 @@ impl Updates {
 }
 
 impl Shared {
-    /// Starts the scan `waiting.scan` was set for.
-    fn start_scan(self: &Arc<Self>) {
+    /// Starts the scan `waiting.scan` was set for, holding `activity` until
+    /// it is reported.
+    fn start_scan(self: &Arc<Self>, activity: Option<ActivityGuard>) {
         let thread = Arc::clone(self);
         let spawned = std::thread::Builder::new()
             .name("meshrmm-update-scan".into())
@@ -331,10 +341,13 @@ impl Shared {
                         ..Default::default()
                     });
                 let run_ids = lock(&thread.waiting).scan.take().unwrap_or_default();
-                let _ = thread.sender.send(AgentStatusMessage::UpdateScan {
-                    run_ids,
-                    scan: Box::new(scan),
-                });
+                let _ = thread.sender.send(Report::answering(
+                    AgentStatusMessage::UpdateScan {
+                        run_ids,
+                        scan: Box::new(scan),
+                    },
+                    activity,
+                ));
             });
         if let Err(error) = spawned {
             tracing::error!(%error, "could not start a thread for an update scan");
@@ -343,7 +356,12 @@ impl Shared {
     }
 
     /// Installs, on the install's thread, and reports.
-    fn install(self: &Arc<Self>, request: UpdateInstallRequest, progress: Progress) {
+    fn install(
+        self: &Arc<Self>,
+        request: UpdateInstallRequest,
+        progress: Progress,
+        activity: ActivityGuard,
+    ) {
         let given_up = Arc::clone(&progress.given_up);
         let worker = (request.clone(), progress);
         let outcome = self.work(Kind::Install, move |runner| {
@@ -373,17 +391,22 @@ impl Shared {
             .take()
             .map(|(_, runs)| runs)
             .unwrap_or_default();
-        let _ = self.sender.send(AgentStatusMessage::UpdateInstall {
-            run_id: request.run_id.clone(),
-            result: Box::new(result.sanitized()),
-        });
+        let _ = self.sender.send(Report::answering(
+            AgentStatusMessage::UpdateInstall {
+                run_id: request.run_id.clone(),
+                result: Box::new(result.sanitized()),
+            },
+            Some(activity),
+        ));
         match scan {
             Some(scan) => {
                 drop(waiting);
-                let _ = self.sender.send(AgentStatusMessage::UpdateScan {
-                    run_ids,
-                    scan: Box::new(scan),
-                });
+                let _ = self
+                    .sender
+                    .send(Report::new(AgentStatusMessage::UpdateScan {
+                        run_ids,
+                        scan: Box::new(scan),
+                    }));
             }
             // It never got to the scan after it, so a scan of its own
             // answers the ones asked for meanwhile.
@@ -392,7 +415,7 @@ impl Shared {
                 None => {
                     waiting.scan = Some(run_ids);
                     drop(waiting);
-                    self.start_scan();
+                    self.start_scan(None);
                 }
             },
         }
@@ -827,6 +850,11 @@ mod tests {
         Updates::with(Box::new(Arc::clone(fake)), LIMITS)
     }
 
+    /// A hold on an Agent of its own, for work whose holds a test ignores.
+    fn activity() -> ActivityGuard {
+        crate::remote::service_link::ServiceLink::new(false).activity()
+    }
+
     fn install_of(run_id: &str) -> UpdateInstallRequest {
         UpdateInstallRequest {
             run_id: run_id.into(),
@@ -877,9 +905,9 @@ mod tests {
         });
         let mut updates = updates(&fake);
         let started = Instant::now();
-        updates.install(install_of("stuck"));
-        updates.scan(Some("asked meanwhile".into()));
-        updates.install(install_of("refused"));
+        updates.install(install_of("stuck"), activity());
+        updates.scan(Some("asked meanwhile".into()), activity());
+        updates.install(install_of("refused"), activity());
         let (run_id, result) = install_result(next_report(&mut updates));
         assert_eq!(run_id, "refused");
         assert!(result.error.unwrap().contains("already installing"));
@@ -900,7 +928,7 @@ mod tests {
         assert_eq!(fake.scans(), 1);
 
         // An install is accepted, and starts once the stuck one returns.
-        updates.install(install_of("next"));
+        updates.install(install_of("next"), activity());
         fake.let_go();
         let (run_id, result) = install_result(next_report(&mut updates));
         assert_eq!(run_id, "next");
@@ -919,14 +947,14 @@ mod tests {
             ..Default::default()
         });
         let mut updates = updates(&fake);
-        updates.install(install_of("stuck"));
+        updates.install(install_of("stuck"), activity());
         let (_, result) = install_result(next_report(&mut updates));
         assert!(result.error.unwrap().contains("did not answer"));
         let (run_ids, scan) = scan_result(next_report(&mut updates));
         assert!(run_ids.is_empty());
         assert_eq!(scan.error, None);
 
-        updates.install(install_of("next"));
+        updates.install(install_of("next"), activity());
         let (run_id, result) = install_result(next_report(&mut updates));
         assert_eq!(run_id, "next");
         assert_eq!(
@@ -939,7 +967,7 @@ mod tests {
         assert_eq!(fake.installs(), 1, "the second install didn't start");
         let _ = scan_result(next_report(&mut updates));
         // Scans still run.
-        updates.scan(Some("scan".into()));
+        updates.scan(Some("scan".into()), activity());
         let (run_ids, scan) = scan_result(next_report(&mut updates));
         assert_eq!(run_ids, ["scan"]);
         assert_eq!(scan.error, None);
@@ -953,8 +981,8 @@ mod tests {
             ..Default::default()
         });
         let mut updates = updates(&fake);
-        updates.scan(Some("first".into()));
-        updates.scan(Some("second".into()));
+        updates.scan(Some("first".into()), activity());
+        updates.scan(Some("second".into()), activity());
         let (run_ids, scan) = scan_result(next_report(&mut updates));
         assert_eq!(run_ids, ["first", "second"]);
         assert_eq!(
@@ -963,14 +991,14 @@ mod tests {
         );
 
         // An install doesn't wait for it.
-        updates.install(install_of("install"));
+        updates.install(install_of("install"), activity());
         let (run_id, result) = install_result(next_report(&mut updates));
         assert_eq!(run_id, "install");
         assert_eq!(result.status, UpdateInstallStatus::Succeeded);
         let _ = scan_result(next_report(&mut updates));
 
         // Another scan waits for it, and runs once it returns.
-        updates.scan(Some("third".into()));
+        updates.scan(Some("third".into()), activity());
         fake.let_go();
         let (run_ids, scan) = scan_result(next_report(&mut updates));
         assert_eq!(run_ids, ["third"]);
@@ -986,7 +1014,7 @@ mod tests {
             ..Default::default()
         });
         let mut updates = updates(&fake);
-        updates.scan(Some("first".into()));
+        updates.scan(Some("first".into()), activity());
         let (run_ids, scan) = scan_result(next_report(&mut updates));
         assert_eq!(run_ids, ["first"]);
         assert_eq!(
@@ -997,7 +1025,7 @@ mod tests {
 
         // Its turn was let go of: the next scan runs at once.
         let started = Instant::now();
-        updates.scan(Some("second".into()));
+        updates.scan(Some("second".into()), activity());
         let (run_ids, scan) = scan_result(next_report(&mut updates));
         assert!(started.elapsed() < LIMITS.scan);
         assert_eq!(run_ids, ["second"]);
@@ -1012,8 +1040,8 @@ mod tests {
             ..Default::default()
         });
         let mut updates = updates(&fake);
-        updates.install(install_of("panics"));
-        updates.scan(Some("asked meanwhile".into()));
+        updates.install(install_of("panics"), activity());
+        updates.scan(Some("asked meanwhile".into()), activity());
         let (run_id, result) = install_result(next_report(&mut updates));
         assert_eq!(run_id, "panics");
         assert_eq!(result.status, UpdateInstallStatus::Failed);
@@ -1026,7 +1054,7 @@ mod tests {
         assert_eq!(scan.error, None);
 
         let started = Instant::now();
-        updates.install(install_of("next"));
+        updates.install(install_of("next"), activity());
         let (run_id, result) = install_result(next_report(&mut updates));
         assert!(started.elapsed() < LIMITS.install);
         assert_eq!(run_id, "next");
@@ -1034,6 +1062,55 @@ mod tests {
         assert_eq!(fake.installs(), 2);
         let _ = scan_result(next_report(&mut updates));
         assert!(report_within(&mut updates, Duration::from_millis(300)).is_none());
+    }
+
+    #[test]
+    fn installs_and_scans_keep_the_agent_busy_until_their_report_is_handed_over() {
+        let fake = Arc::new(Fake {
+            hanging_installs: 1,
+            ..Default::default()
+        });
+        let mut updates = updates(&fake);
+        let link = crate::remote::service_link::ServiceLink::new(false);
+        let report = |updates: &mut Updates| {
+            runtime()
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(30), updates.next()).await
+                })
+                .expect("a report")
+        };
+
+        updates.install(install_of("install"), link.activity());
+        assert!(link.busy(), "installing");
+        fake.let_go();
+        let result = report(&mut updates);
+        assert!(matches!(
+            result.message,
+            AgentStatusMessage::UpdateInstall { .. }
+        ));
+        assert!(link.busy(), "the result is not on the connection yet");
+        drop(result);
+        assert!(!link.busy());
+        // The scan after it is not a job's result.
+        let _ = scan_result(report(&mut updates).message);
+
+        let fake = Arc::new(Fake {
+            hanging_scans: 1,
+            ..Default::default()
+        });
+        let mut updates = self::updates(&fake);
+        updates.scan(Some("scan".into()), link.activity());
+        // A scan asked for meanwhile lets go of its own hold.
+        updates.scan(Some("joined".into()), link.activity());
+        assert!(link.busy(), "scanning");
+        fake.let_go();
+        let scan = report(&mut updates);
+        assert!(link.busy(), "the scan is not on the connection yet");
+        // The connection couldn't send it: it waits for the next one.
+        updates.unsent(scan);
+        assert!(link.busy());
+        drop(report(&mut updates));
+        assert!(!link.busy());
     }
 
     #[test]
@@ -1065,7 +1142,11 @@ mod tests {
             run_ids: vec![],
             scan: Box::default(),
         };
-        updates.shared.sender.send(newer.clone()).unwrap();
+        updates
+            .shared
+            .sender
+            .send(Report::new(newer.clone()))
+            .unwrap();
         assert_eq!(updates.next().now_or_never().unwrap().message, newer);
     }
 

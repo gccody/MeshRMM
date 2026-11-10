@@ -35,10 +35,14 @@ const OVERDUE_CHECK_WINDOW: Duration = Duration::from_secs(29 * 60);
 /// A failed check is retried after this, doubling up to the maximum, until one succeeds.
 const FAILED_CHECK_RETRY: Duration = Duration::from_secs(2 * 60);
 const MAX_FAILED_CHECK_RETRY: Duration = Duration::from_secs(60 * 60);
-/// An update check that falls due during a remote session is retried this often until the
-/// session ends, so the update does not interrupt it.
+/// An update check that falls due while the Agent is busy, with a remote session or a job that
+/// must not be cut off, is retried this often until nothing keeps it busy, so the update does
+/// not interrupt them.
 pub(crate) const DEFERRED_UPDATE_RETRY: Duration = Duration::from_secs(5 * 60);
-/// A session that never ends does not keep the Agent from updating for longer than this.
+/// A session that never ends, or a job that never returns, does not keep the Agent from
+/// updating for longer than this. Update installs and application runs stop at 4 hours, scans
+/// sooner, and scripts at an hour, so only one stuck past its own limit, or work started back to
+/// back for a day, reaches it.
 const MAX_UPDATE_DEFERRAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// A failed update restarts the previous Agent, which checks for updates again, so a release
 /// that cannot be installed is only retried this many times per window.
@@ -59,9 +63,12 @@ pub(crate) fn read_next_check(path: &Path) -> Option<NextCheck> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
-/// Schedules automatic update checks and postpones them while a remote session is live.
+/// Schedules automatic update checks, and postpones them, and the install of a release one
+/// finds, while the Agent is busy.
 pub(crate) struct UpdateSchedule {
     next_check: Instant,
+    /// When the update was first postponed, for the maximum deferral; until a check finds
+    /// nothing to install, or fails.
     deferred_since: Option<Instant>,
     failures: u32,
     /// Whether this build has completed a check.
@@ -90,34 +97,49 @@ impl UpdateSchedule {
         }
     }
 
-    /// Whether to check for an update now; the caller reports how it went to [`Self::checked`].
-    /// Staging an update stops the service and ends the session, so a check waits for the
-    /// session to end, but not beyond the maximum deferral.
-    pub(crate) fn due(&mut self, now: Instant, session_active: bool) -> bool {
+    /// Whether to check for an update now; the caller reports how it went to [`Self::checked`],
+    /// or asks [`Self::install_now`] when to install the release it staged. Installing stops the
+    /// Agent, so a check waits while the Agent is busy, but not beyond the maximum deferral.
+    pub(crate) fn due(&mut self, now: Instant, busy: bool) -> bool {
         if now < self.next_check {
             return false;
         }
-        if session_active {
-            let since = *self.deferred_since.get_or_insert(now);
-            let deferred = now.duration_since(since);
-            if deferred < MAX_UPDATE_DEFERRAL {
-                if deferred.is_zero() {
-                    tracing::info!(
-                        "postponing the automatic Agent update check until the remote session ends"
-                    );
-                }
-                self.next_check = now + DEFERRED_UPDATE_RETRY;
-                return false;
-            }
-            tracing::warn!(
-                deferred_hours = deferred.as_secs() / 3600,
-                "checking for an Agent update although a remote session is still active"
-            );
-        } else if self.deferred_since.is_some() {
-            tracing::info!("the remote session ended; running the postponed Agent update check");
+        if busy && self.postpone(now) {
+            self.next_check = now + DEFERRED_UPDATE_RETRY;
+            return false;
         }
-        self.deferred_since = None;
+        if !busy && self.deferred_since.is_some() {
+            tracing::info!("nothing keeps the Agent busy now; running the postponed update check");
+        }
         true
+    }
+
+    /// Whether to install, and so stop the Agent for, the release a check staged: once the
+    /// Agent is not busy, or the update has waited the maximum deferral, counted from when its
+    /// check was first postponed. Asked on every tick, so the update starts in the first gap
+    /// between jobs rather than waiting for a retry.
+    pub(crate) fn install_now(&mut self, now: Instant, busy: bool) -> bool {
+        !busy || !self.postpone(now)
+    }
+
+    /// Whether to postpone the update at `now` for the Agent being busy: until it has waited
+    /// the maximum deferral.
+    fn postpone(&mut self, now: Instant) -> bool {
+        let since = *self.deferred_since.get_or_insert(now);
+        let deferred = now.duration_since(since);
+        if deferred < MAX_UPDATE_DEFERRAL {
+            if deferred.is_zero() {
+                tracing::info!(
+                    "postponing the automatic Agent update until remote sessions and running jobs end"
+                );
+            }
+            return true;
+        }
+        tracing::warn!(
+            deferred_hours = deferred.as_secs() / 3600,
+            "updating the Agent although a remote session or job is still running"
+        );
+        false
     }
 
     /// Schedules the next check after one that finished at `now` (`now_unix` on the wall clock).
@@ -131,6 +153,7 @@ impl UpdateSchedule {
         succeeded: bool,
         random: u64,
     ) -> Option<NextCheck> {
+        self.deferred_since = None;
         if !succeeded {
             self.failures = self.failures.saturating_add(1);
             self.next_check = now + retry_delay(self.failures, random);
@@ -455,6 +478,68 @@ mod tests {
         updates.checked(now, NOW, true, 0);
         // A later session gets the full deferral again.
         assert!(!updates.due(now + UPDATE_CHECK_INTERVAL, true));
+    }
+
+    #[test]
+    fn waits_to_install_a_release_until_the_work_that_started_meanwhile_ends() {
+        let start = Instant::now();
+        let mut updates = due_at(start);
+        // Nothing ran when the check fell due, but a job was accepted while it downloaded.
+        assert!(updates.due(start, false));
+        let staged = start + Duration::from_secs(60);
+        for tick in 0..10 {
+            assert!(!updates.install_now(staged + Duration::from_secs(30 * tick), true));
+        }
+        // It installs on the first tick the job is over, not a retry later.
+        assert!(updates.install_now(staged + Duration::from_secs(301), false));
+    }
+
+    #[test]
+    fn work_that_keeps_coming_holds_an_update_no_longer_than_the_limit() {
+        let start = Instant::now();
+        let mut updates = due_at(start);
+        // Busy from when the check fell due until it ran, 23 hours later.
+        let mut now = start;
+        while !updates.due(now, now < start + Duration::from_secs(23 * HOUR)) {
+            now += DEFERRED_UPDATE_RETRY;
+        }
+        assert_eq!(now, start + Duration::from_secs(23 * HOUR));
+        // New work started right after it then holds the install only for the rest of the day.
+        while !updates.install_now(now, true) {
+            now += Duration::from_secs(30);
+        }
+        assert_eq!(now, start + MAX_UPDATE_DEFERRAL);
+    }
+
+    #[test]
+    fn a_check_that_finds_nothing_ends_the_deferral() {
+        let start = Instant::now();
+        let mut updates = due_at(start);
+        assert!(!updates.due(start, true));
+        let ran = start + Duration::from_secs(20 * HOUR);
+        assert!(updates.due(ran, false));
+        updates.checked(ran, NOW, true, 0);
+        // The next update the Agent finds waits a full day for its work again.
+        let found = ran + UPDATE_CHECK_INTERVAL.mul_f64(1.1);
+        assert!(updates.due(found, false));
+        assert!(!updates.install_now(found, true));
+        assert!(!updates.install_now(found + MAX_UPDATE_DEFERRAL / 2, true));
+        assert!(updates.install_now(found + MAX_UPDATE_DEFERRAL, true));
+    }
+
+    #[test]
+    fn checks_wait_for_jobs_and_their_results_as_for_sessions() {
+        let link = crate::remote::service_link::ServiceLink::new(false);
+        let start = Instant::now();
+        let mut updates = due_at(start);
+        let install = link.activity();
+        assert!(!updates.due(start, link.busy()), "a running install");
+        // The install ended; its result waits for the connection.
+        install.finished();
+        let retry = start + DEFERRED_UPDATE_RETRY;
+        assert!(!updates.due(retry, link.busy()), "an unsent result");
+        drop(install);
+        assert!(updates.due(retry + DEFERRED_UPDATE_RETRY, link.busy()));
     }
 
     #[test]

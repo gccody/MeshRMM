@@ -51,38 +51,68 @@ pub(crate) async fn run(config: Config, link: Arc<ServiceLink>) {
         record.as_ref(),
         random_bits(),
     );
+    // A release a check found, waiting for the Agent to be free to stop.
+    let mut staged: Option<Staged> = None;
     loop {
-        if schedule.due(Instant::now(), link.session_active()) {
+        if staged.is_none() && schedule.due(Instant::now(), link.busy()) {
             let check_config = config.clone();
             let succeeded = match tokio::task::spawn_blocking(move || stage(&check_config)).await {
-                Ok(Ok(Some(version))) => {
+                Ok(Ok(Some(update))) => {
+                    staged = Some(update);
+                    None
+                }
+                Ok(Ok(None)) => Some(true),
+                Ok(Err(error)) => {
+                    tracing::warn!(error = ?error, "Agent update check failed");
+                    Some(false)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Agent update check stopped");
+                    Some(false)
+                }
+            };
+            if let Some(succeeded) = succeeded
+                && let Some(next) =
+                    schedule.checked(Instant::now(), unix_seconds(), succeeded, random_bits())
+            {
+                record_next_check(&next);
+            }
+        }
+        if let Some(update) = staged.take_if(|_| schedule.install_now(Instant::now(), link.busy()))
+        {
+            let version = update.version.clone();
+            match tokio::task::spawn_blocking(move || update.start()).await {
+                Ok(Ok(())) => {
                     tracing::info!(%version, "stopping the Agent to install an update");
                     link.stop_for_update(version);
                     return;
                 }
-                Ok(Ok(None)) => true,
                 Ok(Err(error)) => {
-                    tracing::warn!(error = ?error, "Agent update check failed");
-                    false
+                    tracing::warn!(error = ?error, "could not start the Agent update")
                 }
-                Err(error) => {
-                    tracing::warn!(%error, "Agent update check stopped");
-                    false
-                }
-            };
-            if let Some(next) =
-                schedule.checked(Instant::now(), unix_seconds(), succeeded, random_bits())
-            {
-                record_next_check(&next);
+                Err(error) => tracing::warn!(%error, "starting the Agent update stopped"),
             }
+            schedule.checked(Instant::now(), unix_seconds(), false, random_bits());
         }
         tokio::time::sleep(SCHEDULE_TICK).await;
     }
 }
 
-/// Downloads and verifies a newer Agent and starts its installer. Returns the
-/// staged version.
-fn stage(config: &Config) -> anyhow::Result<Option<String>> {
+/// A newer Agent, downloaded, verified and staged beside the installed one.
+struct Staged {
+    version: String,
+    executable: std::path::PathBuf,
+}
+
+impl Staged {
+    /// Starts its installer, which waits for the coordinator to stop.
+    fn start(self) -> anyhow::Result<()> {
+        start_installer(&self.executable)
+    }
+}
+
+/// Downloads, verifies and stages a newer Agent, if there is one.
+fn stage(config: &Config) -> anyhow::Result<Option<Staged>> {
     let http = ureq::Agent::config_builder()
         .https_only(true)
         .timeout_global(Some(Duration::from_secs(600)))
@@ -128,8 +158,10 @@ fn stage(config: &Config) -> anyhow::Result<Option<String>> {
     let staged = Path::new(INSTALL_DIRECTORY).join(format!("meshrmm-agent-{}", release.version));
     super::installer::replace_file(&staged, &executable)?;
     std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
-    start_installer(&staged)?;
-    Ok(Some(release.version))
+    Ok(Some(Staged {
+        version: release.version,
+        executable: staged,
+    }))
 }
 
 fn updates_directory() -> anyhow::Result<std::path::PathBuf> {
