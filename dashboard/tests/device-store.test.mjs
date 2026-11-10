@@ -284,3 +284,25 @@ test("clearing empties the store and tells every subscriber", () => {
   assert.deepEqual(devices.counts(), { total: 0, online: 0 });
   assert.equal(devices.reading("a"), undefined);
 });
+
+test("a hidden tab, which runs no frames, is notified by a timer instead", async () => {
+  const frameRequests = [];
+  globalThis.requestAnimationFrame = (callback) => frameRequests.push(callback);
+  globalThis.cancelAnimationFrame = () => {};
+  try {
+    const devices = new DeviceStore();
+    let heard = 0;
+    devices.subscribe("agents", () => heard++);
+    devices.replace({ agents: [device("a", "A", true)], ...empty });
+    devices.apply({ type: "agent_upsert", revision: 1, agent: device("b", "B", true) });
+    assert.equal(frameRequests.length, 1, "one frame is asked for");
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(heard, 1, "the timer notified once");
+    // The frame arriving late, when the tab is shown, does nothing more.
+    frameRequests[0]();
+    assert.equal(heard, 1);
+  } finally {
+    delete globalThis.requestAnimationFrame;
+    delete globalThis.cancelAnimationFrame;
+  }
+});
