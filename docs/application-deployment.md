@@ -270,7 +270,9 @@ and the rest behind **N more**. A run that needs a restart says so. MeshRMM
 doesn't restart for applications; use [patch management](patch-management.md)
 or a script for that. A result that finishes while the device is offline is
 reported when it reconnects. A run that hasn't reported five hours and 15
-minutes after it started is lost.
+minutes after it started is lost. So is one whose report three connections
+in a row fail to send: the Agent drops it, and leaves it out of what it says
+it still owes on the next connection.
 
 Each application keeps the last 16,384 characters of its output, and a run
 1 MiB of output in all, shared evenly between its applications, so a result

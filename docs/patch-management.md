@@ -285,7 +285,8 @@ reboot_error, created_at, completed_at, items}`. The event socket sends
   {install}`; the Agent sends
   `update_scan {run_ids, scan}`, `update_progress` and `update_install
   {run_id, result}` on the control connection. Reports wait in a queue that
-  outlives reconnects.
+  outlives reconnects. One three connections in a row fail to send is
+  dropped, and its run is lost.
 - Agent: `agent/src/remote/updates.rs` (one operation at a time, choosing
   what to install, the restart), `schedule.rs` (when to scan) with
   `windows.rs` (WUA COM), `macos.rs`,

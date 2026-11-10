@@ -32,6 +32,8 @@ use meshrmm_protocol::{
 };
 use tokio::sync::mpsc;
 
+use crate::remote::unsent::{ATTEMPTS, Report, Unsent};
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -199,7 +201,7 @@ struct Shared {
 pub struct Updates {
     receiver: mpsc::UnboundedReceiver<AgentStatusMessage>,
     /// A report the connection failed to send, sent first on the next one.
-    unsent: Option<AgentStatusMessage>,
+    unsent: Unsent,
     shared: Arc<Shared>,
 }
 
@@ -212,7 +214,7 @@ impl Updates {
         let (sender, receiver) = mpsc::unbounded_channel();
         Self {
             receiver,
-            unsent: None,
+            unsent: Unsent::default(),
             shared: Arc::new(Shared {
                 sender,
                 waiting: Mutex::default(),
@@ -279,22 +281,37 @@ impl Updates {
     }
 
     /// The next report for the server. Cancel safe.
-    pub async fn next(&mut self) -> AgentStatusMessage {
+    pub async fn next(&mut self) -> Report {
         if let Some(unsent) = self.unsent.take() {
             return unsent;
         }
         // The sender lives in `self`, so the channel never closes.
-        self.receiver
-            .recv()
-            .await
-            .expect("the update channel stays open")
+        Report::new(
+            self.receiver
+                .recv()
+                .await
+                .expect("the update channel stays open"),
+        )
     }
 
-    /// The connection couldn't send `report`; the next one sends it first.
-    /// Progress is dropped, since a newer one or the result follows.
-    pub fn unsent(&mut self, report: AgentStatusMessage) {
-        if !matches!(report, AgentStatusMessage::UpdateProgress { .. }) {
-            self.unsent = Some(report);
+    /// The connection couldn't send `report`; the next one sends it first,
+    /// unless it has failed too often (see [`Unsent`]). Progress is dropped,
+    /// since a newer one or the result follows.
+    pub fn unsent(&mut self, report: Report) {
+        if matches!(report.message, AgentStatusMessage::UpdateProgress { .. }) {
+            return;
+        }
+        if let Some(message) = self.unsent.failed(report) {
+            let run_ids = match &message {
+                AgentStatusMessage::UpdateScan { run_ids, .. } => run_ids.clone(),
+                AgentStatusMessage::UpdateInstall { run_id, .. } => vec![run_id.clone()],
+                _ => Vec::new(),
+            };
+            tracing::warn!(
+                ?run_ids,
+                attempts = ATTEMPTS,
+                "gave up on an update report no connection could send; the server counts the runs it answers as lost"
+            );
         }
     }
 }
@@ -829,6 +846,7 @@ mod tests {
         runtime()
             .block_on(async { tokio::time::timeout(wait, updates.next()).await })
             .ok()
+            .map(|report| report.message)
     }
 
     fn next_report(updates: &mut Updates) -> AgentStatusMessage {
@@ -1025,6 +1043,30 @@ mod tests {
         assert_eq!(span(Duration::from_secs(60 * 60)), "1 hour");
         assert_eq!(span(Duration::from_secs(90 * 60)), "90 minutes");
         assert_eq!(span(Duration::from_millis(1)), "1 minute");
+    }
+
+    #[test]
+    fn a_scan_no_connection_could_send_stops_going_first() {
+        use futures_util::FutureExt;
+        let mut updates = updates(&Arc::default());
+        let scan = AgentStatusMessage::UpdateScan {
+            run_ids: vec!["run".into()],
+            scan: Box::default(),
+        };
+        let mut report = Report::new(scan.clone());
+        for _ in 1..crate::remote::unsent::ATTEMPTS {
+            updates.unsent(report);
+            report = updates.next().now_or_never().expect("sent first");
+            assert_eq!(report.message, scan);
+        }
+        updates.unsent(report);
+        assert!(updates.next().now_or_never().is_none(), "given up on");
+        let newer = AgentStatusMessage::UpdateScan {
+            run_ids: vec![],
+            scan: Box::default(),
+        };
+        updates.shared.sender.send(newer.clone()).unwrap();
+        assert_eq!(updates.next().now_or_never().unwrap().message, newer);
     }
 
     #[test]

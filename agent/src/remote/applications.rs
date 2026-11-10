@@ -30,6 +30,7 @@ use tokio::sync::mpsc;
 
 use crate::remote::config::{Config, ExecutionMode};
 use crate::remote::process;
+use crate::remote::unsent::{ATTEMPTS, Report, Unsent};
 
 mod download;
 mod parse;
@@ -185,7 +186,8 @@ struct Waiting {
 pub struct Applications {
     sender: mpsc::UnboundedSender<AgentStatusMessage>,
     receiver: mpsc::UnboundedReceiver<AgentStatusMessage>,
-    unsent: Option<AgentStatusMessage>,
+    /// A report the connection failed to send, sent first on the next one.
+    unsent: Unsent,
     waiting: Arc<Mutex<Waiting>>,
     /// The server's scans and runs this Agent has yet to report: going on,
     /// or done with the report waiting to be sent. Each connection starts
@@ -201,7 +203,7 @@ impl Applications {
         Self {
             sender,
             receiver,
-            unsent: None,
+            unsent: Unsent::default(),
             waiting: Arc::default(),
             owed: Vec::new(),
         }
@@ -215,7 +217,8 @@ impl Applications {
         }
     }
 
-    /// `report` reached the connection: the server has what it answers.
+    /// `report` reached the connection, so the server has what it answers,
+    /// or was given up on, so it never will.
     pub fn delivered(&mut self, report: &AgentStatusMessage) {
         match report {
             AgentStatusMessage::ApplicationScan { run_ids, .. } => {
@@ -331,22 +334,43 @@ impl Applications {
     }
 
     /// The next report for the server. Cancel safe.
-    pub async fn next(&mut self) -> AgentStatusMessage {
+    pub async fn next(&mut self) -> Report {
         if let Some(unsent) = self.unsent.take() {
             return unsent;
         }
         // The sender lives in `self`, so the channel never closes.
-        self.receiver
-            .recv()
-            .await
-            .expect("the application channel stays open")
+        Report::new(
+            self.receiver
+                .recv()
+                .await
+                .expect("the application channel stays open"),
+        )
     }
 
-    /// The connection couldn't send `report`; the next one sends it first.
-    /// Progress is dropped, since a newer one or the result follows.
-    pub fn unsent(&mut self, report: AgentStatusMessage) {
-        if !matches!(report, AgentStatusMessage::ApplicationProgress { .. }) {
-            self.unsent = Some(report);
+    /// The connection couldn't send `report`; the next one sends it first,
+    /// unless it has failed too often (see [`Unsent`]). Progress is dropped,
+    /// since a newer one or the result follows.
+    pub fn unsent(&mut self, report: Report) {
+        if matches!(
+            report.message,
+            AgentStatusMessage::ApplicationProgress { .. }
+        ) {
+            return;
+        }
+        if let Some(message) = self.unsent.failed(report) {
+            // No longer owed, so the next connection's activity tells the
+            // server its runs won't be reported.
+            self.delivered(&message);
+            let run_ids = match &message {
+                AgentStatusMessage::ApplicationScan { run_ids, .. } => run_ids.clone(),
+                AgentStatusMessage::ApplicationResult { run_id, .. } => vec![run_id.clone()],
+                _ => Vec::new(),
+            };
+            tracing::warn!(
+                ?run_ids,
+                attempts = ATTEMPTS,
+                "gave up on an application report no connection could send; the server counts the runs it answers as lost"
+            );
         }
     }
 }
@@ -948,6 +972,51 @@ mod tests {
             applications.activity(),
             AgentStatusMessage::ApplicationActivity {
                 run_ids: vec!["scan-2".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn a_result_no_connection_could_send_stops_going_first_and_is_no_longer_owed() {
+        use futures_util::FutureExt;
+        let mut applications = Applications::new();
+        applications.owed = vec!["run".into(), "other".into()];
+        let result = AgentStatusMessage::ApplicationResult {
+            run_id: "run".into(),
+            result: Box::new(ApplicationRunResult::failed("x")),
+        };
+        let mut report = Report::new(result.clone());
+        for _ in 1..ATTEMPTS {
+            applications.unsent(report);
+            // The next connection sends it first, and says it is coming.
+            report = applications.next().now_or_never().expect("sent first");
+            assert_eq!(report.message, result);
+            assert_eq!(
+                applications.activity(),
+                AgentStatusMessage::ApplicationActivity {
+                    run_ids: vec!["run".into(), "other".into()]
+                }
+            );
+        }
+        applications.unsent(report);
+        let _ = applications
+            .sender
+            .send(AgentStatusMessage::ApplicationScan {
+                run_ids: vec!["other".into()],
+                scan: Box::default(),
+            });
+        assert!(
+            matches!(
+                applications.next().now_or_never().unwrap().message,
+                AgentStatusMessage::ApplicationScan { .. }
+            ),
+            "what came after it goes first instead"
+        );
+        // So the server counts the run lost when the Agent next connects.
+        assert_eq!(
+            applications.activity(),
+            AgentStatusMessage::ApplicationActivity {
+                run_ids: vec!["other".into()]
             }
         );
     }

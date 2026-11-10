@@ -6,7 +6,7 @@ use anyhow::{Context, bail};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
-    Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
+    Connector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config,
     tungstenite::{
         client::IntoClientRequest,
         handshake::client::Response,
@@ -15,7 +15,9 @@ use tokio_tungstenite::{
 };
 use url::Url;
 
-pub type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+/// A signaling WebSocket. The TCP stream under TLS records what it writes,
+/// so [`SignalingConnection`] can tell a slow write from a stalled one.
+pub type Socket = WebSocketStream<MaybeTlsStream<Tracked<TcpStream>>>;
 
 /// How long an attempt must stream before its failure restarts the reconnect
 /// schedule. Shorter attempts keep backing off, so a peer that connects and
@@ -137,13 +139,41 @@ pub async fn authenticated_websocket(url: Url, token: &str) -> anyhow::Result<(S
             .context("invalid authentication token header")?,
     );
     let tls = tls::websocket_client_config().context("failed to configure signaling TLS")?;
-    tokio::time::timeout(
-        Duration::from_secs(15),
-        connect_async_tls_with_config(request, None, false, Some(Connector::Rustls(tls))),
-    )
+    let host = match url.host().context("signaling URL has no host")? {
+        url::Host::Domain(domain) => domain.to_owned(),
+        url::Host::Ipv4(address) => address.to_string(),
+        url::Host::Ipv6(address) => address.to_string(),
+    };
+    let port = url
+        .port_or_known_default()
+        .context("signaling URL has no port")?;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let stream = TcpStream::connect((host.as_str(), port))
+            .await
+            .context("could not reach the signaling server")?;
+        client_async_tls_with_config(
+            request,
+            Tracked::new(stream),
+            None,
+            Some(Connector::Rustls(tls)),
+        )
+        .await
+        .context("signaling WebSocket handshake failed")
+    })
     .await
     .context("signaling WebSocket handshake timed out")?
-    .context("signaling WebSocket handshake failed")
+}
+
+/// A WebSocket without TLS to `address`, for tests.
+#[cfg(test)]
+pub(crate) async fn plain_websocket(address: std::net::SocketAddr) -> anyhow::Result<Socket> {
+    let stream = TcpStream::connect(address).await?;
+    let (socket, _) = tokio_tungstenite::client_async(
+        format!("ws://{address}"),
+        MaybeTlsStream::Plain(Tracked::new(stream)),
+    )
+    .await?;
+    Ok(socket)
 }
 
 /// Returns true when retrying a WebSocket with the same credentials cannot
@@ -333,8 +363,10 @@ pub fn signaling_close_error(
 }
 
 mod connection;
+mod progress;
 mod session;
 pub use connection::SignalingConnection;
+pub use progress::Tracked;
 pub use session::SessionSignaling;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
