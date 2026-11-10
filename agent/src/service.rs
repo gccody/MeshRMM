@@ -24,7 +24,7 @@ use windows_service::service_control_handler::{self, ServiceControlHandlerResult
 use windows_service::{define_windows_service, service_dispatcher};
 
 use crate::remote::config::Config;
-use crate::remote::service_link::{SESSION_ACTIVE, SESSION_IDLE, UPDATING_PREFIX};
+use crate::remote::service_link::{BUSY, IDLE, UPDATING_PREFIX};
 use crate::update_policy::{UpdateSchedule, random_bits, unix_seconds};
 use crate::win32::{OwnedHandle, wide};
 
@@ -134,6 +134,8 @@ fn run_service() -> anyhow::Result<()> {
             .as_ref(),
         random_bits(),
     );
+    // A release a check found, waiting for the coordinator to be free to stop.
+    let mut staged: Option<crate::updater::StagedUpdate> = None;
     // Whether the coordinator gets to end its remote sessions and run their close actions.
     let graceful = loop {
         // The authenticated coordinator deliberately remains in the service's
@@ -163,10 +165,27 @@ fn run_service() -> anyhow::Result<()> {
             tracing::warn!(?error, "could not refresh Agent tray sessions");
         }
 
-        let session_active = worker.as_ref().is_some_and(Coordinator::session_active);
-        if updates.due(Instant::now(), session_active) {
-            match crate::updater::check_and_schedule(config) {
-                Ok(Some(version)) => {
+        let busy = worker.as_ref().is_some_and(Coordinator::busy);
+        if staged.is_none() && updates.due(Instant::now(), busy) {
+            match crate::updater::check_and_stage(config) {
+                Ok(Some(update)) => staged = Some(update),
+                Ok(None) => {
+                    let next = updates.checked(Instant::now(), unix_seconds(), true, random_bits());
+                    if let (Some(directory), Some(next)) = (config_directory, next) {
+                        crate::updater::record_next_check(directory, &next);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(error = ?error, "automatic Agent update check failed");
+                    updates.checked(Instant::now(), unix_seconds(), false, random_bits());
+                }
+            }
+        }
+        // Asked again, since the download may have taken minutes.
+        let busy = worker.as_ref().is_some_and(Coordinator::busy);
+        if let Some(update) = staged.take_if(|_| updates.install_now(Instant::now(), busy)) {
+            match update.start() {
+                Ok(version) => {
                     // Stop cleanly: the helper restarts the service on every path, while a
                     // failure exit would let SCM recovery start this executable again while
                     // the helper is replacing it.
@@ -176,14 +195,8 @@ fn run_service() -> anyhow::Result<()> {
                     }
                     break true;
                 }
-                Ok(None) => {
-                    let next = updates.checked(Instant::now(), unix_seconds(), true, random_bits());
-                    if let (Some(directory), Some(next)) = (config_directory, next) {
-                        crate::updater::record_next_check(directory, &next);
-                    }
-                }
                 Err(error) => {
-                    tracing::warn!(error = ?error, "automatic Agent update check failed");
+                    tracing::warn!(error = ?error, "could not start the Agent update");
                     updates.checked(Instant::now(), unix_seconds(), false, random_bits());
                 }
             }
@@ -245,11 +258,12 @@ fn service_status(state: ServiceState, accepted: ServiceControlAccept) -> Servic
 }
 
 /// The persistent coordinator and the pipes it reports on. Closing its stdin asks it to stop;
-/// its stdout reports whether a remote session is live.
+/// its stdout reports whether it is busy with a remote session or a job an update must not cut
+/// off.
 struct Coordinator {
     process: WorkerProcess,
     control: Option<ChildStdin>,
-    session_active: Arc<AtomicBool>,
+    busy: Arc<AtomicBool>,
 }
 
 impl Coordinator {
@@ -277,16 +291,16 @@ impl Coordinator {
                 process: OwnedHandle(HANDLE(child.into_raw_handle())),
             },
             control,
-            session_active: Arc::default(),
+            busy: Arc::default(),
         };
         if let Some(output) = output {
-            follow_session_activity(output, Arc::clone(&coordinator.session_active));
+            follow_activity(output, Arc::clone(&coordinator.busy));
         }
         Ok(coordinator)
     }
 
-    fn session_active(&self) -> bool {
-        self.process.is_running() && self.session_active.load(Ordering::Relaxed)
+    fn busy(&self) -> bool {
+        self.process.is_running() && self.busy.load(Ordering::Relaxed)
     }
 
     /// Tells the coordinator the stop that follows installs `version`, which it reports to the
@@ -329,7 +343,7 @@ impl Coordinator {
     }
 }
 
-fn follow_session_activity(output: ChildStdout, active: Arc<AtomicBool>) {
+fn follow_activity(output: ChildStdout, busy: Arc<AtomicBool>) {
     let reader = std::thread::Builder::new()
         .name("meshrmm-coordinator-activity".into())
         .spawn(move || {
@@ -337,26 +351,26 @@ fn follow_session_activity(output: ChildStdout, active: Arc<AtomicBool>) {
                 let Ok(line) = line else {
                     break;
                 };
-                if let Some(session_active) = session_activity(&line)
-                    && active.swap(session_active, Ordering::Relaxed) != session_active
+                if let Some(reported) = activity(&line)
+                    && busy.swap(reported, Ordering::Relaxed) != reported
                 {
                     tracing::info!(
-                        session_active,
-                        "the Agent coordinator reported remote session activity"
+                        busy = reported,
+                        "the Agent coordinator reported whether an update would interrupt it"
                     );
                 }
             }
-            active.store(false, Ordering::Relaxed);
+            busy.store(false, Ordering::Relaxed);
         });
     if let Err(error) = reader {
-        tracing::warn!(%error, "could not follow remote session activity; updates will not wait for sessions");
+        tracing::warn!(%error, "could not follow the coordinator's activity; updates will not wait for sessions or jobs");
     }
 }
 
-fn session_activity(line: &[u8]) -> Option<bool> {
+fn activity(line: &[u8]) -> Option<bool> {
     match line.trim_ascii() {
-        line if line == SESSION_ACTIVE.as_bytes() => Some(true),
-        line if line == SESSION_IDLE.as_bytes() => Some(false),
+        line if line == BUSY.as_bytes() => Some(true),
+        line if line == IDLE.as_bytes() => Some(false),
         _ => None,
     }
 }
@@ -392,11 +406,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recognizes_only_session_activity_reports() {
-        assert_eq!(session_activity(b"session-active"), Some(true));
-        assert_eq!(session_activity(b"session-idle\r"), Some(false));
-        assert_eq!(session_activity(b""), None);
-        assert_eq!(session_activity(b"session-active-ish"), None);
+    fn recognizes_only_activity_reports() {
+        assert_eq!(activity(b"busy"), Some(true));
+        assert_eq!(activity(b"idle\r"), Some(false));
+        assert_eq!(activity(b""), None);
+        assert_eq!(activity(b"busy-ish"), None);
     }
 
     #[test]

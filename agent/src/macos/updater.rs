@@ -47,30 +47,48 @@ pub(crate) async fn run(config: Config, link: Arc<ServiceLink>) {
         record.as_ref(),
         random_bits(),
     );
+    // A release a check found, waiting for the Agent to be free to stop.
+    let mut staged: Option<Staged> = None;
     loop {
-        if schedule.due(Instant::now(), link.session_active()) {
+        if staged.is_none() && schedule.due(Instant::now(), link.busy()) {
             let check_config = config.clone();
             let succeeded = match tokio::task::spawn_blocking(move || stage(&check_config)).await {
-                Ok(Ok(Some(version))) => {
+                Ok(Ok(Some(update))) => {
+                    staged = Some(update);
+                    None
+                }
+                Ok(Ok(None)) => Some(true),
+                Ok(Err(error)) => {
+                    tracing::warn!(error = ?error, "Agent update check failed");
+                    Some(false)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Agent update check stopped");
+                    Some(false)
+                }
+            };
+            if let Some(succeeded) = succeeded
+                && let Some(next) =
+                    schedule.checked(Instant::now(), unix_seconds(), succeeded, random_bits())
+            {
+                record_next_check(&next);
+            }
+        }
+        if let Some(update) = staged.take_if(|_| schedule.install_now(Instant::now(), link.busy()))
+        {
+            let version = update.version.clone();
+            match tokio::task::spawn_blocking(move || update.start()).await {
+                Ok(Ok(())) => {
                     tracing::info!(%version, "stopping the Agent to install an update");
                     link.stop_for_update(version);
                     return;
                 }
-                Ok(Ok(None)) => true,
                 Ok(Err(error)) => {
-                    tracing::warn!(error = ?error, "Agent update check failed");
-                    false
+                    tracing::warn!(error = ?error, "could not start the Agent update")
                 }
-                Err(error) => {
-                    tracing::warn!(%error, "Agent update check stopped");
-                    false
-                }
-            };
-            if let Some(next) =
-                schedule.checked(Instant::now(), unix_seconds(), succeeded, random_bits())
-            {
-                record_next_check(&next);
+                Err(error) => tracing::warn!(%error, "starting the Agent update stopped"),
             }
+            schedule.checked(Instant::now(), unix_seconds(), false, random_bits());
         }
         tokio::time::sleep(SCHEDULE_TICK).await;
     }
@@ -82,9 +100,22 @@ fn updates_directory() -> anyhow::Result<PathBuf> {
     Ok(directory)
 }
 
-/// Downloads and verifies a newer Agent and starts its installer. Returns the
-/// staged version.
-fn stage(config: &Config) -> anyhow::Result<Option<String>> {
+/// A newer Agent, downloaded, verified and unpacked in its staging folder.
+struct Staged {
+    version: String,
+    app: PathBuf,
+    staging: PathBuf,
+}
+
+impl Staged {
+    /// Starts its installer, which waits for the coordinator to stop.
+    fn start(self) -> anyhow::Result<()> {
+        start_installer(&self.app, &self.staging)
+    }
+}
+
+/// Downloads, verifies and unpacks a newer Agent, if there is one.
+fn stage(config: &Config) -> anyhow::Result<Option<Staged>> {
     let http = ureq::Agent::config_builder()
         .https_only(true)
         .timeout_global(Some(Duration::from_secs(600)))
@@ -151,8 +182,11 @@ fn stage(config: &Config) -> anyhow::Result<Option<String>> {
         Some(team) => macos::verify_developer_id(&app, BUNDLE_IDENTIFIER, team, &release.version)?,
         None => macos::verify_signature(&app)?,
     }
-    start_installer(&app, &staging)?;
-    Ok(Some(release.version))
+    Ok(Some(Staged {
+        version: release.version,
+        app,
+        staging,
+    }))
 }
 
 /// Writes when the next check is due, so a restart keeps its place in the schedule.

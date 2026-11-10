@@ -125,7 +125,9 @@ a whole **succeeded** (every chosen update installed, or none was pending),
 was **partial**, or **failed** (nothing installed, or it couldn't start, such
 as when another program holds the package manager); one the Agent hasn't
 reported five hours after it started is **lost**; the Agent gives an install
-four hours ([below](#time-limits)), so it reports a failed install first. A
+four hours ([below](#time-limits)), so it reports a failed install first. An
+[Agent update](devices.md#agent-updates) waits for an install or scan, and
+for its result to reach the server. A
 device installs one thing at a time: a second install while one runs fails
 at once, and on the device page **Install** is refused (`409
 install_running`).
@@ -148,9 +150,11 @@ install_running`).
   Line Tools) install.
 - **Linux:** APT runs non-interactively, keeps changed configuration files,
   waits up to 10 minutes for the dpkg lock, and suspends `needrestart` so it
-  can't restart the Agent mid-install. Arch Linux supports only upgrading
-  everything at once, so pacman devices offer **Install all** only (`400
-  selection_unsupported` otherwise).
+  can't restart the Agent mid-install. Package managers run in a systemd
+  scope of their own, so an Agent that stops anyway doesn't cut a
+  transaction off ([Linux Agent](linux-agent.md#updates)). Arch Linux
+  supports only upgrading everything at once, so pacman devices offer
+  **Install all** only (`400 selection_unsupported` otherwise).
 - **Restarts** use the platform's scheduled shutdown (`InitiateShutdownW`
   with a grace period on Windows, `shutdown -r +N` on macOS and Linux), so
   the countdown survives the Agent restarting. The message tells the user

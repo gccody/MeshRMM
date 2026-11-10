@@ -43,8 +43,58 @@ const TARGET: &str = meshrmm_self_update::AGENT_WINDOWS_X64;
 #[cfg(target_arch = "aarch64")]
 const TARGET: &str = meshrmm_self_update::AGENT_WINDOWS_ARM64;
 
-/// Returns the version of the update it staged, after which the service must stop.
-pub fn check_and_schedule(config: &Config) -> anyhow::Result<Option<String>> {
+/// A downloaded and verified release, with the helper that installs it, waiting for the Agent
+/// to be free to stop. Files left by one that never starts are removed when the service next
+/// starts (see [`remove_stale_files`]).
+pub struct StagedUpdate {
+    version: String,
+    current: PathBuf,
+    staged: PathBuf,
+    helper: PathBuf,
+    update_directory: PathBuf,
+    json_logs: bool,
+}
+
+impl StagedUpdate {
+    /// Starts the helper and returns the version it installs, after which the service must stop.
+    pub fn start(self) -> anyhow::Result<String> {
+        let mut command = Command::new(&self.helper);
+        command
+            .arg("--apply-agent-update")
+            .arg(&self.current)
+            .arg(&self.staged)
+            // The helper waits for this process to exit before replacing its executable.
+            .arg(std::process::id().to_string());
+        if self.json_logs {
+            command.arg("--json-logs");
+        }
+        let started = command
+            .current_dir(&self.update_directory)
+            .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "failed to start Agent update helper {}",
+                    self.helper.display()
+                )
+            });
+        if let Err(error) = started {
+            remove_if_present(&self.staged);
+            remove_if_present(&self.helper);
+            return Err(error);
+        }
+        tracing::info!(
+            release_version = %self.version,
+            helper = %self.helper.display(),
+            staged = %self.staged.display(),
+            "started the Agent update helper"
+        );
+        Ok(self.version)
+    }
+}
+
+/// Downloads and stages a newer release, if there is one; [`StagedUpdate::start`] installs it.
+pub fn check_and_stage(config: &Config) -> anyhow::Result<Option<StagedUpdate>> {
     let http = http_agent();
     let manifest_bytes = download(&http, &config.update_manifest_url, MAX_MANIFEST_BYTES)
         .context("failed to download the Agent update manifest")?;
@@ -92,43 +142,24 @@ pub fn check_and_schedule(config: &Config) -> anyhow::Result<Option<String>> {
     let suffix = unique_suffix();
     let staged = update_directory.join(format!("agent-{}-{suffix}.exe", release.version));
     let helper = update_directory.join(format!("update-helper-{suffix}.exe"));
-    let scheduled = write_new_file(&staged, &executable)
-        .and_then(|()| {
-            std::fs::copy(&current, &helper).with_context(|| {
-                format!("failed to create Agent update helper {}", helper.display())
-            })
-        })
-        .and_then(|_| {
-            let mut command = Command::new(&helper);
-            command
-                .arg("--apply-agent-update")
-                .arg(&current)
-                .arg(&staged)
-                // The helper waits for this process to exit before replacing its executable.
-                .arg(std::process::id().to_string());
-            if config.json_logs {
-                command.arg("--json-logs");
-            }
-            command
-                .current_dir(&update_directory)
-                .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
-                .spawn()
-                .with_context(|| {
-                    format!("failed to start Agent update helper {}", helper.display())
-                })
-        });
-    if let Err(error) = scheduled {
+    let written = write_new_file(&staged, &executable).and_then(|()| {
+        std::fs::copy(&current, &helper)
+            .map(|_| ())
+            .with_context(|| format!("failed to create Agent update helper {}", helper.display()))
+    });
+    if let Err(error) = written {
         remove_if_present(&staged);
         remove_if_present(&helper);
         return Err(error);
     }
-    tracing::info!(
-        release_version = %release.version,
-        helper = %helper.display(),
-        staged = %staged.display(),
-        "started the Agent update helper"
-    );
-    Ok(Some(release.version))
+    Ok(Some(StagedUpdate {
+        version: release.version,
+        current,
+        staged,
+        helper,
+        update_directory,
+        json_logs: config.json_logs,
+    }))
 }
 
 /// When the last successful check said the next one is due.

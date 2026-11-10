@@ -1,28 +1,40 @@
 //! Private pipes between the Agent service and the coordinator it launches. The service closes
 //! the coordinator's stdin to ask it to stop, so remote sessions end and run their close actions
-//! before the process exits, and reads session activity from its stdout so automatic updates
-//! wait for live remote sessions. Before stopping it for an automatic update, the service first
-//! writes the release version to that stdin, so the coordinator can tell the server why the
-//! Agent is going offline.
+//! before the process exits, and reads from its stdout whether the coordinator is busy, so
+//! automatic updates wait for live remote sessions and for jobs that must not be cut off. Before
+//! stopping it for an automatic update, the service first writes the release version to that
+//! stdin, so the coordinator can tell the server why the Agent is going offline.
+//!
+//! The coordinator is busy while it holds an [`ActivityGuard`]: for a remote session, terminal
+//! or file transfer while it is open, and for an update install or scan, an application run or
+//! scan, a toolbox script or file, or a self-healing action from when it is accepted until its
+//! result reaches the connection. A result waiting for a connection keeps it busy for at most
+//! [`RESULT_HOLD`] after its job ends, since an Agent that is offline cannot deliver it.
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 
-/// Written when the first remote session starts.
-pub const SESSION_ACTIVE: &str = "session-active";
-/// Written when the last remote session ends.
-pub const SESSION_IDLE: &str = "session-idle";
+/// Written when the coordinator becomes busy.
+pub const BUSY: &str = "busy";
+/// Written when nothing keeps the coordinator busy any longer.
+pub const IDLE: &str = "idle";
 /// Written by the service, followed by the release version, before it stops the coordinator to
 /// install an automatic update.
 pub const UPDATING_PREFIX: &str = "updating ";
+/// How long a job's result keeps the Agent busy once the job has ended, if the connection has
+/// not taken it by then. Results are kept only in memory, so an update that waited longer for an
+/// Agent that is offline would not save them, only hold up the update.
+pub const RESULT_HOLD: Duration = Duration::from_secs(10 * 60);
+/// How often an attached coordinator looks for results whose hold ran out, to tell the service.
+const HOLD_CHECK: Duration = Duration::from_secs(30);
 
 pub struct ServiceLink {
     stop: Arc<watch::Sender<bool>>,
-    activity: Option<Arc<Activity>>,
+    activity: Arc<Activity>,
     update: Arc<Mutex<Option<String>>>,
-    sessions: Arc<AtomicUsize>,
 }
 
 impl ServiceLink {
@@ -31,13 +43,11 @@ impl ServiceLink {
     pub fn new(attached: bool) -> Self {
         let stop = Arc::new(watch::Sender::new(false));
         let update = Arc::new(Mutex::new(None));
-        let sessions = Arc::default();
         if !attached {
             return Self {
                 stop,
-                activity: None,
+                activity: Arc::new(Activity::new(None)),
                 update,
-                sessions,
             };
         }
         let sender = Arc::clone(&stop);
@@ -97,26 +107,41 @@ impl ServiceLink {
         if let Err(error) = watcher {
             tracing::warn!(%error, "could not follow Agent service stop requests");
         }
+        let activity = Arc::new(Activity::new(Some(Box::new(std::io::stdout()))));
+        // A result's hold runs out without anything happening, so the service hears of it
+        // from here.
+        let watched = Arc::clone(&activity);
+        let expiry = std::thread::Builder::new()
+            .name("meshrmm-activity".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(HOLD_CHECK);
+                    watched.refresh(Instant::now());
+                }
+            });
+        if let Err(error) = expiry {
+            tracing::warn!(%error, "could not follow finished jobs; updates wait for their results until they are sent");
+        }
         Self {
             stop,
-            activity: Some(Arc::new(Activity::new(Box::new(std::io::stdout())))),
+            activity,
             update,
-            sessions,
         }
     }
 
     /// Stops the coordinator so a staged update can replace it, as the
     /// Windows service does through the pipe.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg_attr(windows, allow(dead_code))]
     pub fn stop_for_update(&self, version: String) {
         *self.update.lock().unwrap_or_else(|e| e.into_inner()) = Some(version);
         self.stop.send_replace(true);
     }
 
-    /// Whether a remote session is running.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub fn session_active(&self) -> bool {
-        self.sessions.load(Ordering::SeqCst) > 0
+    /// Whether something the Agent does must not be cut off by an update: a remote session, or
+    /// a job that runs or has a result to deliver (see [`Self::activity`]).
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn busy(&self) -> bool {
+        self.activity.lock().busy(Instant::now())
     }
 
     /// The release the service announced it is stopping the coordinator to install.
@@ -151,16 +176,19 @@ impl ServiceLink {
         }
     }
 
-    /// Counts a live remote session, and reports it to the service, until the
-    /// returned guard is dropped.
-    pub fn session_started(&self) -> SessionGuard {
-        self.sessions.fetch_add(1, Ordering::SeqCst);
-        if let Some(activity) = &self.activity {
-            activity.change(true);
-        }
-        SessionGuard {
-            activity: self.activity.clone(),
-            sessions: Arc::clone(&self.sessions),
+    /// Keeps the Agent busy, and tells the service, until the returned guard is dropped: for
+    /// the life of a remote session, terminal or transfer, or from when a job is accepted until
+    /// its result reaches the connection, which [`ActivityGuard::finished`] bounds.
+    pub fn activity(&self) -> ActivityGuard {
+        let mut state = self.activity.lock();
+        let id = state.next;
+        state.next += 1;
+        state.holds.insert(id, None);
+        state.report(Instant::now());
+        drop(state);
+        ActivityGuard {
+            activity: Arc::clone(&self.activity),
+            id,
         }
     }
 }
@@ -175,51 +203,96 @@ fn update_announcement(line: &[u8]) -> Option<String> {
     meshrmm_protocol::is_release_version(version).then(|| version.to_owned())
 }
 
-pub struct SessionGuard {
-    activity: Option<Arc<Activity>>,
-    sessions: Arc<AtomicUsize>,
+/// Keeps the Agent busy until dropped; see [`ServiceLink::activity`].
+pub struct ActivityGuard {
+    activity: Arc<Activity>,
+    id: u64,
 }
 
-impl Drop for SessionGuard {
-    fn drop(&mut self) {
-        self.sessions.fetch_sub(1, Ordering::SeqCst);
-        if let Some(activity) = &self.activity {
-            activity.change(false);
+impl ActivityGuard {
+    /// The job ended and its result waits for the connection, which keeps the Agent busy for
+    /// at most [`RESULT_HOLD`] more.
+    pub fn finished(&self) {
+        self.finished_at(Instant::now());
+    }
+
+    fn finished_at(&self, now: Instant) {
+        let mut state = self.activity.lock();
+        if let Some(until) = state.holds.get_mut(&self.id) {
+            *until = Some(now + RESULT_HOLD);
         }
+        state.report(now);
+    }
+}
+
+impl std::fmt::Debug for ActivityGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ActivityGuard")
+            .field("id", &self.id)
+            .finish()
+    }
+}
+
+impl Drop for ActivityGuard {
+    fn drop(&mut self) {
+        let mut state = self.activity.lock();
+        state.holds.remove(&self.id);
+        state.report(Instant::now());
     }
 }
 
 struct Activity(Mutex<ActivityState>);
 
 struct ActivityState {
-    sessions: usize,
-    output: Box<dyn Write + Send>,
+    next: u64,
+    /// What keeps the Agent busy, by guard: until when, or `None` for as long as it is held.
+    holds: HashMap<u64, Option<Instant>>,
+    /// What the service was last told.
+    reported_busy: bool,
+    output: Option<Box<dyn Write + Send>>,
 }
 
 impl Activity {
-    fn new(output: Box<dyn Write + Send>) -> Self {
+    fn new(output: Option<Box<dyn Write + Send>>) -> Self {
         Self(Mutex::new(ActivityState {
-            sessions: 0,
+            next: 0,
+            holds: HashMap::new(),
+            reported_busy: false,
             output,
         }))
     }
 
-    /// Reports only transitions between no sessions and some, in the order they happen.
-    fn change(&self, started: bool) {
-        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let was_active = state.sessions > 0;
-        state.sessions = if started {
-            state.sessions + 1
-        } else {
-            state.sessions.saturating_sub(1)
-        };
-        let active = state.sessions > 0;
-        if active == was_active {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ActivityState> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Tells the service if a result's hold ran out by `now`.
+    fn refresh(&self, now: Instant) {
+        self.lock().report(now);
+    }
+}
+
+impl ActivityState {
+    fn busy(&self, now: Instant) -> bool {
+        self.holds
+            .values()
+            .any(|until| until.is_none_or(|until| until > now))
+    }
+
+    /// Reports only changes between busy and idle, in the order they happen.
+    fn report(&mut self, now: Instant) {
+        let busy = self.busy(now);
+        if busy == self.reported_busy {
             return;
         }
-        let report = if active { SESSION_ACTIVE } else { SESSION_IDLE };
+        self.reported_busy = busy;
+        let Some(output) = &mut self.output else {
+            return;
+        };
+        let report = if busy { BUSY } else { IDLE };
         // Once the service is gone nobody needs the report.
-        let _ = writeln!(state.output, "{report}").and_then(|()| state.output.flush());
+        let _ = writeln!(output, "{report}").and_then(|()| output.flush());
     }
 }
 
@@ -229,6 +302,12 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct Output(Arc<Mutex<Vec<u8>>>);
+
+    impl Output {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
 
     impl Write for Output {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -241,25 +320,54 @@ mod tests {
         }
     }
 
+    fn attached(output: &Output) -> ServiceLink {
+        ServiceLink {
+            stop: Arc::new(watch::Sender::new(false)),
+            activity: Arc::new(Activity::new(Some(Box::new(output.clone())))),
+            update: Arc::default(),
+        }
+    }
+
     #[test]
     fn reports_only_the_first_start_and_the_last_end() {
         let output = Output::default();
-        let activity = Arc::new(Activity::new(Box::new(output.clone())));
-        let link = ServiceLink {
-            stop: Arc::new(watch::Sender::new(false)),
-            activity: Some(activity),
-            update: Arc::default(),
-            sessions: Arc::default(),
-        };
-        let first = link.session_started();
-        let replacement = link.session_started();
+        let link = attached(&output);
+        let first = link.activity();
+        let replacement = link.activity();
         drop(first);
         drop(replacement);
-        drop(link.session_started());
-        assert_eq!(
-            String::from_utf8(output.0.lock().unwrap().clone()).unwrap(),
-            format!("{SESSION_ACTIVE}\n{SESSION_IDLE}\n{SESSION_ACTIVE}\n{SESSION_IDLE}\n")
-        );
+        drop(link.activity());
+        assert_eq!(output.text(), format!("{BUSY}\n{IDLE}\n{BUSY}\n{IDLE}\n"));
+    }
+
+    #[test]
+    fn a_finished_jobs_result_keeps_the_agent_busy_until_it_is_sent_or_its_hold_runs_out() {
+        let output = Output::default();
+        let link = attached(&output);
+        let now = Instant::now();
+        let delivered = link.activity();
+        delivered.finished_at(now);
+        assert!(link.busy(), "a result waiting for the connection");
+        drop(delivered);
+        assert!(!link.busy(), "the connection took it");
+
+        // One no connection takes holds the Agent only for a while.
+        let offline = link.activity();
+        offline.finished_at(now);
+        let state = link.activity.lock();
+        assert!(state.busy(now + RESULT_HOLD - Duration::from_millis(1)));
+        assert!(!state.busy(now + RESULT_HOLD));
+        drop(state);
+        // A job still running is not bound by it.
+        let running = link.activity();
+        assert!(link.activity.lock().busy(now + RESULT_HOLD * 100));
+        drop(running);
+        // The service hears when the hold runs out.
+        assert_eq!(output.text(), format!("{BUSY}\n{IDLE}\n{BUSY}\n"));
+        link.activity.refresh(now + RESULT_HOLD);
+        assert_eq!(output.text(), format!("{BUSY}\n{IDLE}\n{BUSY}\n{IDLE}\n"));
+        drop(offline);
+        assert_eq!(output.text(), format!("{BUSY}\n{IDLE}\n{BUSY}\n{IDLE}\n"));
     }
 
     #[test]
@@ -270,18 +378,18 @@ mod tests {
         );
         assert_eq!(update_announcement(b"updating \n"), None);
         assert_eq!(update_announcement(b"updating 1.0 <script>\n"), None);
-        assert_eq!(update_announcement(b"session-active\n"), None);
+        assert_eq!(update_announcement(b"busy\n"), None);
         assert_eq!(update_announcement(&[0xff, 0xfe]), None);
     }
 
     #[test]
-    fn an_unattached_coordinator_still_counts_sessions() {
+    fn an_unattached_coordinator_still_counts_what_keeps_it_busy() {
         let link = ServiceLink::new(false);
-        assert!(!link.session_active());
-        let session = link.session_started();
-        assert!(link.session_active());
+        assert!(!link.busy());
+        let session = link.activity();
+        assert!(link.busy());
         drop(session);
-        assert!(!link.session_active());
+        assert!(!link.busy());
     }
 
     #[tokio::test]

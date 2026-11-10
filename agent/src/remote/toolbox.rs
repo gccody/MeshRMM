@@ -163,6 +163,7 @@ mod shared {
 
     use super::{MAX_RUNNING_DELIVERIES, MAX_RUNNING_SCRIPTS, platform};
     use crate::remote::config::{Config, ExecutionMode};
+    use crate::remote::service_link::ActivityGuard;
 
     static RUNNING_SCRIPTS: AtomicUsize = AtomicUsize::new(0);
     static RUNNING_DELIVERIES: AtomicUsize = AtomicUsize::new(0);
@@ -190,9 +191,28 @@ mod shared {
         }
     }
 
-    /// Runs `run` on its own thread and reports how it went.
-    pub(crate) fn run_script(config: &Config, mode: ExecutionMode, run: ScriptRunRequest) {
+    /// Runs `run` on its own thread and reports how it went. `activity`
+    /// keeps the Agent from updating until the report is sent or given up on.
+    pub(crate) fn run_script(
+        config: &Config,
+        mode: ExecutionMode,
+        run: ScriptRunRequest,
+        activity: ActivityGuard,
+    ) {
         let config = config.clone();
+        start_script(mode, run, activity, move |run_id, report| {
+            send_report(&config, &["script-runs", run_id, "result"], report);
+        });
+    }
+
+    /// Runs `run` on its own thread and hands how it went to `send`,
+    /// holding `activity` until that returns.
+    pub(super) fn start_script(
+        mode: ExecutionMode,
+        run: ScriptRunRequest,
+        activity: ActivityGuard,
+        send: impl FnOnce(&str, &ScriptRunReport) + Send + 'static,
+    ) {
         let slot = Slot::take(&RUNNING_SCRIPTS, MAX_RUNNING_SCRIPTS);
         let spawned = std::thread::Builder::new()
             .name("meshrmm-toolbox-script".into())
@@ -221,7 +241,9 @@ mod shared {
                     error = ?report.error,
                     "toolbox script finished"
                 );
-                send_report(&config, &["script-runs", &run.run_id, "result"], &report);
+                activity.finished();
+                send(&run.run_id, &report);
+                drop(activity);
             });
         if let Err(error) = spawned {
             tracing::error!(%error, "could not start a thread for a toolbox script");
@@ -245,10 +267,13 @@ mod shared {
     }
 
     /// Saves `delivery`'s file on its own thread and reports how it went.
+    /// `activity` keeps the Agent from updating until the report is sent or
+    /// given up on.
     pub(crate) fn deliver_file(
         config: &Config,
         mode: ExecutionMode,
         delivery: FileDeliveryRequest,
+        activity: ActivityGuard,
     ) {
         let config = config.clone();
         let slot = Slot::take(&RUNNING_DELIVERIES, MAX_RUNNING_DELIVERIES);
@@ -279,11 +304,13 @@ mod shared {
                         }
                     }
                 };
+                activity.finished();
                 send_report(
                     &config,
                     &["file-deliveries", &delivery.delivery_id, "result"],
                     &report,
                 );
+                drop(activity);
             });
         if let Err(error) = spawned {
             tracing::error!(%error, "could not start a thread for a toolbox file");
@@ -582,6 +609,53 @@ mod tests {
             Some(".profile (2)")
         );
         assert_eq!(unique_name("full", |_| true), None);
+    }
+
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn scripts_keep_the_agent_busy_until_their_report_is_sent() {
+        use std::time::{Duration, Instant};
+
+        let link = crate::remote::service_link::ServiceLink::new(false);
+        // One in a language the device doesn't run fails at once, running nothing.
+        let language = if cfg!(windows) {
+            ScriptLanguage::Shell
+        } else {
+            ScriptLanguage::Cmd
+        };
+        let (sending, sent) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        shared::start_script(
+            crate::remote::config::ExecutionMode::Console,
+            meshrmm_protocol::ScriptRunRequest {
+                run_id: "run".into(),
+                language,
+                body: String::new(),
+                run_as: meshrmm_protocol::RunAs::User,
+                timeout_seconds: 30,
+            },
+            link.activity(),
+            move |run_id, report| {
+                sending.send((run_id.to_owned(), report.status)).unwrap();
+                released.recv().unwrap();
+            },
+        );
+        assert!(link.busy(), "accepted");
+        let (run_id, status) = sent.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert_eq!(
+            (run_id.as_str(), status),
+            ("run", meshrmm_protocol::ScriptRunStatus::Failed)
+        );
+        assert!(link.busy(), "the report is being sent");
+        release.send(()).unwrap();
+        let until = Instant::now() + Duration::from_secs(30);
+        while link.busy() {
+            assert!(
+                Instant::now() < until,
+                "still busy once the report was sent"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]

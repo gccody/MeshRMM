@@ -11,6 +11,14 @@
 //! it runs is stopped by then at the latest, whatever its own limit. Work
 //! that isn't a program, such as Windows Update's, reads it with
 //! [`deadline`].
+//!
+//! On Linux a program must outlive an Agent that stops anyway, by a crash or
+//! a restart of its service, rather than leave dpkg or rpm half done. So
+//! under systemd it runs in a transient scope of its own, outside the
+//! service's control group, which stopping the service kills whole (see
+//! [`scope`]); systemd stops it at its limit if the Agent can't. And it
+//! writes to unnamed files rather than pipes, which would break, and end it,
+//! once the Agent is gone.
 use std::cell::Cell;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,6 +30,7 @@ use anyhow::{Context, bail};
 /// How long output readers may outlast the program.
 const OUTPUT_DRAIN: Duration = Duration::from_secs(2);
 /// How often a reader with nothing to read checks whether to stop.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 const READ_POLL: Duration = Duration::from_millis(50);
 /// The most of each stream kept, from its end.
 const KEPT_BYTES: usize = 1024 * 1024;
@@ -112,6 +121,7 @@ pub(crate) fn describe_code(code: i64) -> String {
 
 /// What a reader has read so far, from the stream's end.
 #[derive(Default)]
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 struct Kept {
     bytes: Vec<u8>,
     ended: bool,
@@ -121,11 +131,13 @@ struct Kept {
 /// it goes, so output survives a reader that is given up on, and it checks
 /// whether to stop whenever the stream is quiet, so it ends even while a
 /// lingering child holds the stream open.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 struct Reader {
     kept: Arc<Mutex<Kept>>,
     stop: Arc<AtomicBool>,
 }
 
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 impl Reader {
     fn start<S: pipe::Pipe>(mut stream: S) -> Self {
         let kept = Arc::new(Mutex::new(Kept::default()));
@@ -183,6 +195,7 @@ impl Drop for Reader {
     }
 }
 
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     // Nothing panics while holding these locks, so a poisoned one is whole.
     mutex
@@ -192,6 +205,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// Waiting for a stream to have something to read, so a reader can stop.
 #[cfg(unix)]
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 mod pipe {
     use std::os::fd::AsRawFd;
     use std::time::Duration;
@@ -272,7 +286,7 @@ fn text(bytes: Vec<u8>) -> String {
 /// `timeout`, or at the thread's deadline (see [`by`]) if that's sooner.
 /// Any exit code is returned; only a program that couldn't start or ran
 /// too long is an error.
-pub(crate) fn run(mut command: Command, timeout: Duration) -> anyhow::Result<Ran> {
+pub(crate) fn run(command: Command, timeout: Duration) -> anyhow::Result<Ran> {
     let program = command.get_program().to_string_lossy().into_owned();
     let deadline = DEADLINE.get();
     let limit = deadline.map_or(timeout, |deadline| {
@@ -281,10 +295,12 @@ pub(crate) fn run(mut command: Command, timeout: Duration) -> anyhow::Result<Ran
     if limit.is_zero() {
         bail!("there was no time left to run {program}");
     }
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    #[cfg(target_os = "linux")]
+    let mut command = scope::wrap(command, limit);
+    #[cfg(not(target_os = "linux"))]
+    let mut command = command;
+    command.stdin(Stdio::null());
+    let mut output = capture::Output::attach(&mut command)?;
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -310,8 +326,7 @@ pub(crate) fn run(mut command: Command, timeout: Duration) -> anyhow::Result<Ran
             return Err(error.context(format!("could not start {program}")));
         }
     };
-    let stdout = Reader::start(child.stdout.take().context("no standard output")?);
-    let stderr = Reader::start(child.stderr.take().context("no standard error")?);
+    output.started(&mut child)?;
     let started = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait()? {
@@ -330,7 +345,7 @@ pub(crate) fn run(mut command: Command, timeout: Duration) -> anyhow::Result<Ran
             tree.stop();
             let _ = child.kill();
             let _ = child.wait();
-            let _ = (stdout.finish(Duration::ZERO), stderr.finish(Duration::ZERO));
+            let _ = output.finish(Duration::ZERO);
             if limit < timeout {
                 bail!("{program} was stopped when the time allowed for this ran out");
             }
@@ -339,6 +354,7 @@ pub(crate) fn run(mut command: Command, timeout: Duration) -> anyhow::Result<Ran
                 timeout.as_secs().div_ceil(60)
             );
         }
+        output.trim();
         std::thread::sleep(Duration::from_millis(100));
     };
     let code = status.code().map(|code| {
@@ -349,11 +365,276 @@ pub(crate) fn run(mut command: Command, timeout: Duration) -> anyhow::Result<Ran
             i64::from(code)
         }
     });
+    let (stdout, stderr) = output.finish(OUTPUT_DRAIN);
     Ok(Ran {
         code,
-        stdout: text(stdout.finish(OUTPUT_DRAIN)),
-        stderr: text(stderr.finish(OUTPUT_DRAIN)),
+        stdout: text(stdout),
+        stderr: text(stderr),
     })
+}
+
+/// A program's output, read from pipes as it writes.
+#[cfg(not(target_os = "linux"))]
+mod capture {
+    use std::process::{Child, Command, Stdio};
+    use std::time::Duration;
+
+    use anyhow::Context;
+
+    use super::Reader;
+
+    #[derive(Default)]
+    pub(super) struct Output {
+        readers: Option<(Reader, Reader)>,
+    }
+
+    impl Output {
+        /// Sets `command` to write to it.
+        pub(super) fn attach(command: &mut Command) -> anyhow::Result<Self> {
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            Ok(Self::default())
+        }
+
+        /// `child` was started with `command`.
+        pub(super) fn started(&mut self, child: &mut Child) -> anyhow::Result<()> {
+            let stdout = Reader::start(child.stdout.take().context("no standard output")?);
+            let stderr = Reader::start(child.stderr.take().context("no standard error")?);
+            self.readers = Some((stdout, stderr));
+            Ok(())
+        }
+
+        /// The readers keep only what they must as they go.
+        pub(super) fn trim(&self) {}
+
+        /// What was written to standard output and error, waiting up to
+        /// `drain` for the streams to end.
+        pub(super) fn finish(self, drain: Duration) -> (Vec<u8>, Vec<u8>) {
+            match self.readers {
+                Some((stdout, stderr)) => (stdout.finish(drain), stderr.finish(drain)),
+                None => (Vec::new(), Vec::new()),
+            }
+        }
+    }
+}
+
+/// A program's output, in unnamed files it keeps writing to whether or not
+/// the Agent is still there to read them.
+#[cfg(target_os = "linux")]
+mod capture {
+    use std::fs::File;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{FileExt, OpenOptionsExt};
+    use std::process::{Child, Command, Stdio};
+    use std::time::Duration;
+
+    use anyhow::Context;
+
+    use super::KEPT_BYTES;
+
+    pub(super) struct Output {
+        stdout: File,
+        stderr: File,
+    }
+
+    impl Output {
+        /// Sets `command` to write to it.
+        pub(super) fn attach(command: &mut Command) -> anyhow::Result<Self> {
+            let output = Self {
+                stdout: unnamed()?,
+                stderr: unnamed()?,
+            };
+            command
+                .stdout(Stdio::from(output.stdout.try_clone()?))
+                .stderr(Stdio::from(output.stderr.try_clone()?));
+            Ok(output)
+        }
+
+        /// The program writes to the files itself.
+        pub(super) fn started(&mut self, _: &mut Child) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        /// Frees what is no longer kept of output that has grown large.
+        pub(super) fn trim(&self) {
+            for file in [&self.stdout, &self.stderr] {
+                let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+                    continue;
+                };
+                if length <= 2 * KEPT_BYTES as u64 {
+                    continue;
+                }
+                // Whole blocks before the part kept; the program writes on
+                // past the hole.
+                let end = (length - KEPT_BYTES as u64) & !0xFFF;
+                // SAFETY: the descriptor is open; punching a hole changes
+                // only the file's contents.
+                unsafe {
+                    libc::fallocate(
+                        file.as_raw_fd(),
+                        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                        0,
+                        i64::try_from(end).unwrap_or(0),
+                    )
+                };
+            }
+        }
+
+        /// The end of what was written to standard output and error. A child
+        /// left running writes on into files nobody reads.
+        pub(super) fn finish(self, _: Duration) -> (Vec<u8>, Vec<u8>) {
+            (tail(&self.stdout), tail(&self.stderr))
+        }
+    }
+
+    /// A file only this process and the program can reach: created where
+    /// nobody else can have made it, and unlinked at once.
+    fn unnamed() -> anyhow::Result<File> {
+        let path = std::env::temp_dir().join(format!(".meshrmm-output-{}", uuid::Uuid::new_v4()));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .with_context(|| format!("could not create {} for its output", path.display()))?;
+        let _ = std::fs::remove_file(&path);
+        Ok(file)
+    }
+
+    /// The last [`KEPT_BYTES`] of `file`.
+    fn tail(file: &File) -> Vec<u8> {
+        let length = file.metadata().map_or(0, |metadata| metadata.len());
+        let start = length.saturating_sub(KEPT_BYTES as u64);
+        let mut bytes = vec![0; usize::try_from(length - start).unwrap_or(0)];
+        let mut read = 0;
+        while read < bytes.len() {
+            match file.read_at(&mut bytes[read..], start + read as u64) {
+                Ok(0) => break,
+                Ok(count) => read += count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        bytes.truncate(read);
+        bytes
+    }
+}
+
+/// Transient systemd scopes, which keep a program running when the Agent's
+/// service is stopped or restarted. systemd ends every process in a
+/// service's control group when it stops, whatever process group or session
+/// it is in, so only a unit of its own takes a program out of it. A scope
+/// runs the program in place: it stays the Agent's child, with its
+/// environment, folder, files and process group, so the limit still stops it
+/// and everything it started. Session helpers, terminals and scripts stay in
+/// the service, and end with it.
+#[cfg(target_os = "linux")]
+pub(crate) mod scope {
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+    use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
+
+    const SYSTEMD_RUN: &str = "systemd-run";
+    /// How much longer than the Agent's limit systemd gives a program, so
+    /// the Agent stops it first and says why while it is there to.
+    const SCOPE_GRACE: Duration = Duration::from_secs(60);
+
+    /// `command` in a scope of its own when systemd can start one, stopped
+    /// by systemd after `limit` should the Agent no longer be there to.
+    pub(super) fn wrap(command: Command, limit: Duration) -> Command {
+        if available() {
+            wrapped(command, limit)
+        } else {
+            command
+        }
+    }
+
+    pub(super) fn wrapped(command: Command, limit: Duration) -> Command {
+        let mut scoped = Command::new(SYSTEMD_RUN);
+        scoped
+            .args(arguments(limit))
+            .arg("--")
+            .arg(command.get_program())
+            .args(command.get_args());
+        for (name, value) in command.get_envs() {
+            match value {
+                Some(value) => scoped.env(name, value),
+                None => scoped.env_remove(name),
+            };
+        }
+        if let Some(folder) = command.get_current_dir() {
+            scoped.current_dir(folder);
+        }
+        scoped
+    }
+
+    fn arguments(limit: Duration) -> [String; 6] {
+        [
+            "--scope".into(),
+            "--quiet".into(),
+            "--collect".into(),
+            "--no-ask-password".into(),
+            "--description=MeshRMM Agent package work".into(),
+            format!(
+                "--property=RuntimeMaxSec={}",
+                limit.saturating_add(SCOPE_GRACE).as_secs()
+            ),
+        ]
+    }
+
+    /// Whether systemd starts scopes for the Agent: as root, booted with
+    /// systemd, and one recent enough to stop a scope at its limit. Found out
+    /// once, by starting one.
+    pub(crate) fn available() -> bool {
+        static AVAILABLE: OnceLock<bool> = OnceLock::new();
+        *AVAILABLE.get_or_init(|| {
+            let available = probe();
+            if available {
+                tracing::info!(
+                    "package managers run in systemd scopes, so they outlive an Agent restart"
+                );
+            } else {
+                tracing::info!(
+                    "systemd can't start scopes here; package managers stop with the Agent's service"
+                );
+            }
+            available
+        })
+    }
+
+    fn probe() -> bool {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 || !Path::new("/run/systemd/system").is_dir() {
+            return false;
+        }
+        let mut probe = Command::new(SYSTEMD_RUN);
+        probe
+            .args(arguments(Duration::from_secs(60)))
+            .arg("--")
+            .arg("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let Ok(mut child) = probe.spawn() else {
+            return false;
+        };
+        let started = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return status.success(),
+                Ok(None) if started.elapsed() < Duration::from_secs(30) => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -533,6 +814,96 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(10));
         assert!(by(Instant::now(), || run(slow(), Duration::from_secs(600))).is_err());
         assert_eq!(DEADLINE.get(), None, "the deadline ends with its work");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn programs_write_to_files_that_outlast_the_agent_not_pipes() {
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "for stream in /dev/stdout /dev/stderr; do if [ -p $stream ]; then echo pipe; else echo file; fi; done",
+        ]);
+        let ran = run(command, Duration::from_secs(10)).unwrap();
+        assert_eq!(ran.stdout, "file\nfile\n");
+        // Only the end of a long output is kept, as from a pipe.
+        let mut long = Command::new("/bin/sh");
+        long.args([
+            "-c",
+            "head -c 3000000 /dev/zero | tr '\\0' a; echo; echo end",
+        ]);
+        let ran = run(long, Duration::from_secs(60)).unwrap();
+        assert_eq!(ran.stdout.len(), KEPT_BYTES);
+        assert!(ran.stdout.ends_with("aaa\nend\n"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn package_managers_start_in_a_scope_of_their_own_under_systemd() {
+        let mut command = Command::new("/usr/bin/apt-get");
+        command
+            .args(["install", "-y", "curl"])
+            .env("DEBIAN_FRONTEND", "noninteractive")
+            .env_remove("TERM")
+            .current_dir("/");
+        let scoped = scope::wrapped(command, Duration::from_secs(30 * 60));
+        assert_eq!(scoped.get_program(), "systemd-run");
+        assert_eq!(
+            scoped
+                .get_args()
+                .map(|argument| argument.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "--scope",
+                "--quiet",
+                "--collect",
+                "--no-ask-password",
+                "--description=MeshRMM Agent package work",
+                // systemd stops it a minute after the Agent would have.
+                "--property=RuntimeMaxSec=1860",
+                "--",
+                "/usr/bin/apt-get",
+                "install",
+                "-y",
+                "curl",
+            ]
+        );
+        let mut environment = scoped.get_envs().collect::<Vec<_>>();
+        environment.sort();
+        assert_eq!(
+            environment,
+            [
+                (
+                    std::ffi::OsStr::new("DEBIAN_FRONTEND"),
+                    Some(std::ffi::OsStr::new("noninteractive"))
+                ),
+                (std::ffi::OsStr::new("TERM"), None),
+            ]
+        );
+        assert_eq!(scoped.get_current_dir(), Some(std::path::Path::new("/")));
+    }
+
+    /// Needs root and systemd, which the test runners don't have; it says so
+    /// and passes without them.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn package_managers_leave_the_agents_control_group_under_systemd() {
+        if !scope::available() {
+            eprintln!("skipped: starting a systemd scope needs root and systemd");
+            return;
+        }
+        let ours = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+        let mut command = Command::new("/bin/cat");
+        command.arg("/proc/self/cgroup");
+        let ran = run(command, Duration::from_secs(30)).unwrap();
+        assert_ne!(ran.stdout, ours);
+        assert!(ran.stdout.trim_end().ends_with(".scope"), "{}", ran.stdout);
+        // The limit still stops it, and what it started.
+        let mut slow = Command::new("/bin/sh");
+        slow.args(["-c", "sleep 30 & sleep 30"]);
+        let started = Instant::now();
+        assert!(run(slow, Duration::from_millis(500)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[test]

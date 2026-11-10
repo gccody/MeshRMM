@@ -13,6 +13,8 @@
 
 use meshrmm_protocol::AgentStatusMessage;
 
+use crate::remote::service_link::ActivityGuard;
+
 /// How many connections in a row may fail to send a report. More than one,
 /// so a connection that drops for some other reason while the report goes
 /// out doesn't cost it; few, because each failure takes the device offline
@@ -25,13 +27,25 @@ pub(crate) const ATTEMPTS: u32 = 3;
 pub(crate) struct Report {
     pub(crate) message: AgentStatusMessage,
     failures: u32,
+    /// Keeps automatic updates waiting until the report is written or given
+    /// up on, as the job it answers did while it ran.
+    _activity: Option<ActivityGuard>,
 }
 
 impl Report {
     pub(crate) fn new(message: AgentStatusMessage) -> Self {
+        Self::answering(message, None)
+    }
+
+    /// The result of the job `activity` was held for since it was accepted.
+    pub(crate) fn answering(message: AgentStatusMessage, activity: Option<ActivityGuard>) -> Self {
+        if let Some(activity) = &activity {
+            activity.finished();
+        }
         Self {
             message,
             failures: 0,
+            _activity: activity,
         }
     }
 }

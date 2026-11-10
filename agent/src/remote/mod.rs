@@ -548,8 +548,8 @@ impl Coordinator {
                     tracing::info!("starting the scheduled update scan");
                     self.update_schedule.started(updates::now_unix_ms());
                     // A scan already running answers it.
-                    self.updates.scan(None);
-                    self.applications.scan(None);
+                    self.updates.scan(None, self.link.activity());
+                    self.applications.scan(None, self.link.activity());
                 }
                 report = self.updates.next(), if self.writing_update.is_none() => {
                     if let AgentStatusMessage::UpdateScan { scan, .. } = &report.message {
@@ -609,12 +609,12 @@ impl Coordinator {
                 AgentCommand::StartBackgroundSession { request } => Some(request),
                 AgentCommand::RunScript { run } => {
                     tracing::info!(run_id = %run.run_id, language = run.language.as_str(), run_as = run.run_as.as_str(), "running a toolbox script");
-                    toolbox::run_script(&self.config, self.mode, run);
+                    toolbox::run_script(&self.config, self.mode, run, self.link.activity());
                     return Ok(ControlFlow::Continue(()));
                 }
                 AgentCommand::DeliverFile { delivery } => {
                     tracing::info!(delivery_id = %delivery.delivery_id, size_bytes = delivery.size_bytes, "receiving a toolbox file");
-                    toolbox::deliver_file(&self.config, self.mode, delivery);
+                    toolbox::deliver_file(&self.config, self.mode, delivery, self.link.activity());
                     return Ok(ControlFlow::Continue(()));
                 }
                 AgentCommand::CollectSystemInfo => {
@@ -628,9 +628,9 @@ impl Coordinator {
                 }
                 AgentCommand::ScanUpdates { run_id } => {
                     tracing::info!(%run_id, "the server asked for an update scan");
-                    self.updates.scan(Some(run_id));
+                    self.updates.scan(Some(run_id), self.link.activity());
                     // Applications scan on the update scan's cadence.
-                    self.applications.scan(None);
+                    self.applications.scan(None, self.link.activity());
                     return Ok(ControlFlow::Continue(()));
                 }
                 AgentCommand::SetUpdateScanSchedule { schedule } => {
@@ -647,7 +647,7 @@ impl Coordinator {
                         reboot_delay_minutes = install.reboot_delay_minutes,
                         "the server asked for an update install"
                     );
-                    self.updates.install(install);
+                    self.updates.install(install, self.link.activity());
                     return Ok(ControlFlow::Continue(()));
                 }
                 AgentCommand::OpenTerminal { terminal } => {
@@ -660,7 +660,7 @@ impl Coordinator {
                         "the server asked for a terminal"
                     );
                     // Automatic updates wait for open terminals, as for sessions.
-                    let activity = self.link.session_started();
+                    let activity = self.link.activity();
                     terminal::open(&self.config, self.mode, terminal, activity);
                     return Ok(ControlFlow::Continue(()));
                 }
@@ -681,12 +681,13 @@ impl Coordinator {
                 }
                 AgentCommand::ScanApplications { run_id } => {
                     tracing::info!(?run_id, "the server asked for an application scan");
-                    self.applications.scan(run_id);
+                    self.applications.scan(run_id, self.link.activity());
                     return Ok(ControlFlow::Continue(()));
                 }
                 AgentCommand::RunApplications { run } => {
                     tracing::info!(run_id = %run.run_id, operation = ?run.operation, "the server asked for an application run");
-                    self.applications.run(&self.config, self.mode, run);
+                    self.applications
+                        .run(&self.config, self.mode, run, self.link.activity());
                     return Ok(ControlFlow::Continue(()));
                 }
                 AgentCommand::SetMonitors { monitors, known } => {
@@ -708,7 +709,7 @@ impl Coordinator {
                         action = ?action.action,
                         "the server asked for a self-healing action"
                     );
-                    self.monitors.act(action);
+                    self.monitors.act(action, self.link.activity());
                     return Ok(ControlFlow::Continue(()));
                 }
                 AgentCommand::FileTransfer { transfer } => {
@@ -718,7 +719,7 @@ impl Coordinator {
                         "the server asked for a file transfer"
                     );
                     // Automatic updates wait for transfers, as for sessions.
-                    let activity = self.link.session_started();
+                    let activity = self.link.activity();
                     files::transfer::start(&self.config, self.mode, transfer, activity);
                     return Ok(ControlFlow::Continue(()));
                 }
@@ -803,7 +804,7 @@ impl Coordinator {
         let active_request = request.clone();
         let session_config = self.config.clone();
         let task_session_id = session_id.clone();
-        let activity = self.link.session_started();
+        let activity = self.link.activity();
         let mode = self.mode;
         let task = tokio::spawn(async move {
             let _activity = activity;
