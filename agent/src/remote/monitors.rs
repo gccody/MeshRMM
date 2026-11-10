@@ -11,19 +11,26 @@
 //! monitor's timeout. A check that overruns counts as failing, and the
 //! monitor doesn't run again until it finishes.
 //!
-//! Results reach the coordinator through [`Monitors::next`]: a failure or a
-//! change from passing to failing or back at once, the rest together every
-//! [`MONITOR_STATUS_INTERVAL_SECONDS`], and every monitor's latest result
-//! again when the Agent reconnects.
+//! Results reach the coordinator through [`Monitors::next`], measured
+//! against what the server holds of each monitor (what it was last sent, or
+//! what it said it holds when the Agent connected). A failure, a change
+//! between passing and failing, the first result the server would hold, a
+//! result Check now asked for and every self-healing action's go at once. A
+//! pass the server already holds as passing waits: the latest results of
+//! such monitors go together every [`MONITOR_REFRESH_INTERVAL_SECONDS`], from
+//! a random point in the interval for each connection. On connecting the
+//! Agent waits for the server's monitors and what it holds of them, then
+//! sends only the results it lacks or holds with a different outcome or
+//! count of failures.
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use meshrmm_protocol::{
-    AgentStatusMessage, MAX_MONITOR_DETAIL_CHARS, MAX_MONITOR_FAILURES, MAX_MONITOR_OUTPUT_BYTES,
-    MAX_MONITORS, MONITOR_STATUS_INTERVAL_SECONDS, MonitorAction, MonitorActionResult,
-    MonitorCheck, MonitorDefinition, MonitorResult, truncate_text,
+    AgentStatusMessage, KnownMonitorResult, MAX_MONITOR_DETAIL_CHARS, MAX_MONITOR_FAILURES,
+    MAX_MONITOR_OUTPUT_BYTES, MAX_MONITORS, MONITOR_REFRESH_INTERVAL_SECONDS, MonitorAction,
+    MonitorActionResult, MonitorCheck, MonitorDefinition, MonitorResult, truncate_text,
 };
 
 use super::config::ExecutionMode;
@@ -57,8 +64,19 @@ const MAX_RUNNING_ACTIONS: usize = 4;
 const MAX_JITTER: Duration = Duration::from_secs(30);
 /// How long past its timeout a check may take before it counts as failing.
 const OVERRUN_GRACE: Duration = Duration::from_secs(5);
-/// Results sent in one message.
-const RESULTS_PER_MESSAGE: usize = 32;
+/// The most text, in bytes of details and outputs, one message carries:
+/// even escaped, well within what the server takes in one message. A
+/// refresh of passing monitors usually fits in one, however many there are.
+const MESSAGE_TEXT_BYTES: usize = 512 * 1024;
+/// How long a new connection waits for the server's monitors before sending
+/// what it has, if they don't come.
+const GREETING_WAIT: Duration = Duration::from_secs(10);
+/// How long messages the socket refused wait before they go again.
+const RETRY_WAIT: Duration = Duration::from_secs(5);
+
+fn refresh_interval() -> Duration {
+    Duration::from_secs(MONITOR_REFRESH_INTERVAL_SECONDS)
+}
 
 /// What a check found.
 #[derive(Debug, Clone, PartialEq)]
@@ -127,16 +145,82 @@ pub(crate) fn now_ms() -> i64 {
         .map_or(0, |since| since.as_millis() as i64)
 }
 
+/// What the server holds of a monitor's latest result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Held {
+    checked_at_unix_ms: u64,
+    passing: bool,
+    failures: u32,
+}
+
+impl Held {
+    fn of(result: &MonitorResult) -> Self {
+        Self {
+            checked_at_unix_ms: result.checked_at_unix_ms,
+            passing: result.passing,
+            failures: result.failures,
+        }
+    }
+
+    /// Whether `result` says something this doesn't: another outcome or
+    /// count of failures. A later pass of a passing monitor doesn't.
+    fn differs(self, result: &MonitorResult) -> bool {
+        self.passing != result.passing || self.failures != result.failures
+    }
+}
+
 /// The latest results, waiting for the coordinator.
 #[derive(Default)]
 struct Pending {
     latest: HashMap<String, MonitorResult>,
-    /// Monitors whose latest result the server hasn't been sent.
+    /// What the server holds of each monitor's latest result, as far as the
+    /// Agent knows: what it was last sent on this connection, or what the
+    /// server said it holds when the connection began. Unknown monitors are
+    /// missing.
+    held: HashMap<String, Held>,
+    /// Monitors whose latest result goes at once.
     changed: BTreeSet<String>,
     actions: Vec<MonitorActionResult>,
-    /// Whether to send now rather than with the next status.
-    urgent: bool,
-    flushed: Option<Instant>,
+    /// When the latest results of monitors that kept passing go next; none
+    /// until the Agent connects.
+    refresh_at: Option<Instant>,
+    /// Nothing goes before this: a new connection waits for the server to
+    /// say what it holds, and refused messages wait to go again.
+    quiet_until: Option<Instant>,
+}
+
+impl Pending {
+    /// Marks every monitor whose latest result the server doesn't hold to
+    /// go, for a refresh.
+    fn refresh(&mut self) {
+        let behind = self
+            .latest
+            .iter()
+            .filter(|(id, result)| {
+                self.held
+                    .get(*id)
+                    .is_none_or(|held| held.checked_at_unix_ms != result.checked_at_unix_ms)
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        self.changed.extend(behind);
+    }
+
+    /// The messages to send at `now`, or when to look again (`None` for
+    /// when something changes).
+    fn poll(&mut self, now: Instant) -> Result<Vec<AgentStatusMessage>, Option<Instant>> {
+        if let Some(at) = self.refresh_at
+            && at <= now
+        {
+            self.refresh_at = Some(now + refresh_interval());
+            self.refresh();
+        }
+        let quiet = self.quiet_until.filter(|until| *until > now);
+        if quiet.is_none() && (!self.changed.is_empty() || !self.actions.is_empty()) {
+            return Ok(take(self));
+        }
+        Err(quiet.into_iter().chain(self.refresh_at).min())
+    }
 }
 
 struct Outbox {
@@ -151,35 +235,95 @@ impl Outbox {
             .unwrap_or_else(|error| error.into_inner())
     }
 
-    fn result(&self, result: MonitorResult, urgent: bool) {
+    /// Keeps a monitor's latest result, sending it at once unless it is a
+    /// pass the server holds the monitor passing already, or `asked`.
+    fn result(&self, result: MonitorResult, asked: bool) {
         let mut pending = self.lock();
-        pending.changed.insert(result.monitor_id.clone());
+        let steady = result.passing
+            && pending
+                .held
+                .get(&result.monitor_id)
+                .is_some_and(|held| held.passing);
+        let news = asked || !steady;
+        if news {
+            pending.changed.insert(result.monitor_id.clone());
+        }
         pending.latest.insert(result.monitor_id.clone(), result);
-        pending.urgent |= urgent;
         drop(pending);
-        if urgent {
+        if news {
             self.ready.notify_one();
         }
     }
 
     fn action(&self, result: MonitorActionResult) {
+        self.lock().actions.push(result);
+        self.ready.notify_one();
+    }
+
+    /// A new connection: what the server holds is unknown until it says,
+    /// and the first refresh comes `phase` into the interval.
+    fn connected(&self, now: Instant, phase: Duration) {
         let mut pending = self.lock();
-        pending.actions.push(result);
-        pending.urgent = true;
+        pending.held.clear();
+        pending.quiet_until = Some(now + GREETING_WAIT);
+        pending.refresh_at = Some(now + phase);
+    }
+
+    /// The server said what it holds: the latest results that differ, or
+    /// that it lacks, go at once.
+    fn known(&self, known: Vec<KnownMonitorResult>) {
+        let mut pending = self.lock();
+        pending.held = known
+            .into_iter()
+            .map(|known| {
+                let held = Held {
+                    checked_at_unix_ms: known.checked_at_unix_ms,
+                    passing: known.passing,
+                    failures: known.failures,
+                };
+                (known.monitor_id, held)
+            })
+            .collect();
+        let news = pending
+            .latest
+            .iter()
+            .filter(|(id, result)| {
+                pending
+                    .held
+                    .get(*id)
+                    .is_none_or(|held| held.differs(result))
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        pending.changed.extend(news);
+        pending.quiet_until = None;
         drop(pending);
         self.ready.notify_one();
+    }
+
+    /// Forgets what a monitor found, as when its definition changed: its
+    /// next result is the first.
+    fn forget(&self, id: &str) {
+        let mut pending = self.lock();
+        pending.latest.remove(id);
+        pending.held.remove(id);
+        pending.changed.remove(id);
     }
 
     /// Forgets the results of monitors the device no longer runs.
     fn retain(&self, ids: &BTreeSet<String>) {
         let mut pending = self.lock();
         pending.latest.retain(|id, _| ids.contains(id));
+        pending.held.retain(|id, _| ids.contains(id));
         pending.changed.retain(|id| ids.contains(id));
     }
 }
 
 enum Command {
-    Set(Vec<MonitorDefinition>),
+    Set {
+        definitions: Vec<MonitorDefinition>,
+        known: Option<Vec<KnownMonitorResult>>,
+    },
     CheckNow(Vec<String>),
     Done {
         run: u64,
@@ -225,9 +369,17 @@ impl Monitors {
         }
     }
 
-    /// Runs `monitors` from now on, in place of the ones before.
-    pub(crate) fn set(&self, monitors: Vec<MonitorDefinition>) {
-        let _ = self.commands.send(Command::Set(monitors));
+    /// Runs `monitors` from now on, in place of the ones before. `known` is
+    /// what the server holds of their results, when a connection begins.
+    pub(crate) fn set(
+        &self,
+        monitors: Vec<MonitorDefinition>,
+        known: Option<Vec<KnownMonitorResult>>,
+    ) {
+        let _ = self.commands.send(Command::Set {
+            definitions: monitors,
+            known,
+        });
     }
 
     /// Runs the monitors in `ids`, or every one when it is empty, now.
@@ -288,28 +440,23 @@ impl Monitors {
         }
     }
 
-    /// The server hears every monitor's latest result again: it may have
-    /// missed some while the Agent was away.
+    /// A new connection began. Results wait until the server says what it
+    /// holds (or [`GREETING_WAIT`] passes), and refreshes start at a random
+    /// point in their interval, so a fleet that reconnects together doesn't
+    /// refresh together.
     pub(crate) fn connected(&self) {
-        let mut pending = self.outbox.lock();
-        pending.changed = pending.latest.keys().cloned().collect();
-        pending.urgent = true;
-        drop(pending);
+        let phase = Random::new().up_to(refresh_interval());
+        self.outbox.connected(Instant::now(), phase);
         self.outbox.ready.notify_one();
     }
 
     /// Completes with the messages to send the server. Cancel safe.
     pub(crate) async fn next(&self) -> Vec<AgentStatusMessage> {
-        let status = Duration::from_secs(MONITOR_STATUS_INTERVAL_SECONDS);
         loop {
-            let wait = {
-                let mut pending = self.outbox.lock();
-                let since = pending.flushed.map_or(status, |flushed| flushed.elapsed());
-                let waiting = !pending.changed.is_empty() || !pending.actions.is_empty();
-                if waiting && (pending.urgent || since >= status) {
-                    return take(&mut pending);
-                }
-                status.saturating_sub(since).max(Duration::from_secs(1))
+            let now = Instant::now();
+            let wait = match self.outbox.lock().poll(now) {
+                Ok(messages) => return messages,
+                Err(at) => at.map_or(refresh_interval(), |at| at.saturating_duration_since(now)),
             };
             tokio::select! {
                 () = self.outbox.ready.notified() => {}
@@ -318,13 +465,15 @@ impl Monitors {
         }
     }
 
-    /// Messages [`Self::next`] gave that couldn't be sent go again.
+    /// Messages [`Self::next`] gave that couldn't be sent go again, after
+    /// [`RETRY_WAIT`]. The server may not hold their results.
     pub(crate) fn unsent(&self, messages: Vec<AgentStatusMessage>) {
         let mut pending = self.outbox.lock();
         for message in messages {
             match message {
                 AgentStatusMessage::MonitorResults { results } => {
                     for result in results {
+                        pending.held.remove(&result.monitor_id);
                         if pending.latest.contains_key(&result.monitor_id) {
                             pending.changed.insert(result.monitor_id);
                         }
@@ -334,22 +483,36 @@ impl Monitors {
                 _ => {}
             }
         }
+        pending.quiet_until = Some(Instant::now() + RETRY_WAIT);
     }
 }
 
+/// The marked results and every action, as messages; the server holds the
+/// results from then on, as far as the Agent knows.
 fn take(pending: &mut Pending) -> Vec<AgentStatusMessage> {
-    pending.urgent = false;
-    pending.flushed = Some(Instant::now());
-    let results = std::mem::take(&mut pending.changed)
-        .into_iter()
-        .filter_map(|id| pending.latest.get(&id).cloned())
-        .collect::<Vec<_>>();
-    let mut messages = results
-        .chunks(RESULTS_PER_MESSAGE)
-        .map(|chunk| AgentStatusMessage::MonitorResults {
-            results: chunk.to_vec(),
-        })
-        .collect::<Vec<_>>();
+    let mut messages = Vec::new();
+    let mut results = Vec::new();
+    let mut text = 0;
+    for id in std::mem::take(&mut pending.changed) {
+        let Some(result) = pending.latest.get(&id) else {
+            continue;
+        };
+        pending.held.insert(id, Held::of(result));
+        let size = result.monitor_id.len() + result.detail.len() + result.output.len();
+        if !results.is_empty()
+            && (results.len() >= MAX_MONITORS || text + size > MESSAGE_TEXT_BYTES)
+        {
+            messages.push(AgentStatusMessage::MonitorResults {
+                results: std::mem::take(&mut results),
+            });
+            text = 0;
+        }
+        text += size;
+        results.push(result.clone());
+    }
+    if !results.is_empty() {
+        messages.push(AgentStatusMessage::MonitorResults { results });
+    }
     messages.extend(
         std::mem::take(&mut pending.actions)
             .into_iter()
@@ -390,9 +553,8 @@ struct Entry {
     running: Option<u64>,
     memory: Memory,
     failures: u32,
-    passing: Option<bool>,
-    /// Whether its next result goes at once.
-    urgent: bool,
+    /// Whether Check now asked for its next result, which then goes at once.
+    asked: bool,
 }
 
 impl Entry {
@@ -455,12 +617,12 @@ impl Scheduler {
 
     fn handle(&mut self, command: Command) {
         match command {
-            Command::Set(definitions) => self.set(definitions),
+            Command::Set { definitions, known } => self.set(definitions, known),
             Command::CheckNow(ids) => {
                 let now = Instant::now();
                 for (id, entry) in &mut self.entries {
                     if ids.is_empty() || ids.contains(id) {
-                        entry.urgent = true;
+                        entry.asked = true;
                         if entry.running.is_none() {
                             entry.due = now;
                         }
@@ -476,7 +638,7 @@ impl Scheduler {
         }
     }
 
-    fn set(&mut self, definitions: Vec<MonitorDefinition>) {
+    fn set(&mut self, definitions: Vec<MonitorDefinition>, known: Option<Vec<KnownMonitorResult>>) {
         let now = Instant::now();
         let mut previous = std::mem::take(&mut self.entries);
         for definition in definitions.into_iter().take(MAX_MONITORS) {
@@ -488,6 +650,8 @@ impl Scheduler {
                 self.entries.insert(id, entry);
                 continue;
             }
+            // What it found before says nothing about the new definition.
+            self.outbox.forget(&id);
             let mut check = definition.check.clone();
             let invalid = check
                 .validate()
@@ -508,13 +672,15 @@ impl Scheduler {
                     running: None,
                     memory: Memory::default(),
                     failures: 0,
-                    passing: None,
-                    urgent: false,
+                    asked: false,
                 },
             );
         }
         let ids = self.entries.keys().cloned().collect();
         self.outbox.retain(&ids);
+        if let Some(known) = known {
+            self.outbox.known(known);
+        }
         tracing::info!(
             monitors = self.entries.len(),
             "the server set the device's monitors"
@@ -662,8 +828,6 @@ impl Scheduler {
         let Some(entry) = self.entries.get_mut(id) else {
             return;
         };
-        let changed = entry.passing != Some(outcome.passing);
-        entry.passing = Some(outcome.passing);
         entry.failures = if outcome.passing {
             0
         } else {
@@ -673,7 +837,7 @@ impl Scheduler {
         if entry.running.is_none() && entry.due <= Instant::now() {
             entry.due = Instant::now() + entry.interval();
         }
-        let urgent = changed || !outcome.passing || std::mem::take(&mut entry.urgent);
+        let asked = std::mem::take(&mut entry.asked);
         let result = MonitorResult {
             monitor_id: id.to_owned(),
             checked_at_unix_ms: checked_at_ms.max(0) as u64,
@@ -683,7 +847,7 @@ impl Scheduler {
             detail: truncate_text(&outcome.detail, MAX_MONITOR_DETAIL_CHARS).to_owned(),
             output: truncate_text(&outcome.output, MAX_MONITOR_OUTPUT_BYTES).to_owned(),
         };
-        self.outbox.result(result, urgent);
+        self.outbox.result(result, asked);
     }
 }
 
@@ -726,14 +890,47 @@ mod tests {
         }
     }
 
-    fn results(outbox: &Outbox) -> Vec<MonitorResult> {
-        take(&mut outbox.lock())
+    fn results_in(messages: Vec<AgentStatusMessage>) -> Vec<MonitorResult> {
+        messages
             .into_iter()
             .flat_map(|message| match message {
                 AgentStatusMessage::MonitorResults { results } => results,
                 _ => vec![],
             })
             .collect()
+    }
+
+    /// The results marked to go, taken as the coordinator would.
+    fn results(outbox: &Outbox) -> Vec<MonitorResult> {
+        results_in(take(&mut outbox.lock()))
+    }
+
+    /// The IDs of the results that go at `now`, sorted; none when nothing
+    /// goes yet.
+    fn sent_at(outbox: &Outbox, now: Instant) -> Vec<String> {
+        let Ok(messages) = outbox.lock().poll(now) else {
+            return Vec::new();
+        };
+        let mut ids = results_in(messages)
+            .into_iter()
+            .map(|result| result.monitor_id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
+    fn known(
+        id: &str,
+        checked_at_unix_ms: u64,
+        passing: bool,
+        failures: u32,
+    ) -> KnownMonitorResult {
+        KnownMonitorResult {
+            monitor_id: id.into(),
+            checked_at_unix_ms,
+            passing,
+            failures,
+        }
     }
 
     #[test]
@@ -749,45 +946,173 @@ mod tests {
     fn failures_count_up_and_reset_and_changes_go_at_once() {
         let outbox = outbox();
         let (mut scheduler, _receiver) = scheduler(&outbox);
-        scheduler.set(vec![port_monitor("one", 1)]);
+        scheduler.set(vec![port_monitor("one", 1)], None);
         let first = scheduler.entries["one"].due;
         assert!(first <= Instant::now() + MAX_JITTER);
+        let now = Instant::now();
 
-        scheduler.record("one", 1, Outcome::failing("closed"), Memory::default());
-        scheduler.record("one", 2, Outcome::failing("closed"), Memory::default());
-        assert!(outbox.lock().urgent);
+        // The first result goes at once, even passing; the next pass waits.
+        scheduler.record("one", 1, Outcome::passing("open"), Memory::default());
+        assert_eq!(sent_at(&outbox, now), ["one"], "a first result");
+        scheduler.record("one", 2, Outcome::passing("open"), Memory::default());
+        assert!(sent_at(&outbox, now).is_empty(), "a steady pass waits");
+
+        scheduler.record("one", 3, Outcome::failing("closed"), Memory::default());
+        scheduler.record("one", 4, Outcome::failing("closed"), Memory::default());
         let sent = results(&outbox);
         assert_eq!(sent.len(), 1, "only the latest result is kept");
         assert_eq!((sent[0].failures, sent[0].passing), (2, false));
+        // Every failure goes, with its count.
+        scheduler.record("one", 5, Outcome::failing("closed"), Memory::default());
+        assert_eq!(results(&outbox)[0].failures, 3);
 
         scheduler.record(
             "one",
-            3,
+            6,
             Outcome::passing("open").value(1.5),
             Memory::default(),
         );
-        assert!(outbox.lock().urgent, "recovering is a change");
         let sent = results(&outbox);
+        assert_eq!(sent.len(), 1, "recovering goes at once");
         assert_eq!((sent[0].failures, sent[0].value), (0, Some(1.5)));
 
-        scheduler.record("one", 4, Outcome::passing("open"), Memory::default());
-        assert!(!outbox.lock().urgent, "a steady pass waits for the status");
+        scheduler.record("one", 7, Outcome::passing("open"), Memory::default());
+        assert!(sent_at(&outbox, now).is_empty(), "a steady pass waits");
+
+        // Check now's result goes at once, passing or not.
+        scheduler.handle(Command::CheckNow(vec![]));
+        scheduler.record("one", 8, Outcome::passing("open"), Memory::default());
+        assert_eq!(sent_at(&outbox, now), ["one"], "an asked-for result");
+    }
+
+    #[test]
+    fn steady_passes_wait_for_the_refresh() {
+        let outbox = outbox();
+        let (mut scheduler, _receiver) = scheduler(&outbox);
+        let ids = (0..50).map(|n| format!("m{n}")).collect::<Vec<_>>();
+        let definitions = ids.iter().map(|id| port_monitor(id, 1)).collect::<Vec<_>>();
+        let start = Instant::now();
+        let phase = Duration::from_secs(60);
+        outbox.connected(start, phase);
+        // The server holds every one passing.
+        let held = ids.iter().map(|id| known(id, 1, true, 0)).collect();
+        scheduler.set(definitions, Some(held));
+
+        for round in 2..10 {
+            for id in &ids {
+                scheduler.record(id, round, Outcome::passing("open"), Memory::default());
+            }
+        }
+        assert!(
+            matches!(outbox.lock().poll(start + phase - Duration::from_secs(1)), Err(Some(at)) if at == start + phase),
+            "nothing goes before the refresh"
+        );
+
+        // The refresh carries every latest result, together.
+        let messages = outbox.lock().poll(start + phase).unwrap();
+        assert_eq!(messages.len(), 1, "one message");
+        let refreshed = results_in(messages);
+        assert_eq!(refreshed.len(), ids.len());
+        assert!(
+            refreshed
+                .iter()
+                .all(|result| result.checked_at_unix_ms == 9)
+        );
+
+        // The next refresh carries only what the server doesn't hold yet.
+        let next = start + phase + refresh_interval();
+        assert!(matches!(outbox.lock().poll(start + phase), Err(Some(at)) if at == next));
+        scheduler.record("m7", 10, Outcome::passing("open"), Memory::default());
+        assert_eq!(sent_at(&outbox, next), ["m7"]);
+        assert!(sent_at(&outbox, next + refresh_interval()).is_empty());
+    }
+
+    #[test]
+    fn a_reconnect_sends_only_what_the_server_lacks_or_holds_differently() {
+        let outbox = outbox();
+        let (mut scheduler, _receiver) = scheduler(&outbox);
+        let definitions = ["a", "b", "c", "d"]
+            .into_iter()
+            .map(|id| port_monitor(id, 1))
+            .collect::<Vec<_>>();
+        let start = Instant::now();
+        outbox.connected(start, Duration::from_secs(600));
+        scheduler.set(definitions.clone(), Some(Vec::new()));
+        for id in ["a", "b", "d"] {
+            scheduler.record(id, 1, Outcome::passing("open"), Memory::default());
+        }
+        scheduler.record("c", 1, Outcome::failing("closed"), Memory::default());
+        assert_eq!(sent_at(&outbox, start), ["a", "b", "c", "d"]);
+
+        // Another connection whose server holds the same: nothing goes.
+        let again = start + Duration::from_secs(1);
+        outbox.connected(again, Duration::from_secs(600));
+        scheduler.set(
+            definitions.clone(),
+            Some(vec![
+                known("a", 1, true, 0),
+                known("b", 1, true, 0),
+                known("c", 1, false, 1),
+                known("d", 1, true, 0),
+            ]),
+        );
+        assert!(sent_at(&outbox, again).is_empty());
+        scheduler.record("a", 2, Outcome::passing("open"), Memory::default());
+        assert!(sent_at(&outbox, again).is_empty(), "a steady pass waits");
+
+        // One whose server lacks one and holds another differently: those
+        // go, and only once the server has said.
+        let third = again + Duration::from_secs(1);
+        outbox.connected(third, Duration::from_secs(600));
+        assert!(
+            sent_at(&outbox, third).is_empty(),
+            "it waits for the server"
+        );
+        scheduler.set(
+            definitions,
+            Some(vec![
+                known("a", 1, true, 0),
+                known("b", 1, false, 4),
+                known("c", 1, false, 1),
+            ]),
+        );
+        assert_eq!(sent_at(&outbox, third), ["b", "d"]);
+
+        // Without word from the server, news goes once the wait is over.
+        let fourth = third + Duration::from_secs(1);
+        outbox.connected(fourth, Duration::from_secs(600));
+        scheduler.record("c", 2, Outcome::failing("closed"), Memory::default());
+        assert!(sent_at(&outbox, fourth).is_empty());
+        assert_eq!(sent_at(&outbox, fourth + GREETING_WAIT), ["c"]);
+    }
+
+    #[test]
+    fn a_changed_definition_starts_over_and_its_first_result_goes() {
+        let outbox = outbox();
+        let (mut scheduler, _receiver) = scheduler(&outbox);
+        let now = Instant::now();
+        scheduler.set(vec![port_monitor("one", 1)], None);
+        scheduler.record("one", 1, Outcome::passing("open"), Memory::default());
+        assert_eq!(sent_at(&outbox, now), ["one"]);
+        scheduler.set(vec![port_monitor("one", 2)], None);
+        scheduler.record("one", 2, Outcome::passing("open"), Memory::default());
+        assert_eq!(sent_at(&outbox, now), ["one"]);
     }
 
     #[test]
     fn unchanged_monitors_keep_their_state_and_removed_ones_go() {
         let outbox = outbox();
         let (mut scheduler, _receiver) = scheduler(&outbox);
-        scheduler.set(vec![port_monitor("one", 1), port_monitor("two", 2)]);
+        scheduler.set(vec![port_monitor("one", 1), port_monitor("two", 2)], None);
         scheduler.record("one", 1, Outcome::failing("closed"), Memory::default());
         scheduler.record("two", 1, Outcome::failing("closed"), Memory::default());
-        scheduler.set(vec![port_monitor("one", 1), port_monitor("two", 3)]);
+        scheduler.set(vec![port_monitor("one", 1), port_monitor("two", 3)], None);
         assert_eq!(scheduler.entries["one"].failures, 1);
         assert_eq!(
             scheduler.entries["two"].failures, 0,
             "a changed monitor starts over"
         );
-        scheduler.set(vec![port_monitor("two", 3)]);
+        scheduler.set(vec![port_monitor("two", 3)], None);
         let sent = results(&outbox);
         assert!(sent.iter().all(|result| result.monitor_id == "two"));
     }
@@ -801,7 +1126,7 @@ mod tests {
             name: "-x".into(),
             automatic: false,
         };
-        scheduler.set(vec![monitor]);
+        scheduler.set(vec![monitor], None);
         scheduler.start("bad", Instant::now());
         let sent = results(&outbox);
         assert!(!sent[0].passing);
@@ -819,7 +1144,7 @@ mod tests {
         let (mut scheduler, receiver) = scheduler(&outbox);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        scheduler.set(vec![port_monitor("open", port)]);
+        scheduler.set(vec![port_monitor("open", port)], None);
         scheduler.handle(Command::CheckNow(vec![]));
         scheduler.start_due();
         assert_eq!(scheduler.runs.len(), 1);
@@ -852,8 +1177,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_coordinator_hears_changes_at_once_and_everything_on_connect() {
+    async fn the_coordinator_hears_news_once_the_server_says_and_refused_results_again() {
         let monitors = Monitors::new(ExecutionMode::Console);
+        monitors.connected();
         monitors.outbox.result(
             MonitorResult {
                 monitor_id: "one".into(),
@@ -864,22 +1190,19 @@ mod tests {
                 detail: "down".into(),
                 output: String::new(),
             },
-            true,
+            false,
         );
+        // The server holds nothing, so the failure is news.
+        monitors.outbox.known(Vec::new());
         let messages = tokio::time::timeout(Duration::from_secs(5), monitors.next())
             .await
             .unwrap();
-        assert_eq!(messages.len(), 1);
+        assert_eq!(results_in(messages.clone()).len(), 1);
+
+        // Messages the socket refused go again, after a wait.
         monitors.unsent(messages);
-        assert_eq!(monitors.outbox.lock().changed.len(), 1);
-        monitors.outbox.lock().changed.clear();
-        monitors.connected();
-        let messages = tokio::time::timeout(Duration::from_secs(5), monitors.next())
-            .await
-            .unwrap();
-        assert!(matches!(
-            &messages[..],
-            [AgentStatusMessage::MonitorResults { results }] if results.len() == 1
-        ));
+        let now = Instant::now();
+        assert!(sent_at(&monitors.outbox, now).is_empty());
+        assert_eq!(sent_at(&monitors.outbox, now + RETRY_WAIT), ["one"]);
     }
 }

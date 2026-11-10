@@ -161,8 +161,14 @@ pub enum AgentCommand {
     },
     /// Replaces the monitors the Agent runs; see [`crate::MonitorDefinition`].
     /// A monitor whose definition didn't change keeps its count of failures.
+    /// When the Agent connects, `known` says what the server holds of each
+    /// monitor's latest result (nothing for a monitor it leaves out), and
+    /// the Agent answers with only the results that differ; later sets
+    /// leave `known` out.
     SetMonitors {
         monitors: Vec<crate::MonitorDefinition>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        known: Option<Vec<crate::KnownMonitorResult>>,
     },
     /// Runs the monitors now, or all of them when `monitor_ids` is empty, and
     /// reports their results.

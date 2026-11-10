@@ -587,8 +587,8 @@ impl Coordinator {
                     self.applications.run(&self.config, self.mode, run);
                     return Ok(ControlFlow::Continue(()));
                 }
-                AgentCommand::SetMonitors { monitors } => {
-                    self.monitors.set(monitors);
+                AgentCommand::SetMonitors { monitors, known } => {
+                    self.monitors.set(monitors, known);
                     return Ok(ControlFlow::Continue(()));
                 }
                 AgentCommand::CheckMonitors { monitor_ids } => {

@@ -7,11 +7,16 @@
 //! targets, the device's company or tags, a script or a rule owner's access
 //! changed. A presence change looks again at the devices it names; a rule
 //! change, a deleted tag and every [`RESYNC_INTERVAL`] look at every
-//! connected device, at most once per [`FULL_PASS_SPACING`]. Agents report
-//! results ([`reported`]); the server keeps the latest per monitor and
-//! device, and raises and resolves the rule's alerts through the alert
-//! engine. An offline device reports nothing, so its alerts stay as they
-//! are.
+//! connected device, at most once per [`FULL_PASS_SPACING`]. The monitors
+//! sent on connecting carry what the server holds of their latest results,
+//! so the Agent sends only those that differ.
+//!
+//! Agents report results ([`reported`]): failures and changes at once,
+//! passes of passing monitors together every
+//! [`meshrmm_protocol_types::MONITOR_REFRESH_INTERVAL_SECONDS`]. The server
+//! keeps the latest per monitor and device, and raises and resolves the
+//! rule's alerts through the alert engine, a message's results together. An
+//! offline device reports nothing, so its alerts stay as they are.
 pub mod remediation;
 pub mod settings;
 pub mod store;
@@ -87,7 +92,7 @@ struct Inner {
     /// Devices that get their monitors at the next pass even if unchanged.
     forced: Mutex<HashSet<String>>,
     /// What each connected device was last sent.
-    sent: Mutex<HashMap<String, u64>>,
+    sent: Mutex<HashMap<String, Offer>>,
     rules: Mutex<Option<(Instant, Arc<RuleSet>)>>,
     full_passes: AtomicU64,
 }
@@ -134,6 +139,31 @@ impl Engine {
     fn resend(&self, device_id: &str) {
         lock(&self.inner.forced).insert(device_id.to_owned());
         self.inner.wake.notify_one();
+    }
+
+    /// The IDs of the monitors the connected device was last sent, if it
+    /// was sent any on this connection.
+    fn offered(&self, device_id: &str) -> Option<Arc<HashSet<String>>> {
+        lock(&self.inner.sent)
+            .get(device_id)
+            .map(|offer| Arc::clone(&offer.monitor_ids))
+    }
+}
+
+/// The monitors a connected device was last sent.
+#[derive(Debug)]
+struct Offer {
+    fingerprint: u64,
+    /// Their IDs: the monitors whose results the device reports.
+    monitor_ids: Arc<HashSet<String>>,
+}
+
+impl Offer {
+    fn of(monitors: &[MonitorDefinition]) -> Self {
+        Self {
+            fingerprint: fingerprint(monitors),
+            monitor_ids: Arc::new(monitors.iter().map(|monitor| monitor.id.clone()).collect()),
+        }
     }
 }
 
@@ -322,30 +352,46 @@ async fn sync_device(state: &AppState, device_id: &str) -> anyhow::Result<()> {
 /// what it was last sent, or if `forced`.
 fn offer(state: &AppState, catalog: &Catalog, device_id: &str, forced: bool) {
     let monitors = catalog.definitions(device_id);
-    let print = fingerprint(&monitors);
+    let offer = Offer::of(&monitors);
     let previous = lock(&state.monitors.inner.sent)
         .get(device_id)
-        .copied()
-        .unwrap_or_else(|| fingerprint(&[]));
-    if print == previous && !forced {
+        .map_or_else(|| fingerprint(&[]), |offer| offer.fingerprint);
+    if offer.fingerprint == previous && !forced {
         return;
     }
     let count = monitors.len();
-    if state
-        .agents
-        .send(device_id, AgentCommand::SetMonitors { monitors })
-    {
+    // A connected Agent has said what it found already.
+    let command = AgentCommand::SetMonitors {
+        monitors,
+        known: None,
+    };
+    if state.agents.send(device_id, command) {
         tracing::info!(device_id, monitors = count, "sent the device its monitors");
-        lock(&state.monitors.inner.sent).insert(device_id.to_owned(), print);
+        lock(&state.monitors.inner.sent).insert(device_id.to_owned(), offer);
     }
 }
 
-/// The monitors to send an Agent that just connected, if it has any.
+/// The monitors to send an Agent that just connected, if it has any, with
+/// what the server holds of their latest results, so the Agent sends only
+/// the results that differ. A device without monitors costs no more reads.
 pub async fn greeting(state: &AppState, device_id: &str) -> anyhow::Result<Option<AgentCommand>> {
     let catalog = Catalog::load(state, Some(device_id)).await?;
     let monitors = catalog.definitions(device_id);
-    lock(&state.monitors.inner.sent).insert(device_id.to_owned(), fingerprint(&monitors));
-    Ok((!monitors.is_empty()).then_some(AgentCommand::SetMonitors { monitors }))
+    let offer = Offer::of(&monitors);
+    let ids = Arc::clone(&offer.monitor_ids);
+    lock(&state.monitors.inner.sent).insert(device_id.to_owned(), offer);
+    if monitors.is_empty() {
+        return Ok(None);
+    }
+    let known = store::known(&mut &state.database, device_id)
+        .await?
+        .into_iter()
+        .filter(|known| ids.contains(&known.monitor_id))
+        .collect();
+    Ok(Some(AgentCommand::SetMonitors {
+        monitors,
+        known: Some(known),
+    }))
 }
 
 /// A shared script a monitor runs.
@@ -360,10 +406,18 @@ struct Script {
 #[derive(Debug)]
 struct RuleSet {
     rules: Vec<(Rule, Option<String>)>,
+    /// Where each rule is in `rules`, by ID.
+    positions: HashMap<String, usize>,
     scripts: HashMap<String, Script>,
 }
 
 impl RuleSet {
+    fn rule(&self, id: &str) -> Option<&Rule> {
+        self.positions
+            .get(id)
+            .map(|position| &self.rules[*position].0)
+    }
+
     async fn load(executor: &mut impl Executor) -> db::Result<Self> {
         let mut rules = Vec::new();
         for rule in rules::load(executor, None).await? {
@@ -405,7 +459,16 @@ impl RuleSet {
                 })
                 .collect()
         };
-        Ok(Self { rules, scripts })
+        let positions = rules
+            .iter()
+            .enumerate()
+            .map(|(position, (rule, _))| (rule.id.clone(), position))
+            .collect();
+        Ok(Self {
+            rules,
+            positions,
+            scripts,
+        })
     }
 }
 
@@ -650,6 +713,12 @@ fn storable(text: &str, max_bytes: usize) -> String {
 /// Takes in the results a device's Agent reported: keeps each one, and
 /// raises or resolves its rule's alert. Results for monitors that no longer
 /// apply make the server send the device its monitors again.
+///
+/// A message's results are taken together: matched against the monitors
+/// the device was sent and the rules at hand, kept in one statement, and
+/// judged against the device's unresolved alerts of those rules, read in
+/// one. A message of passes with no alert open costs those two statements
+/// and no alert events, however many results it carries.
 pub async fn reported(state: &AppState, device_id: &str, results: Vec<MonitorResult>) {
     if let Err(error) = take_results(state, device_id, results, now_ms()).await {
         tracing::warn!(
@@ -667,17 +736,28 @@ async fn take_results(
     now: i64,
 ) -> anyhow::Result<()> {
     let mut database = &state.database;
-    let catalog = Catalog::load(state, Some(device_id)).await?;
-    let applicable = catalog
-        .applicable(device_id)
-        .into_iter()
-        .filter(|(_, definition)| definition.is_ok())
-        .map(|(rule, _)| (rule.id.as_str(), rule))
-        .collect::<HashMap<_, _>>();
+    let rules = state.monitors.rules(&mut database).await?;
+    // What the device was sent on this connection is what it runs; only
+    // without that are its row, tags and platform read to decide.
+    let offered = match state.monitors.offered(device_id) {
+        Some(offered) => offered,
+        None => Arc::new(
+            Catalog::load(state, Some(device_id))
+                .await?
+                .definitions(device_id)
+                .into_iter()
+                .map(|definition| definition.id)
+                .collect(),
+        ),
+    };
     let mut stale = false;
-    let mut states = Vec::new();
+    let mut judged: Vec<(&Rule, MonitorState)> = Vec::new();
     for result in results.into_iter().take(MAX_MONITORS) {
-        let Some(rule) = applicable.get(result.monitor_id.as_str()) else {
+        let rule = offered
+            .contains(&result.monitor_id)
+            .then(|| rules.rule(&result.monitor_id))
+            .flatten();
+        let Some(rule) = rule else {
             stale = true;
             continue;
         };
@@ -699,34 +779,56 @@ async fn take_results(
             detail,
             output: storable(&result.output, MAX_MONITOR_OUTPUT_BYTES),
         };
-        store::upsert(&mut database, &monitor_state).await?;
-        judge(state, rule, &monitor_state, now).await?;
-        states.push(monitor_state);
+        // A monitor's later result in the same message stands for it.
+        match judged.iter_mut().find(|(judged, _)| judged.id == rule.id) {
+            Some((_, earlier)) => *earlier = monitor_state,
+            None => judged.push((rule, monitor_state)),
+        }
     }
     if stale {
         state.monitors.resend(device_id);
     }
-    if !states.is_empty() {
-        state.alerts.publish(AlertEvent::MonitorUpdate {
-            device_id: device_id.to_owned(),
-            states,
-        });
+    if judged.is_empty() {
+        return Ok(());
     }
+    let states = judged
+        .iter()
+        .map(|(_, monitor_state)| monitor_state.clone())
+        .collect::<Vec<_>>();
+    store::upsert(&mut database, &states).await?;
+    let rule_ids = judged
+        .iter()
+        .map(|(rule, _)| rule.id.as_str())
+        .collect::<Vec<_>>();
+    let mut open = alert_store::unresolved_of_rules(&mut database, device_id, &rule_ids)
+        .await?
+        .into_iter()
+        .map(|alert| (alert.rule_id.clone(), alert))
+        .collect::<HashMap<_, _>>();
+    for (rule, monitor_state) in &judged {
+        judge(state, rule, monitor_state, open.remove(&rule.id), now).await?;
+    }
+    state.alerts.publish(AlertEvent::MonitorUpdate {
+        device_id: device_id.to_owned(),
+        states,
+    });
     Ok(())
 }
 
-/// Raises the rule's alert once enough checks in a row failed, keeps it
-/// describing the latest failure, and resolves it once a check passes.
+/// Raises the rule's alert once enough checks in a row failed, keeps its
+/// unresolved alert (`open`) describing the latest failure, and resolves it
+/// once a check passes. A pass, or a failure below the threshold, with no
+/// alert open costs nothing.
 async fn judge(
     state: &AppState,
     rule: &Rule,
     result: &MonitorState,
+    open: Option<alert_store::Alert>,
     now: i64,
 ) -> anyhow::Result<()> {
     let threshold = rule.monitor.as_ref().map_or(1, |monitor| monitor.failures);
     let alerting = !result.passing && result.failures >= i64::from(threshold);
     let mut database = &state.database;
-    let open = alert_store::unresolved_for(&mut database, &rule.id, &result.device_id, "").await?;
     match open {
         None if alerting => {
             let raise = Raise {

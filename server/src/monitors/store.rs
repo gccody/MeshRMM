@@ -1,4 +1,5 @@
 //! Each monitor's latest result on each device.
+use meshrmm_protocol_types::KnownMonitorResult;
 use sea_query::{Expr, ExprTrait, OnConflict, Order, Query};
 use serde::Serialize;
 
@@ -38,33 +39,40 @@ fn select() -> sea_query::SelectStatement {
         .to_owned()
 }
 
-pub async fn upsert(executor: &mut impl Executor, state: &MonitorState) -> db::Result<()> {
+/// Keeps `states` as their monitors' latest results, in one statement. Each
+/// monitor and device appears at most once.
+pub async fn upsert(executor: &mut impl Executor, states: &[MonitorState]) -> db::Result<()> {
+    if states.is_empty() {
+        return Ok(());
+    }
+    let mut insert = Query::insert();
+    insert.into_table(MonitorStates::Table).columns([
+        MonitorStates::RuleId,
+        MonitorStates::DeviceId,
+        MonitorStates::CheckedAt,
+        MonitorStates::ReceivedAt,
+        MonitorStates::Passing,
+        MonitorStates::Failures,
+        MonitorStates::Value,
+        MonitorStates::Detail,
+        MonitorStates::Output,
+    ]);
+    for state in states {
+        insert.values_panic([
+            state.rule_id.as_str().into(),
+            state.device_id.as_str().into(),
+            state.checked_at.into(),
+            state.received_at.into(),
+            state.passing.into(),
+            state.failures.into(),
+            state.value.into(),
+            state.detail.as_str().into(),
+            state.output.as_str().into(),
+        ]);
+    }
     executor
         .execute(
-            &Query::insert()
-                .into_table(MonitorStates::Table)
-                .columns([
-                    MonitorStates::RuleId,
-                    MonitorStates::DeviceId,
-                    MonitorStates::CheckedAt,
-                    MonitorStates::ReceivedAt,
-                    MonitorStates::Passing,
-                    MonitorStates::Failures,
-                    MonitorStates::Value,
-                    MonitorStates::Detail,
-                    MonitorStates::Output,
-                ])
-                .values_panic([
-                    state.rule_id.as_str().into(),
-                    state.device_id.as_str().into(),
-                    state.checked_at.into(),
-                    state.received_at.into(),
-                    state.passing.into(),
-                    state.failures.into(),
-                    state.value.into(),
-                    state.detail.as_str().into(),
-                    state.output.as_str().into(),
-                ])
+            &insert
                 .on_conflict(
                     OnConflict::columns([MonitorStates::RuleId, MonitorStates::DeviceId])
                         .update_columns([
@@ -82,6 +90,39 @@ pub async fn upsert(executor: &mut impl Executor, state: &MonitorState) -> db::R
         )
         .await?;
     Ok(())
+}
+
+/// What the server holds of each monitor's latest result on a device, for
+/// its Agent to compare with its own when it connects.
+pub async fn known(
+    executor: &mut impl Executor,
+    device_id: &str,
+) -> db::Result<Vec<KnownMonitorResult>> {
+    let rows = executor
+        .fetch_all::<(String, i64, bool, i64), _>(
+            &Query::select()
+                .columns([
+                    MonitorStates::RuleId,
+                    MonitorStates::CheckedAt,
+                    MonitorStates::Passing,
+                    MonitorStates::Failures,
+                ])
+                .from(MonitorStates::Table)
+                .and_where(Expr::col(MonitorStates::DeviceId).eq(device_id))
+                .to_owned(),
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(monitor_id, checked_at, passing, failures)| KnownMonitorResult {
+                monitor_id,
+                checked_at_unix_ms: u64::try_from(checked_at).unwrap_or(0),
+                passing,
+                failures: u32::try_from(failures).unwrap_or(u32::MAX),
+            },
+        )
+        .collect())
 }
 
 /// A device's monitor results.
