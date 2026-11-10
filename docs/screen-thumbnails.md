@@ -13,7 +13,7 @@ Agent coordinator (Session 0)
        GDI halftone scaling of the primary display to at most 640x400
        Windows Imaging Component JPEG, quality 0.7 (normally 20–80 KiB)
   -> PUT /v1/agents/{device_id}/thumbnail   (Agent credential, HTTPS)
-  -> server -> {data_dir}/thumbnails/{device_id}.jpg
+  -> server -> {data_dir}/thumbnails/{first two digits of device_id}/{device_id}.jpg
 Website tile on screen
   -> GET /v1/agents/{device_id}/thumbnail  (session cookie, If-None-Match)
   -> server -> 200 with the image, 304, or 204 if none
@@ -22,6 +22,18 @@ Website tile on screen
 Images never cross the Agent's control connection or the presence stream,
 and no event announces a new image. The server keeps only the latest image of
 each device, replacing it in one step, and reading it needs `devices.view`.
+
+A large fleet sends hundreds of images a second, so the server keeps the
+cost of each one small:
+
+- An image is renamed into place without waiting for the disk to confirm it.
+  A power cut can lose the latest images, or leave an empty one, until each
+  Agent sends its next; a crash of the server alone cannot.
+- Images are spread over 256 folders named by the first two hex digits of
+  the device ID, so 100,000 devices make folders of about 400 files.
+- The ETag comes from the file's modification time, size and inode rather
+  than its contents, so a 304 costs one look at the file's metadata and no
+  read. Every upload changes it, even one of the same image.
 
 Bandwidth is kept down at each step:
 
@@ -76,6 +88,7 @@ compared with the image the server has.
 
 ## Setup
 
-Nothing to set up: the server creates `thumbnails/` in its data directory.
+Nothing to set up: the server creates `thumbnails/` in its data directory,
+and each of its folders as the first image for it arrives.
 Back it up with the rest of the data directory, or don't; each online device
 uploads its image again within the hour.

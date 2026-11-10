@@ -859,7 +859,14 @@ async fn maintenance_removes_files_nothing_refers_to() {
         let deleted = app.enroll(&mut admin, "deleted").await;
         let storage = &app.state.storage;
         for agent in [&live, &deleted] {
-            std::fs::write(storage.thumbnail(&agent.device_id), b"\xff\xd8\xffjpeg").unwrap();
+            storage
+                .write(
+                    storage.thumbnail(&agent.device_id),
+                    bytes::Bytes::from_static(b"\xff\xd8\xffjpeg"),
+                    meshrmm_server::storage::Durability::Replaceable,
+                )
+                .await
+                .unwrap();
         }
         // As if removing the deleted device's image had failed.
         app.db()
