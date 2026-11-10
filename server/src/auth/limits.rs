@@ -99,18 +99,6 @@ impl RateLimiter {
         self.hit_at(key, Instant::now())
     }
 
-    /// Whether the key may try again, without counting an attempt: for
-    /// limits where only failures count and successes may run in parallel.
-    pub fn check(&self, key: &str) -> Result<(), u64> {
-        let now = Instant::now();
-        let mut keys = self.lock();
-        let Some(entry) = keys.entries.get_mut(&*bounded(key)) else {
-            return Ok(());
-        };
-        Self::expire(&mut entry.times, now, self.window);
-        self.allowed(&entry.times, now)
-    }
-
     /// Hands back the key's most recent attempt.
     pub fn refund(&self, key: &str) {
         let key = bounded(key);
@@ -454,18 +442,6 @@ mod tests {
     }
 
     #[test]
-    fn checking_counts_nothing() {
-        let limiter = RateLimiter::new(2, Duration::from_secs(60));
-        assert!(limiter.check("a").is_ok());
-        assert!(limiter.hit("a").is_ok());
-        assert!(limiter.check("a").is_ok());
-        assert!(limiter.check("a").is_ok());
-        assert!(limiter.hit("a").is_ok());
-        assert!(matches!(limiter.check("a"), Err(seconds) if seconds > 0));
-        assert!(limiter.check("b").is_ok());
-    }
-
-    #[test]
     fn refunded_attempts_dont_count() {
         let limiter = RateLimiter::new(1, Duration::from_secs(60));
         let start = Instant::now();
@@ -595,9 +571,14 @@ mod tests {
         // A refused attempt is a hit too: "a" is now the latest.
         assert!(limiter.hit_at("a", start + Duration::from_secs(3)).is_err());
         assert!(limiter.hit_at("d", start + Duration::from_secs(4)).is_ok());
-        assert!(limiter.check("a").is_err() && limiter.check("c").is_err());
-        assert!(limiter.check("b").is_ok());
-        assert_eq!(limiter.lock().entries.len(), 3);
+        // "b", the least recently hit, made room.
+        let keys = limiter.lock();
+        assert!(
+            ["a", "c", "d"]
+                .iter()
+                .all(|key| keys.entries.contains_key(*key))
+        );
+        assert_eq!(keys.entries.len(), 3);
     }
 
     #[test]
@@ -606,12 +587,11 @@ mod tests {
         let long = "a".repeat(100_000);
         assert!(limiter.hit(&long).is_ok());
         assert!(limiter.hit(&long).is_err());
-        assert!(limiter.check(&long).is_err());
         assert!(limiter.hit(&"a".repeat(99_999)).is_ok());
         limiter.refund(&long);
         assert!(limiter.hit(&long).is_ok());
         limiter.clear(&long);
-        assert!(limiter.check(&long).is_ok());
+        assert!(limiter.hit(&long).is_ok());
         assert!(
             limiter
                 .lock()

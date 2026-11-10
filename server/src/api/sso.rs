@@ -19,7 +19,7 @@ use super::{double_option, require_administrator};
 use crate::{
     audit::{self, Actor, Target},
     auth::{
-        Authorized,
+        Authorized, PendingSso, devices,
         limits::ip_key,
         oidc::{self, Identity, MAX_GROUP_NAME_LENGTH, Provider},
         session::{self, AuthMethod, Client},
@@ -179,7 +179,8 @@ async fn begin(
     ip: std::net::IpAddr,
     next: Option<&str>,
 ) -> Result<Response, Failure> {
-    if state.auth.ceremony_starts.hit(&ip_key(ip)).is_err() {
+    let ip_key = ip_key(ip);
+    if state.auth.ceremony_starts.hit(&ip_key).is_err() {
         return Err(Failure::RateLimited);
     }
     let provider = oidc::enabled(&mut &state.database)
@@ -191,7 +192,12 @@ async fn begin(
         &provider,
         &state.sso_discovery,
         safe_next(next),
-        |pending| state.auth.sso_sign_ins.start(pending),
+        |sign_in| {
+            state
+                .auth
+                .sso_sign_ins
+                .start(PendingSso { ip_key, sign_in })
+        },
     )
     .await
     .map_err(|error| {
@@ -220,7 +226,8 @@ pub struct CallbackQuery {
 }
 
 /// `GET /v1/auth/sso/callback`: where the provider sends the browser back.
-/// Signs in and continues to the page the sign-in started from.
+/// Signs in and continues to the page the sign-in started from, giving the
+/// browser a device cookie for the account as the other sign-ins do.
 pub async fn callback(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
@@ -228,12 +235,29 @@ pub async fn callback(
     Query(query): Query<CallbackQuery>,
 ) -> Response {
     match finish(&state, ip, &headers, query).await {
-        Ok((cookie, next)) => see_other(
+        Ok(SignedIn {
+            cookie,
+            email,
+            next,
+        }) => see_other(
             &format!("{}{next}", state.config.public_origin()),
-            &[cookie, binding_cookie("", 0)],
+            &[
+                cookie,
+                devices::cookie(&state.instance_key, &email),
+                binding_cookie("", 0),
+            ],
         ),
         Err(failure) => to_login(&state, failure),
     }
+}
+
+/// A completed SSO sign-in.
+struct SignedIn {
+    /// The session cookie.
+    cookie: HeaderValue,
+    /// The account's email address, normalized as stored.
+    email: String,
+    next: String,
 }
 
 async fn finish(
@@ -241,8 +265,11 @@ async fn finish(
     ip: std::net::IpAddr,
     headers: &HeaderMap,
     query: CallbackQuery,
-) -> Result<(HeaderValue, String), Failure> {
-    let pending = query
+) -> Result<SignedIn, Failure> {
+    let PendingSso {
+        ip_key,
+        sign_in: pending,
+    } = query
         .state
         .as_deref()
         .and_then(|token| state.auth.sso_sign_ins.take(token))
@@ -327,7 +354,14 @@ async fn finish(
     transaction.commit().await?;
     // The user's groups may have changed their roles.
     state.presence.recheck_access();
-    Ok((cookie, next))
+    // Its prompt is gone and someone signed in: not a start to hold
+    // against the address it came from.
+    state.auth.ceremony_starts.refund(&ip_key);
+    Ok(SignedIn {
+        cookie,
+        email: user.email,
+        next,
+    })
 }
 
 /// The account `identity` signs in to: the one linked to its subject, or
