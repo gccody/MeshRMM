@@ -106,6 +106,10 @@ input.
   starts.
 - `http`: the router, client IP resolution, same-origin checks and security
   headers. `website`: the embedded pages.
+- `serve`: the listener, on axum-server, in each TLS mode: socket options,
+  the timeouts for a TLS handshake and for HTTP to start, hyper's
+  header-read timeout and HTTP/2 pings, TLS session tickets, and certificate
+  file reloads. See [connections](self-hosting.md#connections).
 - `auth`: passwords (Argon2id), TOTP and recovery codes, passkeys, OIDC and
   server-side sessions. `scim`: SCIM 2.0 users and groups. `rbac`: the
   permission list and roles. `audit`, `mail`.

@@ -56,6 +56,7 @@ docker volume create meshrmm-data
 docker run -d --name meshrmm --restart unless-stopped \
   -p 443:443/tcp -p 3478:3478/udp -p 49160-49200:49160-49200/udp \
   -v meshrmm-data:/var/lib/meshrmm \
+  --ulimit nofile=1048576:1048576 \
   -e MESHRMM_PUBLIC_URL=https://rmm.example.com \
   -e MESHRMM_TLS__MODE=acme \
   -e MESHRMM_TLS__CONTACT_EMAIL=admin@example.com \
@@ -70,6 +71,8 @@ services:
   meshrmm:
     image: ghcr.io/gccody/meshrmm-server:latest
     restart: unless-stopped
+    ulimits:
+      nofile: 1048576
     ports:
       - "443:443/tcp"
       - "3478:3478/udp"
@@ -85,6 +88,9 @@ services:
 volumes:
   meshrmm-data:
 ```
+
+The `nofile` limit lets the server hold a socket for each Agent; Docker's
+default lets it open only 1,024 files. See [connections](#connections).
 
 To check a configuration without starting the server, run the same container
 with `check-config` as its command:
@@ -118,7 +124,8 @@ with `SHA256SUMS` beside it. The tarball's `install.sh` installs:
 - `/usr/libexec/meshrmm/rcodesign`, which signs the macOS builds if you
   [set that up](#sign-the-macos-builds);
 - a systemd unit, `meshrmm-server.service`, which runs the server as the
-  `meshrmm` user with most of the file system read-only;
+  `meshrmm` user with most of the file system read-only, and lets it open
+  1,048,576 files (`LimitNOFILE`), enough for a socket per Agent;
 - `/etc/meshrmm/server.toml`, copied from the example on a new install.
 
 ```sh
@@ -609,6 +616,38 @@ Don't run an older release against a database a newer one has migrated: the
 server refuses to start, and `check-config` reports the mismatch. To go back,
 restore the backup taken before the upgrade.
 
+## Connections
+
+Each Agent keeps one WebSocket open to the server, and every connection,
+from Agents, browsers, terminals, file transfers, TURN relays and the
+database alike, takes one of the process's open files. Past the limit the
+server can accept no more, and logs `could not accept a connection` with
+`Too many open files`, at most once every 10 seconds. The systemd unit
+and the Docker examples above set the limit to 1,048,576. If it is below
+65,536 when the server starts, the server logs a warning naming it.
+
+The server closes connections that stall before they make a request:
+
+- 10 seconds for the TLS handshake;
+- 15 seconds for HTTP to start once the connection is open, and 15 seconds
+  for a request's headers to arrive. An HTTP/1 connection that sends no new
+  request for 15 seconds is closed too, so a reverse proxy that keeps
+  connections to the server open between requests should let them go
+  sooner;
+- HTTP/2 connections are pinged every 30 seconds and closed if an answer
+  doesn't come within 20.
+
+Nothing limits how long a request may take once its headers are in, so
+WebSockets, the event stream, and large downloads and uploads run as long
+as they need. TCP keep-alive probes a connection that has been silent for a
+minute, and closes it after three unanswered probes 10 seconds apart, which
+finds a peer that vanished without closing its connection.
+
+Agents and viewers that reconnect resume their TLS session instead of
+making a full handshake, with tickets whose keys the server keeps in memory
+and changes every 6 hours. After a restart each client makes one full
+handshake again.
+
 ## Monitoring and logs
 
 - `GET /healthz` returns `200 {"status":"ok","schema_version":N}` while the
@@ -633,6 +672,8 @@ restore the backup taken before the upgrade.
   this server and port 443 must reach it from the internet. In `files` mode,
   check that the file has the full chain. In every mode the certificate's
   name must match `public_url`, and whatever terminates TLS must offer TLS 1.3.
+  If the log says `could not accept a connection` with `Too many open
+  files`, raise the open-file limit (see [connections](#connections)).
 - **Sign-in or saving settings fails with 403.** The page's origin isn't
   `public_url`'s origin. Open the server by exactly that address, and make
   sure a reverse proxy passes `Host` and `Origin` through.

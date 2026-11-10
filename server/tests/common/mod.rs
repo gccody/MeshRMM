@@ -180,12 +180,17 @@ pub struct Server {
 
 impl Server {
     async fn start(router: axum::Router) -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // The server's own listener, so every test runs under its timeouts.
+        let listener = meshrmm_server::serve::Listener::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
         let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
-            axum::serve(
+            meshrmm_server::serve::serve_http(
                 listener,
-                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                router,
+                axum_server::Handle::new(),
+                meshrmm_server::serve::Timeouts::default(),
             )
             .await
             .unwrap();

@@ -39,7 +39,7 @@ pub mod users;
 pub mod wake;
 pub mod website;
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use anyhow::Context;
 use axum_server::Handle;
@@ -126,6 +126,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         version = meshrmm_self_update::CURRENT_VERSION,
         "starting the MeshRMM server"
     );
+    serve::warn_about_open_file_limit();
     let state = prepare(config).await?;
     state.downloads.warn_about_problems();
     state.downloads.start_signing();
@@ -152,7 +153,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let automating = automation::spawn(state.clone());
     let updating = updates::spawn(state.clone());
     let applying = applications::spawn(state.clone());
-    let handle = Handle::<SocketAddr>::new();
+    let handle = Handle::<serve::Endpoint>::new();
     tokio::spawn({
         let handle = handle.clone();
         async move {
@@ -208,15 +209,9 @@ pub async fn check(config: Config) -> anyhow::Result<()> {
         key_path,
     } = &config.tls
     {
-        axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "could not load the certificate {} and key {}",
-                    cert_path.display(),
-                    key_path.display()
-                )
-            })?;
+        serve::CertificateFiles::new(cert_path.clone(), key_path.clone())?
+            .load()
+            .await?;
     }
     let downloads = Downloads::load(&config).await?;
     match downloads.version() {

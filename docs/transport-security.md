@@ -26,6 +26,13 @@ so one session cache, for the life of the process, and close each connection
 after its upload. There is no certificate pinning. Handshake tests against local
 TLS 1.2-only servers cover each client.
 
+In `acme` and `files` mode the server issues stateless TLS session
+tickets, so a client that reconnects resumes its session: the handshake
+still exchanges fresh keys, but skips the certificate and its signature.
+The ticket keys are random, kept only in memory, and replaced every 6 hours;
+a ticket is good for 12 hours at most. The server accepts no early (0-RTT)
+data. `server/tests/tls.rs` checks that a second connection resumes.
+
 ## The peer connection
 
 Screen, audio, input, clipboard, files and chat use WebRTC data channels,
