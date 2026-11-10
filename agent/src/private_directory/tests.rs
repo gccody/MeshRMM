@@ -268,3 +268,130 @@ fn installed_files_inherit_their_new_directory_security() {
     remove(&install);
     remove(&private);
 }
+
+/// A folder for `name` directly under ProgramData, where any user may create one.
+fn program_data_scratch(name: &str) -> PathBuf {
+    let path = PathBuf::from(std::env::var_os("ProgramData").unwrap())
+        .join(format!("meshrmm-{name}-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir(&path).unwrap();
+    path
+}
+
+fn untrusted_path(result: anyhow::Result<()>) -> PathBuf {
+    let error = result.unwrap_err();
+    error
+        .downcast_ref::<UntrustedPath>()
+        .unwrap_or_else(|| panic!("{error:#}"))
+        .path
+        .clone()
+}
+
+#[test]
+fn trusts_programs_that_windows_accounts_control() {
+    let system32 = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32");
+    ensure_trusted_program(&system32, &system32.join("cmd.exe")).unwrap();
+    // Not a program inside the folder, or not plainly on a local disk.
+    assert!(ensure_trusted_program(&system32, &system32).is_err());
+    assert!(ensure_trusted_program(&system32.join("drivers"), &system32.join("cmd.exe")).is_err());
+    assert!(ensure_trusted_program(&system32, &system32.join(r"..\System32\cmd.exe")).is_err());
+    assert!(
+        ensure_trusted_program(
+            Path::new(r"\localhost\C$\Windows\System32"),
+            Path::new(r"\localhost\C$\Windows\System32\cmd.exe"),
+        )
+        .is_err()
+    );
+    let missing = system32.join("meshrmm-no-such-program.exe");
+    assert_eq!(
+        untrusted_path(ensure_trusted_program(&system32, &missing)),
+        missing
+    );
+}
+
+#[test]
+fn refuses_a_program_a_user_planted_under_program_data() {
+    // As a standard user can plant Chocolatey on a computer without it.
+    let install = program_data_scratch("planted");
+    let bin = install.join("bin");
+    let program = bin.join("choco.exe");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::write(&program, b"MZ").unwrap();
+    let result = ensure_trusted_program(&install, &program);
+    if elevated() {
+        // An administrator's folders still pass down the Users grant to create entries.
+        assert_eq!(untrusted_path(result), bin);
+    } else {
+        assert_eq!(untrusted_path(result), program);
+    }
+    remove(&install);
+}
+
+#[test]
+fn refuses_a_junction_to_trusted_programs() {
+    // A planted junction must not borrow System32's security.
+    let root = scratch("program-junction");
+    let link = root.join("chocolatey");
+    let system32 = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32");
+    let status = std::process::Command::new("cmd.exe")
+        .args(["/D", "/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(&system32)
+        .output()
+        .unwrap()
+        .status;
+    assert!(status.success());
+    assert_eq!(
+        untrusted_path(ensure_trusted_program(&link, &link.join("cmd.exe"))),
+        link
+    );
+    // Removes the junction, not System32.
+    std::fs::remove_dir(&link).unwrap();
+    remove(&root);
+}
+
+#[test]
+fn trusts_a_program_only_while_no_other_account_can_change_it() {
+    if !elevated() {
+        return;
+    }
+    let install = program_data_scratch("trusted");
+    let bin = install.join("bin");
+    let program = bin.join("choco.exe");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::write(&program, b"MZ").unwrap();
+    // As Chocolatey's installer leaves them: Administrators own a protected folder that Users
+    // can only read.
+    const INSTALL: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
+    const BIN: &str = "O:BAD:(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;0x1200a9;;;BU)";
+    const PROGRAM: &str = "O:BAD:(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;0x1200a9;;;BU)";
+    set_sddl(&install, INSTALL);
+    set_sddl(&bin, BIN);
+    set_sddl(&program, PROGRAM);
+    ensure_trusted_program(&install, &program).unwrap();
+
+    let untrusted = |path: &Path, descriptor: &str, original: &str| {
+        set_sddl(path, descriptor);
+        assert_eq!(
+            untrusted_path(ensure_trusted_program(&install, &program)),
+            path
+        );
+        set_sddl(path, original);
+    };
+    // Owned by Users, or by TrustedInstaller but changeable by Users or INTERACTIVE.
+    untrusted(&program, "O:BUD:(A;;FA;;;SY)(A;;FA;;;BA)", PROGRAM);
+    untrusted(
+        &program,
+        "O:S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464D:(A;;FA;;;SY)(A;;0x1301bf;;;BU)",
+        PROGRAM,
+    );
+    untrusted(&bin, "O:BAD:(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x2;;;IU)", BIN);
+    untrusted(&install, "O:BUD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", INSTALL);
+    untrusted(
+        &install,
+        "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;0x4;;;AU)",
+        INSTALL,
+    );
+    untrusted(&install, "O:BAD:NO_ACCESS_CONTROL", INSTALL);
+    ensure_trusted_program(&install, &program).unwrap();
+    remove(&install);
+}

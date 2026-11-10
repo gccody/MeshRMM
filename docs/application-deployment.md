@@ -36,8 +36,19 @@ itself; a device without one lists no packages.
   updates and uninstalls use the ID as the device's scan lists it. An
   install whose ID winget doesn't find as written is tried again with the
   ID `winget show` gives it.
-- **Chocolatey** commands get `-y --no-progress -r`. Chocolatey 1 is listed
-  with `list -l`, Chocolatey 2 with `list`.
+- **Chocolatey** is `bin\choco.exe` in `%ChocolateyInstall%`, else in
+  `%ProgramData%\chocolatey`. Any user may create folders in ProgramData, so
+  the SYSTEM service uses Chocolatey only when Windows' own accounts control
+  it. That shim, the `choco.exe` it runs, and every folder from them up to
+  the Chocolatey folder must be owned by SYSTEM, Administrators or
+  TrustedInstaller, and must not let any other account change them or add
+  entries. The folders above it, up to the drive's root, must not let any
+  other account rename or replace their entries. None of them may be a
+  junction or symbolic link. Chocolatey's installer leaves its folder this
+  way. A Chocolatey that fails these checks is treated as not installed,
+  and the Agent's log gives the reason at each scan. Commands get
+  `-y --no-progress -r`. Chocolatey 1 is listed with `list -l`, Chocolatey 2
+  with `list`.
 - **Homebrew** refuses to run as root. The Agent finds `brew` at
   `/opt/homebrew/bin/brew` or `/usr/local/bin/brew` and runs it as the owner
   of that file:
