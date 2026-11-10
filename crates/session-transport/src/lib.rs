@@ -46,6 +46,8 @@ pub struct ServiceChannel {
     channel: MeteredChannel,
     changed: Arc<Notify>,
     low_buffer_wake: Arc<OnceCell<()>>,
+    /// How many writers wait in [`ServiceChannel::writable`] for room.
+    waiting: Arc<tokio::sync::watch::Sender<usize>>,
 }
 impl std::ops::Deref for ServiceChannel {
     type Target = MeteredChannel;
@@ -59,6 +61,7 @@ impl ServiceChannel {
             channel: MeteredChannel::new(channel),
             changed: Arc::new(Notify::new()),
             low_buffer_wake: Arc::new(OnceCell::new()),
+            waiting: Arc::new(tokio::sync::watch::Sender::new(0)),
         };
         let changed = result.changed.clone();
         result.channel.on_open(Box::new(move || {
@@ -161,8 +164,33 @@ impl ServiceChannel {
             if self.channel.buffered_amount().await <= threshold {
                 continue;
             }
+            let _waiting = WaitingForRoom::new(&self.waiting);
             changed.await;
         }
+    }
+
+    /// Resolves once a writer waits in [`ServiceChannel::writable`] for room: what a test of a
+    /// writer on another thread waits for before it lets a stall's time pass, as tokio's
+    /// paused clock runs on whenever the test's own thread is idle, whatever another is doing.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn writer_waiting(&self) {
+        let _ = self.waiting.subscribe().wait_for(|count| *count > 0).await;
+    }
+}
+
+/// Counts a writer as waiting for room while it lives.
+struct WaitingForRoom<'a>(&'a tokio::sync::watch::Sender<usize>);
+
+impl<'a> WaitingForRoom<'a> {
+    fn new(waiting: &'a tokio::sync::watch::Sender<usize>) -> Self {
+        waiting.send_modify(|count| *count += 1);
+        Self(waiting)
+    }
+}
+
+impl Drop for WaitingForRoom<'_> {
+    fn drop(&mut self) {
+        self.0.send_modify(|count| *count -= 1);
     }
 }
 
