@@ -96,7 +96,8 @@ the Agent's.
   the connection's loop, each within its first interval (at most 30 seconds
   in) and then up to a tenth of the interval (at most 30 seconds) late, so a
   fleet doesn't check at once. At most 8 checks run at a time, 2 of them
-  script checks. A check that overruns its time limit by 5 seconds counts as
+  script checks; a check due while those are taken starts when one
+  finishes or overruns, the one due longest first. A check that overruns its time limit by 5 seconds counts as
   failing, and the monitor doesn't start again until it finishes. Monitors
   keep running while the Agent is reconnecting.
 - **Reporting.** The Agent reports at once a failure (every one, with its

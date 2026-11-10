@@ -8,8 +8,10 @@
 //! each time, so a fleet's devices don't all check at once. Each check runs
 //! on its own thread, at most [`MAX_RUNNING_CHECKS`] at a time and
 //! [`MAX_RUNNING_SCRIPTS`] of them script checks, and is bounded by the
-//! monitor's timeout. A check that overruns counts as failing, and the
-//! monitor doesn't run again until it finishes.
+//! monitor's timeout. A check due while the limits are reached waits,
+//! without the scheduler waking for it, until a check finishes or overruns;
+//! then the one due longest starts. A check that overruns counts as
+//! failing, and the monitor doesn't run again until it finishes.
 //!
 //! Results reach the coordinator through [`Monitors::next`], measured
 //! against what the server holds of each monitor (what it was last sent, or
@@ -355,6 +357,7 @@ impl Monitors {
             random: Random::new(),
             outbox: Arc::clone(&outbox),
             commands: commands.clone(),
+            spawn: spawn_check,
         };
         if let Err(error) = std::thread::Builder::new()
             .name("meshrmm-monitors".into())
@@ -575,6 +578,47 @@ struct Run {
     abandoned: bool,
 }
 
+/// A check to run, and where its result goes when it finishes.
+struct Job {
+    run: u64,
+    check: MonitorCheck,
+    context: Context,
+    memory: Memory,
+    commands: mpsc::Sender<Command>,
+}
+
+/// Runs a check on its own thread, which sends [`Command::Done`] when it
+/// finishes.
+fn spawn_check(job: Job) -> std::io::Result<()> {
+    let Job {
+        run,
+        check,
+        context,
+        mut memory,
+        commands,
+    } = job;
+    std::thread::Builder::new()
+        .name("meshrmm-monitor-check".into())
+        .spawn(move || {
+            let outcome = checks::run(&check, &context, &mut memory);
+            memory.checked_at_ms = Some(context.now_ms);
+            let _ = commands.send(Command::Done {
+                run,
+                checked_at_ms: context.now_ms,
+                outcome,
+                memory,
+            });
+        })
+        .map(drop)
+}
+
+/// The longest the scheduler waits when nothing comes sooner.
+const IDLE_WAIT: Duration = Duration::from_secs(60);
+
+fn is_script(entry: &Entry) -> bool {
+    matches!(entry.definition.check, MonitorCheck::ScriptCheck { .. })
+}
+
 struct Scheduler {
     mode: ExecutionMode,
     entries: BTreeMap<String, Entry>,
@@ -583,36 +627,75 @@ struct Scheduler {
     random: Random,
     outbox: Arc<Outbox>,
     commands: mpsc::Sender<Command>,
+    /// Starts a check, which sends [`Command::Done`] when it finishes.
+    /// Tests start none, and finish them themselves.
+    spawn: fn(Job) -> std::io::Result<()>,
 }
 
 impl Scheduler {
     fn run(mut self, receiver: &mpsc::Receiver<Command>) {
         loop {
-            let now = Instant::now();
-            let next = self
-                .entries
-                .values()
-                .filter(|entry| entry.running.is_none())
-                .map(|entry| entry.due)
-                .chain(
-                    self.runs
-                        .values()
-                        .filter(|run| !run.abandoned)
-                        .map(|run| run.deadline),
-                )
-                .min();
-            let wait = next.map_or(Duration::from_secs(60), |next| {
-                next.saturating_duration_since(now)
-                    .min(Duration::from_secs(60))
-            });
-            match receiver.recv_timeout(wait) {
-                Ok(command) => self.handle(command),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            let command = match receiver.recv_timeout(self.wait(Instant::now())) {
+                Ok(command) => Some(command),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
-            }
-            self.expire();
-            self.start_due();
+            };
+            self.step(command, Instant::now());
         }
+    }
+
+    /// One turn of the loop: the command that came, if any, then the
+    /// overruns and the checks due at `now`.
+    fn step(&mut self, command: Option<Command>, now: Instant) {
+        if let Some(command) = command {
+            self.handle(command);
+        }
+        self.expire(now);
+        self.start_due(now);
+    }
+
+    /// How many checks run, and how many of them are scripts. An overrun no
+    /// longer counts: it was reported failing, and its thread is left to
+    /// finish.
+    fn running(&self) -> (usize, usize) {
+        self.runs
+            .values()
+            .filter(|run| !run.abandoned)
+            .fold((0, 0), |(checks, scripts), run| {
+                (checks + 1, scripts + usize::from(run.script))
+            })
+    }
+
+    /// Whether a limit keeps `entry` from starting while `running` checks,
+    /// and scripts among them, run.
+    fn held_back(entry: &Entry, (checks, scripts): (usize, usize)) -> bool {
+        checks >= MAX_RUNNING_CHECKS || (is_script(entry) && scripts >= MAX_RUNNING_SCRIPTS)
+    }
+
+    /// How long the loop waits for a command before it looks again: until
+    /// the next monitor is due or the next check overruns. A monitor due
+    /// but held back by a limit doesn't count, or the loop would spin until
+    /// a check finished: a check finishing comes as a command, and an
+    /// overrun frees its place at its deadline, so either wakes the loop to
+    /// start it.
+    fn wait(&self, now: Instant) -> Duration {
+        let running = self.running();
+        let next = self
+            .entries
+            .values()
+            .filter(|entry| entry.running.is_none())
+            .filter(|entry| entry.due > now || !Self::held_back(entry, running))
+            .map(|entry| entry.due)
+            .chain(
+                self.runs
+                    .values()
+                    .filter(|run| !run.abandoned)
+                    .map(|run| run.deadline),
+            )
+            .min();
+        next.map_or(IDLE_WAIT, |next| {
+            next.saturating_duration_since(now).min(IDLE_WAIT)
+        })
     }
 
     fn handle(&mut self, command: Command) {
@@ -688,8 +771,7 @@ impl Scheduler {
     }
 
     /// Checks that overran their timeout count as failing.
-    fn expire(&mut self) {
-        let now = Instant::now();
+    fn expire(&mut self, now: Instant) {
         let overrun = self
             .runs
             .iter_mut()
@@ -716,8 +798,9 @@ impl Scheduler {
         }
     }
 
-    fn start_due(&mut self) {
-        let now = Instant::now();
+    /// Starts the checks due at `now` that the limits let run, the one due
+    /// longest first. A script held back doesn't hold back other checks.
+    fn start_due(&mut self, now: Instant) {
         let mut due = self
             .entries
             .iter()
@@ -726,18 +809,11 @@ impl Scheduler {
             .collect::<Vec<_>>();
         due.sort();
         for (_, id) in due {
-            let active = self.runs.values().filter(|run| !run.abandoned);
-            let (checks, scripts) = active.fold((0, 0), |(checks, scripts), run| {
-                (checks + 1, scripts + usize::from(run.script))
-            });
-            if checks >= MAX_RUNNING_CHECKS {
+            let running = self.running();
+            if running.0 >= MAX_RUNNING_CHECKS {
                 break;
             }
-            let script = matches!(
-                self.entries[&id].definition.check,
-                MonitorCheck::ScriptCheck { .. }
-            );
-            if script && scripts >= MAX_RUNNING_SCRIPTS {
+            if Self::held_back(&self.entries[&id], running) {
                 continue;
             }
             self.start(&id, now);
@@ -760,7 +836,7 @@ impl Scheduler {
         let run = self.next_run;
         self.next_run += 1;
         entry.running = Some(run);
-        let script = matches!(entry.definition.check, MonitorCheck::ScriptCheck { .. });
+        let script = is_script(entry);
         // A script check's own timeout stops it; this only catches a hang.
         self.runs.insert(
             run,
@@ -771,28 +847,19 @@ impl Scheduler {
                 abandoned: false,
             },
         );
-        let check = entry.definition.check.clone();
-        let mut memory = entry.memory.clone();
-        let context = Context {
-            mode: self.mode,
-            interval,
-            timeout: entry.timeout(),
-            now_ms: checked_at_ms,
+        let job = Job {
+            run,
+            check: entry.definition.check.clone(),
+            context: Context {
+                mode: self.mode,
+                interval,
+                timeout: entry.timeout(),
+                now_ms: checked_at_ms,
+            },
+            memory: entry.memory.clone(),
+            commands: self.commands.clone(),
         };
-        let commands = self.commands.clone();
-        let spawned = std::thread::Builder::new()
-            .name("meshrmm-monitor-check".into())
-            .spawn(move || {
-                let outcome = checks::run(&check, &context, &mut memory);
-                memory.checked_at_ms = Some(context.now_ms);
-                let _ = commands.send(Command::Done {
-                    run,
-                    checked_at_ms: context.now_ms,
-                    outcome,
-                    memory,
-                });
-            });
-        if let Err(error) = spawned {
+        if let Err(error) = (self.spawn)(job) {
             self.runs.remove(&run);
             let memory = self.entries[id].memory.clone();
             self.record(
@@ -873,6 +940,7 @@ mod tests {
                 random: Random(7),
                 outbox: Arc::clone(outbox),
                 commands,
+                spawn: spawn_check,
             },
             receiver,
         )
@@ -1146,7 +1214,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         scheduler.set(vec![port_monitor("open", port)], None);
         scheduler.handle(Command::CheckNow(vec![]));
-        scheduler.start_due();
+        scheduler.start_due(Instant::now());
         assert_eq!(scheduler.runs.len(), 1);
         let done = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
         scheduler.handle(done);
@@ -1157,10 +1225,10 @@ mod tests {
         // A run past its deadline is reported failing, and its late result
         // is dropped.
         scheduler.handle(Command::CheckNow(vec![]));
-        scheduler.start_due();
+        scheduler.start_due(Instant::now());
         let run = *scheduler.runs.keys().next().unwrap();
         scheduler.runs.get_mut(&run).unwrap().deadline = Instant::now();
-        scheduler.expire();
+        scheduler.expire(Instant::now());
         let sent = results(&outbox);
         assert!(!sent[0].passing);
         assert!(sent[0].detail.contains("didn't finish"));
@@ -1168,12 +1236,207 @@ mod tests {
             scheduler.entries["open"].running.is_some(),
             "it doesn't run twice"
         );
-        scheduler.start_due();
+        scheduler.start_due(Instant::now());
         assert_eq!(scheduler.runs.len(), 1);
         let late = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
         scheduler.handle(late);
         assert!(results(&outbox).is_empty());
         assert!(scheduler.entries["open"].running.is_none());
+    }
+
+    /// Starts nothing: the test finishes each check itself, with [`done`].
+    fn hold(_job: Job) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn done(run: u64) -> Command {
+        Command::Done {
+            run,
+            checked_at_ms: 1,
+            outcome: Outcome::passing("done"),
+            memory: Memory::default(),
+        }
+    }
+
+    fn script_monitor(id: &str) -> MonitorDefinition {
+        MonitorDefinition {
+            id: id.into(),
+            interval_seconds: 60,
+            timeout_seconds: 30,
+            check: MonitorCheck::ScriptCheck {
+                script_id: "script-1".into(),
+                run_as: meshrmm_protocol::RunAs::System,
+                language: Some(meshrmm_protocol::ScriptLanguage::Shell),
+                body: "exit 0".into(),
+            },
+        }
+    }
+
+    /// A scheduler that starts no real checks, running `definitions`, each
+    /// due at `now`.
+    fn due_at(
+        outbox: &Arc<Outbox>,
+        definitions: Vec<MonitorDefinition>,
+        now: Instant,
+    ) -> (Scheduler, mpsc::Receiver<Command>) {
+        let (mut scheduler, receiver) = scheduler(outbox);
+        scheduler.spawn = hold;
+        scheduler.set(definitions, None);
+        for entry in scheduler.entries.values_mut() {
+            entry.due = now;
+        }
+        (scheduler, receiver)
+    }
+
+    /// The monitors running, by ID.
+    fn running(scheduler: &Scheduler) -> Vec<&str> {
+        scheduler
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.running.is_some())
+            .map(|(id, _)| id.as_str())
+            .collect()
+    }
+
+    fn run_of(scheduler: &Scheduler, id: &str) -> u64 {
+        scheduler.entries[id].running.unwrap()
+    }
+
+    #[test]
+    fn a_script_held_back_waits_for_a_script_slot() {
+        let outbox = outbox();
+        let now = Instant::now();
+        let scripts = ["a", "b", "c"].map(script_monitor).into();
+        let (mut scheduler, _receiver) = due_at(&outbox, scripts, now);
+        scheduler.step(None, now);
+        assert_eq!(running(&scheduler), ["a", "b"]);
+
+        // c is due but held back: the wait runs to the first overrun.
+        let overrun = Duration::from_secs(30) + OVERRUN_GRACE;
+        assert_eq!(scheduler.wait(now), overrun);
+        // A port monitor due sooner than that wakes the loop first.
+        let mut port = port_monitor("d", 1);
+        port.interval_seconds = 600;
+        scheduler.set(
+            vec![
+                script_monitor("a"),
+                script_monitor("b"),
+                script_monitor("c"),
+                port,
+            ],
+            None,
+        );
+        scheduler.entries.get_mut("d").unwrap().due = now + Duration::from_secs(20);
+        assert_eq!(scheduler.wait(now), Duration::from_secs(20));
+
+        // A script finishing frees a slot, and c starts on that step.
+        let later = now + Duration::from_secs(3);
+        scheduler.step(Some(done(run_of(&scheduler, "a"))), later);
+        assert_eq!(running(&scheduler), ["b", "c"]);
+        assert_eq!(
+            scheduler.wait(later),
+            Duration::from_secs(17),
+            "a's next check is a minute off; d's sooner"
+        );
+    }
+
+    #[test]
+    fn a_ninth_check_waits_for_one_of_eight_to_finish() {
+        let outbox = outbox();
+        let now = Instant::now();
+        let mut definitions = (0..9)
+            .map(|n| port_monitor(&format!("m{n}"), 1))
+            .collect::<Vec<_>>();
+        // Due after the others, though first by name.
+        definitions.push(port_monitor("a-late", 1));
+        let (mut scheduler, _receiver) = due_at(&outbox, definitions, now);
+        scheduler.entries.get_mut("a-late").unwrap().due = now + Duration::from_secs(1);
+        scheduler.step(None, now);
+        assert_eq!(scheduler.running(), (MAX_RUNNING_CHECKS, 0));
+        assert!(scheduler.entries["m8"].running.is_none());
+
+        // m8 is due but held back; a-late's time is the next thing to come.
+        assert_eq!(scheduler.wait(now), Duration::from_secs(1));
+        let due = now + Duration::from_secs(1);
+        scheduler.step(None, due);
+        assert!(scheduler.entries["a-late"].running.is_none());
+        // Now both are held back: the wait runs to the first overrun.
+        let overrun = Duration::from_secs(5) + OVERRUN_GRACE;
+        assert_eq!(scheduler.wait(due), overrun - Duration::from_secs(1));
+
+        // When one finishes, the one due longest starts.
+        let later = now + Duration::from_secs(2);
+        scheduler.step(Some(done(run_of(&scheduler, "m3"))), later);
+        assert!(scheduler.entries["m8"].running.is_some());
+        assert!(scheduler.entries["a-late"].running.is_none());
+        assert_eq!(scheduler.running(), (MAX_RUNNING_CHECKS, 0));
+    }
+
+    #[test]
+    fn a_monitor_not_yet_due_wakes_the_loop_on_time() {
+        let outbox = outbox();
+        let now = Instant::now();
+        let (mut scheduler, _receiver) = due_at(&outbox, vec![port_monitor("one", 1)], now);
+        let due = now + Duration::from_secs(7);
+        scheduler.entries.get_mut("one").unwrap().due = due;
+        assert_eq!(scheduler.wait(now), Duration::from_secs(7));
+        scheduler.step(None, due - Duration::from_millis(1));
+        assert!(running(&scheduler).is_empty());
+        scheduler.step(None, due);
+        assert_eq!(running(&scheduler), ["one"]);
+        assert_eq!(
+            scheduler.wait(due),
+            Duration::from_secs(5) + OVERRUN_GRACE,
+            "then it waits for the check"
+        );
+
+        // An overrun is due at once, and only once.
+        let late = due + Duration::from_secs(3600);
+        assert_eq!(scheduler.wait(late), Duration::ZERO);
+        scheduler.step(None, late);
+        assert_eq!(scheduler.wait(late), IDLE_WAIT);
+        let (idle, _receiver) = due_at(&outbox, Vec::new(), now);
+        assert_eq!(idle.wait(now), IDLE_WAIT);
+    }
+
+    /// The loop as [`Scheduler::run`] turns it, on a clock of the test's
+    /// own: three scripts due together, the first finishing after 200 of
+    /// its 300 seconds.
+    #[test]
+    fn the_loop_sleeps_while_a_script_waits_for_a_slot() {
+        let outbox = outbox();
+        let start = Instant::now();
+        let scripts = ["a", "b", "c"]
+            .map(|id| MonitorDefinition {
+                timeout_seconds: 300,
+                ..script_monitor(id)
+            })
+            .into();
+        let (mut scheduler, _receiver) = due_at(&outbox, scripts, start);
+        scheduler.step(None, start);
+        let first = run_of(&scheduler, "a");
+        let finishes = start + Duration::from_secs(200);
+        let mut now = start;
+        let mut turns = 0;
+        while scheduler.entries["c"].running.is_none() {
+            turns += 1;
+            assert!(
+                turns <= 10,
+                "the loop turned {turns} times in {:?}",
+                now - start
+            );
+            // It wakes when its wait is over or the check finishes, which
+            // comes first.
+            let wake = now + scheduler.wait(now);
+            if wake >= finishes && scheduler.runs.contains_key(&first) {
+                now = finishes;
+                scheduler.step(Some(done(first)), now);
+            } else {
+                now = wake;
+                scheduler.step(None, now);
+            }
+        }
+        assert_eq!(now, finishes, "c starts as a finishes");
     }
 
     #[tokio::test]
