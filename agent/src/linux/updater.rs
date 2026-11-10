@@ -20,8 +20,8 @@ use super::installer::{EXECUTABLE, INSTALL_DIRECTORY, SERVICE, systemctl};
 use crate::remote::config::Config;
 use crate::remote::service_link::ServiceLink;
 use crate::update_policy::{
-    CHECKED_VERSION_FILE, UpdateAttempts, UpdateSchedule, checked_before, random_bits,
-    read_attempts, record_check,
+    NEXT_CHECK_FILE, NextCheck, UpdateAttempts, UpdateSchedule, random_bits, read_attempts,
+    read_next_check, unix_seconds,
 };
 
 const SCHEDULE_TICK: Duration = Duration::from_secs(30);
@@ -42,12 +42,13 @@ const TARGET: &str = meshrmm_self_update::AGENT_LINUX_ARM64;
 /// Checks for updates until one is staged, then stops the coordinator so the
 /// new Agent can replace it.
 pub(crate) async fn run(config: Config, link: Arc<ServiceLink>) {
-    let first_start = updates_directory()
-        .is_ok_and(|updates| !checked_before(&updates.join(CHECKED_VERSION_FILE)));
+    let record = updates_directory()
+        .ok()
+        .and_then(|updates| read_next_check(&updates.join(NEXT_CHECK_FILE)));
     let mut schedule = UpdateSchedule::new(
         Instant::now(),
-        &config.device_id,
-        first_start,
+        unix_seconds(),
+        record.as_ref(),
         random_bits(),
     );
     loop {
@@ -69,7 +70,11 @@ pub(crate) async fn run(config: Config, link: Arc<ServiceLink>) {
                     false
                 }
             };
-            schedule.checked(Instant::now(), succeeded, random_bits());
+            if let Some(next) =
+                schedule.checked(Instant::now(), unix_seconds(), succeeded, random_bits())
+            {
+                record_next_check(&next);
+            }
         }
         tokio::time::sleep(SCHEDULE_TICK).await;
     }
@@ -93,14 +98,10 @@ fn stage(config: &Config) -> anyhow::Result<Option<String>> {
         MAX_MANIFEST_BYTES,
     )?;
     let manifest = UpdateManifest::parse(&manifest)?;
-    let updates = updates_directory()?;
     let Some(release) = manifest.newer_release(TARGET, CURRENT_VERSION)? else {
-        record_check(
-            &updates.join(CHECKED_VERSION_FILE),
-            super::installer::replace_file,
-        );
         return Ok(None);
     };
+    let updates = updates_directory()?;
     let attempts_path = updates.join(ATTEMPTS_FILE);
     let Some(attempt) = UpdateAttempts::next(
         read_attempts(&attempts_path).as_ref(),
@@ -108,10 +109,6 @@ fn stage(config: &Config) -> anyhow::Result<Option<String>> {
         unix_seconds(),
     ) else {
         tracing::warn!(version = %release.version, "skipping an Agent update that already failed repeatedly");
-        record_check(
-            &updates.join(CHECKED_VERSION_FILE),
-            super::installer::replace_file,
-        );
         return Ok(None);
     };
     tracing::info!(version = %release.version, "downloading an Agent update");
@@ -139,6 +136,16 @@ fn updates_directory() -> anyhow::Result<std::path::PathBuf> {
     let directory = super::installer::config_directory()?.join("updates");
     std::fs::create_dir_all(&directory)?;
     Ok(directory)
+}
+
+/// Writes when the next check is due, so a restart keeps its place in the schedule.
+fn record_next_check(next: &NextCheck) {
+    let written = updates_directory().and_then(|updates| {
+        super::installer::replace_file(&updates.join(NEXT_CHECK_FILE), &serde_json::to_vec(next)?)
+    });
+    if let Err(error) = written {
+        tracing::warn!(error = ?error, "could not record when the next Agent update check is due");
+    }
 }
 
 fn read_limited(reader: impl Read, limit: u64) -> anyhow::Result<Vec<u8>> {
@@ -224,12 +231,6 @@ fn main_pid() -> Option<u32> {
         .parse()
         .ok()
         .filter(|&pid| pid != 0)
-}
-
-fn unix_seconds() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 #[cfg(test)]

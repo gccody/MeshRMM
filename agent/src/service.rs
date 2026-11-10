@@ -25,7 +25,7 @@ use windows_service::{define_windows_service, service_dispatcher};
 
 use crate::remote::config::Config;
 use crate::remote::service_link::{SESSION_ACTIVE, SESSION_IDLE, UPDATING_PREFIX};
-use crate::update_policy::{UpdateSchedule, random_bits};
+use crate::update_policy::{UpdateSchedule, random_bits, unix_seconds};
 use crate::win32::{OwnedHandle, wide};
 
 /// Covers the coordinator's session close helpers, which may each take 10 seconds.
@@ -125,14 +125,13 @@ fn run_service() -> anyhow::Result<()> {
 
     let mut worker: Option<Coordinator> = None;
     let mut trays = trays::Trays::default();
-    let first_start = config
-        .config_path
-        .parent()
-        .is_some_and(|directory| !crate::updater::has_checked(directory));
+    let config_directory = config.config_path.parent();
     let mut updates = UpdateSchedule::new(
         Instant::now(),
-        &config.device_id,
-        first_start,
+        unix_seconds(),
+        config_directory
+            .and_then(crate::updater::scheduled_check)
+            .as_ref(),
         random_bits(),
     );
     // Whether the coordinator gets to end its remote sessions and run their close actions.
@@ -177,10 +176,15 @@ fn run_service() -> anyhow::Result<()> {
                     }
                     break true;
                 }
-                Ok(None) => updates.checked(Instant::now(), true, random_bits()),
+                Ok(None) => {
+                    let next = updates.checked(Instant::now(), unix_seconds(), true, random_bits());
+                    if let (Some(directory), Some(next)) = (config_directory, next) {
+                        crate::updater::record_next_check(directory, &next);
+                    }
+                }
                 Err(error) => {
                     tracing::warn!(error = ?error, "automatic Agent update check failed");
-                    updates.checked(Instant::now(), false, random_bits());
+                    updates.checked(Instant::now(), unix_seconds(), false, random_bits());
                 }
             }
         }

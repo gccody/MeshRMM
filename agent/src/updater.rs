@@ -19,8 +19,8 @@ use crate::private_directory;
 use crate::remote::config::Config;
 use crate::service::service_name_for_path;
 use crate::update_policy::{
-    CHECKED_VERSION_FILE, MAX_ATTEMPTS_PER_VERSION, UpdateAttempts, checked_before, read_attempts,
-    record_check,
+    MAX_ATTEMPTS_PER_VERSION, NEXT_CHECK_FILE, NextCheck, UpdateAttempts, read_attempts,
+    read_next_check, unix_seconds,
 };
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -54,7 +54,6 @@ pub fn check_and_schedule(config: &Config) -> anyhow::Result<Option<String>> {
         .parent()
         .context("Agent configuration has no parent directory")?;
     let Some(release) = manifest.newer_release(TARGET, CURRENT_VERSION)? else {
-        record_completed_check(config_directory);
         return Ok(None);
     };
 
@@ -70,7 +69,6 @@ pub fn check_and_schedule(config: &Config) -> anyhow::Result<Option<String>> {
             attempts = MAX_ATTEMPTS_PER_VERSION,
             "skipping an automatic Agent update that already failed repeatedly; it is retried after 24 hours"
         );
-        record_completed_check(config_directory);
         return Ok(None);
     };
 
@@ -133,20 +131,19 @@ pub fn check_and_schedule(config: &Config) -> anyhow::Result<Option<String>> {
     Ok(Some(release.version))
 }
 
-/// Whether this build has completed an update check before, which tells an ordinary restart from
-/// the first start after an install or update.
-pub fn has_checked(config_directory: &Path) -> bool {
-    checked_before(&config_directory.join("updates").join(CHECKED_VERSION_FILE))
+/// When the last successful check said the next one is due.
+pub fn scheduled_check(config_directory: &Path) -> Option<NextCheck> {
+    read_next_check(&config_directory.join("updates").join(NEXT_CHECK_FILE))
 }
 
-fn record_completed_check(config_directory: &Path) {
-    let path = config_directory.join("updates").join(CHECKED_VERSION_FILE);
-    if checked_before(&path) {
-        return;
-    }
-    match prepare_update_directory(config_directory) {
-        Ok(_) => record_check(&path, crate::installer::replace_file),
-        Err(error) => tracing::warn!(error = ?error, "could not record the Agent update check"),
+/// Writes when the next check is due, so a restart keeps its place in the schedule.
+pub fn record_next_check(config_directory: &Path, next: &NextCheck) {
+    let updates = config_directory.join("updates");
+    let written = private_directory::secure(&updates).and_then(|()| {
+        crate::installer::replace_file(&updates.join(NEXT_CHECK_FILE), &serde_json::to_vec(next)?)
+    });
+    if let Err(error) = written {
+        tracing::warn!(error = ?error, "could not record when the next Agent update check is due");
     }
 }
 
@@ -557,13 +554,6 @@ fn unique_suffix() -> String {
             .unwrap_or_default()
             .as_millis()
     )
-}
-
-fn unix_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 #[cfg(test)]

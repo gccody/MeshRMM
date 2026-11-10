@@ -207,21 +207,30 @@ how relays are chosen and what the sleeping computer needs.
 ## Agent updates
 
 The service checks the server's update manifest about every six hours. Every
-Agent of a server gets the same release, so the checks are spread out:
+Agent of a server gets the same release, so the checks are spread out, and
+after each successful check the Agent writes when the next one is due to
+`updates/next-check.json` in its configuration directory (with the build
+that wrote it), so a restart keeps its place in the schedule:
 
-- The first start of a newly installed or updated build checks 30 to 90
-  seconds after it starts, since its installer may be older than the
-  server's release. A build counts as started before once one of its checks
-  has succeeded (`updates/checked-version` in the Agent's configuration
-  directory).
-- An ordinary restart first checks at the device's own point in the six
-  hours, derived from its device ID, so it may wait up to six hours. Devices
-  that restart together, as when a site's power returns, still check apart.
+- The first start of a newly installed or updated build, one that finds no
+  record of its own, checks 30 to 90 seconds after it starts, since its
+  installer may be older than the server's release. Its next check then
+  falls anywhere from about half an hour to six and a half hours later, so
+  devices installed or updated together do not stay together.
+- A restart before the recorded time checks at that time, but no sooner than
+  30 to 90 seconds after the start.
+- A restart that finds the time passed, because the device was off or
+  asleep, checks 1 to 30 minutes after the start, at a point picked at
+  random on each start. A device that is never up for long still checks, and
+  devices that come back together, as when a site's power returns after an
+  outage, check apart. A recorded time more than six and a half hours ahead
+  means the clock was changed, and is treated as passed.
 - Each later interval is lengthened or shortened by up to 10 percent at
   random, so devices do not stay in step.
 - A check that fails is retried after about 2 minutes, then 4, 8 and so on
   up to about an hour, each shortened by up to half at random, until one
-  succeeds; then the six-hour schedule resumes.
+  succeeds; then the six-hour schedule resumes. A retry is not recorded, so
+  a restart during one finds the check overdue.
 - A check that falls due during a remote session waits for it to end,
   checking again every 5 minutes, for at most 24 hours.
 
