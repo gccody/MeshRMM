@@ -253,34 +253,24 @@ pub async fn progress_reported(
 
 /// Records how an install went, tells the website, and checks a failed one
 /// against the alert rules.
+///
+/// Returns whether the server has the result: just recorded, or recorded
+/// before, as when the Agent sends it again because the answer never reached
+/// it. A result for a run already marked lost replaces that, since the
+/// install did run. False when the device has no such install.
 pub async fn install_reported(
     state: &AppState,
     device_id: &str,
     run_id: &str,
     result: UpdateInstallResult,
-) {
+) -> anyhow::Result<bool> {
     let failed = result.status != UpdateInstallStatus::Succeeded;
-    let mut transaction = match state.database.begin().await {
-        Ok(transaction) => transaction,
-        Err(error) => {
-            tracing::warn!(device_id, run_id, %error, "could not record an install");
-            return;
-        }
-    };
+    let mut transaction = state.database.begin().await?;
     let recorded =
-        match runs::finish_install(&mut transaction, device_id, run_id, result, now_ms()).await {
-            Ok(recorded) => recorded,
-            Err(error) => {
-                tracing::warn!(device_id, run_id, %error, "could not record an install");
-                return;
-            }
-        };
-    if let Err(error) = transaction.commit().await {
-        tracing::warn!(device_id, run_id, %error, "could not record an install");
-        return;
-    }
+        runs::finish_install(&mut transaction, device_id, run_id, result, now_ms()).await?;
+    transaction.commit().await?;
     if !recorded {
-        return;
+        return Ok(runs::install_exists(&mut &state.database, device_id, run_id).await?);
     }
     tracing::info!(device_id, run_id, failed, "recorded an update install");
     publish_run(state, run_id).await;
@@ -289,6 +279,7 @@ pub async fn install_reported(
     if failed {
         crate::alerts::update_install_finished(state, run_id).await;
     }
+    Ok(true)
 }
 
 /// Tells event sockets about a run.

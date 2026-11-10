@@ -52,6 +52,8 @@ mod monitors;
 #[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 mod native_task;
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+mod outbox;
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 mod platform;
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 mod process;
@@ -118,9 +120,10 @@ use self::signaling::{
     ControlAttempt, ControlReconnect, agent_connection_url, authenticated_websocket,
 };
 
-/// An update or application report the connection is writing. Each source
-/// has one at a time, so its reports keep their order, and the one a
-/// connection doesn't get through is the one kept for the next.
+/// An update or application scan or progress report the connection is
+/// writing. Each source has one at a time, so its reports keep their order,
+/// and the one a connection doesn't get through is the one kept for the
+/// next.
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 struct Writing {
     report: unsent::Report,
@@ -349,6 +352,12 @@ pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
         let link = std::sync::Arc::new(service_link::ServiceLink::new(
             mode == ExecutionMode::Worker,
         ));
+        // Read before anything new is added, so results from before a
+        // restart are delivered first.
+        let outbox = std::sync::Arc::new(outbox::Outbox::for_agent(mode));
+        let https = outbox::Https::new(&config);
+        let results_credential = https.credential();
+        outbox.spawn(https);
         #[cfg(target_os = "macos")]
         if mode == ExecutionMode::Service {
             tokio::spawn(crate::macos_updater::run(
@@ -371,20 +380,22 @@ pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
             // from the previous one.
             metrics: metrics::Reports::new(),
             system_info: system_info::Collector::new(),
-            // Likewise, so a result that arrives while offline is sent on
+            // Likewise, so a scan that finishes while offline is sent on
             // the next connection.
-            updates: updates::Updates::new(),
+            updates: updates::Updates::new(std::sync::Arc::clone(&outbox)),
             // Likewise, so a scan that finished offline still counts.
             update_schedule: updates::Schedule::new(
                 meshrmm_signaling_client::random_fraction().unwrap_or(0.5),
             ),
-            applications: applications::Applications::new(),
+            applications: applications::Applications::new(std::sync::Arc::clone(&outbox)),
             wake: wake::Relay::new(),
             files: files::Files::new(),
             // Likewise, so monitors keep running while the Agent reconnects.
             monitors: monitors::Monitors::new(mode),
             writing_update: None,
             writing_application: None,
+            outbox,
+            results_credential,
             config,
             mode,
             link,
@@ -414,6 +425,11 @@ struct Coordinator {
     monitors: monitors::Monitors,
     writing_update: Option<Writing>,
     writing_application: Option<Writing>,
+    /// The final results the Agent owes the server, which a thread of its
+    /// own delivers over HTTPS.
+    outbox: std::sync::Arc<outbox::Outbox>,
+    /// The credential that thread delivers with.
+    results_credential: std::sync::Arc<std::sync::Mutex<String>>,
     active_session: Option<ActiveSession>,
     // Outlives session tasks, which end whenever the viewer drops its
     // connection, so the close action runs only once the session ends.
@@ -538,12 +554,16 @@ impl Coordinator {
 
     async fn serve_messages(&mut self, socket: &mut SignalingConnection) -> anyhow::Result<bool> {
         // Before anything the server sends on this connection, so the
-        // server knows which application runs from before it ended.
+        // server knows which application runs from before it ended. That
+        // includes those whose results are in the outbox, so their runs are
+        // not counted as interrupted before the results arrive.
         let activity = serde_json::to_string(&self.applications.activity())?;
         socket
             .send(Message::Text(activity.into()))
             .await
             .context("could not send the application activity")?;
+        // The server is back: results waiting for a retry go now.
+        self.outbox.connected();
         self.monitors.connected();
         self.thumbnails.connected();
         // The server sends this connection's schedule first thing.
@@ -607,7 +627,7 @@ impl Coordinator {
                 }
                 report = self.applications.next(), if self.writing_application.is_none() => {
                     // A finished run changed what is installed.
-                    if matches!(report.message, AgentStatusMessage::ApplicationResult { .. }) {
+                    if report.after_run {
                         self.system_info.request();
                     }
                     self.writing_application = Some(Writing::start(socket, report));
@@ -648,12 +668,18 @@ impl Coordinator {
                 AgentCommand::StartBackgroundSession { request } => Some(request),
                 AgentCommand::RunScript { run } => {
                     tracing::info!(run_id = %run.run_id, language = run.language.as_str(), run_as = run.run_as.as_str(), "running a toolbox script");
-                    toolbox::run_script(&self.config, self.mode, run, self.link.activity());
+                    toolbox::run_script(&self.outbox, self.mode, run, self.link.activity());
                     return Ok(ControlFlow::Continue(()));
                 }
                 AgentCommand::DeliverFile { delivery } => {
                     tracing::info!(delivery_id = %delivery.delivery_id, size_bytes = delivery.size_bytes, "receiving a toolbox file");
-                    toolbox::deliver_file(&self.config, self.mode, delivery, self.link.activity());
+                    toolbox::deliver_file(
+                        &self.config,
+                        &self.outbox,
+                        self.mode,
+                        delivery,
+                        self.link.activity(),
+                    );
                     return Ok(ControlFlow::Continue(()));
                 }
                 AgentCommand::CollectSystemInfo => {
@@ -794,6 +820,10 @@ impl Coordinator {
             &self.config.config_path,
             &serde_json::to_vec_pretty(&stored)?,
         )?;
+        *self
+            .results_credential
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = token.clone();
         self.config.agent_token = token;
         Ok(ControlFlow::Break(false))
     }

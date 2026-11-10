@@ -802,7 +802,8 @@ async fn update_and_application_jobs_store_what_the_old_reading_said() {
                 &run_id,
                 serde_json::from_value(json!({ "status": status, "items": [] })).unwrap(),
             )
-            .await;
+            .await
+            .unwrap();
         }
         // Application runs report each way.
         for (device, status, item) in [
@@ -825,7 +826,8 @@ async fn update_and_application_jobs_store_what_the_old_reading_said() {
                 }))
                 .unwrap(),
             )
-            .await;
+            .await
+            .unwrap();
         }
         // An Agent that restarted no longer has its run.
         applications::activity_reported(

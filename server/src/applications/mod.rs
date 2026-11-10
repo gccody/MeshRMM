@@ -170,34 +170,24 @@ pub async fn progress_reported(state: &AppState, device_id: &str, run_id: &str, 
 
 /// Records how a run went, and checks a failed install or update against
 /// the alert rules.
+///
+/// Returns whether the server has the result: just recorded, or recorded
+/// before, as when the Agent sends it again because the answer never reached
+/// it. A result for a run already marked lost or interrupted replaces that,
+/// since the run did happen. False when the device has no such run.
 pub async fn result_reported(
     state: &AppState,
     device_id: &str,
     run_id: &str,
     result: ApplicationRunResult,
-) {
+) -> anyhow::Result<bool> {
     // Skipped applications weren't for the device: not failures.
     let failed = matches!(result.status, RunStatus::Failed | RunStatus::Partial);
-    let mut transaction = match state.database.begin().await {
-        Ok(transaction) => transaction,
-        Err(error) => {
-            tracing::warn!(device_id, run_id, %error, "could not record an application run");
-            return;
-        }
-    };
-    let recorded = match runs::finish(&mut transaction, device_id, run_id, result, now_ms()).await {
-        Ok(recorded) => recorded,
-        Err(error) => {
-            tracing::warn!(device_id, run_id, %error, "could not record an application run");
-            return;
-        }
-    };
-    if let Err(error) = transaction.commit().await {
-        tracing::warn!(device_id, run_id, %error, "could not record an application run");
-        return;
-    }
+    let mut transaction = state.database.begin().await?;
+    let recorded = runs::finish(&mut transaction, device_id, run_id, result, now_ms()).await?;
+    transaction.commit().await?;
     if !recorded {
-        return;
+        return Ok(runs::run_exists(&mut &state.database, device_id, run_id).await?);
     }
     tracing::info!(device_id, run_id, failed, "recorded an application run");
     // A job's counts changed, and the device may take its next run.
@@ -205,6 +195,7 @@ pub async fn result_reported(
     if failed {
         crate::alerts::applications::run_finished(state, run_id).await;
     }
+    Ok(true)
 }
 
 /// The device's platform, if it is enrolled.

@@ -238,12 +238,13 @@ that wrote it), so a restart keeps its place in the schedule:
   a restart during one finds the check overdue.
 - A check that falls due while the Agent is busy waits, checking again every
   5 minutes, for at most 24 hours. The Agent is busy while a remote session,
-  terminal or file transfer is open, and while an update install or scan, an
-  application run or scan, a toolbox script or file, or a self-healing
-  action runs, until its result is on the connection. A result the Agent
-  can't send, because it is offline, holds the update for at most 10 minutes
-  after its job ends: results are kept only in memory, so waiting longer
-  would not save it.
+  terminal or file transfer is open; while an update install, an
+  application run or a toolbox script or file runs, until its result is
+  stored on disk, where the new build finds and delivers it; and while an
+  update or application scan or a self-healing action runs, until its
+  result is on the connection. Such a result the Agent can't send, because
+  it is offline, holds the update for at most 10 minutes after its job ends:
+  it is kept only in memory, so waiting longer would not save it.
 
 For a newer release it:
 

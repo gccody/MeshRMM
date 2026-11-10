@@ -4,10 +4,12 @@
 //!
 //! The server asks on the control connection
 //! ([`crate::AgentCommand::ScanApplications`],
-//! [`crate::AgentCommand::RunApplications`]), and the Agent reports on it
-//! ([`crate::AgentStatusMessage::ApplicationScan`],
-//! [`crate::AgentStatusMessage::ApplicationProgress`],
-//! [`crate::AgentStatusMessage::ApplicationResult`]).
+//! [`crate::AgentCommand::RunApplications`]), and the Agent reports scans and
+//! progress on it ([`crate::AgentStatusMessage::ApplicationScan`],
+//! [`crate::AgentStatusMessage::ApplicationProgress`]). A run's
+//! [`ApplicationRunResult`] is posted over HTTPS to
+//! `/v1/agents/{id}/application-runs/{run_id}/result` until the server
+//! acknowledges it.
 //!
 //! Package IDs and versions reach a package manager's command line as their
 //! own arguments, never through a shell, and are limited to the characters

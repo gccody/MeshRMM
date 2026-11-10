@@ -269,21 +269,25 @@ applications that failed or were skipped and why, the first three inline
 and the rest behind **N more**. A run that needs a restart says so. MeshRMM
 doesn't restart for applications; use [patch management](patch-management.md)
 or a script for that. An [Agent update](devices.md#agent-updates) waits for
-a scan or run, and for its result to reach the server; on Linux the package
-managers run in a systemd scope of their own, so even an Agent that stops
-anyway doesn't cut one off. A result that finishes while the device is
-offline is reported when it reconnects, unless the Agent restarts first. A
-run that hasn't reported five hours and 15 minutes after it started is lost.
-So is one whose report three connections in a row fail to send: the Agent
-drops it, and leaves it out of what it says it still owes on the next
-connection.
+a run until its result is stored, and for a scan until it reaches the
+server; on Linux the package managers run in a systemd scope of their own,
+so even an Agent that stops anyway doesn't cut one off. The Agent keeps a
+run's result on disk until the server has it (posted to
+`/v1/agents/{id}/application-runs/{run}/result`, and retried for up to a
+week), so a run that finishes while the device is offline, or before the
+Agent or the device restarts, is still reported. A run that hasn't reported
+five hours and 15 minutes after it started is lost, and a result that
+arrives after that replaces **lost**: the run did happen. A scan whose
+report three connections in a row fail to send is dropped, and left out of
+what the Agent says it still owes on the next connection.
 
 Each application keeps the last 16,384 characters of its output, and a run
 1 MiB of output in all, shared evenly between its applications, so a result
 always fits a message to the server.
 
 Every time the Agent connects, it first says which scans and runs it is
-doing or has yet to report. Any other the server asked for more than 30
+doing or has yet to report, including runs whose results it holds from
+before a restart. Any other the server asked for more than 30
 seconds before that connection is lost at once ("The device's Agent
 restarted, or the device did, before it finished"): the Agent restarted,
 the device rebooted, or the connection dropped before the Agent got it. (One

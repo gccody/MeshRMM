@@ -1,15 +1,17 @@
-//! The update or application report a control connection failed to send,
+//! The update or application scan a control connection failed to send,
 //! which the next connection sends first, before anything newer from the
-//! same source.
+//! same source. Progress goes on the connection too, but is never sent
+//! again. Final results go through the [`crate::remote::outbox`] instead,
+//! which keeps them on disk until the server acknowledges them.
 //!
 //! A report the connection can never get through, such as one the server
 //! drops the connection over, would then take down every connection in turn
 //! and hold up everything behind it, and the device would flap between
 //! online and offline for good. So once [`ATTEMPTS`] connections in a row
-//! have failed to send it, it is given up on. The server treats a report
-//! given up on as one that never came: an update run it asked for is lost
-//! after its report window, an application run as soon as the next
-//! connection's activity leaves it out, and scheduled scans come again.
+//! have failed to send it, it is given up on. A scan can be run again: the
+//! server counts a scan run it asked for as lost after its report window,
+//! an application scan as soon as the next connection's activity leaves it
+//! out, and scheduled scans come again.
 
 use meshrmm_protocol::AgentStatusMessage;
 
@@ -21,14 +23,18 @@ use crate::remote::service_link::ActivityGuard;
 /// until it reconnects.
 pub(crate) const ATTEMPTS: u32 = 3;
 
-/// A report for the server, and how many connections in a row have failed
-/// to send it.
+/// A scan or progress report for the server, and how many connections in a
+/// row have failed to send it.
 #[derive(Debug)]
 pub(crate) struct Report {
     pub(crate) message: AgentStatusMessage,
+    /// An application scan that follows a run, which changed what is
+    /// installed.
+    pub(crate) after_run: bool,
     failures: u32,
-    /// Keeps automatic updates waiting until the report is written or given
-    /// up on, as the job it answers did while it ran.
+    /// Keeps automatic updates waiting until the scan is written or given up
+    /// on, as the scan did while it ran, for at most
+    /// [`crate::remote::service_link::RESULT_HOLD`].
     _activity: Option<ActivityGuard>,
 }
 
@@ -37,13 +43,14 @@ impl Report {
         Self::answering(message, None)
     }
 
-    /// The result of the job `activity` was held for since it was accepted.
+    /// The scan `activity` was held for since it was asked for.
     pub(crate) fn answering(message: AgentStatusMessage, activity: Option<ActivityGuard>) -> Self {
         if let Some(activity) = &activity {
             activity.finished();
         }
         Self {
             message,
+            after_run: false,
             failures: 0,
             _activity: activity,
         }
