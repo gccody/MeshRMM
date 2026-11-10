@@ -23,7 +23,7 @@ use meshrmm_protocol_types::{
     AdapterKind, AgentCommand, MAX_WAKE_MAC_ADDRESSES, MAX_WAKE_PACKETS, SystemInfo, WakePacket,
     WakePacketResult, clean_text, parse_mac,
 };
-use sea_query::{Expr, ExprTrait, LockType, Order, Query};
+use sea_query::{Cond, Expr, ExprTrait, LockType, Order, Query};
 use serde::Serialize;
 use serde_json::json;
 use tokio::sync::broadcast;
@@ -785,22 +785,45 @@ pub async fn give_up_overdue(state: &AppState, now: i64) -> db::Result<()> {
 /// A device's Agent connected: it woke, if it was sent packets lately.
 pub async fn device_connected(state: &AppState, device_id: &str) {
     let now = now_ms();
-    let woken = state
+    let woken = Cond::all()
+        .add(Expr::col(WakeRequests::DeviceId).eq(device_id))
+        .add(Expr::col(WakeRequests::OnlineAt).is_null())
+        .add(
+            Expr::col(WakeRequests::Status)
+                .is_in([Status::Sending.as_str(), Status::Sent.as_str()]),
+        )
+        .add(Expr::col(WakeRequests::CreatedAt).gte(now - ONLINE_WINDOW_MS));
+    // Most devices that connect weren't woken: looking first keeps their
+    // connect from taking SQLite's write lock. A request recorded after the
+    // look is one recorded after the device was online already, which the
+    // update alone would have missed as well.
+    let pending: db::Result<Option<(String,)>> = state
         .database
-        .execute(
-            &Query::update()
-                .table(WakeRequests::Table)
-                .value(WakeRequests::OnlineAt, now)
-                .and_where(Expr::col(WakeRequests::DeviceId).eq(device_id))
-                .and_where(Expr::col(WakeRequests::OnlineAt).is_null())
-                .and_where(
-                    Expr::col(WakeRequests::Status)
-                        .is_in([Status::Sending.as_str(), Status::Sent.as_str()]),
-                )
-                .and_where(Expr::col(WakeRequests::CreatedAt).gte(now - ONLINE_WINDOW_MS))
+        .fetch_optional(
+            &Query::select()
+                .column(WakeRequests::Id)
+                .from(WakeRequests::Table)
+                .cond_where(woken.clone())
+                .limit(1)
                 .to_owned(),
         )
         .await;
+    let woken = match pending {
+        Ok(None) => return,
+        Ok(Some(_)) => {
+            state
+                .database
+                .execute(
+                    &Query::update()
+                        .table(WakeRequests::Table)
+                        .value(WakeRequests::OnlineAt, now)
+                        .cond_where(woken)
+                        .to_owned(),
+                )
+                .await
+        }
+        Err(error) => Err(error),
+    };
     match woken {
         Ok(0) => {}
         Ok(_) => {

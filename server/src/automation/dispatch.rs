@@ -133,8 +133,43 @@ pub async fn queue_devices(
     device_ids: &[String],
     now: i64,
 ) -> db::Result<Vec<String>> {
+    let waiting_in = |devices: &[String]| {
+        Cond::all()
+            .add(Expr::col(JobDevices::State).eq(DeviceState::Waiting.as_str()))
+            .add(Expr::col(JobDevices::DeviceId).is_in(devices.iter().cloned()))
+            // Expired jobs' waiting devices are missed, not started.
+            .add(
+                Expr::col(JobDevices::JobId).in_subquery(
+                    Query::select()
+                        .column(Jobs::Id)
+                        .from(Jobs::Table)
+                        .and_where(Expr::col(Jobs::FinishedAt).is_null())
+                        .and_where(Expr::col(Jobs::ExpiresAt).gt(now))
+                        .to_owned(),
+                ),
+            )
+    };
     let mut queued = Vec::new();
     for chunk in device_ids.chunks(QUEUE_CHUNK) {
+        // Most devices that connect wait in no job: looking first keeps the
+        // pass from taking SQLite's write lock for them. A device that starts
+        // waiting after the look, as the update alone could have missed too,
+        // is queued by the next full pass.
+        let waiting: Vec<(String,)> = state
+            .database
+            .fetch_all(
+                &Query::select()
+                    .distinct()
+                    .column(JobDevices::DeviceId)
+                    .from(JobDevices::Table)
+                    .cond_where(waiting_in(chunk))
+                    .to_owned(),
+            )
+            .await?;
+        if waiting.is_empty() {
+            continue;
+        }
+        let waiting = waiting.into_iter().map(|(id,)| id).collect::<Vec<_>>();
         let updated = state
             .database
             .execute(
@@ -142,24 +177,12 @@ pub async fn queue_devices(
                     .table(JobDevices::Table)
                     .value(JobDevices::State, DeviceState::Queued.as_str())
                     .value(JobDevices::UpdatedAt, now)
-                    .and_where(Expr::col(JobDevices::State).eq(DeviceState::Waiting.as_str()))
-                    .and_where(Expr::col(JobDevices::DeviceId).is_in(chunk.iter().cloned()))
-                    // Expired jobs' waiting devices are missed, not started.
-                    .and_where(
-                        Expr::col(JobDevices::JobId).in_subquery(
-                            Query::select()
-                                .column(Jobs::Id)
-                                .from(Jobs::Table)
-                                .and_where(Expr::col(Jobs::FinishedAt).is_null())
-                                .and_where(Expr::col(Jobs::ExpiresAt).gt(now))
-                                .to_owned(),
-                        ),
-                    )
+                    .cond_where(waiting_in(&waiting))
                     .to_owned(),
             )
             .await?;
         if updated > 0 {
-            queued.extend(chunk.iter().cloned());
+            queued.extend(waiting);
         }
     }
     Ok(queued)

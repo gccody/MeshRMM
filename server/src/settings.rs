@@ -1,7 +1,9 @@
 //! The instance's single row of settings.
+use std::sync::{Arc, Mutex, PoisonError};
+
 use sea_query::{Expr, ExprTrait, Query};
 
-use crate::db::{self, Executor, tables::Settings as SettingsTable};
+use crate::db::{self, Database, Executor, tables::Settings as SettingsTable};
 
 /// Every column of `settings`. The SMTP password stays encrypted here; only
 /// [`crate::mail`] decrypts it.
@@ -104,4 +106,50 @@ pub async fn load(executor: &mut impl Executor) -> db::Result<Settings> {
                 .to_owned(),
         )
         .await
+}
+
+/// The settings row as last read, for readers outside a transaction. The
+/// row changes rarely; whatever saves it calls [`Cache::forget`] once the
+/// change is committed.
+#[derive(Debug, Default)]
+pub struct Cache {
+    inner: Mutex<Cached>,
+}
+
+#[derive(Debug, Default)]
+struct Cached {
+    /// Bumped by every forget, so a read that began before a save isn't kept.
+    generation: u64,
+    settings: Option<Arc<Settings>>,
+}
+
+impl Cache {
+    /// The settings, read from `database` only when none are cached.
+    pub async fn get(&self, database: &Database) -> db::Result<Arc<Settings>> {
+        let generation = {
+            let cached = self.lock();
+            if let Some(settings) = &cached.settings {
+                return Ok(Arc::clone(settings));
+            }
+            cached.generation
+        };
+        let settings = Arc::new(load(&mut &*database).await?);
+        let mut cached = self.lock();
+        if cached.generation == generation {
+            cached.settings = Some(Arc::clone(&settings));
+        }
+        Ok(settings)
+    }
+
+    /// The settings row changed: the next read goes to the database.
+    pub fn forget(&self) {
+        let mut cached = self.lock();
+        cached.generation += 1;
+        cached.settings = None;
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Cached> {
+        // Nothing panics while holding it, so a poisoned one is whole.
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }

@@ -2,13 +2,18 @@
 //! WebSockets.
 mod common;
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use common::{
-    App, Received, apps, apps_with, quiet, receive, receive_close, receive_json, send_json,
-    send_text, set_up, user_with,
+    Agent, App, Received, SOCKET_WAIT, Server, Ws, apps, apps_with, quiet, receive,
+    receive_any_json, receive_close, receive_json, send_json, send_text, set_up, user_with,
 };
+use meshrmm_server::realtime::presence::{PresenceAgent, PresenceEvent};
 use serde_json::{Value, json};
+use tokio::sync::broadcast::Receiver;
 
 /// The device in an event, or in a snapshot's list.
 fn device<'a>(event: &'a Value, id: &str) -> &'a Value {
@@ -822,6 +827,295 @@ async fn a_minute_the_database_refuses_loses_only_itself() {
         }
         // A refused minute isn't tried again.
         assert_eq!(app.state.metrics.flush().await.unwrap().statements, 0);
+        app.finish().await;
+    }
+}
+
+/// Waits until the server has handled every message the Agent sent before:
+/// reports are handled in order, and a reading is only held in memory.
+async fn settle(app: &App, control: &mut Ws, device_id: &str) {
+    send_json(control, metrics_report(1.0, 1)).await;
+    for _ in 0..1_000 {
+        if app.state.metrics.latest(device_id).is_some() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the server never handled the Agent's messages");
+}
+
+/// Connects as an Agent does, saying which runs it has (none), and waits
+/// until the server has handled the connect.
+async fn connect_settled(app: &App, server: &Server, agent: &Agent) -> Ws {
+    let mut control = agent.connect(server).await.unwrap();
+    send_json(&mut control, json!({ "type": "application_activity" })).await;
+    settle(app, &mut control, &agent.device_id).await;
+    control
+}
+
+/// The device's next presence change that `ready` accepts.
+async fn presence_of(
+    presence: &mut Receiver<Arc<PresenceEvent>>,
+    device_id: &str,
+    ready: impl Fn(&PresenceAgent) -> bool,
+) -> PresenceAgent {
+    loop {
+        let event = tokio::time::timeout(SOCKET_WAIT, presence.recv())
+            .await
+            .expect("no presence change")
+            .unwrap();
+        if let PresenceEvent::AgentUpsert { agent, .. } = &*event
+            && agent.id == device_id
+            && ready(agent)
+        {
+            return agent.clone();
+        }
+    }
+}
+
+/// Disconnects the Agent and waits until presence shows it offline, the last
+/// of the disconnect's work when no website watches update events.
+async fn disconnect_settled(
+    presence: &mut Receiver<Arc<PresenceEvent>>,
+    control: Ws,
+    device_id: &str,
+) {
+    drop(control);
+    presence_of(presence, device_id, |agent| !agent.connected).await;
+}
+
+/// A small snapshot as an Agent sends it.
+fn system_info() -> Value {
+    json!({
+        "type": "system_info",
+        "system": {
+            "collected_at_unix_ms": 1_700_000_000_000_i64,
+            "os": { "id": "windows", "name": "Windows 11 Pro", "version": "24H2", "architecture": "x86_64" },
+            "hardware": { "memory_bytes": 1 },
+            "network": { "hostname": "DESK", "adapters": [] },
+        }
+    })
+}
+
+fn update_scan() -> Value {
+    json!({
+        "type": "update_scan",
+        "scan": {
+            "scanned_at_unix_ms": 1_700_000_000_000_i64,
+            "manager": "windows_update",
+            "updates": [],
+            "reboot_pending": false,
+        }
+    })
+}
+
+/// Connects the Agent once to send a snapshot and a scan, so it has nothing
+/// pending when it connects again.
+async fn make_idle(
+    app: &App,
+    server: &Server,
+    presence: &mut Receiver<Arc<PresenceEvent>>,
+    agent: &Agent,
+) {
+    let mut control = agent.connect(server).await.unwrap();
+    send_json(&mut control, system_info()).await;
+    send_json(&mut control, update_scan()).await;
+    settle(app, &mut control, &agent.device_id).await;
+    disconnect_settled(presence, control, &agent.device_id).await;
+}
+
+/// The most statements connecting a device with nothing pending runs, with
+/// the monitor rules read: authenticating, looking for wake requests, the
+/// address, the presence refresh (five), the remote session, a rotated
+/// credential, the update status, the rules (four), and the application
+/// runs to settle.
+const IDLE_CONNECT_STATEMENTS: u64 = 16;
+
+#[tokio::test]
+async fn an_idle_device_connects_in_few_statements_without_the_write_lock() {
+    for app in apps().await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let desk = app.enroll(&mut admin, "Desk").await;
+        let mut presence = app.state.presence.subscribe();
+        make_idle(&app, &server, &mut presence, &desk).await;
+
+        // The monitor rules are kept for a few seconds; forgetting them makes
+        // every measured connect read them, however slow the runner.
+        app.state.monitors.wake();
+        let before = app.db().counts();
+        let control = connect_settled(&app, &server, &desk).await;
+        let alone = app.db().counts() - before;
+        assert_eq!(
+            (alone.writes, alone.transactions),
+            (0, 0),
+            "{name}: {alone:?}"
+        );
+        assert!(
+            alone.statements <= IDLE_CONNECT_STATEMENTS,
+            "{name}: {alone:?}"
+        );
+        disconnect_settled(&mut presence, control, &desk.device_id).await;
+
+        // Other connected devices change nothing about one device's connect.
+        let others = (0..100)
+            .map(|n| app.state.agents.connect(&format!("other-{n}")))
+            .collect::<Vec<_>>();
+        app.state.monitors.wake();
+        let before = app.db().counts();
+        let control = connect_settled(&app, &server, &desk).await;
+        assert_eq!(app.db().counts() - before, alone, "{name}");
+        disconnect_settled(&mut presence, control, &desk.device_id).await;
+        drop(others);
+        app.finish().await;
+    }
+}
+
+/// The device's next update status on the website's socket.
+async fn update_status(events: &mut Ws, device_id: &str) -> Value {
+    loop {
+        let message = receive_any_json(events).await;
+        if message["type"] == "device_updates" && message["device"]["device_id"] == device_id {
+            return message["device"].clone();
+        }
+    }
+}
+
+async fn scan_requested_at(app: &App, device_id: &str) -> Option<i64> {
+    use sea_query::{Expr, ExprTrait, Query};
+    let (requested,): (Option<i64>,) = app
+        .db()
+        .fetch_one(
+            &Query::select()
+                .column("scan_requested_at")
+                .from("device_update_status")
+                .and_where(Expr::col("device_id").eq(device_id))
+                .to_owned(),
+        )
+        .await
+        .unwrap();
+    requested
+}
+
+#[tokio::test]
+async fn a_connect_still_does_what_is_pending() {
+    use meshrmm_server::{
+        time::{HOUR_MS, now_ms},
+        wake::ONLINE_WINDOW_MS,
+    };
+    use sea_query::{Expr, ExprTrait, Order, Query};
+    for app in apps().await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let desk = app.enroll(&mut admin, "Desk").await;
+        let mut presence = app.state.presence.subscribe();
+        make_idle(&app, &server, &mut presence, &desk).await;
+
+        // A device sent wake packets lately counts as woken when it connects;
+        // one sent them long ago doesn't.
+        let now = now_ms();
+        for (id, created_at) in [("recent", now), ("old", now - ONLINE_WINDOW_MS - 1)] {
+            app.db()
+                .execute(
+                    &Query::insert()
+                        .into_table("wake_requests")
+                        .columns([
+                            "id",
+                            "device_id",
+                            "requested_by_user_id",
+                            "status",
+                            "mac_addresses",
+                            "created_at",
+                        ])
+                        .values_panic([
+                            id.into(),
+                            desk.device_id.as_str().into(),
+                            "someone".into(),
+                            "sent".into(),
+                            "00-15-5d-01-02-03".into(),
+                            created_at.into(),
+                        ])
+                        .to_owned(),
+                )
+                .await
+                .unwrap();
+        }
+        // A device that connects from somewhere new shows its new address.
+        let snapshot = serde_json::from_value(system_info()["system"].clone()).unwrap();
+        let elsewhere = "203.0.113.7".parse().unwrap();
+        assert!(
+            meshrmm_server::system_info::store(
+                &app.state.database,
+                &desk.device_id,
+                elsewhere,
+                snapshot
+            )
+            .await
+            .unwrap()
+        );
+        // A website watching update events hears the device come online.
+        let mut events = admin.events(&server).await.unwrap();
+        receive_json(&mut events).await;
+        let control = connect_settled(&app, &server, &desk).await;
+        let online = presence_of(&mut presence, &desk.device_id, |agent| agent.connected).await;
+        let address = online
+            .system
+            .as_ref()
+            .and_then(|system| system.public_ip.as_deref());
+        assert_eq!(address, Some("127.0.0.1"), "{name}");
+        let woken: Vec<(String, Option<i64>)> = app
+            .db()
+            .fetch_all(
+                &Query::select()
+                    .columns(["id", "online_at"])
+                    .from("wake_requests")
+                    .order_by("id", Order::Asc)
+                    .to_owned(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(woken[0], ("old".to_owned(), None), "{name}");
+        assert_eq!(woken[1].0, "recent");
+        assert!(woken[1].1.is_some(), "{name}: {woken:?}");
+        let status = update_status(&mut events, &desk.device_id).await;
+        assert_eq!(status["connected"], true, "{name}: {status}");
+        disconnect_settled(&mut presence, control, &desk.device_id).await;
+        let status = update_status(&mut events, &desk.device_id).await;
+        assert_eq!(status["connected"], false, "{name}: {status}");
+        drop(events);
+
+        // A scan two hours old is recent enough for the default interval, and
+        // a saved change to the interval applies to the next connect.
+        app.db()
+            .execute(
+                &Query::update()
+                    .table("device_update_status")
+                    .value("received_at", now_ms() - 2 * HOUR_MS)
+                    .value("scan_requested_at", Option::<i64>::None)
+                    .and_where(Expr::col("device_id").eq(desk.device_id.as_str()))
+                    .to_owned(),
+            )
+            .await
+            .unwrap();
+        let control = connect_settled(&app, &server, &desk).await;
+        assert_eq!(
+            scan_requested_at(&app, &desk.device_id).await,
+            None,
+            "{name}"
+        );
+        disconnect_settled(&mut presence, control, &desk.device_id).await;
+        let saved = admin
+            .patch("/v1/settings", json!({ "update_scan_interval_hours": 1 }))
+            .await;
+        assert_eq!(saved.status, 200, "{:?}", saved.body);
+        let control = connect_settled(&app, &server, &desk).await;
+        assert!(
+            scan_requested_at(&app, &desk.device_id).await.is_some(),
+            "{name}"
+        );
+        disconnect_settled(&mut presence, control, &desk.device_id).await;
         app.finish().await;
     }
 }

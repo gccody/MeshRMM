@@ -16,7 +16,7 @@
 pub mod runs;
 pub mod store;
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use meshrmm_protocol_types::{AgentCommand, UpdateInstallResult, UpdateInstallStatus, UpdateScan};
 use sea_query::{Expr, ExprTrait, Query};
@@ -30,7 +30,6 @@ use crate::{
         tables::{Agents, DeviceUpdateStatus, UpdateRuns},
     },
     http::AppState,
-    settings,
     time::{DAY_MS, HOUR_MS, now_ms},
 };
 
@@ -78,6 +77,13 @@ impl Engine {
         // Nobody listening is fine.
         let _ = self.events.send(Arc::new(event));
     }
+
+    /// Whether an event published now would reach anyone: when not, there
+    /// is no need to read what it would say. A socket subscribing just after
+    /// is the same as one subscribing just after the event.
+    fn heard(&self) -> bool {
+        self.events.receiver_count() > 0
+    }
 }
 
 /// Runs the engine until the returned task is aborted.
@@ -120,7 +126,9 @@ pub async fn sweep(state: &AppState, now: i64) -> anyhow::Result<()> {
 /// The instance's scan interval, or `None` when devices scan only when
 /// asked or by policies.
 async fn scan_interval_ms(state: &AppState) -> db::Result<Option<i64>> {
-    let hours = settings::load(&mut &state.database)
+    let hours = state
+        .settings
+        .get(&state.database)
         .await?
         .update_scan_interval_hours;
     Ok((hours > 0).then_some(hours * HOUR_MS))
@@ -323,6 +331,9 @@ pub async fn install_reported(
 
 /// Tells event sockets about a run.
 pub async fn publish_run(state: &AppState, run_id: &str) {
+    if !state.updates.heard() {
+        return;
+    }
     match runs::get(&mut &state.database, run_id, false).await {
         Ok(Some(run)) => state
             .updates
@@ -334,13 +345,16 @@ pub async fn publish_run(state: &AppState, run_id: &str) {
 
 /// Tells event sockets about a device's updates.
 pub async fn publish_device(state: &AppState, device_id: &str) {
-    match store::summaries(
-        &mut &state.database,
-        Some(device_id),
-        &state.agents.connected(),
-    )
-    .await
-    {
+    if !state.updates.heard() {
+        return;
+    }
+    // The summary asks only whether this device is connected.
+    let connected = if state.agents.is_connected(device_id) {
+        HashSet::from([device_id.to_owned()])
+    } else {
+        HashSet::new()
+    };
+    match store::summaries(&mut &state.database, Some(device_id), &connected).await {
         Ok(summaries) => {
             if let Some(device) = summaries.into_iter().next() {
                 state.updates.publish(UpdatesEvent::DeviceUpdates {

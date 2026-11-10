@@ -110,9 +110,9 @@ Agent is removed rather than reported as failed.
 
 The work for an Agent that connects is that device's alone: the server
 queues its waiting parts by its ID, and Agents that connect together are
-queued in one statement, so a fleet reconnecting after a server restart
-while a fleet-wide job waits doesn't make the server reread the job for each
-of them. A job's counts, shown on its page and pushed to the website, are
+looked up in one statement and, when any of them waits, queued in one more,
+so a fleet reconnecting after a server restart while a fleet-wide job waits
+doesn't make the server reread the job for each of them. A job's counts, shown on its page and pushed to the website, are
 recounted at most once a second, and only for the jobs whose devices
 changed: those queued or started, and those whose devices reported. A job
 is marked finished on the first recount after its last device reports, and
