@@ -621,3 +621,37 @@ async fn scim_changes_apply_to_the_members_next_request() {
         app.finish().await;
     }
 }
+
+#[tokio::test]
+async fn a_patch_path_too_deep_for_any_attribute_is_refused() {
+    for app in common::apps().await {
+        let name = app.name;
+        let mut admin = common::set_up(&app).await;
+        let scim = token(&app, &mut admin).await;
+        let created = scim.post("/Users", user("grace@example.com")).await;
+        assert_eq!(created.status, StatusCode::CREATED, "{name}");
+        let id = created.body["id"].as_str().unwrap().to_owned();
+
+        // A million bytes of `a.a.a…`, well inside the request size limit.
+        let deep = vec!["a"; 500_000].join(".");
+        for operations in [
+            json!([{ "op": "replace", "path": deep, "value": "x" }]),
+            json!([{ "op": "add", "value": { deep.clone(): "x" } }]),
+        ] {
+            let refused = scim.patch(&format!("/Users/{id}"), operations).await;
+            assert_eq!(
+                refused.status,
+                StatusCode::BAD_REQUEST,
+                "{name}: {:?}",
+                refused.body
+            );
+            assert_eq!(refused.body["scimType"], "invalidPath", "{name}");
+        }
+
+        // The server is still up, and the user as it was.
+        let user = scim.get(&format!("/Users/{id}")).await;
+        assert_eq!(user.status, StatusCode::OK, "{name}");
+        assert_eq!(user.body["displayName"], "Grace Hopper", "{name}");
+        app.finish().await;
+    }
+}
