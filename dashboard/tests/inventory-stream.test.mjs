@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { ACCESS_REVOKED_CLOSE_CODE, SILENT_SOCKET_MS, STALE_GRACE_MS, eventsSocketUrl, inventoryStatus, inventoryStream } from '../features/agents/inventory-stream.ts';
+import { ACCESS_REVOKED_CLOSE_CODE, SILENT_SOCKET_MS, SNAPSHOT_ANSWER_MS, STALE_GRACE_MS, eventsSocketUrl, inventoryStatus, inventoryStream } from '../features/agents/inventory-stream.ts';
 
 class FakeSocket extends EventTarget {
   readyState = 0;
@@ -13,7 +13,11 @@ class FakeSocket extends EventTarget {
   }
 
   receive(value) {
-    this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify(value) }));
+    this.receiveRaw(JSON.stringify(value));
+  }
+
+  receiveRaw(data) {
+    this.dispatchEvent(new MessageEvent('message', { data }));
   }
 
   send(data) {
@@ -61,13 +65,17 @@ function fakeTimers() {
 
 const agent = (id, connected = true) => ({ id, name: id.toUpperCase(), platform: "windows", connected });
 
-// `random` 0.5 makes each reconnect wait three quarters of its step.
+// `random` 0.5 makes each reconnect wait three quarters of its step. Setting
+// `state.failing` makes every listener throw, as a page's bug would.
 function harness({ online, random = () => 0.5 } = {}) {
   const sockets = [];
   const connections = [];
   const timers = fakeTimers();
   const revision = { current: -1 };
-  const state = { agents: [], companies: [], refused: 0, refusedAt: [], readings: [], alerts: [], jobs: [], updates: [] };
+  const state = { agents: [], companies: [], refused: 0, refusedAt: [], readings: [], alerts: [], jobs: [], updates: [], errors: [], failing: false };
+  const fail = name => {
+    if (state.failing) throw new Error(`${name} listener failed`);
+  };
   const stream = inventoryStream({
     openSocket: () => {
       const socket = new FakeSocket();
@@ -75,11 +83,14 @@ function harness({ online, random = () => 0.5 } = {}) {
       return socket;
     },
     revision,
-    onInventory: update => { ({ agents: state.agents, companies: state.companies } = update({ agents: state.agents, companies: state.companies })); },
-    onMetrics: readings => { state.readings.push(...readings); },
-    onAlerts: event => { state.alerts.push(event); },
-    onJobs: event => { state.jobs.push(event); },
-    onUpdates: event => { state.updates.push(event); },
+    onInventory: update => {
+      fail('inventory');
+      ({ agents: state.agents, companies: state.companies } = update({ agents: state.agents, companies: state.companies }));
+    },
+    onMetrics: readings => { fail('metrics'); state.readings.push(...readings); },
+    onAlerts: event => { fail('alerts'); state.alerts.push(event); },
+    onJobs: event => { fail('jobs'); state.jobs.push(event); },
+    onUpdates: event => { fail('updates'); state.updates.push(event); },
     onConnection: connection => connections.push(connection),
     onRefused: () => {
       state.refused++;
@@ -88,6 +99,7 @@ function harness({ online, random = () => 0.5 } = {}) {
     online,
     timers,
     random,
+    reportError: error => { state.errors.push(error.message); },
   });
   return { stream, sockets, connections, timers, revision, state };
 }
@@ -352,12 +364,172 @@ test('a later snapshot overtaken by an HTTP load keeps the newer inventory witho
   assert.equal(revision.current, 10);
 });
 
-test('an unreadable message asks for a snapshot', () => {
-  const { sockets } = harness();
+test('a message of a type the page doesn’t know is ignored', () => {
+  const { sockets, state, revision, connections } = harness();
+  const socket = sockets[0];
+  socket.open();
+  socket.receive({ type: 'snapshot', revision: 3, agents: [agent('a')], generated_at_unix_ms: 1 });
+  socket.receive({ type: 'mystery', device_id: 'a' });
+  socket.receive({ type: 'agent_upsert', revision: 4, agent: agent('b') });
+  assert.deepEqual(state.agents.map(item => item.id), ['a', 'b']);
+  // A change a newer server added takes its revision, so the next isn't a gap.
+  socket.receive({ type: 'site_upsert', revision: 5, site: { id: 's' } });
+  socket.receive({ type: 'agent_deleted', revision: 6, agent_id: 'a' });
+  assert.deepEqual(state.agents.map(item => item.id), ['b']);
+  assert.equal(revision.current, 6);
+  assert.deepEqual(socket.sent, []);
+  assert.equal(socket.closed, null);
+  assert.deepEqual(connections, ['connecting', 'live']);
+});
+
+test('an unknown change before the snapshot waits with the others', () => {
+  const { sockets, state, revision } = harness();
+  const socket = sockets[0];
+  socket.open();
+  socket.receive({ type: 'agent_upsert', revision: 6, agent: agent('c') });
+  socket.receive({ type: 'site_upsert', revision: 5, site: { id: 's' } });
+  socket.receive({ type: 'snapshot', revision: 4, agents: [agent('a')], generated_at_unix_ms: 1 });
+  assert.deepEqual(state.agents.map(item => item.id), ['a', 'c']);
+  assert.equal(revision.current, 6);
+  assert.deepEqual(socket.sent, []);
+});
+
+test('unreadable messages that carry no revision are dropped', () => {
+  const { sockets, state, revision } = harness();
+  const socket = sockets[0];
+  socket.open();
+  socket.receive({ type: 'snapshot', revision: 3, agents: [agent('a')], generated_at_unix_ms: 1 });
+  for (const data of ['{', 'refresh', '', 'null', '[]', '7', '{"type":5}', '{"revision":4}']) socket.receiveRaw(data);
+  socket.receive({ type: 'metrics', readings: 'none' });
+  socket.receive({ type: 'alert_upsert', alert: { id: 'x' } });
+  socket.receive({ type: 'alert_counts' });
+  socket.receive({ type: 'monitor_update', device_id: 'a' });
+  socket.receive({ type: 'job_update', job: null });
+  socket.receive({ type: 'device_updates', device: 'a' });
+  socket.receive({ type: 'update_run' });
+  assert.deepEqual(socket.sent, []);
+  assert.deepEqual([state.readings, state.alerts, state.jobs, state.updates], [[], [], [], []]);
+  socket.receive({ type: 'agent_upsert', revision: 4, agent: agent('b') });
+  assert.deepEqual(state.agents.map(item => item.id), ['a', 'b']);
+  assert.equal(revision.current, 4);
+  assert.deepEqual(state.errors, []);
+});
+
+test('an unreadable device change asks for one snapshot and holds later changes for it', () => {
+  const { sockets, state, revision, connections } = harness();
+  const socket = sockets[0];
+  socket.open();
+  socket.receive({ type: 'snapshot', revision: 3, agents: [agent('a')], generated_at_unix_ms: 1 });
+  socket.receive({ type: 'agent_upsert', revision: 4, agent: { id: 'b' } });
+  assert.deepEqual(socket.sent, ['refresh']);
+  socket.receive({ type: 'agent_upsert', revision: 5, agent: agent('c') });
+  socket.receive({ type: 'agent_deleted', revision: 6 });
+  socket.receive({ type: 'company_upsert', revision: 7, company: { name: 'No ID' } });
+  assert.deepEqual(state.agents.map(item => item.id), ['a'], 'the changes after it wait');
+  assert.deepEqual(socket.sent, ['refresh'], 'the snapshot asked for covers them all');
+  socket.receive({ type: 'snapshot', revision: 7, agents: [agent('a'), agent('b'), agent('c')], generated_at_unix_ms: 2 });
+  socket.receive({ type: 'agent_upsert', revision: 8, agent: agent('e') });
+  assert.deepEqual(state.agents.map(item => item.id), ['a', 'b', 'c', 'e']);
+  assert.equal(revision.current, 8);
+  assert.deepEqual(socket.sent, ['refresh']);
+  assert.deepEqual(connections, ['connecting', 'live']);
+});
+
+test('a burst of gaps and unreadable changes sends one refresh until its snapshot arrives', () => {
+  const { sockets, state, revision } = harness();
+  const socket = sockets[0];
+  socket.open();
+  socket.receive({ type: 'snapshot', revision: 1, agents: [agent('a')], generated_at_unix_ms: 1 });
+  for (const next of [3, 5, 4, 9, 7]) {
+    socket.receive({ type: 'agent_upsert', revision: next, agent: agent(`d${next}`) });
+    socket.receive({ type: 'tag_upsert', revision: next + 10, tag: null });
+  }
+  assert.deepEqual(socket.sent, ['refresh']);
+  socket.receive({ type: 'snapshot', revision: 20, agents: [agent('a')], generated_at_unix_ms: 2 });
+  assert.equal(revision.current, 20);
+  // Once answered, the next gap may ask again.
+  socket.receive({ type: 'agent_upsert', revision: 22, agent: agent('z') });
+  socket.receive({ type: 'agent_upsert', revision: 23, agent: agent('y') });
+  assert.deepEqual(socket.sent, ['refresh', 'refresh']);
+  assert.deepEqual(state.agents.map(item => item.id), ['a']);
+});
+
+test('a refresh unanswered for too long replaces the socket', () => {
+  const { sockets, timers, connections, revision } = harness();
   sockets[0].open();
-  sockets[0].receive({ type: 'mystery', revision: 1 });
-  sockets[0].dispatchEvent(new MessageEvent('message', { data: '{' }));
-  assert.deepEqual(sockets[0].sent, ['refresh', 'refresh']);
+  sockets[0].receive({ type: 'snapshot', revision: 1, agents: [agent('a')], generated_at_unix_ms: 1 });
+  sockets[0].receive({ type: 'agent_upsert', revision: 3, agent: agent('b') });
+  timers.advance(SNAPSHOT_ANSWER_MS);
+  sockets[0].receive({ type: 'metrics', readings: [] });
+  assert.equal(sockets[0].closed, null, 'the snapshot may still be on its way');
+  timers.advance(1);
+  sockets[0].receive({ type: 'metrics', readings: [] });
+  assert.deepEqual(sockets[0].sent, ['refresh'], 'asking again on the same socket would go unread too');
+  assert.equal(sockets[0].closed?.code, 1000);
+  assert.equal(revision.current, -1);
+  assert.deepEqual(connections, ['connecting', 'live', 'reconnecting']);
+  timers.fire();
+  sockets[1].open();
+  sockets[1].receive({ type: 'snapshot', revision: 3, agents: [agent('a'), agent('b')], generated_at_unix_ms: 2 });
+  assert.deepEqual(connections, ['connecting', 'live', 'reconnecting', 'live']);
+});
+
+test('an unreadable snapshot replaces the socket after the growing reconnect wait, never asking again', () => {
+  const { sockets, timers, connections } = harness();
+  for (let attempt = 0; attempt < 3; attempt++) {
+    sockets[attempt].open();
+    sockets[attempt].receive({ type: 'snapshot', revision: 1, agents: [{ id: 'a' }], generated_at_unix_ms: 1 });
+    assert.deepEqual(sockets[attempt].sent, []);
+    assert.equal(sockets[attempt].closed?.code, 1000);
+    timers.fire();
+  }
+  assert.deepEqual(timers.delays, [750, 1_500, 3_000]);
+  assert.deepEqual(connections, ['connecting', 'reconnecting']);
+});
+
+test('a page listener that throws is reported, asks for nothing, and later events still arrive', () => {
+  const { sockets, state, revision, connections } = harness();
+  const socket = sockets[0];
+  socket.open();
+  socket.receive({ type: 'snapshot', revision: 3, agents: [agent('a')], generated_at_unix_ms: 1 });
+  const counts = { open: 0, acknowledged: 0, open_info: 0, open_warning: 0, open_critical: 0 };
+  state.failing = true;
+  socket.receive({ type: 'metrics', readings: [] });
+  socket.receive({ type: 'alert_counts', counts });
+  socket.receive({ type: 'jobs_resync' });
+  socket.receive({ type: 'updates_resync' });
+  assert.deepEqual(state.errors, ['metrics listener failed', 'alerts listener failed', 'jobs listener failed', 'updates listener failed']);
+  assert.deepEqual(socket.sent, []);
+  assert.equal(socket.closed, null);
+  state.failing = false;
+  socket.receive({ type: 'alert_counts', counts });
+  socket.receive({ type: 'jobs_resync' });
+  socket.receive({ type: 'updates_resync' });
+  socket.receive({ type: 'agent_upsert', revision: 4, agent: agent('b') });
+  assert.deepEqual([state.alerts.length, state.jobs.length, state.updates.length], [1, 1, 1]);
+  assert.deepEqual(state.agents.map(item => item.id), ['a', 'b']);
+  assert.equal(revision.current, 4);
+  assert.deepEqual(connections, ['connecting', 'live']);
+});
+
+test('a device change that fails to apply is reported and replaces the socket instead of asking for a refresh', () => {
+  const { sockets, state, timers, connections, revision } = harness();
+  sockets[0].open();
+  sockets[0].receive({ type: 'snapshot', revision: 3, agents: [agent('a')], generated_at_unix_ms: 1 });
+  state.failing = true;
+  sockets[0].receive({ type: 'agent_upsert', revision: 4, agent: agent('b') });
+  assert.deepEqual(state.errors, ['inventory listener failed']);
+  assert.deepEqual(sockets[0].sent, []);
+  assert.equal(sockets[0].closed?.code, 1000);
+  assert.equal(revision.current, -1, 'the next socket’s snapshot rebuilds the inventory');
+  assert.deepEqual(connections, ['connecting', 'live', 'reconnecting']);
+  assert.deepEqual(timers.delays, [750]);
+  state.failing = false;
+  timers.fire();
+  sockets[1].open();
+  sockets[1].receive({ type: 'snapshot', revision: 4, agents: [agent('a'), agent('b')], generated_at_unix_ms: 2 });
+  assert.deepEqual(state.agents.map(item => item.id), ['a', 'b']);
+  assert.deepEqual(connections, ['connecting', 'live', 'reconnecting', 'live']);
 });
 
 test('a closed socket reports reconnecting, keeps the devices, and reconnects within 1 s', () => {
