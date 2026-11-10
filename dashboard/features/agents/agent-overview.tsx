@@ -161,6 +161,17 @@ function InventoryStrip({ inventory, onReconnect }: { inventory: InventoryState;
   );
 }
 
+// Refresh loads nothing while the list is live, so each press turns the icon
+// once to show it was heard; a load spins it until done.
+function RefreshButton({ refreshing, onRefresh }: { refreshing: boolean; onRefresh: () => void }) {
+  const [presses, setPresses] = useState(0);
+  return (
+    <button type="button" className="icon-button" onClick={() => { setPresses((count) => count + 1); onRefresh(); }} aria-label="Refresh devices" title="Refresh">
+      <RefreshCw key={presses} size={16} className={refreshing ? "spin" : presses ? "spin-once" : ""} />
+    </button>
+  );
+}
+
 const FILTERS: { id: AgentStatusFilter; label: string }[] = [
   { id: "all", label: "All" },
   { id: "online", label: "Online" },
@@ -240,7 +251,7 @@ export function AgentOverview({
         {(companies.length > 0 || company) && <CompanyFilterMenu companies={companies} company={company} onChange={onCompanyChange} />}
         {(tags.length > 0 || tagFilter.length > 0) && <TagFilterMenu tags={tags} chosen={tagFilter} match={tagMatch} onChange={onTagsChange} />}
         <label className="search-field"><Search size={16} aria-hidden="true" /><input type="search" aria-label="Search devices" value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="Search devices" title="Searches names, tags, operating systems, models, serial numbers and IP addresses" /></label>
-        <button type="button" className="icon-button" onClick={onRefresh} aria-label="Refresh devices" title="Refresh"><RefreshCw size={16} className={inventory.isRefreshing ? "spin" : ""} /></button>
+        <RefreshButton refreshing={inventory.isRefreshing} onRefresh={onRefresh} />
         {allowed.enroll && <button type="button" className="primary-button" onClick={(event) => onAddDevice(event.currentTarget)} aria-haspopup="dialog"><Plus size={16} /> Add device</button>}
       </HeaderActions>
 

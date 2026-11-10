@@ -1,4 +1,5 @@
 import { type KeyboardEvent, type PointerEvent, type ReactNode, useEffect, useState } from "react";
+import { timeFormat } from "../../lib/format";
 import { type MetricsPoint, areaPath, linePath, nearestPoint } from "./model";
 
 export type Series = {
@@ -30,20 +31,18 @@ type Props = {
 const HEIGHT = 168;
 const MARGIN = { top: 10, right: 12, bottom: 24, left: 60 };
 
+const dayAndHour = timeFormat({ weekday: "short", hour: "numeric" });
+const hourAndMinute = timeFormat({ hour: "numeric", minute: "2-digit" });
+const toTheSecond = timeFormat({ hour: "numeric", minute: "2-digit", second: "2-digit" });
+const dateAndMinute = timeFormat({ month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+
 function formatTime(at: number, spanMs: number) {
-  const date = new Date(at);
-  if (spanMs > 2 * 24 * 60 * 60_000) return date.toLocaleDateString([], { weekday: "short", hour: "numeric" });
-  return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  return spanMs > 2 * 24 * 60 * 60_000 ? dayAndHour(at) : hourAndMinute(at);
 }
 
 function formatTooltipTime(at: number, periodMs: number | null) {
-  const options: Intl.DateTimeFormatOptions = periodMs === null
-    ? { hour: "numeric", minute: "2-digit", second: "2-digit" }
-    : { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" };
-  const start = new Date(at).toLocaleString([], options);
-  if (periodMs === null) return start;
-  const end = new Date(at + periodMs).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-  return `${start} – ${end}`;
+  if (periodMs === null) return toTheSecond(at);
+  return `${dateAndMinute(at)} – ${hourAndMinute(at + periodMs)}`;
 }
 
 // The chart's width follows its container.

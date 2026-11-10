@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { DeviceStore } from '../features/agents/device-store.ts';
-import { ACCESS_REVOKED_CLOSE_CODE, SILENT_SOCKET_MS, SNAPSHOT_ANSWER_MS, STALE_GRACE_MS, eventsSocketUrl, inventoryStatus, inventoryStream } from '../features/agents/inventory-stream.ts';
+import { ACCESS_REVOKED_CLOSE_CODE, SILENT_SOCKET_MS, SNAPSHOT_ANSWER_MS, STALE_GRACE_MS, eventsSocketUrl, inventoryStatus, inventoryStream, refreshInventory } from '../features/agents/inventory-stream.ts';
 
 class FakeSocket extends EventTarget {
   readyState = 0;
@@ -275,6 +275,69 @@ test('wake() before the first snapshot asks for nothing', () => {
   assert.deepEqual(sockets[0].sent, [], 'the snapshot is already on its way');
   assert.equal(sockets[0].closed, null);
   assert.equal(sockets.length, 1);
+});
+
+// The Refresh button over a harness's stream, counting the list loads it
+// starts, as the page's /v1/agents requests.
+function refresher({ stream, connections }) {
+  const counts = { loads: 0 };
+  counts.press = () => refreshInventory(connections.at(-1), {
+    wake: () => stream.wake(),
+    load: async () => { counts.loads++; return true; },
+  });
+  return counts;
+}
+
+test('Refresh on a live stream downloads no list and asks the server for nothing', async () => {
+  const h = harness();
+  const refresh = refresher(h);
+  h.sockets[0].open();
+  h.sockets[0].receive({ type: 'snapshot', revision: 1, agents: [agent('a')], generated_at_unix_ms: 1 });
+  assert.equal(h.connections.at(-1), 'live');
+  assert.equal(await refresh.press(), true);
+  assert.equal(refresh.loads, 0, 'the stream already holds every change');
+  assert.deepEqual(h.sockets[0].sent, [], 'no snapshot is asked for either');
+  assert.equal(h.sockets.length, 1);
+  assert.equal(h.sockets[0].closed, null);
+});
+
+test('Refresh on a live stream that went silent replaces its socket, still without a list download', async () => {
+  const h = harness();
+  const refresh = refresher(h);
+  h.sockets[0].open();
+  h.sockets[0].receive({ type: 'snapshot', revision: 1, agents: [agent('a')], generated_at_unix_ms: 1 });
+  h.timers.advance(SILENT_SOCKET_MS + 1);
+  await refresh.press();
+  assert.equal(refresh.loads, 0, "the new socket's snapshot brings the devices");
+  assert.equal(h.sockets[0].closed?.code, 1000);
+  assert.equal(h.sockets.length, 2);
+});
+
+test('Refresh while the stream is down reconnects at once and loads the list', async () => {
+  const h = harness();
+  const refresh = refresher(h);
+  h.sockets[0].open();
+  h.sockets[0].receive({ type: 'snapshot', revision: 1, agents: [agent('a')], generated_at_unix_ms: 1 });
+  h.sockets[0].close(1006);
+  assert.equal(h.connections.at(-1), 'reconnecting');
+  await refresh.press();
+  assert.equal(refresh.loads, 1);
+  assert.equal(h.sockets.length, 2, 'without waiting out the backoff');
+  assert.equal(h.timers.pending.size, 0);
+});
+
+test('Refresh before the first snapshot and while offline loads the list', async () => {
+  const connecting = harness();
+  const first = refresher(connecting);
+  await first.press();
+  assert.equal(connecting.connections.at(-1), 'connecting');
+  assert.equal(first.loads, 1);
+  assert.equal(connecting.sockets.length, 1, 'the socket still connecting is kept');
+  const offline = harness({ online: false });
+  const second = refresher(offline);
+  await second.press();
+  assert.equal(offline.connections.at(-1), 'offline');
+  assert.equal(second.loads, 1);
 });
 
 test('applies deltas buffered before the snapshot, then live deltas in order', () => {

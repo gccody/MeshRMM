@@ -1,6 +1,7 @@
 
 import { CircleAlert, CircleCheck, LoaderCircle } from "lucide-react";
 import { useEffect, useState } from "react";
+import { timeFormat } from "../../lib/format";
 import { AuthenticationRequired, type AuthorizedFetch } from "../../lib/http";
 import {
   LANGUAGE_LABELS,
@@ -60,8 +61,7 @@ export function useScriptRun(authorizedFetch: AuthorizedFetch, initial: ScriptRu
   return { run, error };
 }
 
-const formatTime = (unixMs: number) =>
-  new Date(unixMs).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit" });
+const formatTime = timeFormat({ month: "short", day: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit" });
 
 /** A run's outcome and output. */
 export function RunResult({ run, deviceName, error }: { run: ScriptRun; deviceName: string; error?: string | null }) {

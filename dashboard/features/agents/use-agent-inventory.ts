@@ -5,7 +5,7 @@ import type { JobEvent } from "../automation/model";
 import type { MetricsReading } from "../metrics/model";
 import type { UpdateEvent } from "../updates/model";
 import { DeviceStore } from "./device-store";
-import { type InventoryTarget, inventoryStatus } from "./inventory-stream";
+import { type InventoryTarget, inventoryStatus, refreshInventory } from "./inventory-stream";
 import { parseAgentList } from "./model";
 import { ThumbnailStore } from "./thumbnails";
 import { useDevicesLoaded } from "./use-devices";
@@ -105,13 +105,10 @@ export function useAgentInventory({ enabled, authorizedFetch, onRefused, onAlert
   const applyMetrics = useCallback((readings: MetricsReading[]) => devices.applyReadings(readings), [devices]);
   const { connection, since, now, reconnect } = useInventoryConnection({ enabled, revisionRef: revision, inventory: target, onMetrics: applyMetrics, onAlerts, onJobs, onUpdates, onRefused });
 
-  // Refresh reloads the list and, while the stream is down, skips the
-  // reconnect wait. An open stream is already current.
-  const isStreamLive = connection === "live";
-  const refresh = useCallback(() => {
-    if (!isStreamLive) reconnect();
-    return loadAgents();
-  }, [isStreamLive, loadAgents, reconnect]);
+  const refresh = useCallback(
+    () => refreshInventory(connection, { wake: reconnect, load: loadAgents }),
+    [connection, loadAgents, reconnect],
+  );
 
   const status = enabled ? inventoryStatus({ hasData, connection, since, now }) : "loading";
   const shownError = enabled ? error : null;

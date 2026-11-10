@@ -109,6 +109,22 @@ test("a snapshot is sorted in the browser's order, not the server's", () => {
   assert.deepEqual(devices.counts(), { total: 4, online: 3 });
 });
 
+test("a snapshot already in the list's order costs one comparison a device; one out of order is still sorted", () => {
+  const count = 5_000;
+  const inOrder = sortAgents(Array.from({ length: count }, (_, index) => device(`id-${index}`, `device ${index}`, index % 3 !== 0)));
+  const counter = counted();
+  const devices = new DeviceStore({ schedule: () => {}, compare: counter.compare });
+  devices.replace({ agents: inOrder, ...empty });
+  assert.deepEqual(devices.agents(), inOrder);
+  assert.equal(counter.comparisons, count - 1, "checked, not sorted again");
+  // Where the server's order and the browser's differ: by case, then ID.
+  const outOfOrder = [...inOrder, device("b", "zz", true), device("a", "ZZ", true)];
+  counter.comparisons = 0;
+  devices.replace({ agents: outOfOrder, ...empty });
+  assert.deepEqual(devices.agents(), sortAgents(outOfOrder));
+  assert.notDeepEqual(devices.agents(), outOfOrder);
+});
+
 test("a snapshot replaces everything", () => {
   const clock = frames();
   const devices = new DeviceStore({ schedule: clock.schedule });

@@ -18,6 +18,7 @@ import { DeviceApplications } from "../applications/device-applications";
 import { DeviceWake } from "../wake/device-wake";
 import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
+import { timeFormat } from "../../lib/format";
 import { useCompanies, useDevice, useDeviceReading, useTags } from "../agents/use-devices";
 import { MetricChart, type Series } from "./metric-chart";
 import {
@@ -43,6 +44,7 @@ const NETWORK: Series[] = [
   { label: "Sent", tone: "series-2", value: (point) => point.network_sent_bytes_per_second, format: formatBitRate },
 ];
 const STORAGE: Series[] = [{ label: "Used", tone: "series-1", value: (point) => point.storage_used_bytes, format: formatBytes }];
+const pointTime = timeFormat({ month: "short", day: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit" });
 
 const isRange = (value: string | null): value is MetricsRange => METRICS_RANGES.some((range) => range.id === value);
 
@@ -310,7 +312,7 @@ function DataTable({ points }: { points: MetricsPoint[] }) {
           <tbody>
             {[...points].reverse().map((point) => (
               <tr key={point.at}>
-                <th scope="row">{new Date(point.at).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit" })}</th>
+                <th scope="row">{pointTime(point.at)}</th>
                 <td>{formatPercent(point.cpu_percent)}</td>
                 <td>{formatBytes(point.memory_used_bytes)}</td>
                 <td>{formatBitRate(point.network_received_bytes_per_second)}</td>
