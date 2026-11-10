@@ -18,6 +18,7 @@ use crate::{
         second_factor::{self, TotpState},
         session::{self, AuthMethod, Client},
     },
+    db::Transaction,
     http::{ApiError, AppState, JsonBody, client_ip::ClientIp},
     settings,
     users::{self, User},
@@ -111,7 +112,8 @@ pub async fn password(
         })
         .into_response());
     }
-    finish(&state, &user, None, Client::new(ip, &headers)).await
+    let transaction = state.database.begin().await?;
+    finish(&state, transaction, &user, None, Client::new(ip, &headers)).await
 }
 
 /// A prompt for one of the user's passkeys, unless passkeys can't work on
@@ -191,11 +193,16 @@ pub async fn second_factor(
         .second_factor_by_user
         .hit(&user.id)
         .map_err(ApiError::rate_limited)?;
+    // The code is used up in the transaction that starts the session, so a
+    // failure in between leaves it unused. Its use is a conditional update,
+    // so a second request with the same code waits for this transaction and
+    // then finds the code used, or, if this one rolled back, unused.
+    let mut transaction = state.database.begin().await?;
     let (method, accepted) = match (&request.code, &request.recovery_code, &request.passkey) {
         (Some(code), None, None) => (
             "totp",
             second_factor::verify_totp(
-                &mut database,
+                &mut transaction,
                 &state.instance_key,
                 &user.id,
                 TotpState::Confirmed,
@@ -205,7 +212,7 @@ pub async fn second_factor(
         ),
         (None, Some(code), None) => (
             "recovery_code",
-            second_factor::use_recovery_code(&mut database, &user.id, code).await?,
+            second_factor::use_recovery_code(&mut transaction, &user.id, code).await?,
         ),
         (None, None, Some(credential)) => {
             let prompt = attempt.passkey.ok_or_else(|| {
@@ -216,7 +223,7 @@ pub async fn second_factor(
             })?;
             (
                 "passkey",
-                check_passkey(&state, &user, credential, &prompt).await?,
+                check_passkey(&state, &mut transaction, &user, credential, &prompt).await?,
             )
         }
         _ => {
@@ -226,6 +233,8 @@ pub async fn second_factor(
         }
     };
     if !accepted {
+        // Ended first: on SQLite it holds the one writer.
+        drop(transaction);
         audit::record(
             &mut database,
             &Actor::anonymous(ip),
@@ -240,19 +249,28 @@ pub async fn second_factor(
         );
     }
     state.auth.second_factor_by_user.refund(&user.id);
+    let response = finish(
+        &state,
+        transaction,
+        &user,
+        Some(method),
+        Client::new(ip, &headers),
+    )
+    .await?;
     state.auth.challenges.complete(&request.challenge);
-    finish(&state, &user, Some(method), Client::new(ip, &headers)).await
+    Ok(response)
 }
 
-/// Checks the browser's answer to a passkey prompt for `user`.
+/// Checks the browser's answer to a passkey prompt for `user`, recording
+/// its use in `transaction`.
 async fn check_passkey(
     state: &AppState,
+    transaction: &mut Transaction,
     user: &User,
     credential: &PublicKeyCredential,
     prompt: &PasskeyAuthentication,
 ) -> Result<bool, ApiError> {
-    let mut database = &state.database;
-    let settings = settings::load(&mut database).await?;
+    let settings = settings::load(transaction).await?;
     let relying_party = passkeys::relying_party(&state.config, &settings.instance_name)?;
     let result = match relying_party.finish_passkey_authentication(credential, prompt) {
         Ok(result) => result,
@@ -261,25 +279,25 @@ async fn check_passkey(
             return Ok(false);
         }
     };
-    let Some(mut stored) = passkeys::by_credential_id(&mut database, result.cred_id())
+    let Some(mut stored) = passkeys::by_credential_id(transaction, result.cred_id())
         .await?
         .filter(|stored| stored.user_id == user.id)
     else {
         return Ok(false);
     };
-    passkeys::record_use(&mut database, &mut stored, &result).await?;
+    passkeys::record_use(transaction, &mut stored, &result).await?;
     Ok(true)
 }
 
-/// Starts the session, records the sign-in and gives the browser a device
-/// cookie for the account.
+/// Starts the session in `transaction`, records the sign-in, commits, and
+/// gives the browser a device cookie for the account.
 async fn finish(
     state: &AppState,
+    mut transaction: Transaction,
     user: &User,
     second_factor: Option<&str>,
     client: Client,
 ) -> Result<Response, ApiError> {
-    let mut transaction = state.database.begin().await?;
     let settings = settings::load(&mut transaction).await?;
     let cookie = session::start(
         &mut transaction,

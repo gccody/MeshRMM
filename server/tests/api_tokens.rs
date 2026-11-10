@@ -515,6 +515,170 @@ async fn tokens_are_revoked_expire_and_follow_the_policy() {
     }
 }
 
+/// A token is a credential its user may have limited on purpose, so it
+/// finds and revokes other tokens, its own user's too, only with
+/// `api_tokens.manage`. It can always read and revoke itself.
+#[tokio::test]
+async fn tokens_manage_other_tokens_only_with_the_permission() {
+    for app in common::apps().await {
+        let name = app.name;
+        let mut admin = common::set_up(&app).await;
+        let (scoped_id, scoped) = make(
+            &mut admin,
+            json!({ "name": "Read devices", "expires_in_days": 7, "permissions": ["devices.view"] }),
+        )
+        .await;
+        let (other_id, other) = make(
+            &mut admin,
+            json!({ "name": "Backups", "expires_in_days": 7 }),
+        )
+        .await;
+        let (_, manager) = make(
+            &mut admin,
+            json!({ "name": "Token audit", "expires_in_days": 7, "permissions": ["api_tokens.manage"] }),
+        )
+        .await;
+
+        for path in ["/v1/api-tokens", "/v1/api-tokens?all=true"] {
+            let listed = get(&app, &scoped, path).await;
+            assert_eq!(listed.status, StatusCode::FORBIDDEN, "{name}: {path}");
+            assert_eq!(listed.code(), "permission_denied", "{name}: {path}");
+        }
+        let revoke = |token: String, id: String| {
+            let app = &app;
+            async move {
+                call(
+                    app,
+                    &token,
+                    Method::DELETE,
+                    &format!("/v1/api-tokens/{id}"),
+                    None,
+                )
+                .await
+            }
+        };
+        let refused = revoke(scoped.clone(), other_id.clone()).await;
+        assert_eq!(refused.code(), "permission_denied", "{name}");
+        assert_eq!(
+            get(&app, &other, "/v1/agents").await.status,
+            StatusCode::OK,
+            "{name}"
+        );
+        assert_eq!(
+            get(&app, &scoped, "/v1/api-tokens/current").await.status,
+            StatusCode::OK,
+            "{name}"
+        );
+
+        // A user without the permission manages their own tokens on the
+        // website, but none of their tokens can, unlimited or not.
+        let (mut tech, _) =
+            common::add_user(&app, &mut admin, "tech@example.com", &["technician"]).await;
+        let (tech_id, tech_token) =
+            make(&mut tech, json!({ "name": "Mine", "expires_in_days": 7 })).await;
+        let (tech_other_id, _) =
+            make(&mut tech, json!({ "name": "Other", "expires_in_days": 7 })).await;
+        assert_eq!(
+            get(&app, &tech_token, "/v1/api-tokens").await.code(),
+            "permission_denied",
+            "{name}"
+        );
+        assert_eq!(
+            revoke(tech_token.clone(), tech_other_id.clone())
+                .await
+                .code(),
+            "permission_denied",
+            "{name}"
+        );
+        let own = tech.get("/v1/api-tokens").await;
+        assert_eq!(own.body["tokens"].as_array().unwrap().len(), 2, "{name}");
+        assert_eq!(
+            tech.delete(&format!("/v1/api-tokens/{tech_other_id}"))
+                .await
+                .status,
+            StatusCode::NO_CONTENT,
+            "{name}"
+        );
+
+        // With the permission, a token sees and revokes others.
+        let listed = get(&app, &manager, "/v1/api-tokens?all=true").await;
+        assert_eq!(listed.status, StatusCode::OK, "{name}: {:?}", listed.body);
+        assert_eq!(listed.body["tokens"].as_array().unwrap().len(), 4, "{name}");
+        assert_eq!(
+            revoke(manager.clone(), other_id.clone()).await.status,
+            StatusCode::NO_CONTENT,
+            "{name}"
+        );
+        assert_eq!(
+            get(&app, &other, "/v1/agents").await.code(),
+            "invalid_token"
+        );
+        // And any token revokes itself.
+        for (token, id) in [(scoped, scoped_id), (tech_token, tech_id)] {
+            assert_eq!(
+                revoke(token.clone(), id).await.status,
+                StatusCode::NO_CONTENT,
+                "{name}"
+            );
+            assert_eq!(
+                get(&app, &token, "/v1/agents").await.code(),
+                "invalid_token"
+            );
+        }
+        app.finish().await;
+    }
+}
+
+/// Lowering the lifetime cap and shortening the tokens it covers commit
+/// together: if shortening them fails, the cap isn't lowered either, and
+/// saving it again does both.
+#[tokio::test]
+async fn a_lower_lifetime_cap_commits_with_the_tokens_it_shortens() {
+    for app in common::apps().await {
+        let name = app.name;
+        let mut admin = common::set_up(&app).await;
+        make(
+            &mut admin,
+            json!({ "name": "Yearly", "expires_in_days": 365 }),
+        )
+        .await;
+        let expires_at = |list: common::Response| list.body["tokens"][0]["expires_at"].clone();
+        let before = expires_at(admin.get("/v1/api-tokens").await);
+        let lower = json!({ "api_token_max_lifetime_days": 30 });
+
+        common::refuse_writes(&app, "UPDATE", "api_tokens", true).await;
+        let failed = admin
+            .patch("/v1/settings/authentication", lower.clone())
+            .await;
+        common::refuse_writes(&app, "UPDATE", "api_tokens", false).await;
+        assert_eq!(
+            failed.status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{name}: {:?}",
+            failed.body
+        );
+        let settings = admin.get("/v1/settings/authentication").await;
+        assert_eq!(settings.body["api_token_max_lifetime_days"], 365, "{name}");
+        assert_eq!(expires_at(admin.get("/v1/api-tokens").await), before);
+        assert!(
+            common::audit_events(&app, "settings.authentication_update")
+                .await
+                .is_empty(),
+            "{name}"
+        );
+
+        let capped = admin.patch("/v1/settings/authentication", lower).await;
+        assert_eq!(capped.body["api_token_max_lifetime_days"], 30, "{name}");
+        let token = admin.get("/v1/api-tokens").await.body["tokens"][0].clone();
+        assert_eq!(
+            token["expires_at"].as_i64().unwrap() - token["created_at"].as_i64().unwrap(),
+            30 * 24 * 3600 * 1000,
+            "{name}"
+        );
+        app.finish().await;
+    }
+}
+
 #[tokio::test]
 async fn unknown_tokens_are_rate_limited_like_sign_ins() {
     for app in common::apps().await {
@@ -533,12 +697,20 @@ async fn unknown_tokens_are_rate_limited_like_sign_ins() {
         let limited = get(&app, &guess, "/v1/agents").await;
         assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS, "{name}");
         assert!(!limited.headers["retry-after"].is_empty());
-        // Once limited, the address gets nothing more, even with a real token.
-        assert_eq!(
-            get(&app, &secret, "/v1/agents").await.status,
-            StatusCode::TOO_MANY_REQUESTS,
-            "{name}"
-        );
+        // A valid token from the same address isn't refused for another
+        // script's failures, and doesn't lift the limit on them.
+        for _ in 0..3 {
+            assert_eq!(
+                get(&app, &secret, "/v1/agents").await.status,
+                StatusCode::OK,
+                "{name}"
+            );
+            assert_eq!(
+                get(&app, &guess, "/v1/agents").await.status,
+                StatusCode::TOO_MANY_REQUESTS,
+                "{name}"
+            );
+        }
         // The website is unaffected.
         assert_eq!(
             admin.get("/v1/agents").await.status,

@@ -12,7 +12,7 @@ use crate::{
     api_tokens,
     audit::{self, Target},
     auth::Authorized,
-    db::tables::Settings as SettingsTable,
+    db::{Transaction, tables::Settings as SettingsTable},
     http::{ApiError, AppState, JsonBody},
     mail::{self, SMTP_PASSWORD_CONTEXT, Security, Smtp},
     rbac::Permission,
@@ -32,10 +32,25 @@ async fn save(
     state: &AppState,
     actor: &Authorized,
     action: &str,
-    mut values: Vec<(SettingsTable, SimpleExpr)>,
+    values: Vec<(SettingsTable, SimpleExpr)>,
     metadata: serde_json::Value,
 ) -> Result<Settings, ApiError> {
     let mut transaction = state.database.begin().await?;
+    let settings = write(&mut transaction, actor, action, values, metadata).await?;
+    transaction.commit().await?;
+    state.settings.forget();
+    Ok(settings)
+}
+
+/// [`save`] in the caller's transaction, for changes that must commit with
+/// it. The caller empties the settings cache after committing.
+async fn write(
+    transaction: &mut Transaction,
+    actor: &Authorized,
+    action: &str,
+    mut values: Vec<(SettingsTable, SimpleExpr)>,
+    metadata: serde_json::Value,
+) -> Result<Settings, ApiError> {
     if !values.is_empty() {
         values.push((SettingsTable::UpdatedAt, now_ms().into()));
         values.push((
@@ -52,7 +67,7 @@ async fn save(
             )
             .await?;
         audit::record(
-            &mut transaction,
+            transaction,
             &actor.actor(),
             action,
             Target::settings(),
@@ -60,10 +75,7 @@ async fn save(
         )
         .await?;
     }
-    let settings = settings::load(&mut transaction).await?;
-    transaction.commit().await?;
-    state.settings.forget();
-    Ok(settings)
+    Ok(settings::load(transaction).await?)
 }
 
 /// The instance name and the policy remote sessions follow.
@@ -455,8 +467,11 @@ pub async fn update_authentication(
         ));
     }
     let metadata = serde_json::to_value(&request).unwrap_or_default();
-    let settings = save(
-        &state,
+    // A lower cap shortens existing tokens in the same transaction, so no
+    // token outlives a policy that was saved.
+    let mut transaction = state.database.begin().await?;
+    let settings = write(
+        &mut transaction,
         &actor,
         "settings.authentication_update",
         values,
@@ -466,8 +481,10 @@ pub async fn update_authentication(
     if request.api_token_max_lifetime_days.is_some()
         && let Some(days) = settings.api_token_max_lifetime_days
     {
-        api_tokens::apply_lifetime_cap(&mut &state.database, days).await?;
+        api_tokens::apply_lifetime_cap(&mut transaction, days).await?;
     }
+    transaction.commit().await?;
+    state.settings.forget();
     Ok(Json(settings.into()))
 }
 

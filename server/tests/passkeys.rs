@@ -483,3 +483,33 @@ async fn a_passkey_shows_on_the_next_request() {
         app.finish().await;
     }
 }
+
+/// Passkey prompts are capped per address, but one a registered passkey
+/// answers hands its place back, so people signing in from one office
+/// address don't use the cap up. Prompts left unanswered, or answered
+/// wrongly, still count.
+#[tokio::test]
+async fn only_unfinished_passkey_prompts_count_against_the_cap() {
+    let app = App::sqlite().await;
+    let mut admin = common::set_up(&app).await;
+    let (mut passkey, _) = add_passkey(&mut admin, ADMIN_PASSWORD, "Laptop").await;
+    for attempt in 0..70 {
+        let (_, signed_in) = passkey_sign_in(&app, &mut passkey, ORIGIN).await;
+        assert_eq!(
+            signed_in.status,
+            StatusCode::OK,
+            "attempt {attempt}: {:?}",
+            signed_in.body
+        );
+    }
+    let (_, phished) = passkey_sign_in(&app, &mut passkey, "https://evil.example").await;
+    assert_eq!(phished.code(), "invalid_passkey");
+    let mut browser = app.browser();
+    for attempt in 0..59 {
+        let options = browser.post("/v1/auth/passkey/options", json!({})).await;
+        assert_eq!(options.status, StatusCode::OK, "attempt {attempt}");
+    }
+    let limited = browser.post("/v1/auth/passkey/options", json!({})).await;
+    assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS);
+    app.finish().await;
+}

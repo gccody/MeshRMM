@@ -1,5 +1,7 @@
 //! Personal API tokens: users make and revoke their own on the website, and
-//! holders of `api_tokens.manage` see and revoke everyone's.
+//! holders of `api_tokens.manage` see and revoke everyone's. An API token
+//! makes no tokens, and sees or revokes others only with
+//! `api_tokens.manage`; it may always read and revoke itself.
 use axum::{
     Json,
     extract::{Path, Query as QueryParams, State},
@@ -63,7 +65,9 @@ pub struct ListQuery {
 }
 
 /// `GET /v1/api-tokens`: the caller's tokens, or with `all=true` or
-/// `user_id`, other users' too.
+/// `user_id`, other users' too. An API token lists tokens, its own user's
+/// included, only with `api_tokens.manage`, so a token limited to other
+/// permissions can't find its user's other tokens.
 pub async fn list(
     State(state): State<AppState>,
     actor: Authorized,
@@ -76,7 +80,7 @@ pub async fn list(
         (true, None) => None,
         (false, user_id) => Some(user_id.unwrap_or_else(|| actor.user.id.clone())),
     };
-    if user_id.as_deref() != Some(actor.user.id.as_str()) {
+    if actor.api_token.is_some() || user_id.as_deref() != Some(actor.user.id.as_str()) {
         actor.require(Permission::ApiTokensManage)?;
     }
     let mut database = &state.database;
@@ -229,16 +233,24 @@ fn check_lifetime(days: Option<u32>, max_days: Option<i64>) -> Result<(), ApiErr
 }
 
 /// `DELETE /v1/api-tokens/{id}`: revokes one of the caller's tokens, or
-/// anyone's with `api_tokens.manage`. It stops working at once.
+/// anyone's with `api_tokens.manage`. It stops working at once. An API
+/// token may always revoke itself, but any other token, its own user's
+/// included, only with `api_tokens.manage`.
 pub async fn revoke(
     State(state): State<AppState>,
     actor: Authorized,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    let itself = actor.api_token.as_ref().is_some_and(|token| token.id == id);
+    if actor.api_token.is_some() && !itself {
+        actor.require(Permission::ApiTokensManage)?;
+    }
     let mut transaction = state.database.begin().await?;
     let token = api_tokens::by_id(&mut transaction, &id)
         .await?
-        .filter(|token| token.user.id == actor.user.id || actor.has(Permission::ApiTokensManage))
+        .filter(|token| {
+            itself || token.user.id == actor.user.id || actor.has(Permission::ApiTokensManage)
+        })
         .ok_or_else(|| ApiError::not_found("no such token"))?;
     transaction
         .execute(

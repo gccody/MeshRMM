@@ -238,6 +238,89 @@ async fn wrong_codes_are_limited_per_challenge_and_per_user() {
     app.finish().await;
 }
 
+/// A code is used up in the transaction that starts its session: if that
+/// fails, the code still works, and two sign-ins with one code at once
+/// can't both get in.
+#[tokio::test]
+async fn a_code_is_used_up_only_by_the_sign_in_it_completes() {
+    for app in common::apps().await {
+        let name = app.name;
+        let mut admin = common::set_up(&app).await;
+        let (secret, codes, _) = enroll(&mut admin, ADMIN_PASSWORD).await;
+        // Computed once, so a later time step can't stand in for a code the
+        // failed attempt used up.
+        let totp = common::totp_code(&secret, 1);
+        for (field, code) in [("code", &totp), ("recovery_code", &codes[0])] {
+            let mut browser = app.browser();
+            let challenge = password_step(&mut browser, ADMIN_EMAIL, ADMIN_PASSWORD).await;
+            let mut body = json!({ "challenge": challenge });
+            body[field] = json!(code);
+            common::refuse_writes(&app, "INSERT", "user_sessions", true).await;
+            let failed = browser
+                .post("/v1/auth/sign-in/second-factor", body.clone())
+                .await;
+            common::refuse_writes(&app, "INSERT", "user_sessions", false).await;
+            assert_eq!(
+                failed.status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{name}: {field}: {:?}",
+                failed.body
+            );
+            assert!(browser.cookie.is_none(), "{name}: {field}");
+            let signed_in = browser
+                .post("/v1/auth/sign-in/second-factor", body.clone())
+                .await;
+            assert_eq!(
+                signed_in.status,
+                StatusCode::OK,
+                "{name}: {field}: {:?}",
+                signed_in.body
+            );
+            assert_eq!(browser.get("/v1/account").await.status, StatusCode::OK);
+            // Now it is used up.
+            let mut again = app.browser();
+            let challenge = password_step(&mut again, ADMIN_EMAIL, ADMIN_PASSWORD).await;
+            let mut body = json!({ "challenge": challenge });
+            body[field] = json!(code);
+            let replay = again.post("/v1/auth/sign-in/second-factor", body).await;
+            assert_eq!(replay.code(), "invalid_code", "{name}: {field}");
+        }
+        let remaining = |account: Value| account["two_factor"]["recovery_codes_remaining"].clone();
+        assert_eq!(remaining(admin.get("/v1/account").await.body), 9, "{name}");
+
+        // Two sign-ins with the same code at once: one gets in.
+        let mut first = app.browser();
+        let mut second = app.browser();
+        let first_challenge = password_step(&mut first, ADMIN_EMAIL, ADMIN_PASSWORD).await;
+        let second_challenge = password_step(&mut second, ADMIN_EMAIL, ADMIN_PASSWORD).await;
+        let (a, b) = tokio::join!(
+            first.post(
+                "/v1/auth/sign-in/second-factor",
+                json!({ "challenge": first_challenge, "recovery_code": codes[1] }),
+            ),
+            second.post(
+                "/v1/auth/sign-in/second-factor",
+                json!({ "challenge": second_challenge, "recovery_code": codes[1] }),
+            ),
+        );
+        let mut outcomes = [
+            (a.status, a.code().to_owned()),
+            (b.status, b.code().to_owned()),
+        ];
+        outcomes.sort_by_key(|(status, _)| status.as_u16());
+        assert_eq!(
+            outcomes,
+            [
+                (StatusCode::OK, String::new()),
+                (StatusCode::UNAUTHORIZED, "invalid_code".to_owned()),
+            ],
+            "{name}"
+        );
+        assert_eq!(remaining(admin.get("/v1/account").await.body), 8, "{name}");
+        app.finish().await;
+    }
+}
+
 #[tokio::test]
 async fn a_strangers_wrong_passwords_dont_block_the_second_factor() {
     let app = common::App::sqlite().await;

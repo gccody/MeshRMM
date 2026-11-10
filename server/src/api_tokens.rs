@@ -221,7 +221,10 @@ fn refused(message: &'static str, code: &'static str) -> ApiError {
 
 /// Authenticates a request carrying `secret`. Unknown tokens count against
 /// the client address like failed sign-ins; once it has used them all,
-/// every token from it is refused until the oldest failure ages out.
+/// unknown tokens from it get `429` until the oldest failure ages out. A
+/// known token is never refused for them: it is 256 random bits, so other
+/// requests' failures aren't guesses at it, and one misconfigured script
+/// mustn't stop every integration behind the same address.
 ///
 /// The token's row is read every time, so a revoked or expired token stops
 /// at once; its user, roles and settings come from the caches on
@@ -231,9 +234,6 @@ pub async fn authenticate(
     secret: &str,
     ip: IpAddr,
 ) -> Result<Authorized, ApiError> {
-    let limits = &state.auth.api_token_failures;
-    let key = ip_key(ip);
-    limits.check(&key).map_err(ApiError::rate_limited)?;
     let mut database = &state.database;
     let settings = state.settings.get(database).await?;
     if !settings.api_tokens_enabled {
@@ -244,7 +244,11 @@ pub async fn authenticate(
     }
     let Some(token) = by_secret(&mut database, secret).await? else {
         tracing::info!(%ip, "refused an unknown API token");
-        limits.hit(&key).map_err(ApiError::rate_limited)?;
+        state
+            .auth
+            .api_token_failures
+            .hit(&ip_key(ip))
+            .map_err(ApiError::rate_limited)?;
         return Err(refused(
             "the API token is invalid or was revoked",
             "invalid_token",

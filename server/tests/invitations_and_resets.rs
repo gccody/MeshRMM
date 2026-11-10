@@ -566,3 +566,67 @@ async fn the_admin_cli_repairs_locked_out_accounts() {
         app.finish().await;
     }
 }
+
+/// A valid link isn't a guess: opening and using real invitation and reset
+/// links from one address doesn't use up its limit, while wrong tokens
+/// still do.
+#[tokio::test]
+async fn only_wrong_link_tokens_count_against_the_limit() {
+    let app = App::sqlite().await;
+    let mut admin = common::set_up(&app).await;
+    let invited = admin
+        .post(
+            "/v1/invitations",
+            json!({ "email": "tess@example.com", "role_ids": ["technician"] }),
+        )
+        .await;
+    let token = common::link_token(invited.body["link"].as_str().unwrap());
+    let mut tess = app.browser();
+    for _ in 0..20 {
+        let details = tess
+            .post("/v1/auth/invitation", json!({ "token": token }))
+            .await;
+        assert_eq!(details.status, StatusCode::OK, "{:?}", details.body);
+    }
+    let accepted = tess
+        .post(
+            "/v1/auth/invitation/accept",
+            json!({ "token": token, "display_name": "Tess", "password": "the first password" }),
+        )
+        .await;
+    assert_eq!(accepted.status, StatusCode::CREATED, "{:?}", accepted.body);
+    let tess_id = tess.get("/v1/account").await.body["user"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let reset = admin
+        .post(&format!("/v1/users/{tess_id}/password-reset"), json!({}))
+        .await;
+    let token = common::link_token(reset.body["link"].as_str().unwrap());
+    for _ in 0..20 {
+        let lookup = tess
+            .post("/v1/auth/password-reset/lookup", json!({ "token": token }))
+            .await;
+        assert_eq!(lookup.status, StatusCode::OK, "{:?}", lookup.body);
+    }
+    let done = tess
+        .post(
+            "/v1/auth/password-reset/complete",
+            json!({ "token": token, "password": "the second password" }),
+        )
+        .await;
+    assert_eq!(done.status, StatusCode::NO_CONTENT, "{:?}", done.body);
+
+    let mut guesser = app.browser();
+    for attempt in 0..30 {
+        let wrong = guesser
+            .post("/v1/auth/invitation", json!({ "token": "wrong" }))
+            .await;
+        assert_eq!(wrong.code(), "invalid_token", "attempt {attempt}");
+    }
+    let limited = guesser
+        .post("/v1/auth/invitation", json!({ "token": "wrong" }))
+        .await;
+    assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS);
+    app.finish().await;
+}
