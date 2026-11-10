@@ -103,6 +103,12 @@ pub(super) unsafe extern "system" fn settings_window_proc(
         WM_COMMAND => {
             let control_id = wparam.0 & 0xffff;
             let notification = (wparam.0 >> 16) & 0xffff;
+            // A click or a choice in the settings is the technician's.
+            if (notification == BN_CLICKED as usize || notification == CBN_SELCHANGE as usize)
+                && let Some(context) = unsafe { window_context(owner) }
+            {
+                context.control.note_activity();
+            }
             for (tab, category) in [
                 (SETTINGS_DISPLAY_TAB_ID, SettingsCategory::Display),
                 (SETTINGS_ADVANCED_TAB_ID, SettingsCategory::Advanced),

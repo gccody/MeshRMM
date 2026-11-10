@@ -122,6 +122,7 @@ define_class!(
             let destination = normalized_video_position(point, bounds, self.ivars().video_width.get(), self.ivars().video_height.get())
                 .map(|(x,y)| meshrmm_protocol::FileDestination::Drop { display_id: self.ivars().active_display.borrow().id, x, y })
                 .unwrap_or(meshrmm_protocol::FileDestination::Documents);
+            self.ivars().control.note_activity();
             self.release_input();
             self.ivars().control.files().send(paths, destination); true
             }
@@ -297,6 +298,9 @@ define_class!(
 
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
+            // Shortcut keys and pasting files send no key to the device, but
+            // a person pressed them all.
+            self.ivars().control.note_activity();
             self.sync_modifiers(event.modifierFlags());
             if self.is_diagnostics_key(event) {
                 if !event.isARepeat() {

@@ -141,6 +141,9 @@ impl WindowContext {
     /// Handles WM_KEYDOWN, WM_KEYUP and their WM_SYS variants: the viewer's
     /// shortcut keys, pasting files with Ctrl+V, and keys for the device.
     pub(super) fn key_message(&self, message: u32, wparam: WPARAM, lparam: LPARAM) {
+        // Shortcut keys and Ctrl+V send no key to the device, but a person
+        // pressed them all.
+        self.control.note_activity();
         let pressed = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
         if let Some(shortcut) = crate::shortcuts::windows_shortcut(
             wparam.0 as u16,
@@ -179,11 +182,12 @@ impl WindowContext {
         self.send(SessionMessage::Input(input));
     }
 
-    /// Releases every key and button held on the device.
+    /// Releases every key and button held on the device. The viewer does
+    /// this by itself, on losing focus among others, so it is not activity.
     pub(super) fn release_input(&self) {
         let released = self.held.borrow_mut().release_all(self.active_display_id());
         for input in released {
-            self.send(SessionMessage::Input(input));
+            self.control.send_automatic(SessionMessage::Input(input));
         }
     }
 
@@ -205,6 +209,7 @@ impl WindowContext {
                 y,
             })
             .unwrap_or(meshrmm_protocol::FileDestination::Documents);
+        self.control.note_activity();
         self.release_input();
         self.control.files().send(paths, destination);
     }

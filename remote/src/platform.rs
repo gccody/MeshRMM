@@ -172,10 +172,35 @@ impl ControlSink {
             .unwrap_or_default()
     }
 
-    /// Sends a message on the technician's behalf. Everything sent here
-    /// comes from the technician, so it also counts as activity.
+    /// Sends a message from the viewer window. It restarts the idle time only
+    /// when its type is one that only a person's action sends; see
+    /// [`crate::idle_disconnect::is_activity`].
     pub fn send(&self, message: meshrmm_protocol::SessionMessage) {
-        self.note_activity();
+        self.send_at(message, std::time::Instant::now());
+    }
+
+    /// [`Self::send`] at `now`, which tests choose.
+    pub(crate) fn send_at(
+        &self,
+        message: meshrmm_protocol::SessionMessage,
+        now: std::time::Instant,
+    ) {
+        if crate::idle_disconnect::is_activity(&message) {
+            self.idle_disconnect().note_activity(now);
+        }
+        self.deliver(message);
+    }
+
+    /// Sends a message the viewer generates by itself although a person's
+    /// action usually sends its type: releasing the keys and buttons still
+    /// held when the window loses focus or changes display, or re-applying
+    /// the session's quality to a new window. It never restarts the idle
+    /// time.
+    pub fn send_automatic(&self, message: meshrmm_protocol::SessionMessage) {
+        self.deliver(message);
+    }
+
+    fn deliver(&self, message: meshrmm_protocol::SessionMessage) {
         if self.technician_blocked()
             && matches!(
                 &message,
@@ -495,7 +520,11 @@ impl ControlSink {
             .unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Restarts the idle time before the session is disconnected.
+    /// Restarts the idle time before the session is disconnected. The window
+    /// calls it for a person's action that sends nothing, or nothing that
+    /// [`crate::idle_disconnect::is_activity`] counts: a toolbar click, a
+    /// menu or settings choice, a viewer shortcut key, dropping or pasting
+    /// files.
     pub fn note_activity(&self) {
         self.idle_disconnect()
             .note_activity(std::time::Instant::now());
