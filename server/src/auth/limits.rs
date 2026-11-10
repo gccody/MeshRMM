@@ -2,35 +2,92 @@
 //! challenges and the first-run setup token. The server runs as one node, so
 //! process memory is enough; a restart only resets the counters.
 use std::{
+    borrow::Cow,
     collections::{HashMap, VecDeque},
     net::IpAddr,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use subtle::ConstantTimeEq;
 use webauthn_rs::prelude::PasskeyAuthentication;
 
+use super::ceremonies::Expiring;
 use crate::secrets::{new_token, token_hash};
 
-/// Above this many tracked keys, keys whose attempts have all aged out are
-/// dropped, so random keys can't grow memory without bound.
-const PRUNE_THRESHOLD: usize = 10_000;
+/// The most keys one limiter tracks, so random keys can't grow memory
+/// without bound. Past it, a new key takes the place of the key with the
+/// fewest attempts (see [`RateLimiter`]).
+const MAX_KEYS: usize = 50_000;
+/// Longer keys are kept as their hash, so a key built from client text can't
+/// make an entry large.
+const MAX_KEY_LENGTH: usize = 128;
 
 /// Allows `limit` attempts per key in any `window`.
+///
+/// It tracks at most [`MAX_KEYS`] keys. Keys whose attempts have all aged out
+/// are dropped as they age, oldest first. When every tracked key still has
+/// attempts in the window, a new key is always let in, in place of the key
+/// with the fewest attempts, least recently hit among those. A key at its
+/// limit therefore goes only once every key is at its limit, and wiping a
+/// count of `n` takes first giving every tracked key `n` attempts: about
+/// [`MAX_KEYS`] times the attempts it frees. Refusing new keys instead would
+/// let anyone with enough keys refuse everyone else.
+///
+/// Every operation takes time proportional to the attempts it expires, with
+/// an occasional pass over the bookkeeping once as many changes have made
+/// that much of it stale, never a pass over every key per attempt.
 #[derive(Debug)]
 pub struct RateLimiter {
     limit: usize,
     window: Duration,
-    attempts: Mutex<HashMap<String, VecDeque<Instant>>>,
+    max_keys: usize,
+    keys: Mutex<Keys>,
+}
+
+#[derive(Debug)]
+struct Keys {
+    entries: HashMap<Arc<str>, Entry>,
+    /// Every hit as `(sequence, key)`, oldest first, to drop keys that aged
+    /// out. A place whose sequence is not its key's latest is stale.
+    by_hit: VecDeque<(u64, Arc<str>)>,
+    /// The same hits, by how many attempts the key held after each: where to
+    /// find the key with the fewest attempts, least recently hit.
+    by_count: Vec<VecDeque<(u64, Arc<str>)>>,
+    next_sequence: u64,
+    /// Places in `by_hit` and `by_count` looked at, for tests to bound the
+    /// work a hit does.
+    #[cfg(test)]
+    visited: usize,
+}
+
+#[derive(Debug)]
+struct Entry {
+    key: Arc<str>,
+    times: VecDeque<Instant>,
+    /// The sequence of the key's latest hit.
+    sequence: u64,
+    hit: Instant,
 }
 
 impl RateLimiter {
     pub fn new(limit: usize, window: Duration) -> Self {
+        Self::with_max_keys(limit, window, MAX_KEYS)
+    }
+
+    fn with_max_keys(limit: usize, window: Duration, max_keys: usize) -> Self {
         Self {
             limit,
             window,
-            attempts: Mutex::new(HashMap::new()),
+            max_keys,
+            keys: Mutex::new(Keys {
+                entries: HashMap::new(),
+                by_hit: VecDeque::new(),
+                by_count: (0..=limit).map(|_| VecDeque::new()).collect(),
+                next_sequence: 0,
+                #[cfg(test)]
+                visited: 0,
+            }),
         }
     }
 
@@ -46,50 +103,73 @@ impl RateLimiter {
     /// limits where only failures count and successes may run in parallel.
     pub fn check(&self, key: &str) -> Result<(), u64> {
         let now = Instant::now();
-        let mut attempts = self.lock();
-        let Some(times) = attempts.get_mut(key) else {
+        let mut keys = self.lock();
+        let Some(entry) = keys.entries.get_mut(&*bounded(key)) else {
             return Ok(());
         };
-        Self::expire(times, now, self.window);
-        match times.front() {
-            Some(oldest) if times.len() >= self.limit => Err((*oldest + self.window)
-                .saturating_duration_since(now)
-                .as_secs()
-                .max(1)),
-            _ => Ok(()),
-        }
+        Self::expire(&mut entry.times, now, self.window);
+        self.allowed(&entry.times, now)
     }
 
     /// Hands back the key's most recent attempt.
     pub fn refund(&self, key: &str) {
-        if let Some(times) = self.lock().get_mut(key) {
-            times.pop_back();
+        let key = bounded(key);
+        let mut keys = self.lock();
+        if let Some(entry) = keys.entries.get_mut(&*key) {
+            entry.times.pop_back();
+            // It stays filed under its count before the refund until its
+            // next hit, which only keeps it longer.
+            if entry.times.is_empty() {
+                keys.entries.remove(&*key);
+            }
         }
     }
 
     pub fn clear(&self, key: &str) {
-        self.lock().remove(key);
+        self.lock().entries.remove(&*bounded(key));
     }
 
     fn hit_at(&self, key: &str, now: Instant) -> Result<(), u64> {
-        let mut attempts = self.lock();
-        if attempts.len() >= PRUNE_THRESHOLD {
-            attempts.retain(|_, times| {
-                Self::expire(times, now, self.window);
-                !times.is_empty()
-            });
+        let key = bounded(key);
+        let mut keys = self.lock();
+        keys.drop_aged_out(now, self.window);
+        if !keys.entries.contains_key(&*key) {
+            if keys.entries.len() >= self.max_keys {
+                keys.evict();
+            }
+            let key: Arc<str> = Arc::from(&*key);
+            keys.entries.insert(
+                Arc::clone(&key),
+                Entry {
+                    key,
+                    times: VecDeque::new(),
+                    sequence: 0,
+                    hit: now,
+                },
+            );
         }
-        let times = attempts.entry(key.to_owned()).or_default();
-        Self::expire(times, now, self.window);
-        if times.len() >= self.limit {
-            let oldest = times.front().copied().unwrap_or(now);
-            return Err((oldest + self.window)
-                .saturating_duration_since(now)
-                .as_secs()
-                .max(1));
+        let entry = keys
+            .entries
+            .get_mut(&*key)
+            .expect("the key was just inserted");
+        Self::expire(&mut entry.times, now, self.window);
+        let allowed = self.allowed(&entry.times, now);
+        if allowed.is_ok() {
+            entry.times.push_back(now);
         }
-        times.push_back(now);
-        Ok(())
+        keys.file(&key, now);
+        allowed
+    }
+
+    fn allowed(&self, times: &VecDeque<Instant>, now: Instant) -> Result<(), u64> {
+        if times.len() < self.limit {
+            return Ok(());
+        }
+        let oldest = times.front().copied().unwrap_or(now);
+        Err((oldest + self.window)
+            .saturating_duration_since(now)
+            .as_secs()
+            .max(1))
     }
 
     fn expire(times: &mut VecDeque<Instant>, now: Instant, window: Duration) {
@@ -101,11 +181,100 @@ impl RateLimiter {
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, VecDeque<Instant>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Keys> {
         // A panic while holding the lock leaves only counters behind.
-        self.attempts
+        self.keys
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Keys {
+    /// Records a hit on the tracked `key` at `now`, filed under the attempts
+    /// it holds.
+    fn file(&mut self, key: &str, now: Instant) {
+        let Some(entry) = self.entries.get_mut(key) else {
+            return;
+        };
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        entry.sequence = sequence;
+        entry.hit = now;
+        self.by_hit.push_back((sequence, Arc::clone(&entry.key)));
+        self.by_count[entry.times.len()].push_back((sequence, Arc::clone(&entry.key)));
+        // Each live key has one current place in each; once the stale ones
+        // outnumber them, drop those in one pass, which the hits and removals
+        // that made them stale pay for.
+        let places = self.by_hit.len() + self.by_count.iter().map(VecDeque::len).sum::<usize>();
+        if places > 4 * self.entries.len() + 64 {
+            #[cfg(test)]
+            {
+                self.visited += places;
+            }
+            let entries = &self.entries;
+            let current = |(sequence, key): &(u64, Arc<str>)| {
+                entries
+                    .get(key)
+                    .is_some_and(|entry| entry.sequence == *sequence)
+            };
+            self.by_hit.retain(current);
+            for queue in &mut self.by_count {
+                queue.retain(current);
+            }
+        }
+    }
+
+    /// Drops keys last hit a `window` or more before `now`: every attempt
+    /// they hold has aged out.
+    fn drop_aged_out(&mut self, now: Instant, window: Duration) {
+        while let Some((sequence, key)) = self.by_hit.front() {
+            #[cfg(test)]
+            {
+                self.visited += 1;
+            }
+            match self.entries.get(key) {
+                Some(entry) if entry.sequence == *sequence => {
+                    if now.saturating_duration_since(entry.hit) < window {
+                        return;
+                    }
+                    let key = Arc::clone(key);
+                    self.entries.remove(&key);
+                }
+                _ => {}
+            }
+            self.by_hit.pop_front();
+        }
+    }
+
+    /// Drops the key with the fewest attempts at its last hit, least
+    /// recently hit among those.
+    fn evict(&mut self) {
+        for queue in &mut self.by_count {
+            while let Some((sequence, key)) = queue.pop_front() {
+                #[cfg(test)]
+                {
+                    self.visited += 1;
+                }
+                if self
+                    .entries
+                    .get(&key)
+                    .is_some_and(|entry| entry.sequence == sequence)
+                {
+                    self.entries.remove(&key);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// `key`, or its hash if it is longer than [`MAX_KEY_LENGTH`]. A hash can't
+/// be mistaken for a shorter key without a SHA-256 preimage.
+fn bounded(key: &str) -> Cow<'_, str> {
+    if key.len() > MAX_KEY_LENGTH {
+        Cow::Owned(token_hash(key))
+    } else {
+        Cow::Borrowed(key)
     }
 }
 
@@ -134,19 +303,19 @@ pub fn account_key(email: &str) -> String {
     token_hash(email)
 }
 
-/// Second-factor challenges issued after a correct password.
+/// Second-factor challenges issued after a correct password. At most
+/// [`MAX_PENDING`](super::ceremonies::MAX_PENDING) are kept; issuing one past
+/// that drops the oldest, whose user signs in again.
 #[derive(Debug)]
 pub struct Challenges {
-    ttl: Duration,
     max_attempts: u32,
-    pending: Mutex<HashMap<String, Challenge>>,
+    pending: Mutex<Expiring<Challenge>>,
 }
 
 #[derive(Debug)]
 struct Challenge {
     user_id: String,
     passkey: Option<PasskeyAuthentication>,
-    expires: Instant,
     attempts: u32,
 }
 
@@ -161,9 +330,8 @@ pub struct ChallengeAttempt {
 impl Challenges {
     pub fn new(ttl: Duration, max_attempts: u32) -> Self {
         Self {
-            ttl,
             max_attempts,
-            pending: Mutex::new(HashMap::new()),
+            pending: Mutex::new(Expiring::new(ttl)),
         }
     }
 
@@ -171,17 +339,14 @@ impl Challenges {
     /// the state of the passkey prompt sent with it.
     pub fn issue(&self, user_id: &str, passkey: Option<PasskeyAuthentication>) -> String {
         let token = new_token();
-        let now = Instant::now();
-        let mut pending = self.lock();
-        pending.retain(|_, challenge| challenge.expires > now);
-        pending.insert(
+        self.lock().insert_at(
             token_hash(&token),
             Challenge {
                 user_id: user_id.to_owned(),
                 passkey,
-                expires: now + self.ttl,
                 attempts: 0,
             },
+            Instant::now(),
         );
         token
     }
@@ -193,8 +358,8 @@ impl Challenges {
     pub fn attempt(&self, token: &str, take_passkey: bool) -> Option<ChallengeAttempt> {
         let key = token_hash(token);
         let mut pending = self.lock();
-        let challenge = pending.get_mut(&key)?;
-        if challenge.expires <= Instant::now() || challenge.attempts >= self.max_attempts {
+        let (expires, challenge) = pending.get_mut(&key)?;
+        if *expires <= Instant::now() || challenge.attempts >= self.max_attempts {
             pending.remove(&key);
             return None;
         }
@@ -213,7 +378,7 @@ impl Challenges {
         self.lock().remove(&token_hash(token));
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Challenge>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Expiring<Challenge>> {
         self.pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -314,13 +479,146 @@ mod tests {
     fn stale_keys_are_pruned() {
         let limiter = RateLimiter::new(1, Duration::from_secs(1));
         let start = Instant::now();
-        for key in 0..PRUNE_THRESHOLD {
+        for key in 0..10_000 {
             limiter.hit_at(&key.to_string(), start).unwrap();
         }
         limiter
             .hit_at("late", start + Duration::from_secs(2))
             .unwrap();
-        assert_eq!(limiter.lock().len(), 1);
+        assert_eq!(limiter.lock().entries.len(), 1);
+    }
+
+    /// Hits `key` at `now` and returns the result with the places it looked
+    /// at.
+    fn counted(limiter: &RateLimiter, key: &str, now: Instant) -> (Result<(), u64>, usize) {
+        let before = limiter.lock().visited;
+        let result = limiter.hit_at(key, now);
+        (result, limiter.lock().visited - before)
+    }
+
+    #[test]
+    fn a_flood_of_keys_stays_under_the_cap_without_scanning_it() {
+        let limiter = RateLimiter::with_max_keys(5, Duration::from_secs(900), 1_000);
+        let start = Instant::now();
+        let hits = 100_000;
+        let (mut visited, mut large) = (0, 0);
+        for n in 0..hits {
+            let now = start + Duration::from_millis(n);
+            // Every key is still live, and a tenth of hits are on a key
+            // already tracked.
+            let key = if n % 10 == 0 {
+                format!("key-{}", n.saturating_sub(1))
+            } else {
+                format!("key-{n}")
+            };
+            let (result, places) = counted(&limiter, &key, now);
+            assert!(result.is_ok());
+            assert!(limiter.lock().entries.len() <= 1_000);
+            visited += places;
+            if places > 64 {
+                large += 1;
+            }
+        }
+        assert!(
+            visited <= 8 * hits as usize,
+            "{visited} places in {hits} hits"
+        );
+        assert!(
+            large <= hits as usize / 500,
+            "{large} hits looked at over 64"
+        );
+    }
+
+    #[test]
+    fn aged_out_keys_are_dropped_as_they_age() {
+        let window = Duration::from_secs(10);
+        let limiter = RateLimiter::new(5, window);
+        let start = Instant::now();
+        let hits = 50_000;
+        let mut visited = 0;
+        for n in 0..hits {
+            let (result, places) =
+                counted(&limiter, &n.to_string(), start + Duration::from_millis(n));
+            assert!(result.is_ok());
+            visited += places;
+            // One key per millisecond: those of the last 10 seconds.
+            assert!(limiter.lock().entries.len() <= 10_001);
+        }
+        assert!(
+            visited <= 4 * hits as usize,
+            "{visited} places in {hits} hits"
+        );
+        assert_eq!(
+            limiter
+                .hit_at("late", start + Duration::from_millis(hits) + window)
+                .map(|()| limiter.lock().entries.len()),
+            Ok(1)
+        );
+    }
+
+    #[test]
+    fn a_flood_of_new_keys_does_not_reset_a_used_key() {
+        let window = Duration::from_secs(900);
+        let limiter = RateLimiter::with_max_keys(3, window, 100);
+        let start = Instant::now();
+        for _ in 0..3 {
+            limiter.hit_at("exhausted", start).unwrap();
+        }
+        limiter.hit_at("partial", start).unwrap();
+        limiter.hit_at("partial", start).unwrap();
+        limiter.hit_at("normal", start).unwrap();
+        for n in 0..10_000 {
+            let now = start + Duration::from_millis(n);
+            limiter.hit_at(&format!("flood-{n}"), now).unwrap();
+        }
+        let later = start + Duration::from_secs(100);
+        assert_eq!(limiter.hit_at("exhausted", later), Err(800));
+        assert!(limiter.hit_at("partial", later).is_ok());
+        assert_eq!(limiter.hit_at("partial", later), Err(800));
+        // Evicted, it starts again with every attempt.
+        for _ in 0..3 {
+            assert!(limiter.hit_at("normal", later).is_ok());
+        }
+        assert_eq!(limiter.hit_at("normal", later), Err(900));
+    }
+
+    #[test]
+    fn a_new_key_gets_in_when_every_key_is_at_its_limit() {
+        let window = Duration::from_secs(60);
+        let limiter = RateLimiter::with_max_keys(1, window, 3);
+        let start = Instant::now();
+        for (n, key) in ["a", "b", "c"].into_iter().enumerate() {
+            limiter
+                .hit_at(key, start + Duration::from_secs(n as u64))
+                .unwrap();
+        }
+        // A refused attempt is a hit too: "a" is now the latest.
+        assert!(limiter.hit_at("a", start + Duration::from_secs(3)).is_err());
+        assert!(limiter.hit_at("d", start + Duration::from_secs(4)).is_ok());
+        assert!(limiter.check("a").is_err() && limiter.check("c").is_err());
+        assert!(limiter.check("b").is_ok());
+        assert_eq!(limiter.lock().entries.len(), 3);
+    }
+
+    #[test]
+    fn long_keys_are_kept_short() {
+        let limiter = RateLimiter::new(1, Duration::from_secs(60));
+        let long = "a".repeat(100_000);
+        assert!(limiter.hit(&long).is_ok());
+        assert!(limiter.hit(&long).is_err());
+        assert!(limiter.check(&long).is_err());
+        assert!(limiter.hit(&"a".repeat(99_999)).is_ok());
+        limiter.refund(&long);
+        assert!(limiter.hit(&long).is_ok());
+        limiter.clear(&long);
+        assert!(limiter.check(&long).is_ok());
+        assert!(
+            limiter
+                .lock()
+                .entries
+                .keys()
+                .all(|key| key.len() <= MAX_KEY_LENGTH)
+        );
     }
 
     #[test]
