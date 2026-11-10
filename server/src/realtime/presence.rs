@@ -9,11 +9,33 @@
 //! company or tag call [`Presence::refresh_company`] or
 //! [`Presence::refresh_tag`] the same way. Reading the truth
 //! rather than trusting the caller keeps presence right however the changes
-//! interleave: the last refresh sees the last change. Snapshots publish whatever they find changed first, so every
-//! subscriber converges on the same state at the same revision.
+//! interleave: the last refresh sees the last change. Snapshots publish
+//! whatever they find changed first, so every subscriber converges on the
+//! same state at the same revision.
+//!
+//! Reads run outside the lock that publishing takes, so a slow read holds up
+//! no other publisher. Each read takes a ticket from a counter before it
+//! starts, and what is published for a device, company or tag remembers the
+//! ticket of the read it came from; a read with an older ticket than that is
+//! dropped. A read sees every change made before its ticket was taken, so
+//! however reads finish, what stays published comes from a read that began
+//! after the last change: the last refresh still sees the last change. A
+//! snapshot keeps what a newer read published in place of what it read
+//! itself, so it never shows anything older than an event already sent, and
+//! once it has published what it found changed it is exactly what is
+//! published at its revision. Whether an Agent is connected or updating is
+//! decided when publishing, under the lock, and each change to either is
+//! followed by a refresh.
+//!
+//! Snapshots asked for while one is being read share it until it fixes its
+//! revision: a requester that subscribed before then gets every later change
+//! from its subscription, and was sent no change the snapshot lacks.
 use std::{
-    collections::HashMap,
-    sync::Arc,
+    collections::{HashMap, HashSet},
+    sync::{
+        Arc, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -27,6 +49,7 @@ use crate::{
         self, Database,
         tables::{Agents, Companies, Tags},
     },
+    http::ApiError,
     notes, system_info,
     tags::{self, Tag},
     time::now_ms,
@@ -119,6 +142,23 @@ impl PresenceEvent {
     }
 }
 
+/// A snapshot couldn't read the database. Everyone who shared its build
+/// gets the same error.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error(transparent)]
+pub struct SnapshotFailed(Arc<sqlx::Error>);
+
+impl From<SnapshotFailed> for ApiError {
+    fn from(error: SnapshotFailed) -> Self {
+        tracing::error!(%error, "could not read the devices for a presence snapshot");
+        Self::internal()
+    }
+}
+
+type Built = Result<Arc<PresenceEvent>, SnapshotFailed>;
+/// A snapshot being built; it holds the result once there is one.
+type Build = watch::Receiver<Option<Built>>;
+
 #[derive(Debug, Clone)]
 pub struct Presence {
     inner: Arc<Inner>,
@@ -130,6 +170,10 @@ struct Inner {
     hub: AgentHub,
     update_grace: Duration,
     state: Mutex<State>,
+    /// Numbers reads in the order they start.
+    tickets: AtomicU64,
+    /// The snapshot being built that requesters may still share.
+    building: std::sync::Mutex<Option<Build>>,
     events: broadcast::Sender<Arc<PresenceEvent>>,
     /// Bumped when users' access may have changed, so event sockets check
     /// their user's session and permissions again at once.
@@ -139,15 +183,23 @@ struct Inner {
 #[derive(Debug, Default)]
 struct State {
     revision: u64,
-    /// What subscribers were last told about each device; `None` once it
-    /// was deleted.
-    published: HashMap<String, Option<PresenceAgent>>,
+    /// What subscribers were last told about each device.
+    published: HashMap<String, Published<PresenceAgent>>,
     /// The same for each company.
-    published_companies: HashMap<String, Option<PresenceCompany>>,
+    published_companies: HashMap<String, Published<PresenceCompany>>,
     /// The same for each tag.
-    published_tags: HashMap<String, Option<Tag>>,
+    published_tags: HashMap<String, Published<Tag>>,
     /// Updates Agents announced before going offline.
     updating: HashMap<String, Update>,
+}
+
+/// What subscribers were last told about one device, company or tag.
+#[derive(Debug)]
+struct Published<T> {
+    /// The ticket of the read it came from.
+    read: u64,
+    /// `None` once it was deleted.
+    value: Option<T>,
 }
 
 #[derive(Debug)]
@@ -164,6 +216,43 @@ struct Details {
     tag_ids: Vec<String>,
     notes_revision: i64,
     system: Option<system_info::Summary>,
+}
+
+/// One device as a refresh read it.
+struct DeviceRead {
+    ticket: u64,
+    device_id: String,
+    found: db::Result<Option<(AgentRow, Details)>>,
+}
+
+/// Everything a snapshot reads.
+struct FleetRead {
+    ticket: u64,
+    rows: Vec<AgentRow>,
+    systems: HashMap<String, system_info::Summary>,
+    device_tags: HashMap<String, Vec<String>>,
+    notes: HashMap<String, i64>,
+    companies: Vec<PresenceCompany>,
+    tags: Vec<Tag>,
+}
+
+/// Stops requesters joining a snapshot's build when dropped: once the build
+/// fixes its revision, or if it ends without doing so.
+struct Closing<'a> {
+    building: &'a std::sync::Mutex<Option<Build>>,
+    build: &'a Build,
+}
+
+impl Drop for Closing<'_> {
+    fn drop(&mut self) {
+        let mut building = self.building.lock().unwrap_or_else(PoisonError::into_inner);
+        if building
+            .as_ref()
+            .is_some_and(|open| open.same_channel(self.build))
+        {
+            *building = None;
+        }
+    }
 }
 
 fn agent_select() -> sea_query::SelectStatement {
@@ -195,6 +284,8 @@ impl Presence {
                 hub,
                 update_grace,
                 state: Mutex::default(),
+                tickets: AtomicU64::new(0),
+                building: std::sync::Mutex::default(),
                 events: broadcast::channel(EVENT_BACKLOG).0,
                 access: watch::channel(0).0,
             }),
@@ -207,38 +298,86 @@ impl Presence {
         self.inner.events.subscribe()
     }
 
-    /// Every device and company as they are now.
-    pub async fn snapshot(&self) -> db::Result<PresenceEvent> {
+    /// Every device, company and tag as they are now. Requesters that ask
+    /// while a snapshot is being read share it.
+    pub async fn snapshot(&self) -> Result<Arc<PresenceEvent>, SnapshotFailed> {
+        loop {
+            let (leader, mut build) = {
+                let mut building = self
+                    .inner
+                    .building
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                match &*building {
+                    Some(build) => (None, build.clone()),
+                    None => {
+                        let (sender, build) = watch::channel(None);
+                        *building = Some(build.clone());
+                        (Some(sender), build)
+                    }
+                }
+            };
+            if let Some(sender) = leader {
+                let built = self.build(&build).await;
+                sender.send_replace(Some(built.clone()));
+                return built;
+            }
+            // Otherwise the requester building it went away first; build
+            // another.
+            if let Ok(built) = build.wait_for(Option::is_some).await {
+                return built.clone().expect("waited for a result");
+            }
+        }
+    }
+
+    async fn build(&self, build: &Build) -> Built {
+        let closing = Closing {
+            building: &self.inner.building,
+            build,
+        };
+        let read = self
+            .read_fleet()
+            .await
+            .map_err(|error| SnapshotFailed(Arc::new(error)))?;
+        Ok(self.publish_fleet(read, Some(closing)).await)
+    }
+
+    async fn read_fleet(&self) -> db::Result<FleetRead> {
+        let ticket = self.ticket();
+        let mut database = &self.inner.database;
+        Ok(FleetRead {
+            ticket,
+            rows: database.fetch_all(&agent_select()).await?,
+            systems: system_info::summaries(database, None).await?,
+            device_tags: tags::device_tag_ids(&mut database, None).await?,
+            notes: notes::revisions(&mut database, None).await?,
+            companies: database.fetch_all(&company_select()).await?,
+            tags: tags::load(&mut database, None).await?,
+        })
+    }
+
+    /// Publishes what the read found changed, unless something newer was
+    /// published for it since the read began, and returns everything as now
+    /// published. Dropping `closing` once the lock is held lets later
+    /// requesters build a newer snapshot.
+    async fn publish_fleet(
+        &self,
+        read: FleetRead,
+        closing: Option<Closing<'_>>,
+    ) -> Arc<PresenceEvent> {
+        let FleetRead {
+            ticket,
+            rows,
+            mut systems,
+            mut device_tags,
+            notes,
+            companies,
+            tags,
+        } = read;
         let mut state = self.inner.state.lock().await;
-        let rows: Vec<AgentRow> = self.inner.database.fetch_all(&agent_select()).await?;
-        let mut systems = system_info::summaries(&self.inner.database, None).await?;
-        let mut device_tags = tags::device_tag_ids(&mut &self.inner.database, None).await?;
-        let notes = notes::revisions(&mut &self.inner.database, None).await?;
-        let mut companies: Vec<PresenceCompany> =
-            self.inner.database.fetch_all(&company_select()).await?;
-        let tags = tags::load(&mut &self.inner.database, None).await?;
+        drop(closing);
         state.prune_updates();
-        // New companies and tags first and deleted ones last, so a device
-        // never names a company or tag subscribers don't know.
-        let gone_companies = state
-            .published_companies
-            .iter()
-            .filter(|(id, company)| company.is_some() && !companies.iter().any(|c| &c.id == *id))
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        let gone_tags = state
-            .published_tags
-            .iter()
-            .filter(|(id, tag)| tag.is_some() && !tags.iter().any(|t| &t.id == *id))
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        for company in &companies {
-            self.publish_company(&mut state, &company.id.clone(), Some(company.clone()));
-        }
-        for tag in &tags {
-            self.publish_tag(&mut state, &tag.id.clone(), Some(tag.clone()));
-        }
-        let mut agents = rows
+        let agents = rows
             .into_iter()
             .map(|row| {
                 let details = Details {
@@ -249,27 +388,39 @@ impl Presence {
                 self.agent(&state, row, details)
             })
             .collect::<Vec<_>>();
-        let gone = state
-            .published
-            .iter()
-            .filter(|(id, agent)| agent.is_some() && !agents.iter().any(|a| &a.id == *id))
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        for id in gone {
-            self.publish(&mut state, &id, None);
+        let gone = missing(&state.published, agents.iter().map(|a| a.id.as_str()));
+        let gone_companies = missing(
+            &state.published_companies,
+            companies.iter().map(|c| c.id.as_str()),
+        );
+        let gone_tags = missing(&state.published_tags, tags.iter().map(|t| t.id.as_str()));
+        // New companies and tags first and deleted ones last, so a device
+        // never names a company or tag subscribers don't know.
+        for company in companies {
+            self.publish_company(&mut state, ticket, &company.id.clone(), Some(company));
         }
-        for agent in &agents {
-            self.publish(&mut state, &agent.id.clone(), Some(agent.clone()));
+        for tag in tags {
+            self.publish_tag(&mut state, ticket, &tag.id.clone(), Some(tag));
+        }
+        for id in gone {
+            self.publish(&mut state, ticket, &id, None);
+        }
+        for agent in agents {
+            self.publish(&mut state, ticket, &agent.id.clone(), Some(agent));
         }
         for id in gone_companies {
-            self.publish_company(&mut state, &id, None);
+            self.publish_company(&mut state, ticket, &id, None);
         }
         for id in gone_tags {
-            self.publish_tag(&mut state, &id, None);
+            self.publish_tag(&mut state, ticket, &id, None);
         }
+        let mut agents = present(&state.published);
+        let mut companies = present(&state.published_companies);
+        let mut tags = present(&state.published_tags);
         sort(&mut agents);
         sort_companies(&mut companies);
-        Ok(PresenceEvent::Snapshot {
+        tags::sort(&mut tags);
+        Arc::new(PresenceEvent::Snapshot {
             revision: state.revision,
             agents,
             companies,
@@ -280,18 +431,23 @@ impl Presence {
 
     /// Publishes the device's current state, if it changed.
     pub async fn refresh(&self, device_id: &str) {
-        let mut state = self.inner.state.lock().await;
-        let row: db::Result<Option<AgentRow>> = self
-            .inner
-            .database
-            .fetch_optional(
-                &agent_select()
-                    .and_where(Expr::col(Agents::Id).eq(device_id))
-                    .to_owned(),
-            )
-            .await;
-        let read: db::Result<Option<(AgentRow, Details)>> = async {
-            let Some(row) = row? else {
+        let read = self.read_device(device_id).await;
+        self.publish_device(read).await;
+    }
+
+    async fn read_device(&self, device_id: &str) -> DeviceRead {
+        let ticket = self.ticket();
+        let found = async {
+            let row: Option<AgentRow> = self
+                .inner
+                .database
+                .fetch_optional(
+                    &agent_select()
+                        .and_where(Expr::col(Agents::Id).eq(device_id))
+                        .to_owned(),
+                )
+                .await?;
+            let Some(row) = row else {
                 return Ok(None);
             };
             let mut database = &self.inner.database;
@@ -311,22 +467,32 @@ impl Presence {
             Ok(Some((row, details)))
         }
         .await;
-        match read {
-            Ok(found) => {
-                state.prune_updates();
-                let agent = found.map(|(row, details)| self.agent(&state, row, details));
-                self.publish(&mut state, device_id, agent);
-            }
-            Err(error) => {
-                tracing::warn!(device_id, %error, "could not read a device to publish its presence")
-            }
+        DeviceRead {
+            ticket,
+            device_id: device_id.to_owned(),
+            found,
         }
+    }
+
+    async fn publish_device(&self, read: DeviceRead) {
+        let device_id = read.device_id.as_str();
+        let found = match read.found {
+            Ok(found) => found,
+            Err(error) => {
+                tracing::warn!(device_id, %error, "could not read a device to publish its presence");
+                return;
+            }
+        };
+        let mut state = self.inner.state.lock().await;
+        state.prune_updates();
+        let agent = found.map(|(row, details)| self.agent(&state, row, details));
+        self.publish(&mut state, read.ticket, device_id, agent);
     }
 
     /// Publishes the company's current state, if it changed. Refresh the
     /// devices a change moved first, so no device names a deleted company.
     pub async fn refresh_company(&self, company_id: &str) {
-        let mut state = self.inner.state.lock().await;
+        let ticket = self.ticket();
         let row: db::Result<Option<PresenceCompany>> = self
             .inner
             .database
@@ -337,7 +503,10 @@ impl Presence {
             )
             .await;
         match row {
-            Ok(company) => self.publish_company(&mut state, company_id, company),
+            Ok(company) => {
+                let mut state = self.inner.state.lock().await;
+                self.publish_company(&mut state, ticket, company_id, company);
+            }
             Err(error) => {
                 tracing::warn!(company_id, %error, "could not read a company to publish it")
             }
@@ -347,7 +516,7 @@ impl Presence {
     /// Publishes the tag's current state, if it changed. Refresh the devices
     /// a change untagged first, so no device names a deleted tag.
     pub async fn refresh_tag(&self, tag_id: &str) {
-        let mut state = self.inner.state.lock().await;
+        let ticket = self.ticket();
         let row: db::Result<Option<Tag>> = self
             .inner
             .database
@@ -358,7 +527,10 @@ impl Presence {
             )
             .await;
         match row {
-            Ok(tag) => self.publish_tag(&mut state, tag_id, tag),
+            Ok(tag) => {
+                let mut state = self.inner.state.lock().await;
+                self.publish_tag(&mut state, ticket, tag_id, tag);
+            }
             Err(error) => tracing::warn!(tag_id, %error, "could not read a tag to publish it"),
         }
     }
@@ -404,7 +576,7 @@ impl Presence {
 
     /// The devices whose Agent went offline to install an update and isn't
     /// back yet.
-    pub async fn updating_devices(&self) -> std::collections::HashSet<String> {
+    pub async fn updating_devices(&self) -> HashSet<String> {
         let mut state = self.inner.state.lock().await;
         state.prune_updates();
         state.updating.keys().cloned().collect()
@@ -417,6 +589,13 @@ impl Presence {
 
     pub fn access_changes(&self) -> watch::Receiver<u64> {
         self.inner.access.subscribe()
+    }
+
+    /// Numbers a read about to start. Acquire-release, so a read with a
+    /// later ticket starts after every change made before an earlier one
+    /// was taken.
+    fn ticket(&self) -> u64 {
+        self.inner.tickets.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     fn agent(
@@ -442,22 +621,27 @@ impl Presence {
         }
     }
 
-    fn publish(&self, state: &mut State, device_id: &str, agent: Option<PresenceAgent>) {
-        if state.published.get(device_id) == Some(&agent) {
+    fn publish(
+        &self,
+        state: &mut State,
+        ticket: u64,
+        device_id: &str,
+        agent: Option<PresenceAgent>,
+    ) {
+        if !record(&mut state.published, device_id, ticket, &agent) {
             return;
         }
         state.revision += 1;
-        let event = match &agent {
+        let event = match agent {
             Some(agent) => PresenceEvent::AgentUpsert {
                 revision: state.revision,
-                agent: agent.clone(),
+                agent,
             },
             None => PresenceEvent::AgentDeleted {
                 revision: state.revision,
                 agent_id: device_id.to_owned(),
             },
         };
-        state.published.insert(device_id.to_owned(), agent);
         // Nobody listening is fine.
         let _ = self.inner.events.send(Arc::new(event));
     }
@@ -465,45 +649,42 @@ impl Presence {
     fn publish_company(
         &self,
         state: &mut State,
+        ticket: u64,
         company_id: &str,
         company: Option<PresenceCompany>,
     ) {
-        if state.published_companies.get(company_id) == Some(&company) {
+        if !record(&mut state.published_companies, company_id, ticket, &company) {
             return;
         }
         state.revision += 1;
-        let event = match &company {
+        let event = match company {
             Some(company) => PresenceEvent::CompanyUpsert {
                 revision: state.revision,
-                company: company.clone(),
+                company,
             },
             None => PresenceEvent::CompanyDeleted {
                 revision: state.revision,
                 company_id: company_id.to_owned(),
             },
         };
-        state
-            .published_companies
-            .insert(company_id.to_owned(), company);
         let _ = self.inner.events.send(Arc::new(event));
     }
 
-    fn publish_tag(&self, state: &mut State, tag_id: &str, tag: Option<Tag>) {
-        if state.published_tags.get(tag_id) == Some(&tag) {
+    fn publish_tag(&self, state: &mut State, ticket: u64, tag_id: &str, tag: Option<Tag>) {
+        if !record(&mut state.published_tags, tag_id, ticket, &tag) {
             return;
         }
         state.revision += 1;
-        let event = match &tag {
+        let event = match tag {
             Some(tag) => PresenceEvent::TagUpsert {
                 revision: state.revision,
-                tag: tag.clone(),
+                tag,
             },
             None => PresenceEvent::TagDeleted {
                 revision: state.revision,
                 tag_id: tag_id.to_owned(),
             },
         };
-        state.published_tags.insert(tag_id.to_owned(), tag);
         let _ = self.inner.events.send(Arc::new(event));
     }
 }
@@ -513,6 +694,59 @@ impl State {
         let now = Instant::now();
         self.updating.retain(|_, update| update.until > now);
     }
+}
+
+/// Records `value`, read with `ticket`, as `id`'s state, and returns whether
+/// subscribers must be told. A read older than the one last recorded is
+/// dropped.
+fn record<T: PartialEq + Clone>(
+    published: &mut HashMap<String, Published<T>>,
+    id: &str,
+    ticket: u64,
+    value: &Option<T>,
+) -> bool {
+    match published.get_mut(id) {
+        Some(last) if last.read > ticket => false,
+        Some(last) => {
+            last.read = ticket;
+            if &last.value == value {
+                return false;
+            }
+            last.value.clone_from(value);
+            true
+        }
+        None => {
+            published.insert(
+                id.to_owned(),
+                Published {
+                    read: ticket,
+                    value: value.clone(),
+                },
+            );
+            true
+        }
+    }
+}
+
+/// The IDs published as present that a read didn't find.
+fn missing<'a, T>(
+    published: &HashMap<String, Published<T>>,
+    found: impl Iterator<Item = &'a str>,
+) -> Vec<String> {
+    let found = found.collect::<HashSet<_>>();
+    published
+        .iter()
+        .filter(|(id, last)| last.value.is_some() && !found.contains(id.as_str()))
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// Everything published as present.
+fn present<T: Clone>(published: &HashMap<String, Published<T>>) -> Vec<T> {
+    published
+        .values()
+        .filter_map(|last| last.value.clone())
+        .collect()
 }
 
 /// Online devices first, then by name ignoring case, then by ID.
@@ -533,6 +767,8 @@ pub fn sort_companies(companies: &mut [PresenceCompany]) {
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::broadcast::error::TryRecvError;
+
     use super::*;
 
     fn agent(id: &str, name: &str, connected: bool) -> PresenceAgent {
@@ -604,6 +840,327 @@ mod tests {
         assert_eq!(
             serde_json::to_value(removed).unwrap(),
             serde_json::json!({ "type": "company_deleted", "revision": 10, "company_id": "c" })
+        );
+    }
+
+    async fn presence() -> Presence {
+        // One connection: each connection to `:memory:` is its own database.
+        let database = Database::connect("sqlite::memory:", 1)
+            .await
+            .expect("an in-memory database opens");
+        database.migrate().await.expect("the schema applies");
+        Presence::new(database, AgentHub::default(), UPDATE_GRACE)
+    }
+
+    async fn enroll(presence: &Presence, ids: &[&str]) {
+        for chunk in ids.chunks(500) {
+            let mut insert = Query::insert()
+                .into_table(Agents::Table)
+                .columns([
+                    Agents::Id,
+                    Agents::Name,
+                    Agents::Platform,
+                    Agents::AuthTokenHash,
+                    Agents::CreatedAt,
+                    Agents::UpdatedAt,
+                ])
+                .to_owned();
+            for id in chunk {
+                insert.values_panic([
+                    (*id).into(),
+                    (*id).into(),
+                    "windows".into(),
+                    "0".repeat(64).into(),
+                    0.into(),
+                    0.into(),
+                ]);
+            }
+            presence.inner.database.execute(&insert).await.unwrap();
+        }
+    }
+
+    async fn rename(presence: &Presence, id: &str, name: &str) {
+        presence
+            .inner
+            .database
+            .execute(
+                &Query::update()
+                    .table(Agents::Table)
+                    .value(Agents::Name, name)
+                    .and_where(Expr::col(Agents::Id).eq(id))
+                    .to_owned(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Marks the devices `which` picks as deleted.
+    async fn delete(presence: &Presence, which: Expr) {
+        presence
+            .inner
+            .database
+            .execute(
+                &Query::update()
+                    .table(Agents::Table)
+                    .value(Agents::DeletionRequestedAt, 1)
+                    .and_where(which)
+                    .to_owned(),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn drain(events: &mut broadcast::Receiver<Arc<PresenceEvent>>) -> Vec<Arc<PresenceEvent>> {
+        let mut drained = Vec::new();
+        loop {
+            match events.try_recv() {
+                Ok(event) => drained.push(event),
+                Err(TryRecvError::Empty) => return drained,
+                Err(error) => panic!("{error}"),
+            }
+        }
+    }
+
+    /// A snapshot's revision and devices.
+    fn devices(snapshot: &PresenceEvent) -> (u64, HashMap<String, PresenceAgent>) {
+        let PresenceEvent::Snapshot {
+            revision, agents, ..
+        } = snapshot
+        else {
+            panic!("not a snapshot: {snapshot:?}");
+        };
+        let agents = agents
+            .iter()
+            .map(|agent| (agent.id.clone(), agent.clone()))
+            .collect();
+        (*revision, agents)
+    }
+
+    fn upserted(event: &PresenceEvent) -> &PresenceAgent {
+        match event {
+            PresenceEvent::AgentUpsert { agent, .. } => agent,
+            _ => panic!("not an upsert: {event:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_older_read_of_a_device_never_replaces_a_newer_one() {
+        let presence = presence().await;
+        enroll(&presence, &["a"]).await;
+        let mut events = presence.subscribe();
+        let older = presence.read_device("a").await;
+        rename(&presence, "a", "Laptop").await;
+        presence.refresh("a").await;
+        let newer = drain(&mut events);
+        assert_eq!(newer.len(), 1);
+        assert_eq!(upserted(&newer[0]).name, "Laptop");
+
+        // The read that began first finishes last, and is dropped.
+        presence.publish_device(older).await;
+        assert!(drain(&mut events).is_empty());
+        let (revision, agents) = devices(&presence.snapshot().await.unwrap());
+        assert_eq!(revision, newer[0].revision());
+        assert_eq!(agents["a"].name, "Laptop");
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_keeps_what_was_published_after_its_read_began() {
+        let presence = presence().await;
+        enroll(&presence, &["a", "b", "c"]).await;
+        presence.snapshot().await.unwrap();
+        let mut events = presence.subscribe();
+        let stale = presence.read_device("b").await;
+        rename(&presence, "b", "Bravo").await;
+
+        let fleet = presence.read_fleet().await.unwrap();
+        // Published while the snapshot was being read: a renamed, c deleted
+        // and d enrolled.
+        rename(&presence, "a", "Alpha").await;
+        presence.refresh("a").await;
+        delete(&presence, Expr::col(Agents::Id).eq("c")).await;
+        presence.refresh("c").await;
+        enroll(&presence, &["d"]).await;
+        presence.refresh("d").await;
+        let before = drain(&mut events);
+        assert_eq!(before.len(), 3, "{before:?}");
+
+        let snapshot = presence.publish_fleet(fleet, None).await;
+        // It publishes only what nobody published since its read began: b's
+        // new name, which no refresh announced.
+        let found = drain(&mut events);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(upserted(&found[0]).name, "Bravo");
+        assert_eq!(found[0].revision(), before[2].revision() + 1);
+        let (revision, agents) = devices(&snapshot);
+        assert_eq!(revision, found[0].revision());
+        let mut ids = agents.keys().map(String::as_str).collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, ["a", "b", "d"], "c stays deleted, d is there");
+        assert_eq!(agents["a"].name, "Alpha");
+        assert_eq!(agents["b"].name, "Bravo");
+
+        // An older read of b doesn't undo the snapshot's.
+        presence.publish_device(stale).await;
+        assert!(drain(&mut events).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn snapshots_taken_during_refreshes_match_the_events_around_them() {
+        let presence = presence().await;
+        let ids = (0..8).map(|i| format!("d{i}")).collect::<Vec<_>>();
+        enroll(
+            &presence,
+            &ids.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+        .await;
+        let mut events = presence.subscribe();
+        let (start, mut replayed) = devices(&presence.snapshot().await.unwrap());
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for writer in 0..3 {
+            let presence = presence.clone();
+            let ids = ids.clone();
+            tasks.spawn(async move {
+                for step in 0..15 {
+                    let id = &ids[(writer * 5 + step * 3) % ids.len()];
+                    rename(&presence, id, &format!("w{writer}s{step}")).await;
+                    presence.refresh(id).await;
+                }
+                Vec::new()
+            });
+        }
+        for _ in 0..2 {
+            let presence = presence.clone();
+            tasks.spawn(async move {
+                let mut taken = Vec::new();
+                for _ in 0..10 {
+                    taken.push(presence.snapshot().await.unwrap());
+                    tokio::task::yield_now().await;
+                }
+                taken
+            });
+        }
+        let mut snapshots = tasks
+            .join_all()
+            .await
+            .concat()
+            .iter()
+            .map(|snapshot| devices(snapshot))
+            .collect::<Vec<_>>();
+        snapshots.sort_by_key(|(revision, _)| *revision);
+        let log = drain(&mut events);
+        let log = log.iter().filter(|event| event.revision() > start);
+
+        // Each snapshot is what the events up to its revision make.
+        let mut log = log.peekable();
+        let mut last = start;
+        for (revision, agents) in &snapshots {
+            while let Some(event) = log.next_if(|event| event.revision() <= *revision) {
+                assert!(event.revision() > last, "revisions strictly increase");
+                last = event.revision();
+                let agent = upserted(event);
+                replayed.insert(agent.id.clone(), agent.clone());
+            }
+            assert_eq!(&replayed, agents, "the snapshot at {revision}");
+        }
+        for event in log {
+            assert!(event.revision() > last, "revisions strictly increase");
+            last = event.revision();
+            let agent = upserted(event);
+            replayed.insert(agent.id.clone(), agent.clone());
+        }
+        // The refreshes left the latest names published: a new snapshot
+        // finds nothing to change.
+        let (revision, agents) = devices(&presence.snapshot().await.unwrap());
+        assert_eq!(revision, last);
+        assert_eq!(agents, replayed);
+        assert!(drain(&mut events).is_empty());
+    }
+
+    #[tokio::test]
+    async fn snapshots_asked_for_together_share_one_build() {
+        let presence = presence().await;
+        enroll(&presence, &["a"]).await;
+        let together = futures_util::future::join_all((0..10).map(|_| presence.snapshot())).await;
+        let first = together[0].as_ref().unwrap();
+        for snapshot in &together {
+            assert!(Arc::ptr_eq(snapshot.as_ref().unwrap(), first));
+        }
+
+        // One asked for after that build gets a new one.
+        rename(&presence, "a", "Laptop").await;
+        presence.refresh("a").await;
+        let later = presence.snapshot().await.unwrap();
+        assert!(!Arc::ptr_eq(&later, first));
+        let (revision, agents) = devices(&later);
+        assert!(revision > first.revision());
+        assert_eq!(agents["a"].name, "Laptop");
+    }
+
+    #[tokio::test]
+    async fn snapshots_find_thousands_of_deleted_devices_and_companies() {
+        let presence = presence().await;
+        let ids = (0..5000).map(|i| format!("d{i:04}")).collect::<Vec<_>>();
+        enroll(
+            &presence,
+            &ids.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+        .await;
+        for chunk in (0..1000).collect::<Vec<_>>().chunks(500) {
+            let mut insert = Query::insert()
+                .into_table(Companies::Table)
+                .columns([
+                    Companies::Id,
+                    Companies::Name,
+                    Companies::CreatedAt,
+                    Companies::UpdatedAt,
+                ])
+                .to_owned();
+            for i in chunk {
+                let id = format!("c{i:04}");
+                insert.values_panic([id.as_str().into(), id.as_str().into(), 0.into(), 0.into()]);
+            }
+            presence.inner.database.execute(&insert).await.unwrap();
+        }
+        let first = presence.snapshot().await.unwrap();
+        let PresenceEvent::Snapshot {
+            agents, companies, ..
+        } = &*first
+        else {
+            unreachable!()
+        };
+        assert_eq!((agents.len(), companies.len()), (5000, 1000));
+
+        delete(&presence, Expr::col(Agents::Id).lt("d2500")).await;
+        presence
+            .inner
+            .database
+            .execute(
+                &Query::delete()
+                    .from_table(Companies::Table)
+                    .and_where(Expr::col(Companies::Id).lt("c0400"))
+                    .to_owned(),
+            )
+            .await
+            .unwrap();
+        let after = presence.snapshot().await.unwrap();
+        let PresenceEvent::Snapshot {
+            revision,
+            agents,
+            companies,
+            ..
+        } = &*after
+        else {
+            unreachable!()
+        };
+        assert_eq!(*revision, first.revision() + 2500 + 400);
+        assert_eq!(agents.len(), 2500);
+        assert!(agents.iter().all(|agent| agent.id.as_str() >= "d2500"));
+        assert_eq!(companies.len(), 600);
+        assert!(
+            companies
+                .iter()
+                .all(|company| company.id.as_str() >= "c0400")
         );
     }
 }
