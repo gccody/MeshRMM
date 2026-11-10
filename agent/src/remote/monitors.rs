@@ -133,6 +133,8 @@ pub(crate) struct Memory {
     pub(crate) checked_at_ms: Option<i64>,
     /// Since when a process has been over its threshold.
     pub(crate) over_since_ms: Option<i64>,
+    /// The newest record of a Windows event log that it has read up to.
+    pub(crate) log_record: Option<u64>,
 }
 
 /// What a check runs with.
@@ -922,6 +924,7 @@ impl Scheduler {
         // An overrun was reported when it overran.
         if finished.abandoned {
             entry.memory.checked_at_ms = memory.checked_at_ms;
+            entry.memory.log_record = memory.log_record;
             return;
         }
         self.record(&finished.monitor_id, checked_at_ms, outcome, memory);
@@ -1281,6 +1284,37 @@ mod tests {
         assert!(scheduler.entries["open"].running.is_none());
     }
 
+    #[test]
+    fn an_overrun_keeps_how_far_it_read_a_log() {
+        let outbox = outbox();
+        let now = Instant::now();
+        let (mut scheduler, _receiver) = due_at(&outbox, vec![port_monitor("one", 1)], now);
+        scheduler.spawn = hold;
+        scheduler.step(None, now);
+        let run = *scheduler.runs.keys().next().unwrap();
+        scheduler.runs.get_mut(&run).unwrap().deadline = now;
+        scheduler.expire(now);
+        assert!(!results(&outbox)[0].passing);
+        // The next check reads on from where the late one got to, rather
+        // than reading the same records, and overrunning, again.
+        scheduler.handle(Command::Done {
+            run,
+            checked_at_ms: 7,
+            outcome: Outcome::passing("late"),
+            memory: Memory {
+                checked_at_ms: Some(7),
+                log_record: Some(42),
+                ..Memory::default()
+            },
+        });
+        assert!(results(&outbox).is_empty(), "the late result is dropped");
+        let memory = &scheduler.entries["one"].memory;
+        assert_eq!(
+            (memory.checked_at_ms, memory.log_record),
+            (Some(7), Some(42))
+        );
+    }
+
     /// Starts nothing: the test finishes each check itself, with [`done`].
     fn hold(_job: Job) -> std::io::Result<()> {
         Ok(())
@@ -1504,6 +1538,7 @@ mod tests {
         let remembered = Memory {
             checked_at_ms: Some(5),
             over_since_ms: Some(3),
+            log_record: Some(8),
         };
         scheduler.entries.get_mut("one").unwrap().memory = remembered.clone();
         scheduler.step(None, now);
@@ -1511,6 +1546,7 @@ mod tests {
             // Halfway through changing what it remembers.
             memory.checked_at_ms = Some(99);
             memory.over_since_ms = None;
+            memory.log_record = Some(9);
             panic!("byte index 1 is not a char boundary");
         });
         scheduler.step(Some(receiver.try_recv().unwrap()), now);
@@ -1562,6 +1598,7 @@ mod tests {
             Memory {
                 checked_at_ms: Some(checked_at),
                 over_since_ms: Some(42),
+                log_record: Some(8),
             }
         );
     }

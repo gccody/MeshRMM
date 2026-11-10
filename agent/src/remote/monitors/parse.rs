@@ -132,6 +132,9 @@ pub(crate) struct LogRead {
     /// The read stopped at its cap, so older entries since the last check
     /// went unread.
     pub(crate) truncated: bool,
+    /// The read stopped at the check's time limit, so older entries since
+    /// the last check went unread.
+    pub(crate) out_of_time: bool,
 }
 
 /// An event log monitor's filters.
@@ -345,9 +348,48 @@ pub(crate) fn windows_events(xml: &str) -> Vec<LogEvent> {
         .collect()
 }
 
-/// The XPath query the Windows Event Log filters by, for events at or
-/// after `since_ms` ago (`age_ms`). The source was checked to hold no quote.
-pub(crate) fn windows_query(filter: &EventFilter, age_ms: u64) -> String {
+/// The number of the Windows event's record, which its log counts up as it
+/// writes them.
+pub(crate) fn windows_record(xml: &str) -> Option<u64> {
+    let system = xml.get(..xml.find("</System>")?)?;
+    element_text(system, "EventRecordID")?.trim().parse().ok()
+}
+
+/// Which records of a Windows log a query selects: those numbered up to
+/// `through`, and after `after`, or with none, logged within the last
+/// `age_ms`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Records {
+    pub(crate) after: Option<u64>,
+    pub(crate) through: u64,
+    pub(crate) age_ms: u64,
+}
+
+/// `terms` joined by `or`, grouped in halves so the expression nests only
+/// as deep as their count's logarithm: the Windows Event Log refuses a
+/// query that nests deeper than 23 (`ERROR_EVT_INVALID_QUERY`), and each
+/// `or` in a plain list nests one deeper.
+fn any_of(terms: &[String]) -> String {
+    match terms {
+        [] => String::new(),
+        [term] => term.clone(),
+        _ => {
+            let (first, second) = terms.split_at(terms.len() / 2);
+            let half = |terms: &[String]| {
+                if terms.len() == 1 {
+                    any_of(terms)
+                } else {
+                    format!("({})", any_of(terms))
+                }
+            };
+            format!("{} or {}", half(first), half(second))
+        }
+    }
+}
+
+/// The XPath query the Windows Event Log filters by, for `records`. The
+/// source was checked to hold no quote.
+pub(crate) fn windows_query(filter: &EventFilter, records: Records) -> String {
     let mut parts = Vec::new();
     if !filter.source.is_empty() {
         parts.push(format!(
@@ -361,7 +403,7 @@ pub(crate) fn windows_query(filter: &EventFilter, age_ms: u64) -> String {
             .iter()
             .map(|id| format!("EventID={id}"))
             .collect::<Vec<_>>();
-        parts.push(format!("({})", ids.join(" or ")));
+        parts.push(format!("({})", any_of(&ids)));
     }
     if !filter.levels.is_empty() {
         let levels = filter
@@ -370,9 +412,16 @@ pub(crate) fn windows_query(filter: &EventFilter, age_ms: u64) -> String {
             .flat_map(|level| level.windows_levels())
             .map(|level| format!("Level={level}"))
             .collect::<Vec<_>>();
-        parts.push(format!("({})", levels.join(" or ")));
+        parts.push(format!("({})", any_of(&levels)));
     }
-    parts.push(format!("TimeCreated[timediff(@SystemTime) <= {age_ms}]"));
+    match records.after {
+        Some(after) => parts.push(format!("EventRecordID > {after}")),
+        None => parts.push(format!(
+            "TimeCreated[timediff(@SystemTime) <= {}]",
+            records.age_ms
+        )),
+    }
+    parts.push(format!("EventRecordID <= {}", records.through));
     format!("*[System[{}]]", parts.join(" and "))
 }
 
@@ -809,9 +858,14 @@ mod tests {
             events.iter().filter(|event| filter.matches(event)).count(),
             1
         );
+        let first = Records {
+            after: None,
+            through: 120,
+            age_ms: 300_000,
+        };
         assert_eq!(
-            windows_query(&filter, 300_000),
-            "*[System[Provider[@Name='service control manager' or @EventSourceName='service control manager'] and (EventID=7031 or EventID=7034) and (Level=2 or Level=1) and TimeCreated[timediff(@SystemTime) <= 300000]]]"
+            windows_query(&filter, first),
+            "*[System[Provider[@Name='service control manager' or @EventSourceName='service control manager'] and (EventID=7031 or EventID=7034) and (Level=2 or Level=1) and TimeCreated[timediff(@SystemTime) <= 300000] and EventRecordID <= 120]]"
         );
         assert_eq!(
             windows_query(
@@ -819,9 +873,148 @@ mod tests {
                     levels: vec![EventLevel::Information],
                     ..EventFilter::default()
                 },
-                60_000
+                Records {
+                    after: Some(100),
+                    ..first
+                }
             ),
-            "*[System[(Level=0 or Level=4) and TimeCreated[timediff(@SystemTime) <= 60000]]]"
+            "*[System[(Level=0 or Level=4) and EventRecordID > 100 and EventRecordID <= 120]]"
+        );
+        assert_eq!(windows_record(xml), Some(20_991));
+        assert_eq!(
+            windows_record("<System><EventRecordID>é</EventRecordID>"),
+            None
+        );
+    }
+
+    /// How deep a Windows Event Log query's expression nests, as the Event
+    /// Log counts it: each `and` or `or` of a list one deeper than the one
+    /// before it, and each group as deep as its own list.
+    fn nesting(expression: &str) -> usize {
+        let (mut operands, mut level, mut start) = (Vec::new(), 0i32, 0);
+        let bytes = expression.as_bytes();
+        let mut at = 0;
+        while at < bytes.len() {
+            match bytes[at] {
+                b'(' | b'[' => level += 1,
+                b')' | b']' => level -= 1,
+                b' ' if level == 0 => {
+                    let rest = &expression[at..];
+                    if let Some(operator) = [" and ", " or "]
+                        .into_iter()
+                        .find(|operator| rest.starts_with(operator))
+                    {
+                        operands.push(&expression[start..at]);
+                        at += operator.len();
+                        start = at;
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            at += 1;
+        }
+        operands.push(&expression[start..]);
+        let depth = |operand: &str| match operand
+            .strip_prefix('(')
+            .and_then(|inner| inner.strip_suffix(')'))
+        {
+            Some(inner) => nesting(inner),
+            None => 1,
+        };
+        operands
+            .iter()
+            .skip(1)
+            .fold(depth(operands[0]), |deepest, operand| {
+                1 + deepest.max(depth(operand))
+            })
+    }
+
+    /// The deepest query the Windows Event Log takes, measured on Windows 11
+    /// against the Application log: 23 event IDs in a plain `or` list are
+    /// taken, 24 aren't, nor are 23 and a time; source and level terms
+    /// count only as one more step each.
+    const WINDOWS_MAX_NESTING: usize = 23;
+
+    fn system_expression(query: &str) -> &str {
+        query
+            .strip_prefix("*[System[")
+            .and_then(|rest| rest.strip_suffix("]]"))
+            .unwrap()
+    }
+
+    #[test]
+    fn windows_queries_nest_within_what_the_event_log_takes() {
+        // The measurements, as the count above models them.
+        let plain = |count: u32| {
+            (0..count)
+                .map(|id| format!("EventID={id}"))
+                .collect::<Vec<_>>()
+                .join(" or ")
+        };
+        assert_eq!(nesting(&plain(23)), 23);
+        assert_eq!(nesting(&plain(24)), 24);
+        assert_eq!(nesting(&format!("({}) and TimeCreated[x]", plain(23))), 24);
+
+        let mut every = EventFilter {
+            source: "Application Error".into(),
+            levels: EventLevel::ALL.to_vec(),
+            message: "disk".into(),
+            ..EventFilter::default()
+        };
+        for count in [1u32, 20, 21, 32] {
+            every.event_ids = (0..count).map(|id| 1000 + id * 3).collect();
+            for after in [None, Some(5)] {
+                let records = Records {
+                    after,
+                    through: 9,
+                    age_ms: 60_000,
+                };
+                let query = windows_query(&every, records);
+                let expression = system_expression(&query);
+                // Well within the limit, with room to spare.
+                assert!(
+                    nesting(expression) <= WINDOWS_MAX_NESTING - 10,
+                    "{count} IDs nest {} deep: {query}",
+                    nesting(expression)
+                );
+                // Exactly the IDs asked for, once each.
+                let mut ids = query
+                    .split("EventID=")
+                    .skip(1)
+                    .map(|rest| {
+                        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+                        rest[..digits].parse::<u32>().unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                ids.sort_unstable();
+                assert_eq!(ids, every.event_ids);
+                // And every other part of the filter.
+                assert!(query.contains(
+                    "Provider[@Name='Application Error' or @EventSourceName='Application Error']"
+                ));
+                for level in [0, 1, 2, 3, 4] {
+                    assert_eq!(query.matches(&format!("Level={level}")).count(), 1);
+                }
+                assert!(query.contains("EventRecordID <= 9"));
+                assert_eq!(query.contains("EventRecordID > 5"), after.is_some());
+                assert_eq!(
+                    query.contains("TimeCreated[timediff(@SystemTime) <= 60000]"),
+                    after.is_none()
+                );
+            }
+        }
+        every.event_ids = vec![7];
+        assert!(
+            windows_query(
+                &every,
+                Records {
+                    after: None,
+                    through: 9,
+                    age_ms: 1
+                }
+            )
+            .contains(" and (EventID=7) and ")
         );
     }
 

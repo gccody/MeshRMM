@@ -243,35 +243,65 @@ pub(super) fn judge_process(
     }
 }
 
-fn events(log: &str, filter: &EventFilter, context: &Context, memory: &Memory) -> Outcome {
+fn events(log: &str, filter: &EventFilter, context: &Context, memory: &mut Memory) -> Outcome {
     // Since the last check, or one interval back on the first.
     let since_ms = memory
         .checked_at_ms
         .filter(|checked| *checked < context.now_ms)
         .unwrap_or(context.now_ms - context.interval.as_millis() as i64);
-    match platform::events(log, filter, since_ms, context.now_ms, context.timeout) {
-        Ok(read) => judge_events(&read, filter, since_ms),
+    match platform::events(
+        log,
+        filter,
+        since_ms,
+        context.now_ms,
+        context.timeout,
+        &mut memory.log_record,
+    ) {
+        Ok(read) => judge_events(&read, filter, log, context.timeout),
         Err(error) => Outcome::failing(format!("Could not read the log: {error:#}")),
     }
 }
 
-/// Fails when any event since `since_ms` matches the filter. A read that
-/// stopped at its cap says so, since older entries went unread.
-pub(super) fn judge_events(read: &LogRead, filter: &EventFilter, since_ms: i64) -> Outcome {
-    const UNREAD: &str =
-        "the log had more entries than one check reads, so older ones weren't looked at";
+/// Fails when any event the read found since the last check matches the
+/// filter. A read that stopped at its cap or at the check's time limit
+/// (`timeout`) says so, since older entries went unread.
+pub(super) fn judge_events(
+    read: &LogRead,
+    filter: &EventFilter,
+    log: &str,
+    timeout: Duration,
+) -> Outcome {
+    let unread = if read.out_of_time {
+        let search = if filter.message.is_empty() {
+            "read"
+        } else {
+            "search by message text"
+        };
+        Some(format!(
+            "the “{log}” log is too busy to {search} within the {}-second time limit, so older entries since the last check weren't looked at; a source or event IDs would narrow the search",
+            timeout.as_secs()
+        ))
+    } else if read.truncated {
+        Some(
+            "the log had more entries than one check reads, so older ones weren't looked at"
+                .to_owned(),
+        )
+    } else {
+        None
+    };
     let mut matching = read
         .events
         .iter()
-        .filter(|event| event.at_ms >= since_ms && filter.matches(event))
+        .filter(|event| filter.matches(event))
         .collect::<Vec<_>>();
     matching.sort_by_key(|event| std::cmp::Reverse(event.at_ms));
     let count = matching.len();
     let Some(latest) = matching.first() else {
-        let detail = if read.truncated {
-            format!("No matching events in the newest entries since the last check; {UNREAD}.")
-        } else {
-            "No matching events since the last check.".to_owned()
+        let detail = match &unread {
+            Some(unread) => {
+                format!("No matching events in the newest entries since the last check; {unread}.")
+            }
+            None => "No matching events since the last check.".to_owned(),
         };
         return Outcome::passing(detail).value(0.0);
     };
@@ -308,10 +338,10 @@ pub(super) fn judge_events(read: &LogRead, filter: &EventFilter, since_ms: i64) 
     } else {
         format!("{count} matching events")
     };
-    let detail = if read.truncated {
-        output.push_str(&format!("({UNREAD})\n"));
+    let detail = if let Some(unread) = &unread {
+        output.push_str(&format!("({unread})\n"));
         format!(
-            "At least {events} since the last check ({UNREAD}); the latest: {}",
+            "At least {events} since the last check ({unread}); the latest: {}",
             describe(latest)
         )
     } else if count == 1 {
@@ -651,17 +681,17 @@ mod tests {
             .lines()
             .filter_map(parse::journal_event)
             .collect::<Vec<_>>();
-        let since = events.iter().map(|event| event.at_ms).min().unwrap();
         let mut read = LogRead {
             events,
-            truncated: false,
+            ..LogRead::default()
         };
         let filter = EventFilter {
             levels: vec![EventLevel::Error, EventLevel::Warning],
             message: "disk".into(),
             ..EventFilter::default()
         };
-        let outcome = judge_events(&read, &filter, since);
+        let judge = |read: &LogRead| judge_events(read, &filter, "System", Duration::from_secs(30));
+        let outcome = judge(&read);
         assert!(!outcome.passing);
         assert_eq!(outcome.value, Some(1.0));
         assert!(
@@ -678,14 +708,14 @@ mod tests {
             "{}",
             outcome.output
         );
-        let later = read.events.iter().map(|event| event.at_ms).max().unwrap() + 1;
-        let calm = judge_events(&read, &filter, later);
-        assert!(calm.passing, "older events don't count");
+        let nothing = LogRead::default();
+        let calm = judge(&nothing);
+        assert!(calm.passing);
         assert_eq!(calm.detail, "No matching events since the last check.");
 
         // A read that stopped at its cap says so.
         read.truncated = true;
-        let capped = judge_events(&read, &filter, since);
+        let capped = judge(&read);
         assert!(!capped.passing);
         assert!(
             capped
@@ -695,12 +725,78 @@ mod tests {
             capped.detail
         );
         assert!(capped.output.contains("older ones weren't looked at"));
-        let capped_calm = judge_events(&read, &filter, later);
+        let capped_calm = judge(&LogRead {
+            truncated: true,
+            ..LogRead::default()
+        });
         assert!(capped_calm.passing);
         assert!(
             capped_calm.detail.contains("older ones weren't looked at"),
             "{}",
             capped_calm.detail
+        );
+    }
+
+    #[test]
+    fn a_read_out_of_time_keeps_what_it_found_and_says_why() {
+        let events = include_str!("testdata/journal.json")
+            .lines()
+            .filter_map(parse::journal_event)
+            .collect::<Vec<_>>();
+        let filter = EventFilter {
+            message: "disk".into(),
+            ..EventFilter::default()
+        };
+        let busy = LogRead {
+            events,
+            truncated: false,
+            out_of_time: true,
+        };
+        const BUSY: &str = "the “Security” log is too busy to search by message text within the 30-second time limit, so older entries since the last check weren't looked at; a source or event IDs would narrow the search";
+        let found = judge_events(&busy, &filter, "Security", Duration::from_secs(30));
+        assert!(!found.passing, "what it found raises the alert");
+        assert_eq!(found.value, Some(1.0));
+        assert!(
+            found.detail.starts_with(&format!(
+                "At least 1 matching event since the last check ({BUSY}); the latest: "
+            )),
+            "{}",
+            found.detail
+        );
+        assert!(found.detail.chars().count() <= meshrmm_protocol::MAX_MONITOR_DETAIL_CHARS);
+        assert!(found.output.contains("Disk \"D:\" failed & retried"));
+        assert!(found.output.ends_with(&format!("({BUSY})\n")));
+
+        let none = judge_events(
+            &LogRead {
+                out_of_time: true,
+                ..LogRead::default()
+            },
+            &filter,
+            "Security",
+            Duration::from_secs(30),
+        );
+        assert!(none.passing);
+        assert_eq!(
+            none.detail,
+            format!("No matching events in the newest entries since the last check; {BUSY}.")
+        );
+        // Without a message to search for, it says it couldn't read them.
+        let plain = judge_events(
+            &LogRead {
+                out_of_time: true,
+                ..LogRead::default()
+            },
+            &EventFilter::default(),
+            "Security",
+            Duration::from_secs(30),
+        );
+        assert!(
+            plain
+                .detail
+                .contains("the “Security” log is too busy to read within the 30-second"),
+            "{}",
+            plain.detail
         );
     }
 }
