@@ -136,7 +136,18 @@ unsafe fn create_top_level_window(
         )
     };
     match window {
-        Ok(window) => Ok(window),
+        Ok(window) => {
+            // A lock keeps the window's focus; WM_WTSSESSION_CHANGE says so.
+            if let Err(error) = unsafe {
+                windows::Win32::System::RemoteDesktop::WTSRegisterSessionNotification(
+                    window,
+                    windows::Win32::System::RemoteDesktop::NOTIFY_FOR_THIS_SESSION,
+                )
+            } {
+                tracing::warn!(%error, "could not watch for the workstation locking");
+            }
+            Ok(window)
+        }
         Err(error) => {
             // A window that got as far as WM_NCCREATE released its reference
             // on WM_NCDESTROY.

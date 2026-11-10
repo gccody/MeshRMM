@@ -13,8 +13,10 @@ fn desktop_switch_discards_unrouted_input_and_resumes_without_replay() {
     controller.release_all().unwrap();
 
     let (reader, writer) = create_pipe().unwrap();
-    *streamer.input_route.lock().unwrap() =
-        Some(Arc::new(CommandWriter::new(writer.into_file()).unwrap()));
+    lock_route(&streamer.input_route).route_to(
+        Arc::new(CommandWriter::new(writer.into_file()).unwrap()),
+        DisplayId(1),
+    );
     controller.apply(event(true)).unwrap();
     controller.release_all().unwrap();
     let mut reader = reader.into_file();

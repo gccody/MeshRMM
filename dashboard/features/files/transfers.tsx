@@ -75,8 +75,9 @@ const hashOf = async (file: File, onProgress: (bytes: number) => void, signal: A
 };
 
 // Failures an upload resumes after on its own, a few times, while the device
-// is online: it went away, or is connected but too busy to take more yet.
-const interruptedCodes = new Set(["device_offline", "device_disconnected", "device_timeout", "device_busy", "network"]);
+// is online: it went away, or is connected but too busy to take more yet,
+// or didn't start the request in time.
+const interruptedCodes = new Set(["device_offline", "device_disconnected", "device_timeout", "timed_out", "device_busy", "network"]);
 
 // The queue of uploads and the downloads started from the page, and what
 // each is doing.

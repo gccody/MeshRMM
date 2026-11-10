@@ -9,7 +9,7 @@ pub(super) struct DesktopInputController {
     pub(super) clipboard_route: InputRoute,
     pub(super) blackout_message: String,
     pub(super) file_route: InputRoute,
-    pub(super) route: InputRoute,
+    pub(super) route: DeviceInputRoute,
     pub(super) cursor: HelperCursor,
     pub(super) clipboard: HelperClipboard,
     pub(super) files: HelperFiles,
@@ -63,11 +63,8 @@ impl ScreenInput for DesktopInputController {
                         && !credentials.state.prompt_active,
                     "No saved credentials or Windows password prompt"
                 );
-                let writer = self
-                    .route
-                    .lock()
-                    .unwrap()
-                    .clone()
+                let writer = lock_route(&self.route)
+                    .writer()
                     .context("Windows desktop is switching; try again")?;
                 // Another session may have forgotten or replaced the saved credential.
                 let Some(encrypted) = crate::remote::credentials::load(&credentials.store)? else {
@@ -99,10 +96,10 @@ impl ScreenInput for DesktopInputController {
         self.background_active.load(Ordering::Acquire)
     }
     fn set_prevent_idle_lock(&self, enabled: bool) -> anyhow::Result<()> {
-        let route = self.route.lock().unwrap_or_else(|e| e.into_inner());
+        let route = lock_route(&self.route);
         self.prevent_idle_lock.store(enabled, Ordering::Release);
-        if let Some(writer) = route.as_ref() {
-            send_command(writer, &ParentCommand::SetPreventIdleLock(enabled))?;
+        if let Some(writer) = route.writer() {
+            send_command(&writer, &ParentCommand::SetPreventIdleLock(enabled))?;
         }
         Ok(())
     }
@@ -115,11 +112,8 @@ impl ScreenInput for DesktopInputController {
         Ok(())
     }
     fn set_blackout(&self, enabled: bool) -> anyhow::Result<()> {
-        let writer = self
-            .route
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        let writer = lock_route(&self.route)
+            .writer()
             .context("desktop input helper is not running")?;
         send_command(
             &writer,
@@ -139,11 +133,8 @@ impl ScreenInput for DesktopInputController {
         })
     }
     fn set_agent_input_blocked(&self, blocked: bool) -> anyhow::Result<()> {
-        let writer = self
-            .route
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        let writer = lock_route(&self.route)
+            .writer()
             .context("desktop input helper is not running")?;
         send_command(&writer, &ParentCommand::BlockInput(blocked))
     }
@@ -237,19 +228,7 @@ impl ScreenInput for DesktopInputController {
             input.set_display_id(*local);
         }
         drop(routes);
-        let Some(writer) = self
-            .route
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone()
-        else {
-            // Desktop switches temporarily unroute input while the old helper
-            // releases its pressed keys/buttons and its replacement starts.
-            // Discard events in this gap instead of ending the remote session
-            // or replaying stale input onto the new desktop.
-            return Ok(());
-        };
-        send_input(&writer, input).context("failed to send input to the active desktop")
+        forward_input(&self.route, input)
     }
 
     fn annotate(&self, mut annotation: meshrmm_protocol::Annotation) -> anyhow::Result<()> {
@@ -263,12 +242,7 @@ impl ScreenInput for DesktopInputController {
             }
         }
         // A desktop switch replaces the helper, and its drawing with it.
-        let Some(writer) = self
-            .route
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone()
-        else {
+        let Some(writer) = lock_route(&self.route).writer() else {
             return Ok(());
         };
         send_command(&writer, &ParentCommand::Annotate(annotation))
@@ -276,16 +250,7 @@ impl ScreenInput for DesktopInputController {
     }
 
     fn release_all(&self) -> anyhow::Result<()> {
-        let Some(writer) = self
-            .route
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone()
-        else {
-            return Ok(());
-        };
-        send_after_input(&writer, &ParentCommand::ReleaseInput)
-            .context("failed to release input on the active desktop")
+        release_routed(&self.route)
     }
 
     fn agent_pointer_display(&self) -> Option<DisplayId> {

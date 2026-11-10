@@ -536,6 +536,17 @@ fn slow(operation: &FileOperation) -> bool {
     )
 }
 
+const DEVICE_TIMEOUT: &str = "device_timeout";
+const DEVICE_DISCONNECTED: &str = "device_disconnected";
+
+/// Whether `error` from [`ask`] leaves unknown what the device did: it
+/// didn't answer in time, or disconnected after it was asked. Either way it
+/// may have done what was asked, or still do it. A request it never got
+/// fails otherwise.
+pub fn unconfirmed(error: &ApiError) -> bool {
+    matches!(error.code(), Some(DEVICE_TIMEOUT | DEVICE_DISCONNECTED))
+}
+
 pub fn device_offline() -> ApiError {
     ApiError::conflict("the device is offline").with_code("device_offline")
 }
@@ -567,6 +578,7 @@ pub async fn ask(
             request_id: request.id.clone(),
             run_as,
             notification,
+            timeout_ms: u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
             operation,
         },
     };
@@ -581,7 +593,7 @@ pub async fn ask(
         Ok(Err(_)) => Err(ApiError::conflict(
             "the device disconnected; try again once it's back online",
         )
-        .with_code("device_disconnected")),
+        .with_code(DEVICE_DISCONNECTED)),
         Err(_) => {
             tracing::warn!(
                 device_id,
@@ -590,9 +602,9 @@ pub async fn ask(
             );
             Err(ApiError::new(
                 axum::http::StatusCode::GATEWAY_TIMEOUT,
-                "the device didn't answer in time; it may still be working on it, so refresh in a moment",
+                "the device didn't answer in time; it may have done this, or still be doing it, so refresh in a moment to see",
             )
-            .with_code("device_timeout"))
+            .with_code(DEVICE_TIMEOUT))
         }
     }
 }
@@ -618,6 +630,7 @@ pub fn agent_error(error: FileError) -> ApiError {
         FileErrorCode::NoSpace => StatusCode::INSUFFICIENT_STORAGE,
         FileErrorCode::ChecksumMismatch => StatusCode::UNPROCESSABLE_ENTITY,
         FileErrorCode::Busy => StatusCode::TOO_MANY_REQUESTS,
+        FileErrorCode::TimedOut => StatusCode::GATEWAY_TIMEOUT,
         FileErrorCode::Failed => StatusCode::BAD_GATEWAY,
     };
     ApiError::new(status, error.message).with_code(error.code.as_str())

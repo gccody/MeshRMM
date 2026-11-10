@@ -890,7 +890,10 @@ mod tests {
                 SocketAddr::new(BLACK_HOLE, 443),
                 SocketAddr::new(REFUSING, 443),
             ],
-            Instant::now() + Duration::from_millis(100),
+            // Long enough that a busy machine, which may leave this thread
+            // waiting for tens of milliseconds, still starts the second
+            // attempt and hears its refusal before the time is up.
+            Instant::now() + Duration::from_secs(2),
             Duration::from_millis(20),
             attempt,
         )

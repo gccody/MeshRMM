@@ -49,7 +49,18 @@ pub(super) fn remove() {
         tracing::warn!(%error, "could not remove the Windows shortcut hook");
     }
     TARGET.set(HWND(std::ptr::null_mut()));
+    forget();
+}
+
+/// Forgets the keys the hook took, whose key-ups it will not see: the
+/// window released them on the device.
+pub(super) fn forget() {
     SHORTCUTS.with_borrow_mut(SystemShortcuts::clear);
+}
+
+/// Whether the hook took `virtual_key`'s press and not yet its release.
+pub(super) fn holds(virtual_key: u32) -> bool {
+    SHORTCUTS.with_borrow(|keys| keys.holds(virtual_key))
 }
 
 /// Unpacks a [`WM_SYSTEM_SHORTCUT_KEY`] WPARAM into the scan code, whether it
@@ -76,7 +87,12 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
         let pressed = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
         let alt = event.flags.0 & LLKHF_ALTDOWN.0 != 0;
         let control = unsafe { GetAsyncKeyState(i32::from(VK_CONTROL.0)) } < 0;
-        if SHORTCUTS.with_borrow_mut(|keys| keys.take(event.vkCode, pressed, alt, control)) {
+        // Windows updates its key state after the hooks, so a key it has
+        // down already is being repeated.
+        let already_down = unsafe { GetAsyncKeyState(event.vkCode as i32) } < 0;
+        if SHORTCUTS
+            .with_borrow_mut(|keys| keys.take(event.vkCode, pressed, alt, control, already_down))
+        {
             let extended = event.flags.0 & LLKHF_EXTENDED.0 != 0;
             let message = pack(event.scanCode, extended, pressed);
             if unsafe { PostMessageW(Some(target), WM_SYSTEM_SHORTCUT_KEY, message, LPARAM(0)) }

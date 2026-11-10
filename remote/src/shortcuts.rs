@@ -116,7 +116,8 @@ const VK_RWIN: u32 = 0x5c;
 /// Windows while the viewer has focus: the Windows keys, Alt+Tab, Alt+Esc and
 /// Ctrl+Esc. Windows never delivers these to a window, so they are forwarded
 /// from the hook. A key's release is taken only if its press was, so a key
-/// already held when the viewer gained focus is released locally.
+/// already held when the viewer gained focus is released locally, and its
+/// auto-repeat stays local too.
 /// Ctrl+Alt+Del and Windows+L always stay with Windows.
 #[cfg(any(windows, test))]
 #[derive(Default)]
@@ -127,18 +128,37 @@ pub struct SystemShortcuts {
 #[cfg(any(windows, test))]
 impl SystemShortcuts {
     /// Returns whether the key event goes to the device instead of Windows.
-    pub fn take(&mut self, virtual_key: u32, pressed: bool, alt: bool, control: bool) -> bool {
+    /// `already_down` is whether Windows has the key down: this press is an
+    /// auto-repeat of one Windows had.
+    pub fn take(
+        &mut self,
+        virtual_key: u32,
+        pressed: bool,
+        alt: bool,
+        control: bool,
+        already_down: bool,
+    ) -> bool {
         if !pressed {
             let held = self.held.iter().position(|key| *key == virtual_key);
             return held.map(|index| self.held.swap_remove(index)).is_some();
         }
-        let take = matches!(virtual_key, VK_LWIN | VK_RWIN)
-            || (virtual_key == VK_TAB && alt)
-            || (virtual_key == VK_ESCAPE && (alt || control));
-        if take && !self.held.contains(&virtual_key) {
+        if self.holds(virtual_key) {
+            return true;
+        }
+        let take = !already_down
+            && (matches!(virtual_key, VK_LWIN | VK_RWIN)
+                || (virtual_key == VK_TAB && alt)
+                || (virtual_key == VK_ESCAPE && (alt || control)));
+        if take {
             self.held.push(virtual_key);
         }
         take
+    }
+
+    /// Whether the device has `virtual_key` down from the hook. Windows' own
+    /// key state never saw it go down.
+    pub fn holds(&self, virtual_key: u32) -> bool {
+        self.held.contains(&virtual_key)
     }
 
     /// Forgets taken keys when the hook is removed; the viewer releases them
@@ -190,21 +210,29 @@ mod tests {
     fn windows_shortcuts_are_taken_with_their_releases() {
         let mut keys = SystemShortcuts::default();
         // Windows key: press and release both go to the device.
-        assert!(keys.take(VK_LWIN, true, false, false));
-        assert!(keys.take(VK_LWIN, true, false, false), "auto-repeat");
-        assert!(keys.take(VK_LWIN, false, false, false));
+        assert!(keys.take(VK_LWIN, true, false, false, false));
+        assert!(keys.take(VK_LWIN, true, false, false, false), "auto-repeat");
+        assert!(keys.take(VK_LWIN, false, false, false, false));
         // Alt+Tab, released after Alt.
-        assert!(keys.take(VK_TAB, true, true, false));
-        assert!(keys.take(VK_TAB, false, false, false));
+        assert!(keys.take(VK_TAB, true, true, false, false));
+        assert!(keys.take(VK_TAB, false, false, false, false));
         // Tab alone stays with the window's normal key handling.
-        assert!(!keys.take(VK_TAB, true, false, false));
-        assert!(!keys.take(VK_TAB, false, false, false));
-        assert!(keys.take(VK_ESCAPE, true, false, true), "Ctrl+Esc");
-        assert!(keys.take(VK_ESCAPE, false, false, true));
-        assert!(keys.take(VK_ESCAPE, true, true, false), "Alt+Esc");
-        assert!(!keys.take(0x41, true, true, true));
+        assert!(!keys.take(VK_TAB, true, false, false, false));
+        assert!(!keys.take(VK_TAB, false, false, false, false));
+        assert!(keys.take(VK_ESCAPE, true, false, true, false), "Ctrl+Esc");
+        assert!(keys.take(VK_ESCAPE, false, false, true, false));
+        assert!(keys.take(VK_ESCAPE, true, true, false, false), "Alt+Esc");
+        assert!(!keys.take(0x41, true, true, true, false));
         // A Windows key held before focus is released locally.
         keys.clear();
-        assert!(!keys.take(VK_RWIN, false, false, false));
+        assert!(!keys.take(VK_RWIN, false, false, false, false));
+        // And so is its auto-repeat, which would press it on the device.
+        assert!(!keys.take(VK_RWIN, true, false, false, true));
+        assert!(!keys.holds(VK_RWIN));
+        assert!(!keys.take(VK_RWIN, false, false, false, false));
+        // A repeat of a key the hook took still goes to the device.
+        assert!(keys.take(VK_LWIN, true, false, false, false));
+        assert!(keys.take(VK_LWIN, true, false, false, true));
+        assert!(keys.holds(VK_LWIN));
     }
 }

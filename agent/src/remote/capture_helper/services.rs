@@ -168,6 +168,8 @@ impl DesktopCaptureStreamer {
             if helper.display_id != display_id {
                 // Commands share one ordered pipe, so the new display mapping
                 // is applied before any subsequent pointer/keyboard events.
+                // The helper releases everything on a new display.
+                let mut route = lock_route(&self.input_route);
                 send_command(
                     &helper.input,
                     &ParentCommand::StartInput {
@@ -175,6 +177,7 @@ impl DesktopCaptureStreamer {
                         viewer_name: self.viewer_name.clone(),
                     },
                 )?;
+                route.released();
                 helper.display_id = display_id;
             }
             return Ok(());
@@ -193,15 +196,12 @@ impl DesktopCaptureStreamer {
             target,
             display_id,
         )?;
-        let mut route = self
-            .input_route
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut route = lock_route(&self.input_route);
         send_command(
             &helper.input,
             &ParentCommand::SetPreventIdleLock(self.prevent_idle_lock.load(Ordering::Acquire)),
         )?;
-        *route = Some(Arc::clone(&helper.input));
+        route.route_to(Arc::clone(&helper.input), display_id);
         self.input = Some(helper);
         Ok(())
     }
@@ -370,10 +370,10 @@ impl DesktopCaptureStreamer {
         let Some(mut helper) = self.input.take() else {
             return;
         };
-        *self
-            .input_route
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = None;
+        // What the helper holds stays in the record: if this release does
+        // not reach it, or its desktop no longer takes input, the next helper
+        // releases it.
+        lock_route(&self.input_route).unroute();
         let _ = send_command(&helper.input, &ParentCommand::ReleaseInput);
         let _ = send_command(&helper.input, &ParentCommand::Stop);
         if unsafe { WaitForSingleObject(helper.process.0, STOP_TIMEOUT_MS) } == WAIT_TIMEOUT {
