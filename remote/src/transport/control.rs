@@ -369,8 +369,15 @@ impl ControlHandler {
                         error: None,
                         power: state.power,
                         platform: state.platform,
+                        typing: state.typing,
                     };
                 }
+            }
+            Ok(SessionMessage::Typing { active }) => {
+                if let Ok(mut state) = self.viewer_control.maintenance.lock() {
+                    state.typing = active;
+                }
+                self.refresh_controls();
             }
             Ok(SessionMessage::DeviceState {
                 platform,

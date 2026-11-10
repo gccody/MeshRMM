@@ -456,38 +456,18 @@ impl InputController {
             .send(&[(EV_KEY, code, pressed.into())])
     }
 
-    /// Types `text` with the keys of a US keyboard. Characters without one
-    /// are skipped. Keys go out a few milliseconds apart: the display server
+    /// Types `text`, a piece of the viewer's text, with the keys of a US
+    /// keyboard. Keys go out a few milliseconds apart: the display server
     /// reads the device's queue in batches, and a queue that overflows drops
     /// keys, which can leave Shift taps that turn on Sticky Keys.
     fn type_text(&mut self, text: &str) -> anyhow::Result<()> {
         self.release_all()?;
-        let mut skipped = 0;
-        let mut shifted = false;
-        let pace = || std::thread::sleep(TYPING_INTERVAL);
-        for character in text.chars() {
-            let character = if character == '\r' { '\n' } else { character };
-            let Some((shift, code)) = keymap::us_keys(character) else {
-                skipped += 1;
-                continue;
-            };
-            let keyboard = &self.devices()?.keyboard;
-            // Shift stays down across a run of shifted characters.
-            if shift != shifted {
-                keyboard.send(&[(EV_KEY, KEY_LEFTSHIFT, shift.into())])?;
-                shifted = shift;
-                pace();
-            }
-            keyboard.send(&[(EV_KEY, code, 1)])?;
-            pace();
-            keyboard.send(&[(EV_KEY, code, 0)])?;
-            pace();
-        }
-        if shifted {
-            self.devices()?
-                .keyboard
-                .send(&[(EV_KEY, KEY_LEFTSHIFT, 0)])?;
-        }
+        let keyboard = &self.devices()?.keyboard;
+        let skipped = type_keys(
+            text,
+            |code, value| keyboard.send(&[(EV_KEY, code, value)]),
+            || std::thread::sleep(TYPING_INTERVAL),
+        )?;
         if skipped > 0 {
             tracing::info!(skipped, "typed text had characters without a US key");
         }
@@ -529,6 +509,44 @@ impl InputController {
         self.blocked = blocked;
         Ok(())
     }
+}
+
+/// Types `text` with the keys of a US keyboard, sending each key event with
+/// `send` and pausing with `pace` after all but a final Shift release.
+/// Characters without a key are skipped and counted. Shift stays down across
+/// a run of shifted characters and is up again at the end, so no key is left
+/// down: at most three paced events a character.
+fn type_keys(
+    text: &str,
+    mut send: impl FnMut(u16, i32) -> anyhow::Result<()>,
+    mut pace: impl FnMut(),
+) -> anyhow::Result<usize> {
+    let mut skipped = 0;
+    let mut shifted = false;
+    let mut typed = || -> anyhow::Result<()> {
+        for character in text.chars() {
+            let character = if character == '\r' { '\n' } else { character };
+            let Some((shift, code)) = keymap::us_keys(character) else {
+                skipped += 1;
+                continue;
+            };
+            if shift != shifted {
+                send(KEY_LEFTSHIFT, shift.into())?;
+                shifted = shift;
+                pace();
+            }
+            send(code, 1)?;
+            pace();
+            send(code, 0)?;
+            pace();
+        }
+        Ok(())
+    };
+    let typed = typed();
+    if shifted {
+        send(KEY_LEFTSHIFT, 0)?;
+    }
+    typed.map(|()| skipped)
 }
 
 fn button_code(button: PointerButton) -> u16 {
@@ -599,6 +617,49 @@ mod tests {
     fn device_structures_have_the_kernel_layout() {
         assert_eq!(std::mem::size_of::<DeviceDescription>(), 1116);
         assert_eq!(std::mem::size_of::<Event>(), 24);
+    }
+
+    /// The keys `text` is typed with, and how many pauses it takes.
+    fn typed_keys(text: &str) -> (Vec<(u16, i32)>, u32, usize) {
+        let mut events = Vec::new();
+        let mut paces = 0;
+        let skipped = type_keys(
+            text,
+            |code, value| {
+                events.push((code, value));
+                Ok(())
+            },
+            || paces += 1,
+        )
+        .unwrap();
+        (events, paces, skipped)
+    }
+
+    #[test]
+    fn a_piece_of_typed_text_leaves_no_key_down_and_types_in_well_under_a_second() {
+        let alternating: String = "aB"
+            .chars()
+            .cycle()
+            .take(crate::remote::transport::typing::TYPING_PIECE_CHARS)
+            .collect();
+        for text in ["Hello, World!", "ABc", alternating.as_str(), "ç"] {
+            let (events, paces, _) = typed_keys(text);
+            let mut down = BTreeSet::new();
+            for (code, value) in events {
+                if value == 1 {
+                    down.insert(code);
+                } else {
+                    down.remove(&code);
+                }
+            }
+            assert!(down.is_empty(), "{text:?} left {down:?} down");
+            assert!(paces <= 3 * text.chars().count() as u32);
+        }
+        let (events, paces, _) = typed_keys(&alternating);
+        assert_eq!(events.last(), Some(&(KEY_LEFTSHIFT, 0)));
+        // A piece takes at most 0.77 s, a twentieth of a helper's call timeout.
+        assert!(paces * TYPING_INTERVAL < std::time::Duration::from_millis(800));
+        assert_eq!(typed_keys("ç").2, 1);
     }
 
     /// Needs root, or write access to /dev/uinput.

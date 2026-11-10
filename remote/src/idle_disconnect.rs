@@ -94,6 +94,7 @@ pub fn is_activity(message: &SessionMessage) -> bool {
         | SessionMessage::ForgetCredentials
         | SessionMessage::SetAudio { .. }
         | SessionMessage::Restart { .. }
+        | SessionMessage::StopTyping
         | SessionMessage::SetHeadlessResolution { .. } => true,
         // The viewer sends these by itself.
         SessionMessage::RequestKeyframe { .. }
@@ -118,7 +119,8 @@ pub fn is_activity(message: &SessionMessage) -> bool {
         | SessionMessage::MaintenanceError { .. }
         | SessionMessage::AgentPointerDisplay { .. }
         | SessionMessage::CredentialState(_)
-        | SessionMessage::DeviceState { .. } => false,
+        | SessionMessage::DeviceState { .. }
+        | SessionMessage::Typing { .. } => false,
     }
 }
 

@@ -54,6 +54,25 @@ pub struct MaintenanceState {
     pub power: Option<bool>,
     /// The agent's operating system, once it reports it.
     pub platform: Option<meshrmm_protocol::DevicePlatform>,
+    /// The agent is typing text from the clipboard.
+    pub typing: bool,
+}
+
+/// The message that types `text` on `display_id`, nothing for no text, or why
+/// the text cannot be typed.
+fn type_text_message(
+    display_id: meshrmm_protocol::DisplayId,
+    text: String,
+) -> Result<Option<meshrmm_protocol::SessionMessage>, String> {
+    if let Some(problem) = meshrmm_protocol::typed_text_problem(&text) {
+        return Err(format!("Clipboard text cannot be typed: {problem}"));
+    }
+    if text.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(meshrmm_protocol::SessionMessage::Input(
+        meshrmm_protocol::RemoteInput::TypeText { display_id, text },
+    )))
 }
 
 /// Sends viewer control messages and keeps the transport's input gate in sync
@@ -261,25 +280,28 @@ impl ControlSink {
         }
     }
 
+    /// Whether the Agent is typing text from the clipboard.
+    pub fn typing(&self) -> bool {
+        self.maintenance_state().typing
+    }
+
+    /// Types the clipboard's text into the remote computer, or stops the
+    /// typing while the Agent is at it.
     pub fn type_clipboard(&self, display_id: meshrmm_protocol::DisplayId) {
+        if self.typing() {
+            self.send(meshrmm_protocol::SessionMessage::StopTyping);
+            return;
+        }
         if self.technician_blocked() {
             return;
         }
         let result = (|| -> anyhow::Result<()> {
             let text = crate::clipboard::ClipboardSync::new(false)?.text()?;
-            anyhow::ensure!(
-                text.len() <= meshrmm_protocol::MAX_CLIPBOARD_TEXT_BYTES,
-                "Clipboard text is too large to type (maximum 60 KiB)"
-            );
-            anyhow::ensure!(
-                !text.contains('\0'),
-                "Clipboard text contains a null character"
-            );
-            if !text.is_empty() {
+            if let Some(message) =
+                type_text_message(display_id, text).map_err(anyhow::Error::msg)?
+            {
                 self.set_input_enabled(true);
-                self.send(meshrmm_protocol::SessionMessage::Input(
-                    meshrmm_protocol::RemoteInput::TypeText { display_id, text },
-                ));
+                self.send(message);
             }
             Ok(())
         })();
@@ -686,5 +708,27 @@ mod tests {
         // and tests never read the user's preference file.
         assert!(crate::transport::ViewerResumeState::default().audio_muted());
         assert!(!crate::transport::ViewerResumeState::with_audio_muted(false).audio_muted());
+    }
+
+    #[test]
+    fn clipboard_text_over_the_typing_maximum_is_not_sent() {
+        use meshrmm_protocol::{DisplayId, MAX_TYPED_TEXT_CHARS, RemoteInput, SessionMessage};
+        let longest = "é".repeat(MAX_TYPED_TEXT_CHARS);
+        assert_eq!(
+            type_text_message(DisplayId(3), longest.clone()),
+            Ok(Some(SessionMessage::Input(RemoteInput::TypeText {
+                display_id: DisplayId(3),
+                text: longest,
+            })))
+        );
+        assert_eq!(
+            type_text_message(DisplayId(3), "a".repeat(MAX_TYPED_TEXT_CHARS + 1)),
+            Err(
+                "Clipboard text cannot be typed: the text has 5001 characters, and at most \
+                 5000 can be typed"
+                    .into()
+            )
+        );
+        assert_eq!(type_text_message(DisplayId(3), String::new()), Ok(None));
     }
 }
