@@ -900,3 +900,503 @@ async fn a_patch_path_too_deep_for_any_attribute_is_refused() {
         app.finish().await;
     }
 }
+
+/// `text` as a query parameter's value.
+fn encode(text: &str) -> String {
+    text.bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                char::from(byte).to_string()
+            }
+            byte => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
+/// A list's response and its resources, checked for success.
+async fn resources(scim: &Scim<'_>, path: &str) -> (Value, Vec<Value>) {
+    let response = scim.get(path).await;
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "{path}: {:?}",
+        response.body
+    );
+    let resources = response.body["Resources"].as_array().unwrap().clone();
+    (response.body, resources)
+}
+
+fn ids(resources: &[Value]) -> Vec<String> {
+    resources
+        .iter()
+        .map(|resource| resource["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+async fn create(scim: &Scim<'_>, path: &str, body: Value) -> String {
+    let created = scim.post(path, body).await;
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "{path}: {:?}",
+        created.body
+    );
+    created.body["id"].as_str().unwrap().to_owned()
+}
+
+/// What `filter` finds, checked three ways: as the list runs it (in SQL
+/// where it can), wrapped in `not (not (...))` so the list evaluates all of
+/// it on every resource, and by the evaluator over the unfiltered list.
+async fn agree(scim: &Scim<'_>, endpoint: &str, everything: &[Value], filter: &str) -> usize {
+    let parsed = meshrmm_server::scim::filter::parse(filter).unwrap();
+    let expected = everything
+        .iter()
+        .filter(|resource| meshrmm_server::scim::filter::matches(resource, &parsed))
+        .cloned()
+        .collect::<Vec<_>>();
+    let (listed, found) = resources(
+        scim,
+        &format!("{endpoint}?count=1000&filter={}", encode(filter)),
+    )
+    .await;
+    let evaluated = format!("not (not ({filter}))");
+    let (evaluated, _) = resources(
+        scim,
+        &format!("{endpoint}?count=1000&filter={}", encode(&evaluated)),
+    )
+    .await;
+    assert_eq!(ids(&found), ids(&expected), "{filter}");
+    assert_eq!(found, expected, "{filter}");
+    assert_eq!(listed, evaluated, "{filter}");
+    assert_eq!(listed["totalResults"], expected.len(), "{filter}");
+    expected.len()
+}
+
+fn with_external_id(email: &str, external_id: Option<&str>) -> Value {
+    let mut user = user(email);
+    match external_id {
+        Some(external_id) => user["externalId"] = json!(external_id),
+        None => {
+            user.as_object_mut().unwrap().remove("externalId");
+        }
+    }
+    user
+}
+
+fn scim_group(name: &str, external_id: Option<&str>, members: &[&String]) -> Value {
+    let mut group = json!({
+        "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+        "displayName": name,
+        "members": members.iter().map(|id| json!({ "value": id })).collect::<Vec<_>>(),
+    });
+    if let Some(external_id) = external_id {
+        group["externalId"] = json!(external_id);
+    }
+    group
+}
+
+#[tokio::test]
+async fn lookups_in_the_database_find_what_the_filter_evaluator_finds() {
+    for app in common::apps().await {
+        let name = app.name;
+        let mut admin = common::set_up(&app).await;
+        let scim = token(&app, &mut admin).await;
+        let ada = with_external_id("ada@example.com", Some("ext-1"));
+        let ada = create(&scim, "/Users", ada).await;
+        let lovelace = with_external_id("Ada.Lovelace@Example.com", Some("EXT-1"));
+        let lovelace = create(&scim, "/Users", lovelace).await;
+        let adam = with_external_id("adam@example.com", Some("ext-10"));
+        let adam = create(&scim, "/Users", adam).await;
+        let bob = create(&scim, "/Users", with_external_id("bob@example.org", None)).await;
+        let admins = scim_group("Admins", Some("g-1"), &[&ada, &adam]);
+        let admins = create(&scim, "/Groups", admins).await;
+        for (display_name, external_id, members) in [
+            ("Admins Team", Some("G-1"), vec![&ada]),
+            ("Administrators", None, vec![&bob]),
+            ("admin", None, vec![]),
+            ("Équipe", Some("g-2"), vec![&lovelace]),
+            // A Kelvin sign, which lowercases to an ASCII k.
+            ("\u{212A}elvin", None, vec![]),
+        ] {
+            create(
+                &scim,
+                "/Groups",
+                scim_group(display_name, external_id, &members),
+            )
+            .await;
+        }
+
+        let (_, users) = resources(&scim, "/Users?count=1000").await;
+        assert_eq!(users.len(), 5, "{name}");
+        let (_, groups) = resources(&scim, "/Groups?count=1000").await;
+        assert_eq!(groups.len(), 6, "{name}");
+        let user_filters = [
+            (r#"userName eq "ADA@example.com""#.to_owned(), 1),
+            (r#"userName eq "ada@example""#.to_owned(), 0),
+            (
+                r#"urn:ietf:params:scim:schemas:core:2.0:User:userName eq "adam@example.com""#
+                    .to_owned(),
+                1,
+            ),
+            (
+                r#"emails.value eq "Ada.Lovelace@example.COM""#.to_owned(),
+                1,
+            ),
+            (r#"emails[value eq "adam@EXAMPLE.com"]"#.to_owned(), 1),
+            (
+                r#"emails[type eq "Work" and value eq "bob@example.org"]"#.to_owned(),
+                1,
+            ),
+            (r#"externalId eq "ext-1""#.to_owned(), 1),
+            (r#"externalId eq "EXT-1""#.to_owned(), 1),
+            (r#"externalId eq "ext""#.to_owned(), 0),
+            (format!(r#"id eq "{ada}""#), 1),
+            (format!(r#"id eq "{}""#, ada.to_uppercase()), 0),
+            (
+                r#"userName eq "ada@example.com" and externalId eq "ext-1""#.to_owned(),
+                1,
+            ),
+            (
+                r#"userName eq "ada@example.com" and externalId eq "EXT-1""#.to_owned(),
+                0,
+            ),
+            // The rest is evaluated on the users SQL selects, or on all.
+            (
+                r#"externalId eq "ext-1" and userName sw "ada""#.to_owned(),
+                1,
+            ),
+            (r#"userName sw "ada""#.to_owned(), 3),
+            (
+                r#"userName co "lovelace" or externalId eq "ext-10""#.to_owned(),
+                2,
+            ),
+            ("not (externalId pr)".to_owned(), 2),
+            (r#"groups[display eq "admins"]"#.to_owned(), 2),
+            (
+                r#"userName eq "ada@example.com" and groups[display eq "Admins Team"]"#.to_owned(),
+                1,
+            ),
+            (
+                r#"emails[type eq "home" and value eq "ada@example.com"]"#.to_owned(),
+                0,
+            ),
+        ];
+        for (filter, found) in user_filters {
+            let matched = agree(&scim, "/Users", &users, &filter).await;
+            assert_eq!(matched, found, "{name}: {filter}");
+        }
+        let group_filters = [
+            (r#"displayName eq "admins""#.to_owned(), 1),
+            (r#"displayName eq "ADMIN""#.to_owned(), 1),
+            (r#"displayName eq "Admins Tea""#.to_owned(), 0),
+            (r#"displayName eq "ÉQUIPE""#.to_owned(), 1),
+            (r#"displayName eq "équipe""#.to_owned(), 1),
+            (r#"displayName eq "kelvin""#.to_owned(), 1),
+            (r#"externalId eq "g-1""#.to_owned(), 1),
+            (r#"externalId eq "G-1""#.to_owned(), 1),
+            (format!(r#"id eq "{admins}""#), 1),
+            (format!(r#"members[value eq "{ada}"]"#), 2),
+            (format!(r#"members.value eq "{bob}""#), 1),
+            (format!(r#"members[value eq "{}"]"#, ada.to_uppercase()), 0),
+            (
+                format!(r#"id eq "{admins}" and members[value eq "{adam}"]"#),
+                1,
+            ),
+            (
+                format!(r#"id eq "{admins}" and members[value eq "{bob}"]"#),
+                0,
+            ),
+            (
+                format!(r#"displayName eq "Admins" and members[value eq "{ada}"]"#),
+                1,
+            ),
+            // The rest is evaluated on the groups SQL selects, or on all.
+            (r#"displayName sw "admin""#.to_owned(), 4),
+            ("members pr".to_owned(), 4),
+            ("not (members pr)".to_owned(), 2),
+            (
+                r#"displayName co "team" or externalId eq "g-2""#.to_owned(),
+                2,
+            ),
+            (
+                format!(r#"members[value eq "{ada}"] and displayName sw "admins ""#),
+                1,
+            ),
+            (
+                r#"members[display eq "ada.lovelace@example.com"]"#.to_owned(),
+                1,
+            ),
+        ];
+        for (filter, found) in group_filters {
+            let matched = agree(&scim, "/Groups", &groups, &filter).await;
+            assert_eq!(matched, found, "{name}: {filter}");
+        }
+        app.finish().await;
+    }
+}
+
+/// What one request read: its statements, less the token's `last_used_at`
+/// write, and the rows they returned.
+async fn cost(app: &App, scim: &Scim<'_>, path: &str) -> ((u64, u64), Value) {
+    let (counts, rows) = (app.db().counts(), app.db().rows());
+    let response = scim.get(path).await;
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "{path}: {:?}",
+        response.body
+    );
+    let counts = app.db().counts() - counts;
+    (
+        (counts.statements - counts.writes, app.db().rows() - rows),
+        response.body,
+    )
+}
+
+/// `count` more users and groups, made after the others, each group with
+/// two of the new users.
+async fn add_many(app: &App, count: usize) {
+    use meshrmm_server::db::tables::{ScimGroupMembers, ScimGroups, Users};
+    use sea_query::Query;
+    let later = meshrmm_server::time::now_ms() + 1_000_000_000;
+    let mut users = Query::insert();
+    users.into_table(Users::Table).columns([
+        Users::Id,
+        Users::Email,
+        Users::DisplayName,
+        Users::ScimExternalId,
+        Users::CreatedAt,
+        Users::UpdatedAt,
+    ]);
+    let mut groups = Query::insert();
+    groups.into_table(ScimGroups::Table).columns([
+        ScimGroups::Id,
+        ScimGroups::DisplayName,
+        ScimGroups::DisplayNameKey,
+        ScimGroups::CreatedAt,
+        ScimGroups::UpdatedAt,
+    ]);
+    let mut members = Query::insert();
+    members
+        .into_table(ScimGroupMembers::Table)
+        .columns([ScimGroupMembers::GroupId, ScimGroupMembers::UserId]);
+    for n in 0..count {
+        let at = later + i64::try_from(n).unwrap();
+        users.values_panic([
+            format!("many-{n:05}").into(),
+            format!("many-{n:05}@example.com").into(),
+            format!("Many {n}").into(),
+            format!("ext-many-{n:05}").into(),
+            at.into(),
+            at.into(),
+        ]);
+        groups.values_panic([
+            format!("team-{n:05}").into(),
+            format!("Team {n:05}").into(),
+            format!("team {n:05}").into(),
+            at.into(),
+            at.into(),
+        ]);
+        for member in [n, (n + 1) % count] {
+            members.values_panic([
+                format!("team-{n:05}").into(),
+                format!("many-{member:05}").into(),
+            ]);
+        }
+    }
+    for insert in [users, groups, members] {
+        app.db().execute(&insert).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_lookup_reads_as_much_with_1200_users_and_groups_as_with_5() {
+    for app in common::apps().await {
+        let name = app.name;
+        let mut admin = common::set_up(&app).await;
+        let scim = token(&app, &mut admin).await;
+        let mut users = Vec::new();
+        for n in 0..4 {
+            users.push(create(&scim, "/Users", user(&format!("user{n}@example.com"))).await);
+        }
+        let mut groups = Vec::new();
+        for n in 0..5 {
+            let members = users
+                .iter()
+                .enumerate()
+                .filter(|(m, _)| (n + m) % 2 == 0)
+                .map(|(_, id)| json!({ "value": id }))
+                .collect::<Vec<_>>();
+            let body = json!({ "displayName": format!("Group {n}"), "members": members });
+            groups.push(create(&scim, "/Groups", body).await);
+        }
+        let (user, group) = (&users[1], &groups[1]);
+        let membership = format!(r#"id eq "{group}" and members[value eq "{user}"]"#);
+        // Each lookup, and the statements it reads: the token, the page
+        // and, where returned, the page's groups or members.
+        let lookups = [
+            // Okta and Entra look each user up by name or external ID.
+            (
+                format!(
+                    "/Users?filter={}",
+                    encode(r#"userName eq "USER1@example.com""#)
+                ),
+                3,
+            ),
+            (
+                format!(
+                    "/Users?filter={}&excludedAttributes=groups",
+                    encode(r#"externalId eq "ext-user1@example.com""#)
+                ),
+                2,
+            ),
+            // Entra looks groups up without their members.
+            (
+                format!(
+                    "/Groups?filter={}&excludedAttributes=members",
+                    encode(r#"displayName eq "group 1""#)
+                ),
+                2,
+            ),
+            (
+                format!("/Groups?filter={}", encode(r#"displayName eq "Group 1""#)),
+                3,
+            ),
+            (
+                format!(
+                    "/Groups?filter={}&excludedAttributes=members",
+                    encode(&format!(r#"members[value eq "{user}"]"#))
+                ),
+                2,
+            ),
+            (
+                format!(
+                    "/Groups?filter={}&excludedAttributes=members",
+                    encode(&membership)
+                ),
+                2,
+            ),
+            // A full page counts the rest too.
+            ("/Users?count=3".to_owned(), 4),
+            ("/Groups?count=3&excludedAttributes=members".to_owned(), 3),
+            (format!("/Groups/{group}?excludedAttributes=members"), 2),
+            (format!("/Groups/{group}"), 3),
+            (format!("/Users/{user}?attributes=userName"), 2),
+        ];
+        let mut few = Vec::new();
+        for (path, statements) in &lookups {
+            let ((reads, rows), body) = cost(&app, &scim, path).await;
+            assert_eq!(reads, *statements, "{name}: {path}");
+            if path.contains("excludedAttributes=members") {
+                let listed = body["Resources"].as_array().cloned().unwrap_or_default();
+                assert!(
+                    body.get("members").is_none()
+                        && listed.iter().all(|group| group.get("members").is_none()),
+                    "{name}: {path}: {body}"
+                );
+            }
+            few.push((rows, body));
+        }
+        assert_eq!(
+            few[0].1["Resources"][0]["groups"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(
+            few[3].1["Resources"][0]["members"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(few[5].1["totalResults"], 1, "{name}");
+
+        add_many(&app, 1195).await;
+        for ((path, statements), (rows, body)) in lookups.iter().zip(&few) {
+            let ((reads, more_rows), more_body) = cost(&app, &scim, path).await;
+            assert_eq!(reads, *statements, "{name}: {path}");
+            assert_eq!(more_rows, *rows, "{name}: {path}");
+            if path.contains("count=3") {
+                assert_eq!(more_body["Resources"], body["Resources"], "{name}: {path}");
+                assert_eq!(more_body["totalResults"], 1200, "{name}: {path}");
+            } else {
+                assert_eq!(&more_body, body, "{name}: {path}");
+            }
+        }
+
+        // Pages are capped, with or without a count.
+        let (all, page) = resources(&scim, "/Users?count=5000&excludedAttributes=groups").await;
+        assert_eq!(all["itemsPerPage"], 1000, "{name}");
+        assert_eq!(all["totalResults"], 1200, "{name}");
+        assert_eq!(page.len(), 1000, "{name}");
+        let (rest, page) = resources(
+            &scim,
+            "/Users?startIndex=1001&count=1000&excludedAttributes=groups",
+        )
+        .await;
+        assert_eq!(rest["itemsPerPage"], 200, "{name}");
+        assert_eq!(page.last().unwrap()["userName"], "many-01194@example.com");
+        let (default, _) = resources(&scim, "/Groups").await;
+        assert_eq!(default["itemsPerPage"], 100, "{name}");
+        assert_eq!(default["totalResults"], 1200, "{name}");
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn pages_walk_the_whole_list_once() {
+    for app in common::apps().await {
+        let name = app.name;
+        let mut admin = common::set_up(&app).await;
+        let scim = token(&app, &mut admin).await;
+        let mut walkers = Vec::new();
+        for n in 0..7 {
+            walkers.push(create(&scim, "/Users", user(&format!("walker{n}@example.com"))).await);
+        }
+        for n in 0..7 {
+            let members = walkers[..=n].iter().collect::<Vec<_>>();
+            let body = scim_group(&format!("Walkers {n}"), None, &members);
+            create(&scim, "/Groups", body).await;
+        }
+        let in_groups = |user: &String| encode(&format!(r#"members[value eq "{user}"]"#));
+        let lists = [
+            ("/Users?".to_owned(), 8),
+            ("/Groups?".to_owned(), 7),
+            (format!("/Groups?filter={}&", in_groups(&walkers[6])), 1),
+            (format!("/Groups?filter={}&", in_groups(&walkers[3])), 4),
+            (
+                format!("/Users?filter={}&", encode(r#"userName sw "walker""#)),
+                7,
+            ),
+        ];
+        for (list, total) in lists {
+            let (_, everything) = resources(&scim, &format!("{list}count=1000")).await;
+            assert_eq!(everything.len(), total, "{name}: {list}");
+            let mut walked = Vec::new();
+            for start in (1..=total + 3).step_by(3) {
+                let path = format!("{list}startIndex={start}&count=3");
+                let (page, found) = resources(&scim, &path).await;
+                assert_eq!(page["totalResults"], total, "{name}: {path}");
+                assert_eq!(page["startIndex"], start, "{name}: {path}");
+                assert_eq!(page["itemsPerPage"], found.len(), "{name}: {path}");
+                walked.extend(found);
+            }
+            assert_eq!(walked, everything, "{name}: {list}");
+
+            // A count of 0 returns only the total, and a negative count is
+            // 0; a start before 1 is 1.
+            for query in ["count=0", "count=-5"] {
+                let (page, found) = resources(&scim, &format!("{list}{query}")).await;
+                assert_eq!(page["totalResults"], total, "{name}: {list}{query}");
+                assert_eq!(page["itemsPerPage"], 0, "{name}: {list}{query}");
+                assert!(found.is_empty(), "{name}: {list}{query}");
+            }
+            let (page, found) = resources(&scim, &format!("{list}startIndex=-3&count=2")).await;
+            assert_eq!(page["startIndex"], 1, "{name}: {list}");
+            assert_eq!(found, everything[..total.min(2)], "{name}: {list}");
+            let (page, found) = resources(&scim, &format!("{list}startIndex=50&count=2")).await;
+            assert_eq!(page["totalResults"], total, "{name}: {list}");
+            assert!(found.is_empty(), "{name}: {list}");
+        }
+        app.finish().await;
+    }
+}

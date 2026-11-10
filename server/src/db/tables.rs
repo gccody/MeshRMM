@@ -243,6 +243,7 @@ pub enum ScimGroups {
     Table,
     Id,
     DisplayName,
+    DisplayNameKey,
     ExternalId,
     RoleId,
     CreatedAt,

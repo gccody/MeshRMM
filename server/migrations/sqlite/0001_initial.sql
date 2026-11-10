@@ -83,6 +83,9 @@ CREATE TABLE users (
   last_sign_in_at INTEGER
 );
 
+-- SCIM lists users in the order they were created.
+CREATE INDEX idx_users_created ON users (created_at, id);
+
 CREATE TABLE user_totp (
   user_id TEXT NOT NULL PRIMARY KEY REFERENCES users (id) ON DELETE CASCADE,
   -- Encrypted with the instance key.
@@ -288,12 +291,16 @@ CREATE INDEX idx_api_tokens_expiry ON api_tokens (expires_at);
 CREATE TABLE scim_groups (
   id TEXT NOT NULL PRIMARY KEY,
   display_name TEXT NOT NULL UNIQUE CHECK (length(display_name) BETWEEN 1 AND 256),
+  -- display_name lowercased by the server, which SCIM filters compare it by.
+  display_name_key TEXT NOT NULL,
   external_id TEXT UNIQUE,
   -- Members of the group hold this role while they stay in it.
   role_id TEXT REFERENCES roles (id) ON DELETE SET NULL,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+
+CREATE INDEX idx_scim_groups_display_name_key ON scim_groups (display_name_key);
 
 CREATE TABLE scim_group_members (
   group_id TEXT NOT NULL REFERENCES scim_groups (id) ON DELETE CASCADE,
