@@ -5,11 +5,14 @@
 //! check out, and starts the new Agent's `--apply-update`. That process waits
 //! for the coordinator to stop, swaps the app bundle, restarts the launchd
 //! jobs, and puts the previous bundle back if the new coordinator does not
-//! stay up or does not connect to the server within [`CONFIRM_TIMEOUT`].
+//! stay up or does not connect to the server within [`CONFIRM_TIMEOUT`]. See
+//! [`crate::update_files`] for how the swap, and the removal of what earlier
+//! updates left, work.
 //!
 //! An Agent signed with a Developer ID takes only the server's build signed
 //! by the same team; an ad-hoc signed one takes the release build, which the
 //! release key vouches for.
+use std::ffi::OsStr;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,9 +21,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use meshrmm_self_update::{AGENT_MACOS, CURRENT_VERSION, UpdateManifest, macos};
 
-use super::installer::{APP, BUNDLE_IDENTIFIER, DAEMON_LABEL, HELPER_LABEL, SUPPORT_DIRECTORY};
+use super::installer::{APP, BUNDLE_IDENTIFIER, DAEMON_LABEL, HELPER_LABEL};
 use crate::remote::config::Config;
 use crate::remote::service_link::ServiceLink;
+use crate::update_files::{self, InstallLock};
 use crate::update_policy::{
     CONFIRM_TIMEOUT, Confirmation, NEXT_CHECK_FILE, NextCheck, UpdateAttempts, UpdateSchedule,
     random_bits, read_attempts, read_next_check, unix_seconds,
@@ -31,14 +35,30 @@ const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_UPDATE_BYTES: u64 = 256 * 1024 * 1024;
 /// The coordinator ends remote sessions and runs their close actions first.
 const COORDINATOR_EXIT_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long the installer waits for the coordinator's lock once the coordinator has exited.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the new coordinator must keep running before the installer waits for it to connect,
 /// so one that crashes at once is rolled back without waiting for [`CONFIRM_TIMEOUT`].
 const HEALTHY_AFTER: Duration = Duration::from_secs(15);
 const ATTEMPTS_FILE: &str = "update-attempts.json";
+/// A release is staged in a folder of the update directory named this, its version and the
+/// staging coordinator's process ID. After the swap the folder holds the previous bundle, and
+/// after a rollback the failed one.
+const STAGING_PREFIX: &str = "agent-";
+/// In the update directory: the installer's output from the last update that failed.
+const FAILED_LOG_FILE: &str = "failed-update.log";
 
 /// Checks for updates until one is staged, then stops the coordinator so the
 /// new Agent can replace it.
 pub(crate) async fn run(config: Config, link: Arc<ServiceLink>) {
+    let _ = tokio::task::spawn_blocking(|| {
+        if let Err(error) =
+            updates_directory().and_then(|updates| remove_leftovers_unless_installing(&updates))
+        {
+            tracing::warn!(error = ?error, "could not remove what earlier Agent updates left");
+        }
+    })
+    .await;
     let record = updates_directory()
         .ok()
         .and_then(|updates| read_next_check(&updates.join(NEXT_CHECK_FILE)));
@@ -119,12 +139,33 @@ struct Staged {
     version: String,
     app: PathBuf,
     staging: PathBuf,
+    /// Taken before staging; see [`crate::update_files`].
+    lock: InstallLock,
 }
 
 impl Staged {
     /// Starts its installer, which waits for the coordinator to stop.
     fn start(self) -> anyhow::Result<()> {
-        start_installer(&self.app, &self.staging)
+        start_installer(&self.app, &self.staging)?;
+        // Released as this process exits, which the installer waits for.
+        self.lock.hold_until_exit();
+        Ok(())
+    }
+}
+
+/// Removes the staging folders earlier updates left in `updates`, with the downloads and
+/// bundles they hold, unless an installer holds the lock there and so may still need them.
+fn remove_leftovers_unless_installing(updates: &Path) -> anyhow::Result<()> {
+    if let Some(_lock) = InstallLock::try_take(updates)? {
+        remove_leftovers(updates);
+    }
+    Ok(())
+}
+
+fn remove_leftovers(updates: &Path) {
+    let removed = update_files::remove_leftovers(updates, STAGING_PREFIX);
+    if removed > 0 {
+        tracing::info!(removed, "removed files left by earlier Agent updates");
     }
 }
 
@@ -165,6 +206,10 @@ fn stage(config: &Config) -> anyhow::Result<Option<Staged>> {
         tracing::warn!(version = %release.version, "skipping an Agent update that already failed repeatedly");
         return Ok(None);
     };
+    // Held until the installer takes over, so nothing removes what is staged meanwhile.
+    let lock =
+        InstallLock::try_take(&updates)?.context("an Agent update is still being installed")?;
+    remove_leftovers(&updates);
     tracing::info!(version = %release.version, "downloading an Agent update");
     let archive = read_limited(
         http.get(&release.url)
@@ -177,7 +222,11 @@ fn stage(config: &Config) -> anyhow::Result<Option<Staged>> {
     // Only a complete download uses an attempt, so one cut short is retried on the backoff.
     super::installer::replace_file(&attempts_path, &serde_json::to_vec(&attempt)?)?;
     release.verify(&archive)?;
-    let staging = updates.join(format!("agent-{}-{}", release.version, std::process::id()));
+    let staging = updates.join(format!(
+        "{STAGING_PREFIX}{}-{}",
+        release.version,
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging)?;
     let archive_path = staging.join("agent.zip");
@@ -200,6 +249,7 @@ fn stage(config: &Config) -> anyhow::Result<Option<Staged>> {
         version: release.version,
         app,
         staging,
+        lock,
     }))
 }
 
@@ -247,43 +297,70 @@ fn start_installer(app: &Path, staging: &Path) -> anyhow::Result<()> {
 }
 
 /// Entry point of `--apply-update <staged app> <coordinator pid>`.
-pub fn apply(staged: &Path, coordinator: libc::pid_t) -> anyhow::Result<()> {
-    let deadline = Instant::now() + COORDINATOR_EXIT_TIMEOUT;
-    // SAFETY: signal 0 only checks that the process exists.
-    while unsafe { libc::kill(coordinator, 0) } == 0 {
-        if Instant::now() >= deadline {
-            // SAFETY: as above; SIGKILL ends the stuck coordinator.
-            unsafe { libc::kill(coordinator, libc::SIGKILL) };
-            break;
+pub fn apply(staged: &Path, coordinator: u32) -> anyhow::Result<()> {
+    let updates = updates_directory()?;
+    let lock = InstallLock::queue(&updates)?;
+    update_files::wait_for_coordinator(
+        coordinator,
+        COORDINATOR_EXIT_TIMEOUT,
+        Instant::now,
+        std::thread::sleep,
+        || update_files::process_exists(coordinator),
+        coordinator_pid,
+        || {
+            let job = format!("system/{DAEMON_LABEL}");
+            if let Err(error) = command(
+                "/bin/launchctl",
+                &["kill".as_ref(), "SIGKILL".as_ref(), job.as_ref()],
+            ) {
+                tracing::warn!(error = ?error, "could not end the Agent");
+            }
+        },
+    );
+    let _lock = match lock.wait(LOCK_TIMEOUT) {
+        Ok(lock) => lock,
+        Err(error) => {
+            restart();
+            return Err(error);
         }
-        std::thread::sleep(Duration::from_millis(250));
+    };
+    let result = install(staged, &updates);
+    // The folder holds the download, and the new bundle if it was never installed, the previous
+    // one once the update is committed, or the failed one after a rollback.
+    if let Some(staging) = staging_folder(staged, &updates) {
+        let failed_log = updates.join(FAILED_LOG_FILE);
+        update_files::discard_staging(staging, result.is_err().then_some(failed_log.as_path()));
     }
+    result
+}
+
+/// The staging folder in `updates` that `staged` was unpacked in.
+fn staging_folder<'a>(staged: &'a Path, updates: &Path) -> Option<&'a Path> {
+    staged.parent().filter(|staging| {
+        staging.parent() == Some(updates)
+            && staging
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.starts_with(STAGING_PREFIX))
+    })
+}
+
+/// Swaps the staged bundle in, and back out unless it proves it works.
+fn install(staged: &Path, updates: &Path) -> anyhow::Result<()> {
     // The new Agent secures its own bundle, whatever the Agent that staged
     // it did.
     super::installer::secure_bundle(staged)?;
-    if let Err(error) = super::installer::forget_lost_permissions(staged) {
-        tracing::warn!(error = ?error, "the Agent's privacy permissions may be out of date");
-    }
     // Before the new build starts, so only its own connection confirms it, and it holds back
     // updates of its own meanwhile.
-    let confirmation = match updates_directory().and_then(|updates| {
-        Confirmation::begin(&updates, CURRENT_VERSION, Instant::now(), unix_seconds())
-    }) {
-        Ok(confirmation) => confirmation,
-        Err(error) => {
-            restart();
-            return Err(error).context("could not prepare to confirm the Agent update");
-        }
-    };
-    let previous = Path::new(SUPPORT_DIRECTORY).join("MeshRMM Agent.app.previous");
-    let _ = std::fs::remove_dir_all(&previous);
-    if let Err(error) = std::fs::rename(APP, &previous) {
-        drop(confirmation);
-        restart();
-        return Err(error).context("could not set the installed Agent aside");
-    }
-    if let Err(error) = std::fs::rename(staged, APP) {
-        let _ = std::fs::rename(&previous, APP);
+    let confirmation =
+        match Confirmation::begin(updates, CURRENT_VERSION, Instant::now(), unix_seconds()) {
+            Ok(confirmation) => confirmation,
+            Err(error) => {
+                restart();
+                return Err(error).context("could not prepare to confirm the Agent update");
+            }
+        };
+    if let Err(error) = update_files::exchange(staged, Path::new(APP)) {
         drop(confirmation);
         restart();
         return Err(error).context("could not install the Agent update");
@@ -302,9 +379,10 @@ pub fn apply(staged: &Path, coordinator: libc::pid_t) -> anyhow::Result<()> {
                 release_version = CURRENT_VERSION,
                 "Agent update installed: the updated Agent connected to the server"
             );
-            let _ = std::fs::remove_dir_all(&previous);
-            if let Some(staging) = staged.parent() {
-                let _ = std::fs::remove_dir_all(staging);
+            // Only for a build that is kept: the previous one, now where the staged one was,
+            // keeps its permissions if the update is rolled back.
+            if let Err(error) = super::installer::forget_lost_permissions(staged, Path::new(APP)) {
+                tracing::warn!(error = ?error, "the Agent's privacy permissions may be out of date");
             }
             return Ok(());
         }
@@ -314,10 +392,8 @@ pub fn apply(staged: &Path, coordinator: libc::pid_t) -> anyhow::Result<()> {
         failure,
         "the updated Agent did not prove it works; restoring the previous Agent"
     );
-    let failed = Path::new(SUPPORT_DIRECTORY).join("MeshRMM Agent.app.failed");
-    let _ = std::fs::remove_dir_all(&failed);
-    let _ = std::fs::rename(APP, &failed);
-    let restored = std::fs::rename(&previous, APP).context("could not restore the previous Agent");
+    let restored = update_files::exchange(staged, Path::new(APP))
+        .context("could not restore the previous Agent");
     drop(confirmation);
     restart();
     restored?;
@@ -385,5 +461,23 @@ mod tests {
     fn reads_downloads_up_to_the_limit() {
         assert_eq!(read_limited(&b"abc"[..], 3).unwrap(), b"abc");
         assert!(read_limited(&b"abcd"[..], 3).is_err());
+    }
+
+    #[test]
+    fn discards_only_staging_folders_in_the_update_directory() {
+        let updates = Path::new("/Library/Application Support/MeshRMM/Agent/updates");
+        let staging = updates.join(format!("{STAGING_PREFIX}1.2.3-41"));
+        assert_eq!(
+            staging_folder(&staging.join("MeshRMM Agent.app"), updates),
+            Some(staging.as_path())
+        );
+        assert_eq!(
+            staging_folder(Path::new("/Applications/MeshRMM Agent.app"), updates),
+            None
+        );
+        assert_eq!(
+            staging_folder(&updates.join("MeshRMM Agent.app"), updates),
+            None
+        );
     }
 }
