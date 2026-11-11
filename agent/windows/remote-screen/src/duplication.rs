@@ -590,6 +590,7 @@ impl CaptureLoop {
         )?;
         if let Some(desktop) = desktop.as_mut() {
             desktop.set_frames_per_second(frames_per_second);
+            desktop.stream_started();
         }
         Ok(Self {
             stats: CaptureStats::new(monotonic_timestamp_us()?),
@@ -683,10 +684,17 @@ impl CaptureLoop {
             self.apply_controls(controls)?;
 
             let capture_cursor = controls.capture_cursor.load(Ordering::Acquire);
-            let desktop_texture = match self.desktop.as_mut() {
+            // As Desktop Duplication does, region capture reports only a
+            // changed desktop, which stays pending until the encoder takes it.
+            let desktop_changed = match self.desktop.as_mut() {
                 Some(desktop) => desktop.capture(&self.context, capture_cursor)?,
-                None => None,
+                None => false,
             };
+            let desktop_texture = self
+                .desktop
+                .as_ref()
+                .and_then(DesktopCapture::pending_texture)
+                .cloned();
             let frame = if let Some(duplication) = duplication.as_deref_mut() {
                 match duplication.acquire_next_frame(ACQUIRE_TIMEOUT_MS) {
                     Ok(frame) => Some(frame),
@@ -706,7 +714,7 @@ impl CaptureLoop {
             let pointer_drawn =
                 self.cursor_compositor.is_some() && crate::cursor::system_pointer_drawn();
             self.pointer.checked(pointer_drawn);
-            let capture_idle = frame.is_none() && desktop_texture.is_none();
+            let capture_idle = frame.is_none() && !desktop_changed;
             let mut access_units = self.encoder.poll()?;
             if frame
                 .as_ref()
@@ -719,7 +727,7 @@ impl CaptureLoop {
             if let Some(frame) = frame.as_ref() {
                 self.track_damage(frame, capture_cursor, pointer_drawn);
             }
-            let new_capture = frame.is_some() || desktop_texture.is_some();
+            let new_capture = frame.is_some() || desktop_changed;
             if new_capture {
                 self.stats.frames_captured += 1;
             }
@@ -829,6 +837,11 @@ impl CaptureLoop {
                 self.keyframe_input_pending = false;
                 self.desktop_pending = false;
                 self.encoded_cursor = Some(capture_cursor);
+                if desktop_texture.is_some()
+                    && let Some(desktop) = self.desktop.as_mut()
+                {
+                    desktop.submitted();
+                }
             } else if new_capture {
                 if self.encoder.wants_input() {
                     self.stats.frames_rate_limited += 1;
@@ -847,16 +860,14 @@ impl CaptureLoop {
             let capture_timestamp_us = monotonic_timestamp_us()?;
             access_units.extend(self.encoder.submit(yuv, capture_timestamp_us)?);
             self.keyframe_input_pending = false;
-        } else if self.desktop.is_none()
-            && self.refinement.pending()
+        } else if self.refinement.pending()
             && self.encoder.wants_input()
             && let Some(yuv) = self.cached_yuv.as_ref()
         {
             // An idle desktop leaves a keyframe at the quality its single-frame
             // budget allowed. Re-encode the unchanged surface at the stream
             // rate so it sharpens as it would under motion, instead of waiting
-            // for new damage. Region capture already submits every interval;
-            // refining there would displace its captures.
+            // for new damage.
             let capture_timestamp_us = monotonic_timestamp_us()?;
             if self.frame_pacer.allow(capture_timestamp_us) {
                 access_units.extend(self.encoder.submit(yuv, capture_timestamp_us)?);
