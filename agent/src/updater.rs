@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+use std::io::{Read, Seek};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -131,30 +132,28 @@ pub fn check_and_stage(config: &Config) -> anyhow::Result<Option<StagedUpdate>> 
         attempt = attempt.attempts,
         "downloading automatic Agent update"
     );
-    let executable = download(&http, &release.url, MAX_UPDATE_BYTES)
-        .context("failed to download the Agent update")?;
-    // Only a complete download uses an attempt, so one cut short is retried on the backoff.
-    crate::installer::replace_file(&attempts_path, &serde_json::to_vec(&attempt)?)
-        .context("failed to record the Agent update attempt")?;
-    release.verify(&executable)?;
-    if !executable.starts_with(b"MZ") {
-        bail!("downloaded Agent update is not a Windows executable");
-    }
-
     let current = std::env::current_exe().context("could not locate the Agent executable")?;
     let suffix = unique_suffix();
     let staged = update_directory.join(format!("agent-{}-{suffix}.exe", release.version));
     let helper = update_directory.join(format!("update-helper-{suffix}.exe"));
-    let written = write_new_file(&staged, &executable).and_then(|()| {
-        std::fs::copy(&current, &helper)
-            .map(|_| ())
-            .with_context(|| format!("failed to create Agent update helper {}", helper.display()))
-    });
-    if let Err(error) = written {
-        remove_if_present(&staged);
+    let body = http
+        .get(&release.url)
+        .call()
+        .context("failed to download the Agent update")?
+        .into_body()
+        .into_reader();
+    let verified = stage_executable(body, &staged, &release, || {
+        // Only a complete download uses an attempt, so one cut short is retried on the backoff.
+        crate::installer::replace_file(&attempts_path, &serde_json::to_vec(&attempt)?)
+            .context("failed to record the Agent update attempt")
+    })?;
+    // The verified build stays open, so nothing can change it, until the helper exists.
+    if let Err(error) = std::fs::copy(&current, &helper) {
         remove_if_present(&helper);
-        return Err(error);
+        return Err(error)
+            .with_context(|| format!("failed to create Agent update helper {}", helper.display()));
     }
+    let staged = verified.keep();
     Ok(Some(StagedUpdate {
         version: release.version,
         current,
@@ -630,16 +629,26 @@ fn download(http: &ureq::Agent, url: &str, maximum: u64) -> anyhow::Result<Vec<u
         .context("download exceeded its size limit or could not be read")
 }
 
-fn write_new_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("failed to create staged update {}", path.display()))?;
-    std::io::Write::write_all(&mut file, contents)
-        .with_context(|| format!("failed to write staged update {}", path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("failed to flush staged update {}", path.display()))
+/// Downloads the Agent update from `body` into `staged`, a new file in the private update
+/// directory, and checks that it is the release and a Windows executable; see
+/// [`crate::update_download`]. `complete` runs once the whole of it has arrived.
+fn stage_executable(
+    body: impl std::io::Read,
+    staged: &Path,
+    release: &meshrmm_self_update::Release,
+    complete: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<crate::update_download::Verified> {
+    let verified =
+        crate::update_download::download(body, staged, MAX_UPDATE_BYTES, release, complete)?;
+    let mut header = [0; 2];
+    let mut file = verified.file();
+    file.seek(std::io::SeekFrom::Start(0))
+        .and_then(|_| file.read_exact(&mut header))
+        .context("failed to read the downloaded Agent update")?;
+    if header != *b"MZ" {
+        bail!("downloaded Agent update is not a Windows executable");
+    }
+    Ok(verified)
 }
 
 fn schedule_cleanup(helper: &Path, helper_directory: &Path) -> anyhow::Result<()> {
@@ -666,6 +675,7 @@ fn unique_suffix() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::update_download::tests::{Staging, crash_during_download, release_of_bytes};
     use meshrmm_signaling_client::test_support::TlsServer;
     use rustls::version::{TLS12, TLS13};
 
@@ -722,5 +732,56 @@ mod tests {
         remaining.sort();
         assert_eq!(remaining, ["agent-directory.exe", ATTEMPTS_FILE]);
         std::fs::remove_dir_all(&config).unwrap();
+    }
+
+    #[test]
+    fn removes_a_download_a_crash_cut_short_at_the_next_start() {
+        let config = Staging::new();
+        let updates = config.0.join("updates");
+        std::fs::create_dir(&updates).unwrap();
+        let name = format!("agent-1.2.3-{}.exe", unique_suffix());
+        crash_during_download(&updates, &name);
+        remove_stale_files(&config.0);
+        assert!(std::fs::read_dir(&updates).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn stages_only_a_verified_windows_executable() {
+        let staging = Staging::new();
+        let build = b"MZ a Windows build".repeat(10_000);
+        let path = staging
+            .0
+            .join(format!("agent-1.2.3-{}.exe", unique_suffix()));
+        let verified =
+            stage_executable(&build[..], &path, &release_of_bytes(&build), || Ok(())).unwrap();
+        assert_eq!(verified.keep(), path);
+        assert_eq!(std::fs::read(&path).unwrap(), build);
+        std::fs::remove_file(&path).unwrap();
+        // A signed build that is not an executable is refused, and removed.
+        let script = b"#!/bin/sh".repeat(10_000);
+        let error = stage_executable(&script[..], &path, &release_of_bytes(&script), || Ok(()))
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("not a Windows executable"));
+        assert!(staging.names().is_empty(), "{:?}", staging.names());
+    }
+
+    #[test]
+    fn a_staged_build_takes_the_private_update_directory_security() {
+        if !private_directory::test_support::elevated() {
+            return;
+        }
+        let config = private_directory::test_support::scratch("staged-update");
+        let updates = prepare_update_directory(&config).unwrap();
+        let build = b"MZ a Windows build".to_vec();
+        let path = updates.join(format!("agent-1.2.3-{}.exe", unique_suffix()));
+        let staged = stage_executable(&build[..], &path, &release_of_bytes(&build), || Ok(()))
+            .unwrap()
+            .keep();
+        assert_eq!(
+            private_directory::test_support::sddl_of(&staged),
+            private_directory::test_support::INHERITED_FILE
+        );
+        private_directory::test_support::remove(&config);
     }
 }

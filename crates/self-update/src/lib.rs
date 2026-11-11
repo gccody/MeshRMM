@@ -162,8 +162,37 @@ impl Release {
     }
 
     pub fn verify(&self, contents: &[u8]) -> anyhow::Result<()> {
-        let actual = format!("{:x}", Sha256::digest(contents));
-        if actual.eq_ignore_ascii_case(&self.sha256) {
+        let mut digest = self.digest();
+        digest.update(contents);
+        digest.verify()
+    }
+
+    /// Starts checking this release's SHA-256 over a download that arrives in
+    /// pieces, so it need not be held whole.
+    pub fn digest(&self) -> ReleaseDigest {
+        ReleaseDigest {
+            expected: self.sha256.clone(),
+            hasher: Sha256::new(),
+        }
+    }
+}
+
+/// The SHA-256 of a download so far, from [`Release::digest`].
+pub struct ReleaseDigest {
+    expected: String,
+    hasher: Sha256,
+}
+
+impl ReleaseDigest {
+    /// Adds the next piece of the download.
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.hasher.update(bytes);
+    }
+
+    /// Checks that the pieces added make up the release.
+    pub fn verify(self) -> anyhow::Result<()> {
+        let actual = format!("{:x}", self.hasher.finalize());
+        if actual.eq_ignore_ascii_case(&self.expected) {
             Ok(())
         } else {
             bail!("downloaded update failed SHA-256 verification")
@@ -407,6 +436,23 @@ mod tests {
         let release = release("1.2.0");
         release.verify(b"agent").unwrap();
         assert!(release.verify(b"tampered").is_err());
+    }
+
+    #[test]
+    fn verifies_release_bytes_that_arrive_in_pieces() {
+        let release = release("1.2.0");
+        let mut digest = release.digest();
+        for piece in [&b"ag"[..], b"", b"ent"] {
+            digest.update(piece);
+        }
+        digest.verify().unwrap();
+        let mut short = release.digest();
+        short.update(b"agen");
+        assert!(short.verify().is_err());
+        let mut long = release.digest();
+        long.update(b"agent");
+        long.update(b"!");
+        assert!(long.verify().is_err());
     }
 
     #[test]
