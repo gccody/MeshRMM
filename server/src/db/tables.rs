@@ -918,3 +918,77 @@ pub enum AlertRemediations {
     StartedAt,
     FinishedAt,
 }
+
+#[derive(Iden)]
+pub enum ReportSchedules {
+    Table,
+    Id,
+    Name,
+    Enabled,
+    Template,
+    Target,
+    TagMatch,
+    Period,
+    StaleDays,
+    Frequency,
+    TimeOfDay,
+    Weekday,
+    DayOfMonth,
+    TimeZone,
+    Emails,
+    OwnerUserId,
+    NextRunAt,
+    LastRunAt,
+    LastReportId,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Iden)]
+pub enum ReportScheduleCompanies {
+    Table,
+    ScheduleId,
+    CompanyId,
+}
+
+#[derive(Iden)]
+pub enum ReportScheduleTags {
+    Table,
+    ScheduleId,
+    TagId,
+}
+
+#[derive(Iden)]
+pub enum ReportScheduleUsers {
+    Table,
+    ScheduleId,
+    UserId,
+}
+
+#[derive(Iden)]
+pub enum Reports {
+    Table,
+    Id,
+    Template,
+    Status,
+    Error,
+    Trigger,
+    ScheduleId,
+    ScheduleName,
+    RequestedByUserId,
+    RequestedByLabel,
+    Scope,
+    ScopeLabel,
+    Period,
+    PeriodStart,
+    PeriodEnd,
+    TimeZone,
+    StaleDays,
+    CreatedAt,
+    StartedAt,
+    FinishedAt,
+    ExpiresAt,
+    SizeBytes,
+    Delivery,
+    DeliveryDetail,
+}

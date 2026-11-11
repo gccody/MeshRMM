@@ -50,6 +50,8 @@ export type Permission =
   | "alerts.view"
   | "alerts.respond"
   | "alerts.manage"
+  | "reports.view"
+  | "reports.manage"
   | "users.manage"
   | "roles.manage"
   | "settings.manage"

@@ -26,12 +26,14 @@ use crate::secrets::{hex, new_token};
 
 const THUMBNAILS_DIR: &str = "thumbnails";
 const TOOLBOX_DIR: &str = "toolbox";
+const REPORTS_DIR: &str = "reports";
 const PARTIAL_SUFFIX: &str = ".part";
 
 #[derive(Debug, Clone)]
 pub struct Storage {
     thumbnails: PathBuf,
     toolbox: PathBuf,
+    reports: PathBuf,
     /// How many files were flushed to disk, so tests can tell which writes
     /// asked for it.
     #[cfg(test)]
@@ -79,10 +81,11 @@ impl Storage {
         let storage = Self {
             thumbnails: data_dir.join(THUMBNAILS_DIR),
             toolbox: data_dir.join(TOOLBOX_DIR),
+            reports: data_dir.join(REPORTS_DIR),
             #[cfg(test)]
             syncs: Default::default(),
         };
-        for dir in [&storage.thumbnails, &storage.toolbox] {
+        for dir in [&storage.thumbnails, &storage.toolbox, &storage.reports] {
             create_private_dir(dir)
                 .with_context(|| format!("could not create {}", dir.display()))?;
         }
@@ -99,6 +102,11 @@ impl Storage {
 
     pub fn toolbox_file(&self, file_id: &str) -> PathBuf {
         self.toolbox.join(file_id)
+    }
+
+    /// Where a generated report's document is kept.
+    pub fn report(&self, report_id: &str) -> PathBuf {
+        self.reports.join(format!("{report_id}.json"))
     }
 
     /// Replaces `path` with `contents` in one step.
@@ -164,6 +172,11 @@ impl Storage {
         old_files(&self.toolbox, age, "")
     }
 
+    /// The reports kept, by report ID, whatever their age.
+    pub fn report_ids(&self) -> io::Result<Vec<String>> {
+        old_files(&self.reports, Duration::ZERO, ".json")
+    }
+
     /// Thumbnails last changed before `age` ago, by device ID.
     pub fn old_thumbnails(&self, age: Duration) -> io::Result<Vec<String>> {
         let mut ids = Vec::new();
@@ -182,6 +195,7 @@ impl Storage {
         let mut removed = 0;
         let mut dirs = self.thumbnail_shards()?;
         dirs.push(self.toolbox.clone());
+        dirs.push(self.reports.clone());
         for dir in dirs {
             for entry in fs::read_dir(dir)? {
                 let entry = entry?;

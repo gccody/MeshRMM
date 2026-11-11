@@ -3,7 +3,7 @@
 // Imports carry the .ts extension so node:test can load this module directly.
 import { type Account, type Permission, canAny } from "../auth/types.ts";
 
-export type View = "devices" | "device" | "companies" | "tags" | "deployment" | "software" | "updates" | "applications" | "toolbox" | "alerts" | "alert-rules" | "notification-channels" | "users" | "roles" | "authentication" | "settings" | "audit" | "account" | "jobs" | "job" | "policies" | "terminal" | "files";
+export type View = "devices" | "device" | "companies" | "tags" | "deployment" | "software" | "updates" | "applications" | "toolbox" | "alerts" | "alert-rules" | "reports" | "notification-channels" | "users" | "roles" | "authentication" | "settings" | "audit" | "account" | "jobs" | "job" | "policies" | "terminal" | "files";
 
 export const VIEW_PATHS: Record<View, string> = {
   devices: "/",
@@ -18,6 +18,7 @@ export const VIEW_PATHS: Record<View, string> = {
   alerts: "/alerts",
   "alert-rules": "/alert-rules",
   "notification-channels": "/notification-channels",
+  reports: "/reports",
   users: "/users",
   roles: "/roles",
   authentication: "/authentication",
@@ -47,6 +48,7 @@ export const VIEW_COPY: Record<View, { title: string }> = {
   alerts: { title: "Alerts" },
   "alert-rules": { title: "Alert rules" },
   "notification-channels": { title: "Notification channels" },
+  reports: { title: "Reports" },
   users: { title: "Users" },
   roles: { title: "Roles" },
   authentication: { title: "Authentication" },
@@ -78,6 +80,7 @@ const VIEW_ACCESS: Record<View, readonly Permission[]> = {
   alerts: ["alerts.view"],
   "alert-rules": ["alerts.view"],
   "notification-channels": ["alerts.manage"],
+  reports: ["reports.view"],
   users: ["users.manage"],
   roles: ["roles.manage"],
   authentication: ["authentication.manage", "api_tokens.manage"],

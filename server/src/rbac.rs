@@ -87,6 +87,8 @@ permissions! {
     AlertsView = "alerts.view": "See alerts and the rules that raise them.",
     AlertsRespond = "alerts.respond": "Acknowledge and resolve alerts.",
     AlertsManage = "alerts.manage": "Create, edit and delete alert rules and notification channels.",
+    ReportsView = "reports.view": "See report templates, schedules and generated reports, and run and download reports.",
+    ReportsManage = "reports.manage": "Create, edit, run and delete report schedules and choose who they are emailed to, and delete generated reports.",
     UsersManage = "users.manage": "Invite, disable and remove users and assign their roles.",
     RolesManage = "roles.manage": "Create, edit and delete roles.",
     SettingsManage = "settings.manage": "Change the instance name, remote session policy and how new Agent releases roll out to devices.",
