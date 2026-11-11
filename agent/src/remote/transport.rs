@@ -340,7 +340,12 @@ async fn open_session_channels(
                 // keyframe recovery already protect the predictive chain, while
                 // the reliable control stream remains independently ordered.
                 ordered: Some(false),
-                max_retransmits: Some(1),
+                // One retransmission: webrtc-sctp abandons a chunk once it was
+                // sent this many times, so 1 never retransmits. The fast
+                // retransmission arrives about a round trip late, and the
+                // viewer's reassembler waits that long for it; a second one
+                // would come only after the 1 s retransmission timeout.
+                max_retransmits: Some(2),
                 protocol: Some("meshrmm.video.v1".into()),
                 ..Default::default()
             }),

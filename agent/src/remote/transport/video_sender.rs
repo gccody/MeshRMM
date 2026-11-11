@@ -434,9 +434,7 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
-    use meshrmm_protocol::{
-        FrameReassembler, ReassemblyConfig, ReassemblyOutcome, VideoPacket, VideoStreamId,
-    };
+    use meshrmm_protocol::{FrameReassembler, ReassemblyConfig, VideoPacket, VideoStreamId};
     use meshrmm_session_transport::SendQueue;
     use meshrmm_session_transport::simulated_link::SimulatedLink;
     use tokio::time::Instant;
@@ -631,10 +629,10 @@ mod tests {
             tokio::time::sleep_until(arrival).await;
             let now_us = clock_us(start);
             let incomplete = reassembler.stats().incomplete_frames_dropped;
-            let outcome = reassembler.push(VideoPacket::decode(&packet).unwrap(), now_us);
+            let pushed = reassembler.push(VideoPacket::decode(&packet).unwrap(), now_us);
             let mut want_keyframe = reassembler.stats().incomplete_frames_dropped > incomplete;
             waiting_for_keyframe |= want_keyframe;
-            if let ReassemblyOutcome::Completed(frame) = outcome {
+            for frame in pushed.frames {
                 if last_accepted.is_some_and(|last| frame.frame_id != last + 1) {
                     waiting_for_keyframe = true;
                 }
