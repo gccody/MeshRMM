@@ -528,6 +528,7 @@ td.row-actions > * + * { margin-left: 6px; }
 .copy-field .installer-command { grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
 .copy-field .installer-command button { justify-self: stretch; }
 .copy-field { display: grid; gap: 6px; color: var(--text-2); font-size: 13px; font-weight: 500; }
+.deployment-downloads { display: flex; flex-wrap: wrap; gap: 8px; }
 
 /* ── Forms ─────────────────────────────────────────────── */
 .form-stack { display: grid; gap: 14px; margin: 0; padding: 0; border: 0; min-width: 0; }

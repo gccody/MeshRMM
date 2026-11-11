@@ -564,7 +564,12 @@ Then, in the website:
 - **Alerts** holds the alert rules and the email and webhook channels they
   notify. Email channels need email set up. See [alerts](alerts.md).
 - **Devices → Add device** downloads a Windows installer or shows the macOS
-  install command. Both enroll the device with this server.
+  or Linux install command, each for one computer within 30 minutes. For a
+  rollout through Group Policy, an MDM or a script, **Companies →
+  Deployment tokens** makes one installer and one command that enroll any
+  number of computers into a company until the token expires, is revoked or
+  runs out. A leaked one enrolls computers the attacker controls into that
+  company until then; see [deployment tokens](devices.md#deployment-tokens).
 
 Technicians download the viewer from the website's Remote app menu, in the top bar.
 Agents and viewers update themselves from the server.

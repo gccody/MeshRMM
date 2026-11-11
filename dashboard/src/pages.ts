@@ -9,6 +9,7 @@ export const PAGES: readonly { path: string; title: string }[] = [
   { path: "/files", title: "Files" },
   { path: "/companies", title: "Companies" },
   { path: "/tags", title: "Tags" },
+  { path: "/deployment", title: "Deployment tokens" },
   { path: "/software", title: "Software" },
   { path: "/updates", title: "Updates" },
   { path: "/applications", title: "Applications" },

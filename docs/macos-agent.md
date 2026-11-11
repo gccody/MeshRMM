@@ -50,6 +50,21 @@ app bundle in `/Library/Application Support/MeshRMM`.
 the WebRTC identity live in `/Library/Application Support/MeshRMM/Agent`,
 which only root can read.
 
+To install on many Macs, make a
+[deployment token](devices.md#deployment-tokens). Its command is the same,
+carrying the token instead of a one-time authorization, and runs as root
+without `sudo`, as a Jamf policy script or another MDM's script does:
+
+```sh
+curl -fsSL https://rmm.example.com/install-agent-macos.sh | /bin/sh -s -- https://rmm.example.com <authorization>
+```
+
+Every Mac that runs it joins the token's company until the token expires, is
+revoked or reaches its limit. Running it on an enrolled Mac repairs the
+install and keeps its identity. Each Mac's user still grants the
+[privacy permissions](#privacy-permissions) before its screen can be watched
+or controlled.
+
 ## Processes
 
 - A launchd daemon runs the **root coordinator**, which keeps the signaling

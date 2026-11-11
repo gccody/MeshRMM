@@ -57,7 +57,7 @@ macro_rules! permissions {
 permissions! {
     DevicesView = "devices.view": "See devices, their status and inventory.",
     DevicesEdit = "devices.edit": "Add and remove devices' tags and edit their notes.",
-    DevicesEnroll = "devices.enroll": "Create Agent installers to enroll devices.",
+    DevicesEnroll = "devices.enroll": "Create Agent installers and deployment tokens to enroll devices, and see and revoke deployment tokens.",
     DevicesDelete = "devices.delete": "Delete devices and uninstall their Agents.",
     DevicesRotateCredentials = "devices.rotate_credentials": "Rotate a device's Agent credential.",
     DevicesWake = "devices.wake": "Wake offline devices with Wake-on-LAN, through online devices on their network.",

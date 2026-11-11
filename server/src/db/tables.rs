@@ -434,6 +434,33 @@ pub enum AgentInstallTokens {
     RedemptionKeyHash,
 }
 
+#[derive(Iden, Clone, Copy)]
+pub enum DeploymentTokens {
+    Table,
+    Id,
+    Name,
+    TokenHash,
+    CompanyId,
+    CreatedByUserId,
+    CreatedAt,
+    ExpiresAt,
+    MaxUses,
+    Uses,
+    LastUsedAt,
+    RevokedAt,
+}
+
+#[derive(Iden, Clone, Copy)]
+pub enum DeploymentTokenEnrollments {
+    Table,
+    TokenId,
+    RedemptionKeyHash,
+    ComputerName,
+    DeviceId,
+    CreatedAt,
+    RecoverableUntil,
+}
+
 #[derive(Iden)]
 pub enum RemoteHandoffs {
     Table,

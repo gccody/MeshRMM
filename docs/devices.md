@@ -44,6 +44,92 @@ identity.
 The server stores only the SHA-256 hash of an Agent credential. No
 environment variables are needed on the device.
 
+### Deployment tokens
+
+The single-use installer suits one computer at a time. To roll the Agent
+out to many through Group Policy, Intune, Jamf or a script, make a
+**deployment token** on **Companies → Deployment tokens** (`/deployment`,
+also linked from **Add device**). A deployment token is a reusable
+enrollment authorization for one company: every computer that redeems it
+becomes a device in that company, as one enrolled with a single-use
+installer for the company does (the token's creator is recorded as who
+added it, and automation policies for new devices start the same way).
+
+A token has a name, an expiry (30 days unless you choose 1 to 365) and an
+optional limit on how many devices it enrolls (none unless set). It enrolls
+nothing more once it expires, is revoked, reaches its limit, or its company
+is deleted (which deletes the company's tokens); none of these touch the
+devices it already enrolled. Each enrollment takes one use, by a
+conditional update in the same transaction as the device, so computers
+enrolling at once can't pass the limit, and an enrollment that fails gives
+its use back. An interrupted install on the same computer finishes within
+30 minutes of its first try without taking another use, while the token
+still works; a revoked or expired token can't finish it.
+
+Making a token, and revoking one, needs `devices.enroll`, the permission
+that makes single-use installers: a holder can already make an installer
+for every computer, so a reusable one grants nothing new. Both are
+website-only, like the other routes that make lasting credentials, so a
+leaked [API token](api.md) can't make one; the list (name, company, who made
+it and when, expiry, uses and limit, last use and state) can be read with
+one. Only the token's SHA-256 hash is stored, and the website shows the
+token once, inside what it hands you:
+
+- **Windows (x64 and ARM64):** download the installer for each
+  architecture; the token is appended to it as for a single-use installer.
+  Run `MeshRMM-Agent-Setup-Windows-x64.exe --quiet` (or the ARM64 name) as
+  SYSTEM or an administrator: from a Group Policy computer startup script,
+  as an Intune Win32 app's install command, or from any deployment tool. It
+  shows no window and asks for no approval, prints what it did, and exits
+  with 0 once the Agent is installed or 1 with the reason on standard
+  error. On a computer where the Agent is already installed and enrolled it
+  changes nothing and exits with 0, even after the token expired, so a
+  startup script can run it on every boot and won't put back an older Agent
+  than the updater installed. For Intune, detect the `MeshRMMAgent` service
+  or `%ProgramData%\MeshRMM\Agent\agent.json`.
+- **macOS and Linux:** the same commands as **Add device** shows, with the
+  token in place of a single-use authorization and without `sudo`, for
+  tools that run scripts as root such as Jamf; put `sudo` back to run one in
+  a terminal. See the [macOS](macos-agent.md#install) and
+  [Linux](linux-agent.md#install) pages. Running one on an enrolled computer
+  repairs the install and keeps its identity, without taking a use.
+
+The token's expiry is in the installer and the commands too, so they stop
+working when it does even before reaching the server.
+
+Redeeming a token goes through the same route, the same per-address limit
+on wrong guesses, and the same answer for every refusal as a single-use
+installer (`401 installer_rejected`), so the answer doesn't tell an unknown
+token from an expired, revoked or used-up one. Making and revoking a token
+are audited (`deployment_token.create`, `deployment_token.revoke`), and each
+device it enrolls, or install it finishes, is recorded as
+`deployment_token.redeem` with the token's ID and name.
+
+**The risk.** Anyone who has a deployment token, from a copied installer, a
+script in a repository or an MDM's logs, can enroll computers they control
+into its company until it expires, is revoked or runs out; revoke it as soon
+as it may have leaked, and set a limit near the rollout's size. Treat
+installers and scripts that carry it like a password. What such a device
+can and can't do, from what the server allows an Agent's credential:
+
+- It can't read anything about other devices, users or the company, and
+  can't call the website's API: its credential opens only its own control
+  connection and reports about itself (inventory, metrics, monitors,
+  thumbnail, the results of what it was sent).
+- It is sent whatever goes to its company's devices: scripts, files,
+  application installs and updates from jobs and automation policies that
+  target its company, its tags or every device, including those scripts'
+  text and those files' contents.
+- Technicians who open a remote session to it see whatever it shows and
+  may type into it, so it could imitate a real computer to collect what
+  they enter.
+- What it reports appears in the inventory and can raise alerts.
+
+Revoking the token doesn't remove the devices it enrolled; delete any you
+don't recognize, which revokes their credentials. A token keeps working
+after the user who made it is deleted, so revoke the tokens someone made
+when they leave.
+
 ## Companies
 
 Companies group devices, for example by the customer or site they belong
@@ -55,7 +141,9 @@ on its page (`PUT /v1/agents/{id}/company`, with `null` for no company).
 
 Deleting a company keeps its devices enrolled, in no company. An installer
 made for a company enrolls its device into it; if the company is deleted
-first, the device enrolls into none. Company names are unique, ignoring
+first, the device enrolls into none. A
+[deployment token](#deployment-tokens) is deleted with its company and
+enrolls nothing more. Company names are unique, ignoring
 case. Creating, renaming and deleting a company, and moving a device, are
 recorded in the audit log.
 
