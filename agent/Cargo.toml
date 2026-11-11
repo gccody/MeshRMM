@@ -37,7 +37,7 @@ url.workspace = true
 webrtc.workspace = true
 
 [target.'cfg(any(windows, target_os = "macos", target_os = "linux"))'.dependencies]
-ureq = { version = "3.4.0", features = ["json", "platform-verifier"] }
+ureq = { version = "3.5.1", features = ["json", "platform-verifier"] }
 uuid = { version = "1.24.1", features = ["v4"] }
 zip = { version = "9.5.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 

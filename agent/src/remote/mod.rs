@@ -281,26 +281,6 @@ fn report_file_reply(
     }
 }
 
-/// Sends a system information snapshot without waiting for it to be
-/// written, without its applications when they are the list the server
-/// holds. One that can't be queued is dropped: the server asks for a new one
-/// when the Agent reconnects and the one it has is old.
-#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-fn report_system_info(
-    socket: &SignalingConnection,
-    collector: &system_info::Collector,
-    system: meshrmm_protocol::SystemInfo,
-) {
-    let status = collector.report(system);
-    let queued = match serde_json::to_string(&status) {
-        Ok(text) => socket.queue(Message::Text(text.into())),
-        Err(error) => Err(error.into()),
-    };
-    if let Err(error) = queued {
-        tracing::warn!(error = %error, "could not send the system information");
-    }
-}
-
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 async fn uninstall(socket: &SignalingConnection) -> anyhow::Result<ControlFlow<bool>> {
     crate::installer::schedule_uninstall().context("failed to schedule Agent self-uninstall")?;
@@ -358,6 +338,12 @@ pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
         let https = outbox::Https::new(&config);
         let results_credential = https.credential();
         outbox.spawn(https);
+        // Snapshots go over HTTPS too, on a thread of their own.
+        let (snapshots, receipts) = system_info::upload::Snapshots::new(jittered);
+        snapshots.spawn(system_info::upload::Https::new(
+            &config,
+            std::sync::Arc::clone(&results_credential),
+        ));
         #[cfg(target_os = "macos")]
         if mode == ExecutionMode::Service {
             tokio::spawn(crate::macos_updater::run(
@@ -380,6 +366,8 @@ pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
             // from the previous one.
             metrics: metrics::Reports::new(),
             system_info: system_info::Collector::new(),
+            snapshots,
+            receipts,
             // Likewise, so a scan that finishes while offline is sent on
             // the next connection.
             updates: updates::Updates::new(std::sync::Arc::clone(&outbox)),
@@ -417,6 +405,10 @@ struct Coordinator {
     thumbnails: thumbnail::Thumbnails,
     metrics: metrics::Reports,
     system_info: system_info::Collector,
+    /// Posts the snapshots the collector takes.
+    snapshots: std::sync::Arc<system_info::upload::Snapshots>,
+    /// The server's answers to them.
+    receipts: tokio::sync::mpsc::UnboundedReceiver<meshrmm_protocol::SystemInfoReceipt>,
     updates: updates::Updates,
     update_schedule: updates::Schedule,
     applications: applications::Applications,
@@ -568,8 +560,17 @@ impl Coordinator {
         self.thumbnails.connected();
         // The server sends this connection's schedule first thing.
         self.update_schedule.connected();
-        // And the application list it holds.
+        // And the application list it holds, which answers to snapshots
+        // from before it are older than; a request for a snapshot in one
+        // still stands.
         self.system_info.connected();
+        while let Ok(receipt) = self.receipts.try_recv() {
+            if receipt.collect_again {
+                self.system_info.request();
+            }
+        }
+        // A snapshot waiting for a retry goes now.
+        self.snapshots.connected();
         loop {
             if self
                 .active_session
@@ -599,7 +600,10 @@ impl Coordinator {
                 }
                 () = self.thumbnails.due() => self.thumbnails.refresh(&self.config),
                 metrics = self.metrics.next() => report_metrics(socket, metrics),
-                system = self.system_info.next() => report_system_info(socket, &self.system_info, system),
+                // Handed to its own thread, so neither this loop nor the
+                // connection waits for it.
+                system = self.system_info.next() => self.snapshots.offer(&self.system_info.report(system)),
+                Some(receipt) = self.receipts.recv() => self.system_info.answered(receipt),
                 results = self.wake.next() => report_wake_results(socket, results),
                 (request_id, reply) = self.files.next() => report_file_reply(socket, request_id, reply),
                 messages = self.monitors.next() => report_monitors(socket, &self.monitors, messages),

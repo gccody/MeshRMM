@@ -5,9 +5,11 @@
 //! gives the Agent its live remote session and any rotated credential it
 //! hasn't used yet, says which application list it holds and asks for a
 //! system information snapshot if the one it has is old, then forwards what
-//! the API sends, and records the resource usage and snapshots the Agent
-//! reports, until the Agent disconnects or a newer connection from the device
-//! replaces it.
+//! the API sends, and records the resource usage and reports the Agent
+//! sends, until the Agent disconnects or a newer connection from the device
+//! replaces it. Snapshots, which can be megabytes, don't travel here: the
+//! Agent posts them over HTTPS (`crate::api::agent`), so they never hold up
+//! the connection, or keep the server from hearing the Agent's pings.
 use std::{net::IpAddr, time::Instant};
 
 use axum::extract::ws::{Message, WebSocket};
@@ -15,7 +17,7 @@ use meshrmm_protocol_types::{
     AgentCommand, AgentSessionRequest, AgentStatusMessage, is_release_version,
 };
 
-use super::{LIVENESS, ToAgent, close_frame, send};
+use super::{ToAgent, close_frame, send};
 use crate::{agents, http::AppState, monitors, system_info, updates, wake};
 
 /// Serves the control connection of an Agent that authenticated as
@@ -27,8 +29,9 @@ pub async fn serve(
     ip: IpAddr,
     socket: WebSocket,
 ) {
+    let silence = state.agent_timeouts.silence;
     if deletion_requested {
-        uninstall(socket).await;
+        uninstall(socket, silence).await;
         return;
     }
     let mut socket = socket;
@@ -100,19 +103,6 @@ pub async fn serve(
                                 state.metrics.record(&device_id, metrics);
                             }
                         }
-                        Ok(AgentStatusMessage::SystemInfo { system, applications_unchanged }) => {
-                            if state.agents.is_current(&device_id, connection.id) {
-                                let replies = record_system_info(&state, &device_id, ip, *system, applications_unchanged).await;
-                                let mut sent = true;
-                                for reply in replies {
-                                    let message = ToAgent::Command(reply).to_json();
-                                    sent = sent && send(&mut socket, Message::Text(message.into())).await;
-                                }
-                                if !sent {
-                                    break;
-                                }
-                            }
-                        }
                         Ok(AgentStatusMessage::UpdateScan { run_ids, scan }) => {
                             if state.agents.is_current(&device_id, connection.id) {
                                 updates::scan_reported(&state, &device_id, run_ids, *scan).await;
@@ -162,7 +152,9 @@ pub async fn serve(
                         }
                     }
                 }
-                () = tokio::time::sleep_until((last_heard + LIVENESS).into()) => break,
+                // A frame is heard only once it has arrived whole, so no
+                // message may take this long to send.
+                () = tokio::time::sleep_until((last_heard + silence).into()) => break,
             }
         }
     }
@@ -176,49 +168,6 @@ pub async fn serve(
     state.presence.disconnected(&device_id).await;
     updates::publish_device(&state, &device_id).await;
     tracing::info!(device_id, "Agent disconnected");
-}
-
-/// Stores a snapshot and shows the device list what changed. Returns what
-/// to tell the Agent: which application list the server now holds, after
-/// storing one, and, after a snapshot that named a list the server doesn't
-/// hold, that and a request for a new snapshot, which then carries the list.
-async fn record_system_info(
-    state: &AppState,
-    device_id: &str,
-    ip: IpAddr,
-    system: meshrmm_protocol_types::SystemInfo,
-    applications_unchanged: Option<String>,
-) -> Vec<AgentCommand> {
-    let stored = match system_info::store(
-        &state.database,
-        device_id,
-        ip,
-        system,
-        applications_unchanged,
-    )
-    .await
-    {
-        Ok(Some(stored)) => stored,
-        Ok(None) => return Vec::new(),
-        Err(error) => {
-            tracing::warn!(device_id, %error, "could not store the device's system information");
-            return Vec::new();
-        }
-    };
-    tracing::info!(device_id, applications = ?stored, "stored the device's system information");
-    state.presence.refresh(device_id).await;
-    match stored {
-        system_info::Stored::Listed { applications_hash } => {
-            vec![AgentCommand::StoredApplications {
-                applications_hash: Some(applications_hash),
-            }]
-        }
-        system_info::Stored::Unchanged => Vec::new(),
-        system_info::Stored::Unknown { applications_hash } => vec![
-            AgentCommand::StoredApplications { applications_hash },
-            AgentCommand::CollectSystemInfo,
-        ],
-    }
 }
 
 /// What a newly connected Agent is owed: the session it should be in, a
@@ -336,13 +285,13 @@ fn repeats_session(last: &mut Option<AgentSessionRequest>, outgoing: &ToAgent) -
 
 /// A deleted device's Agent is told to uninstall itself. It says when it has
 /// scheduled that, and the connection ends.
-async fn uninstall(mut socket: WebSocket) {
+async fn uninstall(mut socket: WebSocket, silence: std::time::Duration) {
     let message = ToAgent::Command(AgentCommand::Uninstall).to_json();
     if !send(&mut socket, Message::Text(message.into())).await {
         return;
     }
     loop {
-        let frame = match tokio::time::timeout(LIVENESS, socket.recv()).await {
+        let frame = match tokio::time::timeout(silence, socket.recv()).await {
             Ok(Some(Ok(frame))) => frame,
             _ => return,
         };

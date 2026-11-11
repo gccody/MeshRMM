@@ -1,7 +1,7 @@
 //! A computer's operating system, hardware, network and installed software,
 //! which an Agent collects when it starts, every
-//! [`SYSTEM_INFO_INTERVAL_SECONDS`], and when the server asks, and sends on
-//! its control connection as one snapshot.
+//! [`SYSTEM_INFO_INTERVAL_SECONDS`], and when the server asks, and posts
+//! over HTTPS as one snapshot ([`SystemInfoReport`]).
 use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,40 @@ pub const MAX_SYSTEM_INFO_TEXT_CHARS: usize = 256;
 /// The largest snapshot an Agent sends, as JSON. An Agent drops applications
 /// from a larger one, and says so in its problems.
 pub const MAX_SYSTEM_INFO_BYTES: usize = 6 * 1024 * 1024;
+
+/// The most a [`SystemInfoReport`]'s body may be: a snapshot at its limit,
+/// with room for the report around it.
+pub const MAX_SYSTEM_INFO_REPORT_BYTES: usize = MAX_SYSTEM_INFO_BYTES + 64 * 1024;
+
+/// A snapshot, as an Agent posts it to `POST /v1/agents/{id}/system-info`
+/// with its credential. It travels apart from the control connection, which
+/// a snapshot of megabytes would hold for minutes on a slow uplink.
+///
+/// When its applications are the list the server said it holds
+/// ([`crate::AgentCommand::StoredApplications`] or
+/// [`SystemInfoReceipt::applications_hash`]), `applications_unchanged` names
+/// that list's hash and `system` lists none: the server keeps its list if the
+/// hash is the one it holds, and otherwise asks for the list
+/// ([`SystemInfoReceipt::collect_again`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemInfoReport {
+    pub system: SystemInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applications_unchanged: Option<String>,
+}
+
+/// The server's answer to a stored [`SystemInfoReport`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemInfoReceipt {
+    /// The application list the server now holds for the device, by
+    /// [`applications_hash`], or `None` for none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applications_hash: Option<String>,
+    /// The report named a list the server doesn't hold: it kept the rest,
+    /// and wants a new snapshot, which then carries the list.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub collect_again: bool,
+}
 
 /// One snapshot of a computer. Parts the Agent could not read are left
 /// empty, and say why in [`SystemInfo::problems`].
@@ -503,6 +537,46 @@ impl SystemInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reports_and_receipts_leave_out_what_they_do_not_say() {
+        let report = SystemInfoReport::default();
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(
+            json.starts_with(r#"{"system":{"collected_at_unix_ms":0,"#),
+            "{json}"
+        );
+        assert!(!json.contains("applications_unchanged"), "{json}");
+        let unchanged = SystemInfoReport {
+            applications_unchanged: Some("ab12".into()),
+            ..report
+        };
+        let json = serde_json::to_string(&unchanged).unwrap();
+        assert!(
+            json.ends_with(r#","applications_unchanged":"ab12"}"#),
+            "{json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<SystemInfoReport>(&json).unwrap(),
+            unchanged
+        );
+        for (receipt, json) in [
+            (SystemInfoReceipt::default(), "{}"),
+            (
+                SystemInfoReceipt {
+                    applications_hash: Some("ab12".into()),
+                    collect_again: true,
+                },
+                r#"{"applications_hash":"ab12","collect_again":true}"#,
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&receipt).unwrap(), json);
+            assert_eq!(
+                serde_json::from_str::<SystemInfoReceipt>(json).unwrap(),
+                receipt
+            );
+        }
+    }
 
     fn sample() -> SystemInfo {
         SystemInfo {

@@ -1,7 +1,9 @@
 //! The computer's operating system, hardware, network and installed
 //! software, collected a little after the Agent starts, about every
-//! [`INTERVAL`] after that, and when the server asks, and sent to the server
-//! on the control connection as one snapshot.
+//! [`INTERVAL`] after that, and when the server asks, and posted to the
+//! server over HTTPS as one snapshot ([`upload`]), never on the control
+//! connection, which a snapshot of megabytes would hold for minutes on a
+//! slow uplink.
 //!
 //! The coordinator collects, as it reports resource usage: the Windows
 //! service's SYSTEM worker, the Mac's root launchd daemon and the Linux root
@@ -15,15 +17,15 @@
 //!
 //! The applications are most of a snapshot and seldom change, so a snapshot
 //! leaves them out when they are the list the server said it holds
-//! (`AgentCommand::StoredApplications`), and names that list's hash
-//! instead. The snapshots the Agent collects on its own fall at random
+//! (`AgentCommand::StoredApplications` when the Agent connects, and the
+//! answer to each snapshot), and names that list's hash instead. The snapshots the Agent collects on its own fall at random
 //! points ([`next_collection`]), so a fleet that started together, after an
 //! update or a power cut, doesn't send together.
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use meshrmm_protocol::{
-    AgentStatusMessage, MAX_SYSTEM_INFO_BYTES, SYSTEM_INFO_INTERVAL_SECONDS, SystemInfo,
-    applications_hash, clean_text,
+    MAX_SYSTEM_INFO_BYTES, SYSTEM_INFO_INTERVAL_SECONDS, SystemInfo, SystemInfoReceipt,
+    SystemInfoReport, applications_hash, clean_text,
 };
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -34,6 +36,7 @@ mod linux;
 mod macos;
 #[cfg(unix)]
 mod unix;
+pub(crate) mod upload;
 #[cfg(windows)]
 pub(crate) mod windows;
 
@@ -163,17 +166,16 @@ fn random_fraction() -> f64 {
     meshrmm_signaling_client::random_fraction().unwrap_or(0.5)
 }
 
-/// The status message for a snapshot, given the hash of the application list
-/// the server holds (`stored`): without the applications when they are that
+/// The report of a snapshot, given the hash of the application list the
+/// server holds (`stored`): without the applications when they are that
 /// list.
-fn report(system: SystemInfo, stored: Option<&str>) -> AgentStatusMessage {
-    let mut system = Box::new(system);
+fn report(mut system: SystemInfo, stored: Option<&str>) -> SystemInfoReport {
     let unchanged = stored.filter(|stored| *stored == applications_hash(&system.applications));
     let applications_unchanged = unchanged.map(|hash| {
         system.applications = Vec::new();
         hash.to_owned()
     });
-    AgentStatusMessage::SystemInfo {
+    SystemInfoReport {
         system,
         applications_unchanged,
     }
@@ -187,8 +189,8 @@ pub struct Collector {
     /// The collection running, and when it is given up on.
     task: Option<(JoinHandle<SystemInfo>, Instant)>,
     requested: bool,
-    /// The hash of the application list this connection's server last said
-    /// it holds.
+    /// The hash of the application list the server last said it holds, on
+    /// this connection or in answer to a snapshot.
     stored: Option<String>,
 }
 
@@ -216,8 +218,18 @@ impl Collector {
         self.stored = applications_hash;
     }
 
-    /// The status message that sends `system`.
-    pub fn report(&self, system: SystemInfo) -> AgentStatusMessage {
+    /// The server answered a snapshot: it holds this list, and may want a
+    /// new snapshot to carry the list it lacks.
+    pub fn answered(&mut self, receipt: SystemInfoReceipt) {
+        self.stored(receipt.applications_hash);
+        if receipt.collect_again {
+            tracing::info!("the server asked for the applications it lacks");
+            self.request();
+        }
+    }
+
+    /// The report that sends `system`.
+    pub fn report(&self, system: SystemInfo) -> SystemInfoReport {
         report(system, self.stored.as_deref())
     }
 
@@ -311,15 +323,11 @@ mod tests {
     }
 
     /// How many applications a report sends, and the hash it names instead.
-    fn sent(message: AgentStatusMessage) -> (usize, Option<String>) {
-        let AgentStatusMessage::SystemInfo {
-            system,
-            applications_unchanged,
-        } = message
-        else {
-            panic!("not a snapshot: {message:?}");
-        };
-        (system.applications.len(), applications_unchanged)
+    fn sent(report: SystemInfoReport) -> (usize, Option<String>) {
+        (
+            report.system.applications.len(),
+            report.applications_unchanged,
+        )
     }
 
     #[tokio::test]
@@ -362,6 +370,26 @@ mod tests {
             sent(collector.report(listing(&[]))),
             (0, Some(applications_hash(&[])))
         );
+    }
+
+    #[tokio::test]
+    async fn the_answer_to_a_snapshot_says_which_list_the_next_leaves_out() {
+        let listed = listing(&["curl"]);
+        let hash = applications_hash(&listed.applications);
+        let mut collector = Collector::new();
+        collector.answered(SystemInfoReceipt {
+            applications_hash: Some(hash.clone()),
+            collect_again: false,
+        });
+        assert_eq!(sent(collector.report(listed.clone())), (0, Some(hash)));
+        assert!(!collector.requested);
+        // One that lacks the list it named asks for a snapshot with it.
+        collector.answered(SystemInfoReceipt {
+            applications_hash: None,
+            collect_again: true,
+        });
+        assert!(collector.requested);
+        assert_eq!(sent(collector.report(listed)), (1, None));
     }
 
     #[test]

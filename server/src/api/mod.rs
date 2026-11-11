@@ -325,7 +325,10 @@ fn device_routes() -> Router<AppState> {
         .route("/file-uploads/{id}/finish", post(files::finish_upload))
         .route("/agents/{id}/close-session", post(remote::close))
         .route("/agents/{id}/metrics", get(metrics::get))
-        .route("/agents/{id}/system-info", get(system_info::get))
+        .route(
+            "/agents/{id}/system-info",
+            get(system_info::get).post(agent::report_system_info),
+        )
         .route(
             "/agents/{id}/system-info/refresh",
             post(system_info::refresh),

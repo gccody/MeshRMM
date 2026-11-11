@@ -1,13 +1,15 @@
-//! Devices' hardware and software: Agents' snapshots over the control
-//! connection, the device list's summary, refreshes, application changes,
-//! snapshots that leave out an unchanged list, and searching devices and the
-//! fleet's applications.
+//! Devices' hardware and software: Agents' snapshots posted over HTTPS, the
+//! device list's summary, refreshes, application changes, snapshots that
+//! leave out an unchanged list, and searching devices and the fleet's
+//! applications.
 mod common;
 
 use std::{net::IpAddr, time::Duration};
 
+use axum::body::{Body, Bytes};
 use common::{
-    App, Browser, Ws, apps, receive_any_json, receive_json, send_json, set_up, user_with,
+    Agent, App, Browser, Ws, apps, apps_with, receive_any, receive_any_json, receive_json, set_up,
+    user_with,
 };
 use meshrmm_protocol_types::{SystemInfo, applications_hash};
 use meshrmm_server::{
@@ -23,7 +25,6 @@ fn application(name: &str, version: Option<&str>) -> Value {
 
 fn snapshot(serial: &str, address: &str, applications: Vec<Value>) -> Value {
     json!({
-        "type": "system_info",
         "system": {
             "collected_at_unix_ms": 1_700_000_000_000_i64,
             "os": {
@@ -78,12 +79,40 @@ fn unchanged(serial: &str, hash: &str) -> Value {
     message
 }
 
-/// What the server says it holds, as it tells the Agent.
+/// What the server says it holds, as it tells the Agent when it connects.
 fn stored_message(hash: Option<&str>) -> Value {
     match hash {
         Some(hash) => json!({ "type": "stored_applications", "applications_hash": hash }),
         None => json!({ "type": "stored_applications" }),
     }
+}
+
+/// The server's answer to a snapshot: the list it holds, and whether it
+/// wants a new snapshot to carry the list it lacks.
+fn receipt(hash: Option<&str>, collect_again: bool) -> Value {
+    let mut receipt = json!({});
+    if let Some(hash) = hash {
+        receipt["applications_hash"] = json!(hash);
+    }
+    if collect_again {
+        receipt["collect_again"] = json!(true);
+    }
+    receipt
+}
+
+/// Posts `body` to the Agent's snapshot route, as the Agent does.
+async fn post_body(agent: &Agent, body: Body) -> common::RawResponse {
+    agent.post_snapshot(body).await
+}
+
+/// Posts a snapshot, and returns the server's answer, which must be a
+/// success.
+async fn post(agent: &Agent, snapshot: &Value) -> Value {
+    let response = post_body(agent, Body::from(snapshot.to_string()))
+        .await
+        .json("snapshot");
+    assert_eq!(response.status, 200, "{:?}", response.body);
+    response.body
 }
 
 /// The device in a presence event.
@@ -146,11 +175,10 @@ async fn agents_send_system_information_the_website_shows_and_searches() {
             ],
         );
         let first_hash = hash_of(&first);
-        send_json(&mut control, first).await;
         // The Agent hears which list the server now holds.
         assert_eq!(
-            receive_any_json(&mut control).await,
-            stored_message(Some(&first_hash)),
+            post(&desk, &first).await,
+            receipt(Some(&first_hash), false),
             "{}",
             app.name
         );
@@ -203,10 +231,9 @@ async fn agents_send_system_information_the_website_shows_and_searches() {
             ],
         );
         let second_hash = hash_of(&second);
-        send_json(&mut control, second).await;
         assert_eq!(
-            receive_any_json(&mut control).await,
-            stored_message(Some(&second_hash))
+            post(&desk, &second).await,
+            receipt(Some(&second_hash), false)
         );
         receive_json(&mut events).await;
         let changes = admin
@@ -244,11 +271,11 @@ async fn agents_send_system_information_the_website_shows_and_searches() {
         // A second device, on Linux in no company.
         let laptop = app.enroll_on(&mut admin, "Laptop", "linux").await;
         receive_json(&mut events).await;
-        let mut laptop_control = laptop.connect(&server).await.unwrap();
+        let laptop_control = laptop.connect(&server).await.unwrap();
         receive_json(&mut events).await;
-        send_json(
-            &mut laptop_control,
-            snapshot(
+        post(
+            &laptop,
+            &snapshot(
                 "SER-2",
                 "192.168.7.20",
                 vec![application("Firefox", Some("131.0"))],
@@ -464,8 +491,7 @@ async fn stored_row(app: &App, device_id: &str) -> Option<(Option<String>, Optio
         .unwrap()
 }
 
-/// Stores a snapshot message as the control connection does, returning what
-/// it ran.
+/// Stores a snapshot as the snapshot route does, returning what it ran.
 async fn store(app: &App, device_id: &str, message: &Value) -> (Option<Stored>, Counts) {
     let info: SystemInfo = serde_json::from_value(message["system"].clone()).unwrap();
     let unchanged = message["applications_unchanged"]
@@ -653,25 +679,23 @@ async fn an_agent_naming_a_list_the_server_lacks_is_asked_for_it_once() {
             ],
         );
         let hash = hash_of(&full);
-        send_json(&mut control, full.clone()).await;
         assert_eq!(
-            next_command(&mut control).await,
-            stored_message(Some(&hash)),
+            post(&desk, &full).await,
+            receipt(Some(&hash), false),
             "{name}"
         );
 
-        // A snapshot naming the stored list is answered with nothing; one
-        // naming another is told the stored one and asked for a snapshot.
-        send_json(&mut control, unchanged("SER-2", &hash)).await;
-        send_json(&mut control, unchanged("SER-3", "stale")).await;
+        // A snapshot naming the stored list is told that list; one naming
+        // another is told the stored one and asked for a snapshot.
         assert_eq!(
-            next_command(&mut control).await,
-            stored_message(Some(&hash)),
+            post(&desk, &unchanged("SER-2", &hash)).await,
+            receipt(Some(&hash), false),
             "{name}"
         );
         assert_eq!(
-            next_command(&mut control).await["type"],
-            "collect_system_info"
+            post(&desk, &unchanged("SER-3", "stale")).await,
+            receipt(Some(&hash), true),
+            "{name}"
         );
 
         // The rows went away: the Agent hears there is no list, and the
@@ -679,20 +703,14 @@ async fn an_agent_naming_a_list_the_server_lacks_is_asked_for_it_once() {
         system_info::forget(app.db(), &desk.device_id)
             .await
             .unwrap();
-        send_json(&mut control, unchanged("SER-4", &hash)).await;
         assert_eq!(
-            next_command(&mut control).await,
-            stored_message(None),
+            post(&desk, &unchanged("SER-4", &hash)).await,
+            receipt(None, true),
             "{name}"
         );
         assert_eq!(
-            next_command(&mut control).await["type"],
-            "collect_system_info"
-        );
-        send_json(&mut control, full).await;
-        assert_eq!(
-            next_command(&mut control).await,
-            stored_message(Some(&hash)),
+            post(&desk, &full).await,
+            receipt(Some(&hash), false),
             "{name}"
         );
         assert_eq!(
@@ -704,6 +722,8 @@ async fn an_agent_naming_a_list_the_server_lacks_is_asked_for_it_once() {
             .await;
         assert_eq!(stored.body["hardware"]["serial_number"], "SER-1");
         assert_eq!(stored.body["application_count"], 2, "{name}");
+        // The control connection carried none of it.
+        common::quiet(&mut control, Duration::from_millis(200)).await;
 
         // The next connection's greeting names it.
         drop(control);
@@ -718,6 +738,23 @@ async fn an_agent_naming_a_list_the_server_lacks_is_asked_for_it_once() {
     }
 }
 
+/// Posts a snapshot to `server` over a real socket, as the Agent does.
+async fn post_over_tcp(server: &common::Server, agent: &Agent, snapshot: &Value) -> Value {
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://{}/v1/agents/{}/system-info",
+            server.addr, agent.device_id
+        ))
+        .bearer_auth(&agent.token)
+        .header("content-type", "application/json")
+        .body(snapshot.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    response.json().await.unwrap()
+}
+
 #[tokio::test]
 async fn a_snapshot_far_larger_than_the_read_buffer_arrives_whole() {
     for app in apps().await {
@@ -726,37 +763,47 @@ async fn a_snapshot_far_larger_than_the_read_buffer_arrives_whole() {
         let desk = app.enroll(&mut admin, "Desk").await;
         let mut events = admin.events(&server).await.unwrap();
         receive_json(&mut events).await;
-        let mut control = desk.connect(&server).await.unwrap();
-        receive_json(&mut events).await;
 
-        // Hundreds of KiB, many times the control connection's read buffer
-        // (and tungstenite's default one).
+        // Megabytes, many times any read buffer on the way, and more than
+        // the control connection takes in one message.
+        // Each field within the 256 characters a snapshot keeps.
         let padding = "x".repeat(200);
-        let applications: Vec<_> = (0..2_000)
-            .map(|index| application(&format!("App {index:04} {padding}"), Some("1.0")))
+        let applications: Vec<_> = (0..10_000)
+            .map(|index| {
+                published(
+                    &format!("App {index:05} {padding}"),
+                    Some("1.0"),
+                    Some(&padding),
+                    "windows",
+                )
+            })
             .collect();
         let large = snapshot("SER-1", "10.1.2.3", applications);
-        assert!(large.to_string().len() > 512 * 1024);
-        send_json(&mut control, large).await;
+        assert!(large.to_string().len() > 4 * 1024 * 1024);
+        let answer = post_over_tcp(&server, &desk, &large).await;
+        assert_eq!(answer, receipt(Some(&hash_of(&large)), false));
         receive_json(&mut events).await;
         let path = format!("/v1/agents/{}/system-info", desk.device_id);
         let stored = admin.get(&path).await;
         assert_eq!(stored.status, 200, "{:?}", stored.body);
-        assert_eq!(stored.body["application_count"], 2_000, "{}", app.name);
+        assert_eq!(stored.body["application_count"], 10_000, "{}", app.name);
+        // A device that isn't connected: the credential is what counts.
+        assert_eq!(stored.body["public_ip"], "127.0.0.1");
         let listed = admin
             .get(&format!("/v1/agents/{}/applications", desk.device_id))
             .await;
         let stored_applications = listed.body["applications"].as_array().unwrap();
-        assert_eq!(stored_applications.len(), 2_000, "{}", app.name);
+        assert_eq!(stored_applications.len(), 10_000, "{}", app.name);
         assert_eq!(
-            stored_applications[1_999]["name"],
-            format!("App 1999 {padding}")
+            stored_applications[9_999]["name"],
+            format!("App 09999 {padding}")
         );
 
-        // A small message after it is still read.
-        send_json(
-            &mut control,
-            snapshot("SER-2", "10.1.2.3", vec![application("7-Zip", None)]),
+        // A small one after it replaces it.
+        post_over_tcp(
+            &server,
+            &desk,
+            &snapshot("SER-2", "10.1.2.3", vec![application("7-Zip", None)]),
         )
         .await;
         let event = receive_json(&mut events).await;
@@ -766,7 +813,238 @@ async fn a_snapshot_far_larger_than_the_read_buffer_arrives_whole() {
             "{}",
             app.name
         );
+        app.finish().await;
+    }
+}
+
+/// A body whose chunks the test sends, ending when the sender is dropped.
+fn gated_body() -> (
+    tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    Body,
+) {
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    let stream = futures_util::stream::unfold(receiver, |mut receiver| async move {
+        receiver.recv().await.map(|chunk| (chunk, receiver))
+    });
+    (sender, Body::from_stream(stream))
+}
+
+#[tokio::test]
+async fn an_oversized_snapshot_or_a_wrong_credential_is_refused_and_stores_nothing() {
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let desk = app.enroll(&mut admin, "Desk").await;
+        let small = snapshot("SER-1", "10.1.2.3", vec![application("7-Zip", None)]);
+
+        // A wrong credential, or another device's, is refused before the
+        // body is read: this one never ends.
+        let other = app.enroll(&mut admin, "Other").await;
+        for agent in [
+            desk.with_token(&"0".repeat(64)),
+            desk.with_token(&other.token),
+        ] {
+            let (_sender, body) = gated_body();
+            let refused = tokio::time::timeout(common::SOCKET_WAIT, post_body(&agent, body))
+                .await
+                .expect("refused without reading the body");
+            assert_eq!(refused.status, 401, "{name}");
+        }
+
+        // One that says it is too large is refused at once.
+        let (_sender, body) = gated_body();
+        let request = desk
+            .request(
+                axum::http::Method::POST,
+                &format!("/v1/agents/{}/system-info", desk.device_id),
+            )
+            .header("content-length", 7 * 1024 * 1024)
+            .body(body)
+            .unwrap();
+        let refused = tokio::time::timeout(common::SOCKET_WAIT, desk.send(request))
+            .await
+            .expect("refused without reading the body");
+        assert_eq!(refused.status, 413, "{name}");
+
+        // One that doesn't say is refused once it has sent more than the
+        // limit, without waiting for the rest, which never comes.
+        let (sender, body) = gated_body();
+        let posting = tokio::spawn({
+            let desk = desk.clone();
+            async move { post_body(&desk, body).await }
+        });
+        let chunk = Bytes::from(vec![b' '; 1024 * 1024]);
+        let mut sent = 0;
+        while sender.send(Ok(chunk.clone())).await.is_ok() {
+            sent += chunk.len();
+            // The limit, and the piece waiting in the channel.
+            assert!(sent <= 8 * 1024 * 1024, "{name}: the server kept reading");
+        }
+        let refused = tokio::time::timeout(common::SOCKET_WAIT, posting)
+            .await
+            .expect("refused without waiting for the end")
+            .unwrap();
+        assert_eq!(refused.status, 413, "{name}");
+
+        // A malformed one is refused too.
+        let malformed = post_body(&desk, Body::from("{\"system\": 1}")).await;
+        assert_eq!(malformed.status, 400, "{name}");
+        assert_eq!(stored_row(&app, &desk.device_id).await, None, "{name}");
+
+        // A device being removed takes no snapshot.
+        let deleted = admin
+            .delete(&format!("/v1/agents/{}", desk.device_id))
+            .await;
+        assert_eq!(deleted.status, 204, "{:?}", deleted.body);
+        let gone = post_body(&desk, Body::from(small.to_string())).await;
+        assert!(
+            matches!(gone.status.as_u16(), 401 | 409),
+            "{name}: {}",
+            gone.status
+        );
+        assert_eq!(stored_row(&app, &desk.device_id).await, None, "{name}");
+        app.finish().await;
+    }
+}
+
+/// How long a snapshot's body may send nothing, and the control connection
+/// go unheard, with [`impatient`].
+const STALL: Duration = Duration::from_millis(800);
+const SILENCE: Duration = Duration::from_millis(1200);
+
+fn impatient(state: &mut meshrmm_server::http::AppState) {
+    state.agent_timeouts = meshrmm_server::agents::Timeouts {
+        silence: SILENCE,
+        upload_stall: STALL,
+    };
+}
+
+#[tokio::test]
+async fn a_snapshot_that_trickles_arrives_and_one_that_stalls_is_dropped() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    for app in apps_with(impatient).await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let desk = app.enroll(&mut admin, "Desk").await;
+        let mut control = desk.connect(&server).await.unwrap();
+        assert_eq!(next_command(&mut control).await, stored_message(None));
+
+        // A snapshot sent a piece at a time, each well within the stall
+        // limit, for three times the silence the control connection
+        // allows, while the Agent pings that connection as it does when it
+        // has nothing to say.
+        let full = snapshot("SER-1", "10.1.2.3", vec![application("7-Zip", None)]);
+        let text = full.to_string().into_bytes();
+        let (sender, body) = gated_body();
+        let posting = tokio::spawn({
+            let desk = desk.clone();
+            async move { post_body(&desk, body).await }
+        });
+        let started = tokio::time::Instant::now();
+        // A piece every quarter of the stall limit, enough of them to take
+        // longer than three times the silence.
+        let pace = STALL / 4;
+        let count = (SILENCE * 3).as_millis() / pace.as_millis() + 6;
+        let mut pace = tokio::time::interval(pace);
+        for piece in text.chunks(text.len().div_ceil(count as usize)) {
+            pace.tick().await;
+            sender
+                .send(Ok(Bytes::copy_from_slice(piece)))
+                .await
+                .unwrap();
+            control
+                .send(Message::Ping(Default::default()))
+                .await
+                .unwrap();
+        }
+        assert!(started.elapsed() > SILENCE * 3);
+        // The control connection stayed up all along.
+        assert!(app.state.agents.is_connected(&desk.device_id), "{name}");
+        drop(sender);
+        let answer = posting.await.unwrap().json(name);
+        assert_eq!(answer.status, 200, "{name}: {:?}", answer.body);
+        assert_eq!(
+            stored_row(&app, &desk.device_id).await,
+            Some((Some(hash_of(&full)), Some("SER-1".into()))),
+            "{name}"
+        );
+
+        // One that stops sending, its connection still open, is dropped
+        // after the stall limit, and stores nothing.
+        let (sender, body) = gated_body();
+        let posting = tokio::spawn({
+            let desk = desk.clone();
+            async move { post_body(&desk, body).await }
+        });
+        let half = &text[..text.len() / 2];
+        sender.send(Ok(Bytes::copy_from_slice(half))).await.unwrap();
+        let started = tokio::time::Instant::now();
+        let dropped = tokio::time::timeout(common::SOCKET_WAIT, posting)
+            .await
+            .expect("dropped")
+            .unwrap();
+        assert_eq!(dropped.status, 408, "{name}");
+        assert!(started.elapsed() >= STALL / 2, "{name}");
+        drop(sender);
+        assert_eq!(
+            stored_row(&app, &desk.device_id).await,
+            Some((Some(hash_of(&full)), Some("SER-1".into()))),
+            "{name}"
+        );
         drop(control);
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn the_control_connection_refuses_a_message_above_its_limit() {
+    for app in apps().await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let desk = app.enroll(&mut admin, "Desk").await;
+        // A message the server ignores, padded to the limit and past it.
+        let padded = |size: usize| {
+            let empty = r#"{"type":"uninstall_scheduled","padding":""}"#;
+            let padding = "x".repeat(size - empty.len());
+            let message = format!(r#"{{"type":"uninstall_scheduled","padding":"{padding}"}}"#);
+            assert_eq!(message.len(), size);
+            message
+        };
+        let limit = 4 * 1024 * 1024;
+        let mut control = desk.connect(&server).await.unwrap();
+        common::send_text(&mut control, &padded(limit)).await;
+        // Still up: it answers a ping.
+        {
+            use futures_util::SinkExt;
+            control
+                .send(tokio_tungstenite::tungstenite::Message::Ping(
+                    b"up".to_vec().into(),
+                ))
+                .await
+                .unwrap();
+        }
+        let pong = loop {
+            use futures_util::StreamExt;
+            match tokio::time::timeout(common::SOCKET_WAIT, control.next())
+                .await
+                .expect("an answer")
+            {
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Pong(payload))) => {
+                    break payload;
+                }
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Text(_))) => {}
+                other => panic!("{name}: the connection ended: {other:?}"),
+            }
+        };
+        assert_eq!(&pong[..], b"up");
+
+        common::send_text(&mut control, &padded(limit + 1)).await;
+        // It ends, after any messages the server sent before.
+        while let common::Received::Json(_) = receive_any(&mut control).await {}
         app.finish().await;
     }
 }
