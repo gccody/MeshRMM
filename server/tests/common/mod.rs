@@ -1155,11 +1155,12 @@ pub async fn receive(socket: &mut Ws) -> Received {
 }
 
 /// Whether the message tells an Agent how often to report its resource
-/// usage, which every Agent is told on connecting and again as website tabs
-/// start and stop watching its device: only [`metrics_interval_within`]
-/// reads them.
+/// usage or refresh its screen thumbnail, which every Agent is told on
+/// connecting and again as website tabs start and stop watching its device:
+/// only [`metrics_interval_within`] and [`thumbnail_interval_within`] read
+/// them.
 fn reporting_interval(value: &serde_json::Value) -> bool {
-    value["type"] == "set_metrics_interval"
+    value["type"] == "set_metrics_interval" || value["type"] == "set_thumbnail_interval"
 }
 
 /// What a socket received next, ignoring pings and pongs and how often an
@@ -1237,6 +1238,17 @@ pub async fn quiet(socket: &mut Ws, wait: std::time::Duration) {
 /// report at, skipping everything else, or `None` if it tells none within
 /// `wait`.
 pub async fn metrics_interval_within(socket: &mut Ws, wait: std::time::Duration) -> Option<u64> {
+    interval_within(socket, "set_metrics_interval", wait).await
+}
+
+/// The interval, in seconds, the server next tells the Agent on `socket` to
+/// refresh its screen thumbnail at, skipping everything else, or `None` if
+/// it tells none within `wait`.
+pub async fn thumbnail_interval_within(socket: &mut Ws, wait: std::time::Duration) -> Option<u64> {
+    interval_within(socket, "set_thumbnail_interval", wait).await
+}
+
+async fn interval_within(socket: &mut Ws, kind: &str, wait: std::time::Duration) -> Option<u64> {
     use futures_util::StreamExt;
     use tokio_tungstenite::tungstenite::Message;
 
@@ -1246,7 +1258,7 @@ pub async fn metrics_interval_within(socket: &mut Ws, wait: std::time::Duration)
             Err(_) => return None,
             Ok(Some(Ok(Message::Text(text)))) => {
                 let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-                if reporting_interval(&value) {
+                if value["type"] == kind {
                     return Some(value["seconds"].as_u64().expect("an interval in seconds"));
                 }
             }

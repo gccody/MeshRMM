@@ -35,10 +35,12 @@ function harness({ visible } = {}) {
   const timers = fakeTimers();
   const devices = new DeviceStore({ schedule: () => {} });
   const watched = [];
+  const added = [];
   const watch = metricsWatch({
     shown: () => devices.readers(),
-    onWatching: (set) => {
+    onWatching: (set, newly) => {
       watched.push([...set].sort());
+      added.push([...newly].sort());
       devices.watching(set);
     },
     visible,
@@ -54,7 +56,7 @@ function harness({ visible } = {}) {
   };
   // A tile in view, until its returned function unmounts it.
   const show = (id) => devices.subscribeReading(id, () => {});
-  return { timers, devices, watch, watched, open, show };
+  return { timers, devices, watch, watched, added, open, show };
 }
 
 test("the tiles in view are watched, and only they", () => {
@@ -160,4 +162,27 @@ test("at most the server's bound is asked for", () => {
   const sent = open();
   timers.advance(0);
   assert.equal(sent[0].length, MAX_WATCHED);
+});
+
+test("each change names the devices the socket did not watch before, and a new socket all of them", () => {
+  const { timers, open, show, watch, added } = harness();
+  show("a");
+  const hideB = show("b");
+  open();
+  timers.advance(0);
+  show("c");
+  hideB();
+  timers.advance(WATCH_INTERVAL_MS);
+  assert.deepEqual(added, [["a", "b"], ["c"]]);
+  // Hidden and shown again, its images may have changed unannounced.
+  watch.setVisible(false);
+  timers.advance(WATCH_INTERVAL_MS);
+  watch.setVisible(true);
+  timers.advance(WATCH_INTERVAL_MS);
+  assert.deepEqual(added.slice(2), [[], ["a", "c"]]);
+  // As after a reconnect: the new socket missed what the old one heard.
+  watch.detach();
+  open();
+  timers.advance(WATCH_INTERVAL_MS);
+  assert.deepEqual(added.at(-1), ["a", "c"]);
 });

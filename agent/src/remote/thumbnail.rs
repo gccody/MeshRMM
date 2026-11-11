@@ -1,5 +1,6 @@
-//! A small image of the console's main display, uploaded for the dashboard
-//! every few minutes.
+//! A small image of the console's main display, for the website: refreshed
+//! every few minutes while a website tab shows the device, about hourly
+//! otherwise, and uploaded when the screen changed ([`Thumbnails`]).
 //!
 //! The coordinator runs in Session 0, which cannot see the console. A
 //! LocalSystem desktop helper captures and encodes the image on the console's
@@ -17,13 +18,9 @@
     not(any(windows, target_os = "macos", target_os = "linux")),
     allow(dead_code)
 )]
-use std::time::Duration;
-
 use anyhow::ensure;
 use serde::{Deserialize, Serialize};
 
-/// How often the dashboard's image is refreshed, on average.
-pub const INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// The image fits in this box. It is sharp at the dashboard's preview size
 /// and small enough to be a few dozen KiB as a JPEG.
 pub const MAX_WIDTH: u32 = 640;
@@ -501,67 +498,196 @@ mod windows {
 /// The schedule and upload, around each platform's capture.
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 mod schedule {
-    use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     use anyhow::Context;
-    use meshrmm_signaling_client::random_fraction;
+    use meshrmm_protocol::{THUMBNAIL_IDLE_INTERVAL_SECONDS, THUMBNAIL_WATCHED_INTERVAL_SECONDS};
     use tokio::task::JoinHandle;
+    use tokio::time::Instant;
 
     use super::platform::capture_for;
-    use super::{Capture, INTERVAL, Signature};
+    use super::{Capture, Signature};
     use crate::remote::config::{Config, ExecutionMode};
 
+    /// How often the image is refreshed on a connection until the server
+    /// says otherwise: what it asks for while no website tab shows the
+    /// device.
+    pub const IDLE_INTERVAL: Duration = Duration::from_secs(THUMBNAIL_IDLE_INTERVAL_SECONDS);
+    /// The shortest interval the Agent refreshes at, whatever it is told:
+    /// what the server asks for while a tab shows the device.
+    const SHORTEST_INTERVAL: Duration = Duration::from_secs(THUMBNAIL_WATCHED_INTERVAL_SECONDS);
+    /// The longest, so an image is never more than a few hours old.
+    const LONGEST_INTERVAL: Duration = Duration::from_secs(3 * 60 * 60);
+    /// A capture that finished this recently is fresh enough for someone
+    /// who just started looking, so a tab reloading or a wall scrolled back
+    /// and forth does not have the device capture again and again.
+    const FRESH: Duration = Duration::from_secs(60);
+    /// A capture that looks like the last image sent is sent anyway once
+    /// that one is this old, so a change too small to notice is shown within
+    /// a few hours. The first capture on each connection is always sent, so
+    /// a server that lost the image, as in a crash or a restore from a
+    /// backup, has it back once the Agent reconnects.
+    const RESEND_AFTER: Duration = Duration::from_secs(3 * 60 * 60);
     const UPLOAD_TIMEOUT: Duration = Duration::from_secs(30);
     /// After a failure, such as when the Agent starts before the session it
-    /// captures, the next few attempts come sooner than [`INTERVAL`].
+    /// captures, the next few attempts come sooner than the interval.
     const RETRY: Duration = Duration::from_secs(30);
     const QUICK_RETRIES: u32 = 4;
     /// The first capture after the Agent starts falls within this, so a newly
     /// enrolled device shows its screen soon, but a fleet that restarts
     /// together does not upload in the same second.
     const STARTUP_SPREAD: Duration = Duration::from_secs(60);
-    /// Each interval is up to this fraction longer or shorter than
-    /// [`INTERVAL`]. The random phase each connection starts with is what
-    /// spreads a fleet out; this only keeps it from falling back into step.
-    /// Kept narrow so a new image still arrives before the dashboard's check,
-    /// 20 seconds after the next one is due.
+    /// Each interval is up to this fraction longer or shorter than the one
+    /// set. The random phase a longer interval starts at is what spreads a
+    /// fleet out; this only keeps it from falling back into step.
     const JITTER: f64 = 0.05;
-    /// A capture that looks like the last uploaded image is skipped at most
-    /// this many times in a row, about an hour's worth, and then sent anyway:
-    /// a change too small to notice is shown within the hour, and a server
-    /// that lost the image, as when restored from a backup, gets it back.
-    const MAX_SKIPPED: u32 = 11;
 
-    /// Refreshes the device's thumbnail about every [`INTERVAL`] while the
-    /// Agent is connected, when the screen changed. One capture and upload
-    /// runs at a time, off the signaling task.
+    /// Captures the screen and uploads it unless it looks like the image
+    /// given, and returns the signature of the one it sent, if it sent one.
+    type Refresh =
+        dyn Fn(&Config, Option<&Signature>) -> anyhow::Result<Option<Signature>> + Send + Sync;
+    type Fraction = Box<dyn FnMut() -> f64 + Send>;
+    /// A refresh's result, with the connection it started on.
+    type Finished = (u64, anyhow::Result<Option<Signature>>);
+
+    /// Refreshes the device's thumbnail every interval the server set while
+    /// the Agent is connected, when the screen changed: about hourly, at a
+    /// random phase, while no website tab shows the device, and every few
+    /// minutes while one does, starting at once. One capture and upload runs
+    /// at a time, off the signaling task.
     pub struct Thumbnails {
-        mode: ExecutionMode,
+        interval: Duration,
         /// When the next capture is due.
         next: Instant,
-        task: Option<JoinHandle<()>>,
-        state: Arc<Mutex<State>>,
-        /// One client for the life of the process: the TLS configuration it
-        /// builds on the first upload keeps the session cache that lets the
-        /// next upload resume the TLS session instead of a full handshake.
-        http: ureq::Agent,
-    }
-
-    #[derive(Default)]
-    struct State {
-        /// What the last image the server accepted looks like.
-        uploaded: Option<Signature>,
-        /// Captures since then that looked the same, so were not sent.
-        skipped: u32,
-        /// Repeated failures, such as while no display is attached, are logged once.
+        refresh: Arc<Refresh>,
+        /// A random fraction of 1, for phases and jitter.
+        fraction: Fraction,
+        task: Option<JoinHandle<Finished>>,
+        /// Counts connections, so an upload that finishes after a reconnect
+        /// does not count as the new connection's first.
+        connection: u64,
+        /// The last image the server accepted on this connection, and when.
+        sent: Option<(Signature, Instant)>,
+        /// When the last capture finished, whether or not it was sent.
+        captured_at: Option<Instant>,
+        /// Repeated failures, such as while no display is attached, are
+        /// logged once.
         failing: bool,
         /// Failures in a row, and when the last one happened.
         failures: u32,
         failed_at: Option<Instant>,
     }
 
-    impl State {
+    impl Thumbnails {
+        pub fn new(mode: ExecutionMode) -> Self {
+            // One client for the life of the process: the TLS configuration
+            // it builds on the first upload keeps the session cache that lets
+            // the next upload resume the TLS session instead of a full
+            // handshake.
+            let http = http_client();
+            Self::with(
+                move |config, baseline| upload_if_changed(mode, config, &http, baseline),
+                || meshrmm_signaling_client::random_fraction().unwrap_or(0.5),
+            )
+        }
+
+        fn with(
+            refresh: impl Fn(&Config, Option<&Signature>) -> anyhow::Result<Option<Signature>>
+            + Send
+            + Sync
+            + 'static,
+            fraction: impl FnMut() -> f64 + Send + 'static,
+        ) -> Self {
+            let mut thumbnails = Self {
+                interval: IDLE_INTERVAL,
+                next: Instant::now(),
+                refresh: Arc::new(refresh),
+                fraction: Box::new(fraction),
+                task: None,
+                connection: 0,
+                sent: None,
+                captured_at: None,
+                failing: false,
+                failures: 0,
+                failed_at: None,
+            };
+            let delay = STARTUP_SPREAD.mul_f64(thumbnails.fraction());
+            thumbnails.next += delay;
+            thumbnails
+        }
+
+        /// A random fraction in `[0, 1]`.
+        fn fraction(&mut self) -> f64 {
+            let fraction = (self.fraction)();
+            if fraction.is_finite() {
+                fraction.clamp(0.0, 1.0)
+            } else {
+                0.5
+            }
+        }
+
+        /// The interval, up to [`JITTER`] longer or shorter at random.
+        fn jittered_interval(&mut self) -> Duration {
+            let fraction = self.fraction();
+            self.interval
+                .mul_f64(1.0 - JITTER + 2.0 * JITTER * fraction)
+        }
+
+        /// The interval the Agent refreshes at now.
+        #[cfg(test)]
+        fn interval(&self) -> Duration {
+            self.interval
+        }
+
+        /// Called on each connection to the server: it refreshes at
+        /// [`IDLE_INTERVAL`] until the server says otherwise, and sends its
+        /// first capture whatever it looks like. A capture that fell due
+        /// while the Agent was offline is put at a random point of the
+        /// interval, so a fleet reconnecting after an outage does not upload
+        /// together.
+        pub fn connected(&mut self) {
+            self.connection += 1;
+            self.sent = None;
+            let now = Instant::now();
+            if self.interval != IDLE_INTERVAL {
+                self.set_interval(IDLE_INTERVAL);
+            } else if self.next <= now {
+                self.next = now + self.interval.mul_f64(self.fraction());
+            }
+        }
+
+        /// Refreshes every `seconds` the server asked for, within what the
+        /// Agent accepts. The interval it already has changes nothing.
+        pub fn set_interval_seconds(&mut self, seconds: u32) {
+            let interval =
+                Duration::from_secs(u64::from(seconds)).clamp(SHORTEST_INTERVAL, LONGEST_INTERVAL);
+            self.set_interval(interval);
+        }
+
+        /// A shorter interval means someone started looking, so the next
+        /// capture is now, unless one finished within [`FRESH`]: then it is
+        /// an interval after that one. A longer one starts at a random part
+        /// of itself, so a fleet told the same in the same second, as when
+        /// the server restarts, does not capture together.
+        fn set_interval(&mut self, interval: Duration) {
+            if interval == self.interval {
+                return;
+            }
+            tracing::debug!(?interval, "screen thumbnail interval changed");
+            let now = Instant::now();
+            let sooner = interval < self.interval;
+            self.interval = interval;
+            self.next = if sooner {
+                match self.captured_at.filter(|at| now < *at + FRESH) {
+                    Some(at) => self.next.min(at + interval),
+                    None => now,
+                }
+            } else {
+                now + interval.mul_f64(self.fraction())
+            };
+        }
+
         /// When a quick retry is due, if one is.
         fn retry_at(&self) -> Option<Instant> {
             (self.failures <= QUICK_RETRIES)
@@ -570,112 +696,92 @@ mod schedule {
                 .map(|failed| failed + RETRY)
         }
 
-        /// What a new capture is compared with: nothing, so it is sent,
-        /// before the first upload and after [`MAX_SKIPPED`] skipped captures.
-        fn baseline(&self) -> Option<Signature> {
-            self.uploaded.clone().filter(|_| self.skipped < MAX_SKIPPED)
-        }
-
-        /// Records a capture, and returns the image to send, if any. It is
-        /// remembered as uploaded only once the server accepts it.
-        fn captured(&mut self, capture: Capture) -> Option<(Signature, Vec<u8>)> {
-            match capture {
-                Capture::Unchanged => {
-                    self.skipped = self.skipped.saturating_add(1);
-                    None
-                }
-                Capture::Changed { signature, jpeg } => Some((signature, jpeg)),
-            }
-        }
-
-        fn uploaded(&mut self, signature: Signature) {
-            self.uploaded = Some(signature);
-            self.skipped = 0;
-        }
-    }
-
-    impl Thumbnails {
-        pub fn new(mode: ExecutionMode) -> Self {
-            Self {
-                mode,
-                next: Instant::now() + random_part(STARTUP_SPREAD),
-                task: None,
-                state: Arc::default(),
-                http: http_client(),
-            }
-        }
-
-        /// Called on each connection to the server. A capture that fell due
-        /// while the Agent was offline is put at a random point of the next
-        /// interval, so a fleet reconnecting after an outage does not upload
-        /// together then and every five minutes after.
-        pub fn connected(&mut self) {
-            let now = Instant::now();
-            if self.next <= now {
-                self.next = now + random_part(INTERVAL);
-            }
-        }
-
-        /// Completes when the next thumbnail is due.
+        /// Completes when the next thumbnail is due. Cancel safe: a refresh
+        /// that finishes meanwhile is recorded by the next call.
         pub async fn due(&mut self) {
             loop {
-                let now = Instant::now();
-                if self.next <= now {
-                    self.next = now + jittered_interval();
-                    return;
-                }
-                let retry_at = {
-                    let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-                    state.retry_at()
+                let retry_at = self.retry_at();
+                let wake = retry_at.map_or(self.next, |at| at.min(self.next));
+                let running = async {
+                    match &mut self.task {
+                        Some(task) => task.await,
+                        None => std::future::pending().await,
+                    }
                 };
-                if retry_at.is_some_and(|at| at <= now) {
-                    self.state
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .failed_at = None;
+                tokio::select! {
+                    finished = running => {
+                        self.task = None;
+                        self.finished(finished);
+                    }
+                    () = tokio::time::sleep_until(wake) => {
+                        let now = Instant::now();
+                        if self.next <= now {
+                            self.next = now + self.jittered_interval();
+                            return;
+                        }
+                        if retry_at.is_some_and(|at| at <= now) {
+                            self.failed_at = None;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        fn finished(&mut self, finished: Result<Finished, tokio::task::JoinError>) {
+            let now = Instant::now();
+            let error = match finished {
+                Ok((connection, Ok(sent))) => {
+                    tracing::debug!(sent = sent.is_some(), "refreshed the screen thumbnail");
+                    self.captured_at = Some(now);
+                    if let Some(signature) = sent
+                        && connection == self.connection
+                    {
+                        self.sent = Some((signature, now));
+                    }
+                    self.failures = 0;
+                    self.failed_at = None;
+                    if std::mem::take(&mut self.failing) {
+                        tracing::info!("screen thumbnails are updating again");
+                    }
                     return;
                 }
-                // A capture still running can fail and ask for a retry, so
-                // this looks again at least once a second.
-                let wake = retry_at
-                    .map_or(self.next, |at| at.min(self.next))
-                    .saturating_duration_since(now)
-                    .min(Duration::from_secs(1));
-                tokio::time::sleep(wake).await;
+                Ok((_, Err(error))) => error,
+                Err(error) => error.into(),
+            };
+            self.failures = self.failures.saturating_add(1);
+            self.failed_at = Some(now);
+            if std::mem::replace(&mut self.failing, true) {
+                tracing::debug!(error = ?error, "screen thumbnail still unavailable");
+            } else {
+                tracing::warn!(error = ?error, "could not refresh the screen thumbnail; retrying");
             }
+        }
+
+        /// What a new capture is compared with: the last image sent on this
+        /// connection, until it is [`RESEND_AFTER`] old. Nothing, so the
+        /// capture is sent, before then and after.
+        fn baseline(&self) -> Option<Signature> {
+            let now = Instant::now();
+            self.sent
+                .as_ref()
+                .filter(|(_, at)| now < *at + RESEND_AFTER)
+                .map(|(signature, _)| signature.clone())
         }
 
         /// Starts a capture and upload unless one is still running.
         pub fn refresh(&mut self, config: &Config) {
-            if self.task.as_ref().is_some_and(|task| !task.is_finished()) {
+            if self.task.is_some() {
                 return;
             }
-            let (mode, config, state, http) = (
-                self.mode,
+            let (refresh, config, baseline, connection) = (
+                Arc::clone(&self.refresh),
                 config.clone(),
-                Arc::clone(&self.state),
-                self.http.clone(),
+                self.baseline(),
+                self.connection,
             );
             self.task = Some(tokio::task::spawn_blocking(move || {
-                let result = upload_if_changed(mode, &config, &http, &state);
-                let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
-                let Err(error) = result.map(|sent| {
-                    tracing::debug!(sent, "refreshed the screen thumbnail");
-                }) else {
-                    state.failures = 0;
-                    state.failed_at = None;
-                    if std::mem::take(&mut state.failing) {
-                        tracing::info!("screen thumbnails are updating again");
-                    }
-                    return;
-                };
-                state.failures = state.failures.saturating_add(1);
-                state.failed_at = Some(Instant::now());
-                if std::mem::replace(&mut state.failing, true) {
-                    tracing::debug!(error = ?error, "screen thumbnail still unavailable");
-                } else {
-                    tracing::warn!(error = ?error, "could not refresh the screen thumbnail; retrying");
-                }
+                (connection, refresh(&config, baseline.as_ref()))
             }));
         }
     }
@@ -688,33 +794,21 @@ mod schedule {
         }
     }
 
-    /// `of` scaled by a random fraction in `[0, 1)`.
-    fn random_part(of: Duration) -> Duration {
-        of.mul_f64(random_fraction().unwrap_or(0.5))
-    }
-
-    /// [`INTERVAL`], up to [`JITTER`] longer or shorter at random.
-    fn jittered_interval() -> Duration {
-        INTERVAL.mul_f64(1.0 - JITTER + 2.0 * JITTER * random_fraction().unwrap_or(0.5))
-    }
-
-    /// Returns whether an image was sent: one that looks like the last
-    /// upload is not, and isn't even encoded.
+    /// Returns the signature of the image sent: one that looks like
+    /// `baseline` is not sent, and isn't even encoded.
     fn upload_if_changed(
         mode: ExecutionMode,
         config: &Config,
         http: &ureq::Agent,
-        state: &Mutex<State>,
-    ) -> anyhow::Result<bool> {
-        let lock = || state.lock().unwrap_or_else(|error| error.into_inner());
-        let baseline = lock().baseline();
-        let capture = capture_for(mode, baseline.as_ref())?;
-        let Some((signature, jpeg)) = lock().captured(capture) else {
-            return Ok(false);
-        };
-        upload(config, http, &jpeg)?;
-        lock().uploaded(signature);
-        Ok(true)
+        baseline: Option<&Signature>,
+    ) -> anyhow::Result<Option<Signature>> {
+        match capture_for(mode, baseline)? {
+            Capture::Unchanged => Ok(None),
+            Capture::Changed { signature, jpeg } => {
+                upload(config, http, &jpeg)?;
+                Ok(Some(signature))
+            }
+        }
     }
 
     /// Keeps no connection open between uploads, minutes apart: an idle
@@ -749,70 +843,269 @@ mod schedule {
 
     #[cfg(test)]
     mod tests {
+        use std::sync::Mutex;
+
         use super::*;
+
+        const WATCHED: u32 = 300;
+        const IDLE: u32 = 3_600;
 
         fn signature(brightness: u8) -> Signature {
             Signature::from_bytes(&[brightness; Signature::BYTES])
         }
 
-        #[test]
-        fn failures_retry_soon_a_few_times_then_wait_for_the_interval() {
-            let failed = Instant::now();
-            let mut state = State::default();
-            assert_eq!(state.retry_at(), None);
-            state.failed_at = Some(failed);
-            for failures in 1..=QUICK_RETRIES {
-                state.failures = failures;
-                assert_eq!(state.retry_at(), Some(failed + RETRY));
-            }
-            state.failures = QUICK_RETRIES + 1;
-            assert_eq!(state.retry_at(), None);
+        fn at(minutes: u64, seconds: u64) -> Duration {
+            Duration::from_secs(minutes * 60 + seconds)
         }
 
-        #[test]
-        fn an_unchanged_screen_is_sent_again_after_about_an_hour() {
-            let mut state = State::default();
-            // The first capture is always sent.
-            assert_eq!(state.baseline(), None);
-            state.uploaded(signature(40));
-            for _ in 0..MAX_SKIPPED {
-                assert_eq!(state.baseline(), Some(signature(40)));
-                assert_eq!(state.captured(Capture::Unchanged), None);
-            }
-            assert_eq!(state.baseline(), None);
-            assert!(INTERVAL * (MAX_SKIPPED + 1) <= Duration::from_secs(60 * 60));
-            // Sending it starts the count again.
-            state.uploaded(signature(41));
-            assert_eq!(state.baseline(), Some(signature(41)));
+        /// A fake screen: what each capture sees, and what became of it.
+        struct Screen {
+            /// The brightness the screen shows, or none for a capture that
+            /// fails.
+            shows: Option<u8>,
+            /// Each capture's time since the test started, and whether it
+            /// was sent.
+            captures: Vec<(Duration, bool)>,
+            /// When captures failed.
+            failures: Vec<Duration>,
         }
 
-        #[test]
-        fn a_failed_upload_is_not_remembered_as_uploaded() {
-            let mut state = State::default();
-            state.uploaded(signature(40));
-            state.skipped = 3;
-            let changed = Capture::Changed {
-                signature: signature(200),
-                jpeg: vec![0xff, 0xd8],
-            };
-            assert_eq!(
-                state.captured(changed),
-                Some((signature(200), vec![0xff, 0xd8]))
+        struct Fake {
+            thumbnails: Thumbnails,
+            screen: Arc<Mutex<Screen>>,
+            config: Config,
+        }
+
+        /// Thumbnails of a fake screen, with `fraction` for every random
+        /// part. Its upload sends what the comparison says.
+        fn fake(fraction: f64) -> Fake {
+            let screen = Arc::new(Mutex::new(Screen {
+                shows: Some(40),
+                captures: Vec::new(),
+                failures: Vec::new(),
+            }));
+            let seen = Arc::clone(&screen);
+            let start = Instant::now();
+            let thumbnails = Thumbnails::with(
+                move |_, baseline| {
+                    let mut screen = seen.lock().unwrap();
+                    let at = start.elapsed();
+                    let Some(shows) = screen.shows else {
+                        screen.failures.push(at);
+                        anyhow::bail!("no display");
+                    };
+                    let image = signature(shows);
+                    let sent = !baseline.is_some_and(|baseline| baseline.looks_like(&image));
+                    screen.captures.push((at, sent));
+                    Ok(sent.then_some(image))
+                },
+                move || fraction,
             );
-            // Until the server accepts it, captures still compare with the
-            // image it has.
-            assert_eq!(state.baseline(), Some(signature(40)));
-            assert_eq!(state.skipped, 3);
+            Fake {
+                thumbnails,
+                screen,
+                config: Config {
+                    config_path: "agent.json".into(),
+                    server: "https://rmm.example.com".into(),
+                    device_id: "device".into(),
+                    agent_token: "token".into(),
+                    frames_per_second: 30,
+                    bitrate_bits_per_second: 1_000_000,
+                    json_logs: false,
+                },
+            }
         }
 
-        #[test]
-        fn intervals_average_about_the_interval() {
-            let low = INTERVAL.mul_f64(1.0 - JITTER);
-            let high = INTERVAL.mul_f64(1.0 + JITTER);
-            for _ in 0..100 {
-                assert!((low..=high).contains(&jittered_interval()));
-                assert!(random_part(STARTUP_SPREAD) < STARTUP_SPREAD);
+        impl Fake {
+            /// Runs the coordinator's loop for `wait`.
+            async fn run(&mut self, wait: Duration) {
+                let (thumbnails, config) = (&mut self.thumbnails, &self.config);
+                let _ = tokio::time::timeout(wait, async {
+                    loop {
+                        thumbnails.due().await;
+                        thumbnails.refresh(config);
+                    }
+                })
+                .await;
             }
+
+            /// The captures since the last call, as the time since the test
+            /// started, and whether each was sent.
+            fn captures(&self) -> Vec<(Duration, bool)> {
+                std::mem::take(&mut self.screen.lock().unwrap().captures)
+            }
+
+            fn show(&self, brightness: Option<u8>) {
+                self.screen.lock().unwrap().shows = brightness;
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_connection_starts_hourly_after_the_startup_spread() {
+            let mut fake = fake(0.5);
+            fake.thumbnails.connected();
+            assert_eq!(fake.thumbnails.interval(), IDLE_INTERVAL);
+            fake.run(at(200, 0)).await;
+            // Half the spread in, then an hour (the jitter's middle) after
+            // each. The screen did not change, so it is sent again only
+            // three hours after the first.
+            assert_eq!(
+                fake.captures(),
+                [
+                    (at(0, 30), true),
+                    (at(60, 30), false),
+                    (at(120, 30), false),
+                    (at(180, 30), true)
+                ]
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn becoming_watched_captures_at_once_then_every_five_minutes() {
+            let mut fake = fake(0.5);
+            fake.thumbnails.connected();
+            fake.run(at(10, 0)).await;
+            assert_eq!(fake.captures(), [(at(0, 30), true)]);
+            fake.show(Some(200));
+            fake.thumbnails.set_interval_seconds(WATCHED);
+            fake.run(at(16, 0)).await;
+            assert_eq!(
+                fake.captures(),
+                [
+                    (at(10, 0), true),
+                    (at(15, 0), false),
+                    (at(20, 0), false),
+                    (at(25, 0), false)
+                ]
+            );
+            // Told the same again, the timer stays where it was.
+            fake.thumbnails.set_interval_seconds(WATCHED);
+            fake.run(at(5, 0)).await;
+            assert_eq!(fake.captures(), [(at(30, 0), false)]);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn becoming_watched_again_within_the_minute_does_not_capture_again() {
+            let mut fake = fake(0.5);
+            fake.thumbnails.connected();
+            fake.run(at(2, 0)).await;
+            fake.thumbnails.set_interval_seconds(WATCHED);
+            fake.run(at(0, 10)).await;
+            assert_eq!(fake.captures(), [(at(0, 30), true), (at(2, 0), false)]);
+            // Unwatched and watched again, as a wall scrolled back and
+            // forth: the image is half a minute old, so the next is five
+            // minutes after it.
+            fake.thumbnails.set_interval_seconds(IDLE);
+            fake.run(at(0, 20)).await;
+            fake.thumbnails.set_interval_seconds(WATCHED);
+            fake.run(at(0, 10)).await;
+            assert_eq!(fake.captures(), []);
+            fake.run(at(5, 0)).await;
+            assert_eq!(fake.captures(), [(at(7, 0), false)]);
+            // Watched again minutes later: at once.
+            fake.thumbnails.set_interval_seconds(IDLE);
+            fake.run(at(2, 0)).await;
+            fake.thumbnails.set_interval_seconds(WATCHED);
+            fake.run(at(0, 1)).await;
+            assert_eq!(fake.captures(), [(at(9, 40), false)]);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn unwatched_refreshes_hourly_from_a_random_phase() {
+            for (fraction, first) in [(0.0, at(5, 0)), (0.25, at(20, 0)), (0.75, at(50, 0))] {
+                let mut fake = fake(fraction);
+                fake.thumbnails.connected();
+                fake.thumbnails.set_interval_seconds(WATCHED);
+                fake.run(at(5, 0)).await;
+                fake.captures();
+                // Unwatched five minutes in: a random part of the hour on.
+                fake.thumbnails.set_interval_seconds(IDLE);
+                fake.run(at(110, 0)).await;
+                let captures: Vec<Duration> =
+                    fake.captures().into_iter().map(|(at, _)| at).collect();
+                let hour = IDLE_INTERVAL.mul_f64(1.0 - JITTER + 2.0 * JITTER * fraction);
+                assert_eq!(captures, [first, first + hour], "fraction {fraction}");
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn the_interval_is_kept_within_what_the_agent_accepts() {
+            let mut fake = fake(0.0);
+            fake.thumbnails.set_interval_seconds(0);
+            assert_eq!(fake.thumbnails.interval(), SHORTEST_INTERVAL);
+            fake.thumbnails.set_interval_seconds(u32::MAX);
+            assert_eq!(fake.thumbnails.interval(), LONGEST_INTERVAL);
+            fake.thumbnails.set_interval_seconds(IDLE);
+            assert_eq!(fake.thumbnails.interval(), IDLE_INTERVAL);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn an_unchanged_screen_is_skipped_and_sent_again_after_three_hours() {
+            let mut fake = fake(0.0);
+            fake.thumbnails.connected();
+            fake.thumbnails.set_interval_seconds(WATCHED);
+            // Every 4 m 45 s, with the jitter at its shortest.
+            let every = at(4, 45);
+            fake.run(RESEND_AFTER + every).await;
+            let captures = fake.captures();
+            assert_eq!(captures.len(), 39);
+            let sent: Vec<Duration> = captures
+                .iter()
+                .filter(|(_, sent)| *sent)
+                .map(|(at, _)| *at)
+                .collect();
+            // The first, and the first three hours after it.
+            assert!(every * 37 < RESEND_AFTER && every * 38 >= RESEND_AFTER);
+            assert_eq!(sent, [Duration::ZERO, every * 38]);
+            // A change is sent at once.
+            fake.show(Some(200));
+            fake.run(every).await;
+            assert_eq!(fake.captures(), [(every * 39, true)]);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_new_connection_is_hourly_until_told_and_sends_its_first_capture() {
+            let mut fake = fake(0.5);
+            fake.thumbnails.connected();
+            fake.thumbnails.set_interval_seconds(WATCHED);
+            fake.run(at(6, 0)).await;
+            assert_eq!(fake.captures(), [(at(0, 0), true), (at(5, 0), false)]);
+            // Reconnected: hourly from a random phase, and the image is sent
+            // though the screen looks the same.
+            fake.thumbnails.connected();
+            assert_eq!(fake.thumbnails.interval(), IDLE_INTERVAL);
+            fake.run(at(60, 0)).await;
+            assert_eq!(fake.captures(), [(at(36, 0), true)]);
+            // Reconnected and told it is watched: at once, and sent.
+            fake.thumbnails.connected();
+            fake.thumbnails.set_interval_seconds(WATCHED);
+            fake.run(at(0, 1)).await;
+            assert_eq!(fake.captures(), [(at(66, 0), true)]);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn failures_retry_soon_a_few_times_then_wait_for_the_interval() {
+            let mut fake = fake(0.0);
+            fake.show(None);
+            fake.thumbnails.connected();
+            fake.thumbnails.set_interval_seconds(WATCHED);
+            fake.run(at(9, 0)).await;
+            // At once, four quick retries, then at the interval.
+            assert_eq!(
+                fake.screen.lock().unwrap().failures,
+                [
+                    at(0, 0),
+                    at(0, 30),
+                    at(1, 0),
+                    at(1, 30),
+                    at(2, 0),
+                    at(4, 45)
+                ]
+            );
+            fake.show(Some(40));
+            fake.run(at(1, 0)).await;
+            assert_eq!(fake.captures(), [(at(9, 30), true)]);
+            assert_eq!(fake.thumbnails.failures, 0);
         }
     }
 }
@@ -983,8 +1276,8 @@ mod tests {
             panic!("an unchanged capture was encoded")
         });
         assert_eq!(unchanged.unwrap(), Capture::Unchanged);
-        // Without an image to compare with, as when the last was sent an
-        // hour ago, it is encoded.
+        // Without an image to compare with, as the first on a connection
+        // or hours after the last was sent, it is encoded.
         let first = encode_if_changed(previous.clone(), None, || Ok(vec![0xff, 0xd8])).unwrap();
         assert_eq!(
             first,

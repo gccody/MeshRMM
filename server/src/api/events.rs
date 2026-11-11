@@ -1,5 +1,5 @@
 //! `GET /v1/events`: the website's socket for device presence, resource
-//! usage and alerts.
+//! usage, screen thumbnails and alerts.
 //!
 //! It sends a snapshot of the devices, then each change with the next
 //! revision. Live resource usage, which carries no revision, it sends only
@@ -15,7 +15,10 @@
 //!   latest reading of each device it starts watching at once, then every
 //!   few seconds the watched devices' readings taken since, and after each
 //!   snapshot every watched device's latest. A deleted device is dropped
-//!   from the set.
+//!   from the set. When the Agent of a watched device uploads a new screen
+//!   thumbnail, the socket sends `{"type":"thumbnails","device_ids":[...]}`
+//!   so the tab loads it; one that fell behind names every device it
+//!   watches.
 //! - `{"type":"refresh"}` asks for a new snapshot, when the tab missed a
 //!   change.
 //! - `{"type":"ping"}` is answered with `{"type":"pong"}`, so a tab can tell

@@ -10,7 +10,7 @@ use std::{
 use common::{
     Agent, App, Received, SOCKET_WAIT, Server, Ws, apps, apps_with, metrics_interval_within, quiet,
     receive, receive_any_json, receive_close, receive_json, send_json, send_text, set_up,
-    user_with,
+    thumbnail_interval_within, user_with,
 };
 use meshrmm_server::realtime::{
     metrics::WatchedSignal,
@@ -1611,6 +1611,147 @@ async fn agents_report_often_only_while_a_tab_watches_their_device() {
             "{name}"
         );
         drop((control, laptop_control));
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn agents_refresh_their_thumbnail_often_only_while_a_tab_watches_their_device() {
+    for app in apps_with(short_linger).await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let desk = app.enroll(&mut admin, "Desk").await;
+        let laptop = app.enroll(&mut admin, "Laptop").await;
+        let (d, l) = (desk.device_id.as_str(), laptop.device_id.as_str());
+        let mut events = admin.events(&server).await.unwrap();
+        assert_eq!(receive_json(&mut events).await["type"], "snapshot");
+        let (watched, idle) = (Some(300), Some(3_600));
+
+        // Nobody watches the desk: hourly.
+        let mut control = desk.connect(&server).await.unwrap();
+        assert_eq!(
+            thumbnail_interval_within(&mut control, SOCKET_WAIT).await,
+            idle,
+            "{name}"
+        );
+        // A tab watching it has it refresh every five minutes, told at once
+        // with the metrics interval.
+        watch(&mut events, &[d]).await;
+        until_pong(&mut events).await;
+        assert_eq!(
+            metrics_interval_within(&mut control, SOCKET_WAIT).await,
+            Some(5),
+            "{name}"
+        );
+        assert_eq!(
+            thumbnail_interval_within(&mut control, SOCKET_WAIT).await,
+            watched,
+            "{name}"
+        );
+        // An Agent connecting while a tab watches its device is told so.
+        watch(&mut events, &[d, l]).await;
+        until_pong(&mut events).await;
+        let mut laptop_control = laptop.connect(&server).await.unwrap();
+        assert_eq!(
+            thumbnail_interval_within(&mut laptop_control, SOCKET_WAIT).await,
+            watched,
+            "{name}"
+        );
+
+        // A second tab watching the desk, and leaving, tells nothing.
+        let mut second = admin.events(&server).await.unwrap();
+        receive_json(&mut second).await;
+        watch(&mut second, &[d]).await;
+        until_pong(&mut second).await;
+        drop(second);
+        assert_eq!(
+            thumbnail_interval_within(&mut control, 2 * LINGER).await,
+            None,
+            "{name}"
+        );
+
+        // Unwatched, it is slowed down only after the linger.
+        let left = Instant::now();
+        watch(&mut events, &[l]).await;
+        until_pong(&mut events).await;
+        assert_eq!(
+            thumbnail_interval_within(&mut control, SOCKET_WAIT).await,
+            idle,
+            "{name}"
+        );
+        assert!(left.elapsed() >= LINGER, "{name}: {:?}", left.elapsed());
+        assert_eq!(
+            thumbnail_interval_within(&mut laptop_control, Duration::ZERO).await,
+            None,
+            "{name}"
+        );
+        drop((control, laptop_control));
+        app.finish().await;
+    }
+}
+
+/// Uploads a screen thumbnail as the device's Agent.
+async fn upload_thumbnail(agent: &Agent, seed: u8) {
+    let mut jpeg = vec![seed; 64];
+    jpeg[..3].copy_from_slice(&[0xff, 0xd8, 0xff]);
+    let request = agent
+        .request(
+            axum::http::Method::PUT,
+            &format!("/v1/agents/{}/thumbnail", agent.device_id),
+        )
+        .header("content-type", "image/jpeg")
+        .body(axum::body::Body::from(jpeg))
+        .unwrap();
+    assert_eq!(
+        agent.send(request).await.status,
+        axum::http::StatusCode::NO_CONTENT
+    );
+}
+
+/// The devices of the next replaced thumbnails message, skipping others.
+async fn next_thumbnails(events: &mut Ws) -> Value {
+    loop {
+        let message = receive_json(events).await;
+        if message["type"] == "thumbnails" {
+            return message["device_ids"].clone();
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_new_thumbnail_is_announced_only_to_the_tabs_watching_its_device() {
+    for app in apps().await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let desk = app.enroll(&mut admin, "Desk").await;
+        let laptop = app.enroll(&mut admin, "Laptop").await;
+        let spare = app.enroll(&mut admin, "Spare").await;
+        let (d, l) = (desk.device_id.as_str(), laptop.device_id.as_str());
+        let mut desk_tab = admin.events(&server).await.unwrap();
+        assert_eq!(receive_json(&mut desk_tab).await["type"], "snapshot");
+        let mut laptop_tab = admin.events(&server).await.unwrap();
+        assert_eq!(receive_json(&mut laptop_tab).await["type"], "snapshot");
+        watch(&mut desk_tab, &[d]).await;
+        until_pong(&mut desk_tab).await;
+        watch(&mut laptop_tab, &[l]).await;
+        until_pong(&mut laptop_tab).await;
+
+        // Nobody watches the spare, so its upload is announced to no one;
+        // each tab's first announcement is of the device it watches.
+        upload_thumbnail(&spare, 1).await;
+        upload_thumbnail(&desk, 2).await;
+        assert_eq!(next_thumbnails(&mut desk_tab).await, json!([d]), "{name}");
+        upload_thumbnail(&laptop, 3).await;
+        assert_eq!(next_thumbnails(&mut laptop_tab).await, json!([l]), "{name}");
+        upload_thumbnail(&laptop, 4).await;
+        upload_thumbnail(&desk, 5).await;
+        assert_eq!(
+            next_thumbnails(&mut desk_tab).await,
+            json!([d]),
+            "{name}: the laptop's uploads went elsewhere"
+        );
         app.finish().await;
     }
 }

@@ -7,6 +7,8 @@ import type { Agent } from "./types";
 // A tile waits this long before asking for its image, so tiles that only
 // scroll past ask for nothing.
 const SETTLE_DELAY_MS = 150;
+// After a failed load.
+const RETRY_DELAY_MS = 60_000;
 
 const formatUpdated = (date: Date | null) =>
   date?.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) ?? null;
@@ -17,11 +19,11 @@ function useThumbnail(store: ThumbnailStore, id: string): Thumbnail | null {
   return useSyncExternalStore(subscribe, () => store.snapshot(id), () => null);
 }
 
-// The device's latest screen image, kept current while its tile is drawn
-// and the page is in front. The wall draws only the tiles on screen or
-// about to be. A hidden tab checks again as soon as it is shown.
-export function useDeviceScreen(store: ThumbnailStore, agent: Agent): Thumbnail | null {
-  const { id, connected } = agent;
+// The device's latest screen image, loaded when its tile is drawn and the
+// page is in front, and again when the server says it changed. The wall
+// draws only the tiles on screen or about to be. A load that failed is
+// tried again a while later.
+export function useDeviceScreen(store: ThumbnailStore, id: string): Thumbnail | null {
   const thumbnail = useThumbnail(store, id);
   useEffect(() => {
     let timer: number | undefined;
@@ -29,8 +31,7 @@ export function useDeviceScreen(store: ThumbnailStore, agent: Agent): Thumbnail 
     const check = async () => {
       window.clearTimeout(timer);
       if (document.visibilityState !== "visible") return;
-      const delay = await store.refresh(id, connected);
-      if (!cancelled && delay !== null) timer = window.setTimeout(() => void check(), delay);
+      if (await store.refresh(id) && !cancelled) timer = window.setTimeout(() => void check(), RETRY_DELAY_MS);
     };
     const onVisibilityChange = () => void check();
     timer = window.setTimeout(() => void check(), SETTLE_DELAY_MS);
@@ -40,7 +41,7 @@ export function useDeviceScreen(store: ThumbnailStore, agent: Agent): Thumbnail 
       window.clearTimeout(timer);
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, [store, id, connected]);
+  }, [store, id]);
   return thumbnail;
 }
 
@@ -59,7 +60,7 @@ export function ScreenPreview({ agent, store, returnFocus, onClose }: {
     <ModalDialog className="settings-modal thumbnail-modal" labelledBy={titleId} returnFocus={returnFocus} onClose={onClose}>
       <button type="button" className="modal-close" onClick={onClose} aria-label="Close"><X size={18} /></button>
       <h2 id={titleId}>{agent.name}</h2>
-      <p>{agent.connected ? "Refreshes every 5 minutes." : "Offline. This is the last image it sent."}{updated && <> Captured {updated}.</>}</p>
+      <p>{agent.connected ? "Refreshes every 5 minutes while shown." : "Offline. This is the last image it sent."}{updated && <> Captured {updated}.</>}</p>
       <img className="thumbnail-preview" src={thumbnail.url} alt={`The main display of ${agent.name}${updated ? ` at ${updated}` : ""}`} />
     </ModalDialog>
   );

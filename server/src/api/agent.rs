@@ -190,8 +190,9 @@ pub async fn put_thumbnail(
         return Err(problem);
     }
     let path = state.storage.thumbnail(&agent.device_id);
-    // Not flushed to disk: the Agent sends another within the hour, and a
-    // large fleet sends hundreds a second.
+    // Not flushed to disk: an image a crash loses comes back with the
+    // Agent's first capture after it reconnects, which it sends even when
+    // the screen looks the same, and a large fleet sends many a second.
     state
         .storage
         .write(path.clone(), bytes, Durability::Replaceable)
@@ -206,6 +207,8 @@ pub async fn put_thumbnail(
             .map_err(anyhow::Error::from)?;
         return Err(ApiError::conflict("the device is being removed"));
     }
+    // A tab showing the device loads the new image now.
+    state.metrics.thumbnail_replaced(&agent.device_id);
     Ok(StatusCode::NO_CONTENT)
 }
 

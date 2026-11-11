@@ -557,6 +557,7 @@ impl Coordinator {
         // The server is back: results waiting for a retry go now.
         self.outbox.connected();
         self.monitors.connected();
+        // Hourly until the server says someone watches the device.
         self.thumbnails.connected();
         // The server sends this connection's schedule first thing.
         self.update_schedule.connected();
@@ -715,6 +716,10 @@ impl Coordinator {
                 }
                 AgentCommand::SetMetricsInterval { seconds } => {
                     self.metrics.set_interval_seconds(seconds);
+                    return Ok(ControlFlow::Continue(()));
+                }
+                AgentCommand::SetThumbnailInterval { seconds } => {
+                    self.thumbnails.set_interval_seconds(seconds);
                     return Ok(ControlFlow::Continue(()));
                 }
                 AgentCommand::InstallUpdates { install } => {

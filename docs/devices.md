@@ -288,6 +288,13 @@ arrives instead of an old one. A tab that has heard nothing for 30
 seconds when it is shown sends `{"type":"ping"}` and replaces the socket
 if no `{"type":"pong"}` comes within 5 seconds.
 
+The same watch decides how often the device's Agent refreshes its
+[screen thumbnail](screen-thumbnails.md): every 5 minutes, starting at
+once, while a tab watches it, and about hourly otherwise. When it uploads
+one, each socket watching the device is sent
+`{"type":"thumbnails","device_ids":[...]}` and the tab loads the new image;
+a socket that fell behind is sent every device it watches.
+
 The server keeps the live readings in memory
 (`server/src/realtime/metrics.rs`) and averages each minute into the
 database, where history is kept for 7 days. Averages weight each reading by

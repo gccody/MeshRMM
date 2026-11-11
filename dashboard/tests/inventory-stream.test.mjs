@@ -77,7 +77,7 @@ function harness({ online, random = () => 0.5, watch } = {}) {
   const state = {
     get agents() { return devices.agents(); },
     get companies() { return devices.companies(); },
-    refused: 0, refusedAt: [], readings: [], alerts: [], jobs: [], updates: [], errors: [], failing: false,
+    refused: 0, refusedAt: [], readings: [], thumbnails: [], alerts: [], jobs: [], updates: [], errors: [], failing: false,
   };
   const fail = name => {
     if (state.failing) throw new Error(`${name} listener failed`);
@@ -94,6 +94,7 @@ function harness({ online, random = () => 0.5, watch } = {}) {
       apply: change => { fail('inventory'); devices.apply(change); },
     },
     onMetrics: readings => { fail('metrics'); state.readings.push(...readings); },
+    onThumbnails: ids => { fail('thumbnails'); state.thumbnails.push(ids); },
     watch,
     onAlerts: event => { fail('alerts'); state.alerts.push(event); },
     onJobs: event => { fail('jobs'); state.jobs.push(event); },
@@ -759,5 +760,16 @@ test('update events arrive beside the revisions without disturbing them', () => 
   sockets[0].receive({ type: 'updates_resync' });
   assert.deepEqual(state.updates, [{ type: 'device_updates', device }, { type: 'update_run', run }, { type: 'updates_resync' }]);
   assert.equal(revision.current, 2);
+  assert.deepEqual(sockets[0].sent, [], 'no snapshot is requested');
+});
+
+test('replaced screen images arrive beside the revisions without disturbing them', () => {
+  const { sockets, state, revision } = harness();
+  sockets[0].open();
+  sockets[0].receive({ type: 'snapshot', revision: 3, agents: [agent('a')], generated_at_unix_ms: 0 });
+  sockets[0].receive({ type: 'thumbnails', device_ids: ['a', 7, 'b'] });
+  sockets[0].receive({ type: 'thumbnails' });
+  assert.deepEqual(state.thumbnails, [['a', 'b']], 'only device IDs');
+  assert.equal(revision.current, 3);
   assert.deepEqual(sockets[0].sent, [], 'no snapshot is requested');
 });

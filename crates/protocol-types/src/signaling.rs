@@ -2,6 +2,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{FileDeliveryRequest, RemoteSessionId, ScriptRunRequest};
 
+/// How often the Agent refreshes the device's screen thumbnail while a
+/// website tab shows the device ([`AgentCommand::SetThumbnailInterval`]).
+pub const THUMBNAIL_WATCHED_INTERVAL_SECONDS: u64 = 5 * 60;
+/// How often it does otherwise.
+pub const THUMBNAIL_IDLE_INTERVAL_SECONDS: u64 = 60 * 60;
+
 pub fn default_enabled() -> bool {
     true
 }
@@ -145,6 +151,17 @@ pub enum AgentCommand {
     /// otherwise. Sent when the Agent connects and when that changes. The
     /// Agent keeps what it is told within a range of its own.
     SetMetricsInterval {
+        seconds: u32,
+    },
+    /// How often the Agent refreshes the device's screen thumbnail, in
+    /// seconds: every [`THUMBNAIL_WATCHED_INTERVAL_SECONDS`] while a website
+    /// tab shows the device, every [`THUMBNAIL_IDLE_INTERVAL_SECONDS`]
+    /// otherwise. Sent with [`Self::SetMetricsInterval`], when the Agent
+    /// connects and when the device's watched state changes. A shorter
+    /// interval than the Agent had means someone is looking, so it captures
+    /// at once unless it just did. The Agent keeps what it is told within a
+    /// range of its own.
+    SetThumbnailInterval {
         seconds: u32,
     },
     /// Installs pending operating system updates, then scans again.
@@ -511,6 +528,13 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<AgentCommand>(&json).unwrap(),
             interval
+        );
+        let thumbnails = AgentCommand::SetThumbnailInterval { seconds: 300 };
+        let json = serde_json::to_string(&thumbnails).unwrap();
+        assert_eq!(json, r#"{"type":"set_thumbnail_interval","seconds":300}"#);
+        assert_eq!(
+            serde_json::from_str::<AgentCommand>(&json).unwrap(),
+            thumbnails
         );
         let install = AgentCommand::InstallUpdates {
             install: crate::UpdateInstallRequest {
