@@ -190,22 +190,19 @@ fn stage(config: &Config) -> anyhow::Result<Option<Staged>> {
         InstallLock::try_take(&updates)?.context("an Agent update is still being installed")?;
     remove_leftovers(Path::new(INSTALL_DIRECTORY));
     tracing::info!(version = %release.version, "downloading an Agent update");
-    let executable = read_limited(
-        http.get(&release.url)
-            .call()
-            .context("could not download the Agent update")?
-            .into_body()
-            .into_reader(),
-        MAX_UPDATE_BYTES,
-    )?;
-    // Only a complete download uses an attempt, so one cut short is retried on the backoff.
-    super::installer::replace_file(&attempts_path, &serde_json::to_vec(&attempt)?)?;
-    release.verify(&executable)?;
+    let body = http
+        .get(&release.url)
+        .call()
+        .context("could not download the Agent update")?
+        .into_body()
+        .into_reader();
     // Beside the installed Agent, so the swap is a rename on one file system
     // and the new file gets the folder's SELinux label.
     let staged = Path::new(INSTALL_DIRECTORY).join(format!("{STAGED_PREFIX}{}", release.version));
-    super::installer::replace_file(&staged, &executable)?;
-    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
+    stage_executable(body, &staged, &release, || {
+        // Only a complete download uses an attempt, so one cut short is retried on the backoff.
+        super::installer::replace_file(&attempts_path, &serde_json::to_vec(&attempt)?)
+    })?;
     Ok(Some(Staged {
         version: release.version,
         executable: staged,
@@ -238,6 +235,25 @@ fn record_next_check(next: &NextCheck) {
     if let Err(error) = written {
         tracing::warn!(error = ?error, "could not record when the next Agent update check is due");
     }
+}
+
+/// Downloads the Agent update from `body` into `staged`, a new file in the root-owned install
+/// directory, checks that it is the release, and makes it executable through the handle it was
+/// written with; see [`crate::update_download`]. `complete` runs once the whole of it has arrived.
+fn stage_executable(
+    body: impl Read,
+    staged: &Path,
+    release: &meshrmm_self_update::Release,
+    complete: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let verified =
+        crate::update_download::download(body, staged, MAX_UPDATE_BYTES, release, complete)?;
+    verified
+        .file()
+        .set_permissions(std::fs::Permissions::from_mode(0o755))
+        .context("could not make the Agent update executable")?;
+    verified.keep();
+    Ok(())
 }
 
 fn read_limited(reader: impl Read, limit: u64) -> anyhow::Result<Vec<u8>> {
@@ -378,6 +394,7 @@ fn main_pid() -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::update_download::tests::{Staging, crash_during_download, release_of_bytes};
 
     #[test]
     fn reads_downloads_up_to_the_limit() {
@@ -418,5 +435,39 @@ mod tests {
         remove_leftovers_unless_installing(&updates, &install).unwrap();
         assert_eq!(names(), ["meshrmm-agent"]);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn stages_a_verified_build_only_root_can_change() {
+        let install = Staging::new();
+        let build = b"ELF a Linux build".repeat(10_000);
+        let staged = install.0.join(format!("{STAGED_PREFIX}1.2.3"));
+        stage_executable(&build[..], &staged, &release_of_bytes(&build), || Ok(())).unwrap();
+        assert_eq!(install.names(), [format!("{STAGED_PREFIX}1.2.3")]);
+        assert_eq!(std::fs::read(&staged).unwrap(), build);
+        let metadata = std::fs::metadata(&staged).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o755);
+        // SAFETY: geteuid has no preconditions.
+        assert_eq!(std::os::unix::fs::MetadataExt::uid(&metadata), unsafe {
+            libc::geteuid()
+        });
+        std::fs::remove_file(&staged).unwrap();
+        // One that does not match is refused, and removed.
+        let error = stage_executable(&build[1..], &staged, &release_of_bytes(&build), || Ok(()))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("SHA-256"), "{error:#}");
+        assert!(install.names().is_empty(), "{:?}", install.names());
+    }
+
+    #[test]
+    fn removes_a_download_a_crash_cut_short_at_the_next_start() {
+        let root = Staging::new();
+        let updates = root.0.join("updates");
+        let install = root.0.join("opt");
+        std::fs::create_dir_all(&updates).unwrap();
+        std::fs::create_dir_all(&install).unwrap();
+        crash_during_download(&install, &format!("{STAGED_PREFIX}1.2.3"));
+        remove_leftovers_unless_installing(&updates, &install).unwrap();
+        assert!(std::fs::read_dir(&install).unwrap().next().is_none());
     }
 }

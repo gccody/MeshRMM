@@ -357,8 +357,18 @@ that wrote it), so a restart keeps its place in the schedule:
 
 For a newer release it:
 
-1. checks the manifest entry's release signature and downloads the build;
-2. checks the build's SHA-256;
+1. checks the manifest entry's release signature and downloads the build
+   straight into a new file in its staging area, which only the Agent
+   (LocalSystem or root) can write: the private `updates` directory on
+   Windows and macOS, `/opt/meshrmm` on Linux. The build passes through one
+   64 KB buffer, hashed as it is written, rather than being held in memory,
+   and the download stops as soon as it passes 256 MB;
+2. checks the build's SHA-256 over every byte written. Nothing runs or
+   unpacks the file before then. A download that is cut short, fills the
+   disk, is too large or doesn't match is removed at once, with the reason
+   in the log, and one a crash or power cut interrupts is removed when the
+   Agent next starts. A download is never resumed: the next check starts it
+   again;
 3. waits, if work started while it downloaded, until the Agent is not busy,
    looking every few seconds, but no longer than the 24 hours counted from
    when its check was first postponed. Work that arrives meanwhile is

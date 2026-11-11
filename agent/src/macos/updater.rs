@@ -211,17 +211,13 @@ fn stage(config: &Config) -> anyhow::Result<Option<Staged>> {
         InstallLock::try_take(&updates)?.context("an Agent update is still being installed")?;
     remove_leftovers(&updates);
     tracing::info!(version = %release.version, "downloading an Agent update");
-    let archive = read_limited(
-        http.get(&release.url)
-            .call()
-            .context("could not download the Agent update")?
-            .into_body()
-            .into_reader(),
-        MAX_UPDATE_BYTES,
-    )?;
-    // Only a complete download uses an attempt, so one cut short is retried on the backoff.
-    super::installer::replace_file(&attempts_path, &serde_json::to_vec(&attempt)?)?;
-    release.verify(&archive)?;
+    let body = http
+        .get(&release.url)
+        .call()
+        .context("could not download the Agent update")?
+        .into_body()
+        .into_reader();
+    // In the root-only update directory, which the sweep above and the next start clear.
     let staging = updates.join(format!(
         "{STAGING_PREFIX}{}-{}",
         release.version,
@@ -230,7 +226,18 @@ fn stage(config: &Config) -> anyhow::Result<Option<Staged>> {
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging)?;
     let archive_path = staging.join("agent.zip");
-    std::fs::write(&archive_path, &archive)?;
+    let archive =
+        crate::update_download::download(body, &archive_path, MAX_UPDATE_BYTES, &release, || {
+            // Only a complete download uses an attempt, so one cut short is retried on the backoff.
+            super::installer::replace_file(&attempts_path, &serde_json::to_vec(&attempt)?)
+        });
+    let archive_path = match archive {
+        Ok(archive) => archive.keep(),
+        Err(error) => {
+            let _ = std::fs::remove_dir(&staging);
+            return Err(error);
+        }
+    };
     command(
         "/usr/bin/ditto",
         &[
@@ -456,6 +463,21 @@ fn command(program: &str, arguments: &[&std::ffi::OsStr]) -> anyhow::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::update_download::tests::{Staging, crash_during_download};
+
+    #[test]
+    fn removes_a_download_a_crash_cut_short_unless_an_installer_runs() {
+        let updates = Staging::new();
+        let staging = updates.0.join(format!("{STAGING_PREFIX}1.2.3-41"));
+        std::fs::create_dir(&staging).unwrap();
+        crash_during_download(&staging, "agent.zip");
+        let installer = InstallLock::try_take(&updates.0).unwrap().unwrap();
+        remove_leftovers_unless_installing(&updates.0).unwrap();
+        assert!(staging.join("agent.zip").is_file());
+        drop(installer);
+        remove_leftovers_unless_installing(&updates.0).unwrap();
+        assert_eq!(updates.names(), ["install.lock"]);
+    }
 
     #[test]
     fn reads_downloads_up_to_the_limit() {

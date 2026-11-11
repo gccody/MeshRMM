@@ -927,6 +927,7 @@ pub(crate) mod test_support {
     use windows::Win32::Security::{TOKEN_ELEVATION, TokenElevation};
 
     pub const PRIVATE: &str = PRIVATE_DIRECTORY_SDDL;
+    pub const INHERITED_FILE: &str = INHERITED_FILE_SDDL;
 
     /// Replacing owners and bypassing hostile DACLs needs an elevated administrator.
     pub fn elevated() -> bool {
