@@ -8,7 +8,7 @@
 //! docs/application-deployment.md.
 use axum::{
     Json,
-    extract::{Path, Query as QueryParameters, State},
+    extract::{Path, Query as QueryParameters, State, rejection::QueryRejection},
     http::{HeaderMap, StatusCode},
     response::Response,
 };
@@ -22,7 +22,7 @@ use crate::{
         self, Start,
         jobs::{self, Request},
         library::{self, Application, ApplicationInput, Usage},
-        policies,
+        outdated, policies,
         runs::{self, Action, Filter, NewRun, Run},
         store::{self, Matches},
     },
@@ -550,17 +550,95 @@ pub async fn get_run(
         .ok_or_else(|| ApiError::not_found("Application run not found"))
 }
 
-/// `GET /v1/packages/outdated`: every outdated package in the fleet, with
-/// the devices it is outdated on.
+/// The most outdated packages, or devices of one, a page holds.
+const MAX_OUTDATED_PAGE: u64 = 200;
+const DEFAULT_OUTDATED_PAGE: u64 = 100;
+
+/// Refused, like any other mistake, as an error the website can show.
+fn parameters<T>(query: Result<QueryParameters<T>, QueryRejection>) -> Result<T, ApiError> {
+    query
+        .map(|QueryParameters(parameters)| parameters)
+        .map_err(|rejection| ApiError::bad_request(rejection.body_text()))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutdatedParameters {
+    /// Part of the package's name or ID, or of its library application's
+    /// name, in any case.
+    query: Option<String>,
+    /// 0 for only the counts.
+    limit: Option<u64>,
+    offset: Option<u64>,
+}
+
+/// `GET /v1/packages/outdated?query=&limit=&offset=`: a page of the fleet's
+/// outdated packages, on the most devices first, each with how many devices
+/// have it outdated; how many packages the search matches; and of those
+/// not pinned, how many there are and how many updates they make.
 pub async fn outdated(
     State(state): State<AppState>,
     actor: Authorized,
-) -> Result<Json<Value>, ApiError> {
+    query: Result<QueryParameters<OutdatedParameters>, QueryRejection>,
+) -> Result<Json<outdated::Page>, ApiError> {
     actor.require(Permission::ApplicationsView)?;
+    let parameters = parameters(query)?;
+    let text = super::system_info::search_text(parameters.query, "query")?;
+    let limit = parameters
+        .limit
+        .unwrap_or(DEFAULT_OUTDATED_PAGE)
+        .min(MAX_OUTDATED_PAGE);
     let mut database = &state.database;
     let library = library::load(&mut database, None).await?;
-    let packages = store::outdated(&mut database, &Matches::new(&library)).await?;
-    Ok(Json(json!({ "packages": packages })))
+    let matches = Matches::new(&library);
+    let filter = outdated::ListFilter::new(text, &matches);
+    Ok(Json(
+        outdated::page(
+            &mut database,
+            &filter,
+            &matches,
+            limit,
+            parameters.offset.unwrap_or(0),
+        )
+        .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutdatedDevicesParameters {
+    /// As `source:id`, such as `winget:Mozilla.Firefox`.
+    package: String,
+    limit: Option<u64>,
+    /// The `next` of the page before.
+    after: Option<String>,
+}
+
+/// `GET /v1/packages/outdated/devices?package=&limit=&after=`: a page of the
+/// devices with a package outdated, in device ID order, and the `after` of
+/// the next page.
+pub async fn outdated_devices(
+    State(state): State<AppState>,
+    actor: Authorized,
+    query: Result<QueryParameters<OutdatedDevicesParameters>, QueryRejection>,
+) -> Result<Json<outdated::DevicePage>, ApiError> {
+    actor.require(Permission::ApplicationsView)?;
+    let parameters = parameters(query)?;
+    let package = jobs::parse_packages(std::slice::from_ref(&parameters.package))?
+        .pop()
+        .ok_or_else(|| jobs::invalid("name the package as source:id"))?;
+    let after = parameters
+        .after
+        .as_deref()
+        .map(|id| parse_id(id, "device"))
+        .transpose()?;
+    let limit = parameters
+        .limit
+        .unwrap_or(DEFAULT_OUTDATED_PAGE)
+        .min(MAX_OUTDATED_PAGE);
+    Ok(Json(
+        outdated::devices(&mut &state.database, &package, after.as_deref(), limit).await?,
+    ))
 }
 
 /// `GET /v1/agents/{id}/application-runs/{run_id}/files/{file_id}`: the

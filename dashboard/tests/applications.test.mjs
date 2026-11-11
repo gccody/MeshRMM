@@ -9,9 +9,13 @@ import {
   describeUpdate,
   filterPackages,
   installersChanged,
+  chosenUpdates,
+  joinDevicePage,
   namesText,
-  oldestOutdated,
-  outdatedTotals,
+  outdatedDevicesQuery,
+  outdatedLabel,
+  outdatedQuery,
+  outdatedSummary,
   packageKey,
   platformsOf,
   itemTone,
@@ -175,7 +179,32 @@ test("library applications, packages and runs read as words", () => {
   assert.deepEqual(["succeeded", "unchanged", "skipped", "failed"].map(itemTone), ["success", "success", "muted", "problem"]);
 });
 
-test("device packages and the fleet's outdated ones filter and total", () => {
+test("the fleet's outdated packages are asked for a page at a time", () => {
+  // The search is trimmed and left out when empty; the first page has no offset.
+  assert.equal(outdatedQuery("", 0), "limit=100");
+  assert.equal(outdatedQuery("  fire fox ", 200, 50), "query=fire+fox&limit=50&offset=200");
+  const git = { source: "winget", package_id: "Git.Git" };
+  assert.equal(outdatedDevicesQuery(git, null), "package=winget%3AGit.Git&limit=100");
+  assert.equal(outdatedDevicesQuery(git, "d2", 2), "package=winget%3AGit.Git&limit=2&after=d2");
+
+  const device = (id) => ({ device_id: id, device_name: id, version: "1", available_version: "2", outdated_since: 1 });
+  const first = { devices: [device("d1"), device("d2")], next: "d2" };
+  const second = joinDevicePage(first, "d2", { devices: [device("d2"), device("d3")], next: null });
+  assert.deepEqual(second.devices.map((shown) => shown.device_id), ["d1", "d2", "d3"], "a device already shown isn't shown again");
+  assert.equal(second.next, null, "the last page ends the list");
+  assert.equal(joinDevicePage(second, "d2", { devices: [device("d4")], next: null }), second, "a page asked after another than the last one shown changes nothing");
+
+  // Pinned packages can't be chosen, so these count every update chosen.
+  assert.equal(chosenUpdates([{ devices: 3 }, { devices: 2 }]), 5);
+  assert.equal(chosenUpdates([]), 0);
+  assert.equal(outdatedLabel(["Firefox"]), "Firefox is outdated");
+  assert.equal(outdatedLabel(["Firefox", "7-Zip"]), "any of Firefox and 7-Zip is outdated");
+  assert.equal(outdatedLabel([]), "an application that isn't pinned is outdated");
+  assert.equal(outdatedSummary(1, false), "1 application, on the most devices first");
+  assert.equal(outdatedSummary(3, true), "3 applications match");
+});
+
+test("device packages filter", () => {
   const packages = [
     { source: "winget", package_id: "Git.Git", name: "Git", version: "2.44", available_version: "2.45", outdated_since: 5, application_id: null, application_name: null, held: false },
     { source: "chocolatey", package_id: "7zip", name: "7-Zip", version: "24.08", available_version: null, outdated_since: null, application_id: "a", application_name: "Archiver", held: false },
@@ -183,22 +212,6 @@ test("device packages and the fleet's outdated ones filter and total", () => {
   assert.deepEqual(filterPackages(packages, "", true).map((pkg) => pkg.name), ["Git"]);
   assert.deepEqual(filterPackages(packages, "archiver", false).map((pkg) => pkg.name), ["7-Zip"]);
   assert.deepEqual(filterPackages(packages, "GIT.git", false).map((pkg) => pkg.name), ["Git"]);
-  const outdated = [
-    { source: "winget", package_id: "Git.Git", name: "Git", application_id: null, application_name: null, held: false, devices: [
-      { device_id: "d1", device_name: "One", version: "2.44", available_version: "2.45", outdated_since: 20 },
-      { device_id: "d2", device_name: "Two", version: "2.43", available_version: "2.45", outdated_since: 10 },
-    ] },
-    { source: "homebrew", package_id: "wget", name: "wget", application_id: null, application_name: null, held: false, devices: [
-      { device_id: "d1", device_name: "One", version: "1.21", available_version: "1.24", outdated_since: null },
-    ] },
-  ];
-  assert.deepEqual(outdatedTotals(outdated), { packages: 2, devices: 2, updates: 3 });
-  const pinned = { source: "snap", package_id: "hello", name: "hello", application_id: "h", application_name: "GNU Hello", held: true, devices: [
-    { device_id: "d3", device_name: "Three", version: "2.10.1", available_version: "2.10", outdated_since: 5 },
-  ] };
-  assert.deepEqual(outdatedTotals([...outdated, pinned]), { packages: 2, devices: 2, updates: 3 }, "pinned packages aren't pending");
-  assert.equal(oldestOutdated(outdated[0]), 10);
-  assert.equal(oldestOutdated(outdated[1]), null);
   assert.deepEqual(uninstallableInventory([{ name: "a", source: "windows" }, { name: "b", source: "windows_user" }, { name: "c", source: "dpkg" }]).map((program) => program.name), ["a"]);
 });
 

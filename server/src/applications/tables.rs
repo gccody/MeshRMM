@@ -45,10 +45,22 @@ pub enum DevicePackages {
     DeviceId,
     Source,
     PackageId,
+    PackageKey,
     Name,
     Version,
     AvailableVersion,
     OutdatedSince,
+}
+
+#[derive(Iden)]
+pub enum OutdatedPackages {
+    Table,
+    Source,
+    PackageKey,
+    PackageId,
+    Name,
+    AvailableVersion,
+    Devices,
 }
 
 #[derive(Iden)]

@@ -403,8 +403,8 @@ impl Ord for PackageKey {
 }
 
 impl PackageKey {
-    /// The ID as keys compare it.
-    fn folded(&self) -> std::borrow::Cow<'_, str> {
+    /// The ID as keys compare it: lowercase where the manager ignores case.
+    pub fn folded(&self) -> std::borrow::Cow<'_, str> {
         if self.source.ignores_case() {
             std::borrow::Cow::Owned(self.id.to_ascii_lowercase())
         } else {

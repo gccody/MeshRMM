@@ -84,7 +84,7 @@ fn contains(text: &str) -> String {
 /// `lower(column) LIKE lower('%text%')`. Each database folds both sides the
 /// same way, so SQLite, whose `lower` knows only ASCII letters, still
 /// matches other letters in their exact case.
-fn column_contains(column: impl sea_query::IntoColumnRef, text: &str) -> SimpleExpr {
+pub(crate) fn column_contains(column: impl sea_query::IntoColumnRef, text: &str) -> SimpleExpr {
     expr_contains(Expr::col(column), text)
 }
 

@@ -866,7 +866,8 @@ CREATE TABLE jobs (
   reboot TEXT CHECK (reboot IS NULL OR reboot IN ('never', 'if_required', 'always')),
   reboot_delay_minutes INTEGER,
   -- Which devices it was started on, and that in words, such as "Acme, Globex".
-  target TEXT NOT NULL CHECK (target IN ('devices', 'companies', 'tags', 'all')),
+  -- 'outdated': the devices where chosen packages, or any, were outdated.
+  target TEXT NOT NULL CHECK (target IN ('devices', 'companies', 'tags', 'all', 'outdated')),
   target_label TEXT NOT NULL,
   -- Offline devices are skipped, or waited for until expires_at.
   offline TEXT NOT NULL CHECK (offline IN ('skip', 'wait')),
@@ -1199,11 +1200,15 @@ CREATE TABLE device_application_status (
 
 -- The packages each device's latest scan found installed, with the newer
 -- version the manager offers. outdated_since is when a scan first found it
--- outdated, kept across scans while it stays so.
+-- outdated, kept across scans while it stays so. package_key is the ID as
+-- the package's manager compares it: lowercase for those that ignore case
+-- (winget, Chocolatey, Homebrew), so `Git.Git` and `git.git` are one
+-- package.
 CREATE TABLE device_packages (
   device_id TEXT NOT NULL,
   source TEXT NOT NULL,
   package_id TEXT NOT NULL,
+  package_key TEXT NOT NULL,
   name TEXT NOT NULL,
   version TEXT,
   available_version TEXT,
@@ -1213,6 +1218,29 @@ CREATE TABLE device_packages (
 
 CREATE INDEX idx_device_packages_package ON device_packages (source, package_id);
 CREATE INDEX idx_device_packages_outdated ON device_packages (outdated_since);
+-- The devices with a package outdated, in device ID order: a page of one
+-- package's devices, and the devices a job on an outdated package covers.
+CREATE INDEX idx_device_packages_outdated_key ON device_packages (source, package_key, device_id)
+  WHERE outdated_since IS NOT NULL;
+
+-- How many devices have each package outdated, changed in the transaction
+-- that changes a device's rows in device_packages, so the fleet's outdated
+-- packages are read from here instead of grouping every device's packages.
+-- Keyed as device_packages' package_key; package_id and name are as the
+-- first device to have it outdated listed them, and available_version the
+-- newest version a scan offered. A row whose count reaches 0 is removed.
+CREATE TABLE outdated_packages (
+  source TEXT NOT NULL,
+  package_key TEXT NOT NULL,
+  package_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  available_version TEXT,
+  devices INTEGER NOT NULL,
+  PRIMARY KEY (source, package_key)
+);
+
+-- The packages outdated on the most devices first.
+CREATE INDEX idx_outdated_packages_devices ON outdated_packages (devices DESC, name, source, package_key);
 
 -- Scans, installs, updates and uninstalls the server asked a device for: by
 -- a user, or as a device's part of a job (job_id). `request` is the JSON

@@ -23,7 +23,7 @@ the same job list.
   [patch management](patch-management.md#the-website).
 - **Applications page:** **Install on devices** on a library application,
   or the **Outdated** tab's **Update on their devices…** and **Update
-  all…**; see
+  all…**, which can also run where the packages are outdated; see
   [application deployment](application-deployment.md#installing-updating-and-uninstalling).
 
 The dialog chooses:
@@ -34,7 +34,13 @@ The dialog chooses:
 - the devices: chosen ones, every device in chosen companies, every device
   with any (or all) of chosen tags, or every device. Companies, tags and
   every device need `jobs.run_wide`. They are resolved when the job starts,
-  so a device that enrolls or is tagged later isn't part of it;
+  so a device that enrolls or is tagged later isn't part of it. An update of
+  applications can also run where packages are outdated: the devices where
+  chosen packages, or any that the library doesn't pin, are outdated as the
+  job starts, which needs no `jobs.run_wide` since it only updates what the
+  devices have outdated. Policies and alert rules can't use it: an update
+  policy already updates only what is outdated on its devices each time it
+  runs, and a rule watches devices rather than packages;
 - what happens to devices that are offline: skip them, or run when they
   connect within 1 to 168 hours (24 by default).
 
@@ -390,7 +396,7 @@ All routes need a signed-in user.
 
 | Route | |
 |---|---|
-| `POST /v1/jobs` | `{script_id, run_as}`, `{file_id, destination}` or `{updates: {action: "scan"}}` / `{updates: {action: "install", categories, reboot, reboot_delay_minutes}}` or `{applications: {action, application_ids, packages, mode, inventory}}` (see [application deployment](application-deployment.md#api)), with `target` (`devices`, `companies`, `tags` or `all`), `device_ids`, `company_ids` or `tag_ids` with `tag_match` (`any`, the default, or `all`), `offline` (`skip` or `wait`) and `wait_hours`. Returns the job with its counts. `400 no_devices` if the target covers none. |
+| `POST /v1/jobs` | `{script_id, run_as}`, `{file_id, destination}` or `{updates: {action: "scan"}}` / `{updates: {action: "install", categories, reboot, reboot_delay_minutes}}` or `{applications: {action, application_ids, packages, mode, inventory}}` (see [application deployment](application-deployment.md#api)), with `target` (`devices`, `companies`, `tags` or `all`; for an update of applications also `outdated`, with `packages` as `source:id`, none for any that isn't pinned), `device_ids`, `company_ids` or `tag_ids` with `tag_match` (`any`, the default, or `all`), `offline` (`skip` or `wait`) and `wait_hours`. Returns the job with its counts. `400 no_devices` if the target covers none. |
 | `GET /v1/jobs?policy_id=&limit=` | Jobs the user may see, newest first, with counts (50 by default, at most 200). |
 | `GET /v1/jobs/{id}` | The job with its counts. |
 | `GET /v1/jobs/{id}/devices?outcome=&after=&offset=&limit=` | `{devices, matching}`: a page of the job's devices in device ID order, those with `outcome` (one of the counts' names) or every one, from after the device ID `after` and past `offset` more (100 by default, at most 200; `limit=0` for `matching` alone). `matching` is how many have the outcome, or the job's total, on the page or not. Each device has its `outcome`, `detail`, `run_id`, `delivery_id`, `update_run_id`, `application_run_id` or `wake_id`, exit code, saved path and times, and for an application job `applications`: `[{name, outcome, error}]` for those that failed or were skipped. 404 for a job the user may not see. |
@@ -470,7 +476,9 @@ should read the lists again.
   devices, companies, tags, every device) for jobs, policies and
   [alert rules](alerts.md) alike: as an SQL condition when a job is
   created, or against one device's company and tags when a policy or rule
-  checks it.
+  checks it. A job's outdated packages are only an SQL condition, on
+  `device_packages` through `idx_device_packages_outdated_key`
+  (`server/src/applications/outdated.rs`).
 - Tables: `jobs` (what it sends, its target and expiry, who or which policy
   started it), `job_devices` (each device's state and outcome), `automation_policies`
   (with `tag_match`) and `automation_policy_companies`, `_devices`, `_tags`

@@ -1,38 +1,46 @@
 import { AppWindow, ArrowUpCircle, ChevronDown, ChevronRight, CircleAlert, Library, LoaderCircle, PackageCheck, Pencil, Pin, Plus, RefreshCw, Rocket, Search, Trash2, X } from "lucide-react";
-import { Fragment, useCallback, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import { formatDateTime, formatRelative } from "../../lib/format";
 import { AuthenticationRequired, errorText } from "../../lib/http";
+import { ShowMore } from "../../lib/show-more";
+import { usePagedList } from "../../lib/use-paged-list";
 import { useResource } from "../../lib/use-resource";
+import { useSettled } from "../../lib/use-settled";
 import { type DevicePlatform, PLATFORM_LABELS } from "../agents/types";
 import type { ToolboxFile } from "../toolbox/model";
 import { fetchToolbox } from "../toolbox/toolbox-api";
 import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
 import { ApplicationEditor } from "./application-editor";
-import { deleteApplication, fetchLibrary, fetchOutdated } from "./applications-api";
-import { DeployDialog } from "./deploy-dialog";
+import { deleteApplication, fetchLibrary, fetchOutdated, fetchOutdatedDevices } from "./applications-api";
+import { DeployDialog, type OutdatedChoice } from "./deploy-dialog";
 import {
   type Application,
+  MAX_OUTDATED_QUERY_LENGTH,
   MAX_RUN_ITEMS,
+  OUTDATED_PAGE_SIZE,
   type OutdatedPackage,
+  type OutdatedTotals,
   type RunRequest,
   SOURCE_LABELS,
   SOURCE_PLATFORM,
+  chosenUpdates,
   describeSource,
+  joinDevicePage,
   namesText,
-  oldestOutdated,
-  outdatedTotals,
+  outdatedLabel,
+  outdatedSummary,
   packageKey,
   platformsOf,
 } from "./model";
 
 type Tab = "library" | "outdated";
 
-type Deploy = { title: string; intro: string; request: RunRequest; platforms: DevicePlatform[]; deviceIds?: string[] };
+type Deploy = { title: string; intro: string; request: RunRequest; platforms: DevicePlatform[]; deviceIds?: string[]; outdated?: OutdatedChoice };
 
-// `/applications`: the library of applications to deploy, and every
-// outdated package in the fleet.
+// `/applications`: the library of applications to deploy, and the fleet's
+// outdated packages, which the server counts and sends a page at a time.
 export function ApplicationsPage() {
   const [searchParams] = useSearchParams();
   const tab: Tab = searchParams.get("tab") === "outdated" ? "outdated" : "library";
@@ -188,50 +196,59 @@ function LibraryTab() {
   );
 }
 
+const OUTDATED_MESSAGES = { first: "The outdated applications could not be loaded.", more: "More outdated applications could not be loaded." };
+
 function OutdatedTab() {
   const { authorizedFetch, can } = useWorkspace();
-  const load = useCallback(() => fetchOutdated(authorizedFetch), [authorizedFetch]);
-  const { data, error, reload } = useResource(load, "The outdated applications could not be loaded.");
   const [query, setQuery] = useState("");
-  const [chosen, setChosen] = useState<ReadonlySet<string>>(() => new Set());
+  // Typing reaches the server after a pause.
+  const settled = useSettled(query);
+  const [totals, setTotals] = useState<OutdatedTotals | null>(null);
+  const fetchPage = useCallback(async (offset: number) => {
+    const page = await fetchOutdated(authorizedFetch, settled, offset);
+    setTotals(page.totals);
+    return { items: page.packages, matching: page.matching };
+  }, [authorizedFetch, settled]);
+  const { list, error, reload, showMore, loadingMore, remaining, current } = usePagedList(settled.trim(), fetchPage, packageKey, OUTDATED_MESSAGES);
+  // Kept across searches, by key.
+  const [chosen, setChosen] = useState<ReadonlyMap<string, OutdatedPackage>>(() => new Map());
   const [open, setOpen] = useState<string | null>(null);
   const [deploy, setDeploy] = useState<Deploy | null>(null);
   const opener = useRef<HTMLElement | null>(null);
   const canDeploy = can("applications.deploy");
-  const needle = query.trim().toLocaleLowerCase();
-  const packages = useMemo(() => (data ?? []).filter((pkg) => !needle
-    || [pkg.name, pkg.package_id, pkg.application_name ?? ""].some((text) => text.toLocaleLowerCase().includes(needle))), [data, needle]);
-  const totals = outdatedTotals(data ?? []);
-  const chosenPackages = (data ?? []).filter((pkg) => chosen.has(packageKey(pkg)));
-  const allShownChosen = packages.length > 0 && packages.every((pkg) => chosen.has(packageKey(pkg)));
+  const packages = list?.items ?? [];
+  const choosable = packages.filter((pkg) => !pkg.held);
+  const chosenPackages = [...chosen.values()];
+  const allShownChosen = choosable.length > 0 && choosable.every((pkg) => chosen.has(packageKey(pkg)));
+  const searching = Boolean(settled.trim());
 
-  const toggle = (key: string, checked: boolean) => setChosen((current) => {
-    const next = new Set(current);
-    if (checked) next.add(key);
-    else next.delete(key);
+  const toggle = (pkg: OutdatedPackage, checked: boolean) => setChosen((current) => {
+    const next = new Map(current);
+    if (checked) next.set(packageKey(pkg), pkg);
+    else next.delete(packageKey(pkg));
     return next;
   });
   const toggleShown = (checked: boolean) => setChosen((current) => {
-    const next = new Set(current);
-    for (const pkg of packages) {
-      if (checked) next.add(packageKey(pkg));
+    const next = new Map(current);
+    for (const pkg of choosable) {
+      if (checked) next.set(packageKey(pkg), pkg);
       else next.delete(packageKey(pkg));
     }
     return next;
   });
-  const devicesOf = (list: readonly OutdatedPackage[]) => [...new Set(list.flatMap((pkg) => pkg.devices.map((device) => device.device_id)))];
   const platformsOfPackages = (list: readonly OutdatedPackage[]) =>
     [...new Set(list.map((pkg) => (pkg.source === "custom" ? null : SOURCE_PLATFORM[pkg.source])).filter((platform): platform is DevicePlatform => platform !== null))];
 
   const updateChosen = (button: HTMLElement) => {
     opener.current = button;
     const names = chosenPackages.map((pkg) => pkg.application_name ?? pkg.name);
+    const keys = chosenPackages.map(packageKey);
     setDeploy({
       title: `Update ${namesText(names)}`,
       intro: "Each device updates the chosen applications it has outdated, then lists its applications again.",
-      request: { action: "update", mode: "only", packages: chosenPackages.map(packageKey) },
+      request: { action: "update", mode: "only", packages: keys },
       platforms: platformsOfPackages(chosenPackages),
-      deviceIds: devicesOf(chosenPackages),
+      outdated: { packages: keys, label: outdatedLabel(names), updates: chosenUpdates(chosenPackages) },
     });
   };
   const updateAll = (button: HTMLElement) => {
@@ -241,7 +258,7 @@ function OutdatedTab() {
       intro: "Each device updates every outdated application its package managers list, except those the library pins to a version.",
       request: { action: "update", mode: "all" },
       platforms: ["windows", "macos", "linux"],
-      deviceIds: devicesOf((data ?? []).filter((pkg) => !pkg.held)),
+      outdated: { packages: [], label: outdatedLabel([]), updates: totals?.updates ?? 0 },
     });
   };
 
@@ -249,12 +266,12 @@ function OutdatedTab() {
     <>
       <HeaderActions>
         <button type="button" className="icon-button" onClick={reload} aria-label="Refresh" title="Refresh"><RefreshCw size={16} /></button>
-        {canDeploy && data && data.length > 0 && <button type="button" className="primary-button" onClick={(event) => updateAll(event.currentTarget)} aria-haspopup="dialog"><ArrowUpCircle size={16} /> Update all…</button>}
+        {canDeploy && totals && totals.packages > 0 && <button type="button" className="primary-button" onClick={(event) => updateAll(event.currentTarget)} aria-haspopup="dialog"><ArrowUpCircle size={16} /> Update all…</button>}
       </HeaderActions>
-      {data && (
+      {totals && (
         <div className="update-tiles" role="group" aria-label="Outdated applications">
           <div className={`update-tile${totals.packages ? " attention" : ""}`}><span>Outdated applications</span><strong>{totals.packages}</strong><small>{totals.packages ? "across the fleet" : "Everything is up to date"}</small></div>
-          <div className="update-tile"><span>Devices with updates</span><strong>{totals.devices}</strong><small>{totals.updates} {totals.updates === 1 ? "update" : "updates"} pending</small></div>
+          <div className="update-tile"><span>Updates pending</span><strong>{totals.updates}</strong><small>{totals.updates === 1 ? "an application on a device" : "applications on devices"}</small></div>
         </div>
       )}
       {canDeploy && chosenPackages.length > 0 && (
@@ -262,48 +279,52 @@ function OutdatedTab() {
           <strong>{chosenPackages.length} chosen</strong>
           <div className="selection-actions">
             <button type="button" className="primary-button" disabled={chosenPackages.length > MAX_RUN_ITEMS} title={chosenPackages.length > MAX_RUN_ITEMS ? `Choose at most ${MAX_RUN_ITEMS}` : undefined} onClick={(event) => updateChosen(event.currentTarget)} aria-haspopup="dialog"><ArrowUpCircle size={15} /> Update on their devices…</button>
-            <button type="button" className="secondary-button" onClick={() => setChosen(new Set())}>Clear</button>
+            <button type="button" className="secondary-button" onClick={() => setChosen(new Map())}>Clear</button>
           </div>
         </div>
       )}
       <section className="agent-panel">
-        {!data ? (
+        <div className="table-toolbar">
+          <label className="search-field software-search">
+            <Search size={16} aria-hidden="true" />
+            <input type="search" aria-label="Search applications" value={query} maxLength={MAX_OUTDATED_QUERY_LENGTH} onChange={(event) => setQuery(event.target.value)} placeholder="Search applications" />
+          </label>
+        </div>
+        {!list ? (
           error
             ? <div className="empty-state"><CircleAlert size={22} aria-hidden="true" /><strong>{error}</strong><button type="button" className="secondary-button" onClick={reload}><RefreshCw size={16} /> Try again</button></div>
             : <div className="empty-state"><LoaderCircle size={22} className="spin" aria-hidden="true" /><strong>Loading outdated applications…</strong></div>
-        ) : data.length === 0 ? (
-          <div className="empty-state">
-            <PackageCheck size={22} aria-hidden="true" />
-            <strong>Everything is up to date</strong>
-            <span>Devices list their applications when they look for operating system updates, and outdated ones show here.</span>
-          </div>
+        ) : packages.length === 0 && remaining === 0 ? (
+          searching
+            ? <p className="table-message field-help">No outdated applications match.</p>
+            : (
+              <div className="empty-state">
+                <PackageCheck size={22} aria-hidden="true" />
+                <strong>Everything is up to date</strong>
+                <span>Devices list their applications when they look for operating system updates, and outdated ones show here.</span>
+              </div>
+            )
         ) : (
           <>
-            <div className="table-toolbar">
-              <label className="search-field software-search">
-                <Search size={16} aria-hidden="true" />
-                <input type="search" aria-label="Search applications" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search applications" />
-              </label>
-            </div>
+            {error && <p className="table-message form-error" role="alert"><CircleAlert size={16} aria-hidden="true" />{error}</p>}
             <div className="table-scroll">
-              <table className="data-table" aria-label="Outdated applications">
+              <table className="data-table" aria-label="Outdated applications" aria-busy={!current}>
                 <thead>
                   <tr>
-                    {canDeploy && <th scope="col" className="select-cell"><input type="checkbox" aria-label={`Choose all ${packages.length} applications shown`} checked={allShownChosen} onChange={(event) => toggleShown(event.target.checked)} /></th>}
+                    {canDeploy && <th scope="col" className="select-cell"><input type="checkbox" aria-label={`Choose all ${choosable.length} applications shown`} checked={allShownChosen} disabled={!choosable.length} onChange={(event) => toggleShown(event.target.checked)} /></th>}
                     <th scope="col">Application</th>
                     <th scope="col">Source</th>
+                    <th scope="col">Newest version</th>
                     <th scope="col" className="numeric">Devices</th>
-                    <th scope="col">Oldest</th>
                   </tr>
                 </thead>
                 <tbody>
                   {packages.map((pkg) => {
                     const key = packageKey(pkg);
-                    const oldest = oldestOutdated(pkg);
                     return (
                       <Fragment key={key}>
                         <tr className={chosen.has(key) ? "selected-row" : undefined}>
-                          {canDeploy && <td className="select-cell"><input type="checkbox" aria-label={`Choose ${pkg.name}`} checked={chosen.has(key)} disabled={pkg.held} onChange={(event) => toggle(key, event.target.checked)} /></td>}
+                          {canDeploy && <td className="select-cell"><input type="checkbox" aria-label={`Choose ${pkg.name}`} checked={chosen.has(key)} disabled={pkg.held} onChange={(event) => toggle(pkg, event.target.checked)} /></td>}
                           <td>
                             <button type="button" className="link-button" aria-expanded={open === key} onClick={() => setOpen(open === key ? null : key)}>
                               {open === key ? <ChevronDown size={14} aria-hidden="true" /> : <ChevronRight size={14} aria-hidden="true" />}<strong>{pkg.name}</strong>
@@ -312,22 +333,12 @@ function OutdatedTab() {
                             {pkg.held && <span className="badge badge-muted" title="Its library application pins a version, so updates leave it alone"><Pin size={11} aria-hidden="true" />Pinned</span>}
                           </td>
                           <td>{SOURCE_LABELS[pkg.source]}<span className="mono-detail">{pkg.package_id}</span></td>
-                          <td className="numeric">{pkg.devices.length}</td>
-                          <td title={oldest ? formatDateTime(oldest) : undefined}>{oldest ? formatRelative(oldest) : "—"}</td>
+                          <td>{pkg.available_version ?? "—"}</td>
+                          <td className="numeric">{pkg.devices}</td>
                         </tr>
                         {open === key && (
                           <tr>
-                            <td colSpan={canDeploy ? 5 : 4}>
-                              <ul className="run-items">
-                                {pkg.devices.map((device) => (
-                                  <li key={device.device_id}>
-                                    <Link to={`/device?${new URLSearchParams({ id: device.device_id, tab: "applications" })}`}>{device.device_name}</Link>
-                                    <span>{device.version ?? "?"} → {device.available_version ?? "newer"}</span>
-                                    {device.outdated_since && <span>since {formatRelative(device.outdated_since)}</span>}
-                                  </li>
-                                ))}
-                              </ul>
-                            </td>
+                            <td colSpan={canDeploy ? 5 : 4}><OutdatedDevices pkg={pkg} /></td>
                           </tr>
                         )}
                       </Fragment>
@@ -335,12 +346,67 @@ function OutdatedTab() {
                   })}
                 </tbody>
               </table>
-              {!packages.length && <p className="table-message field-help">No applications match.</p>}
+            </div>
+            <div className="panel-footer fleet-footer">
+              <span className="field-help">
+                {outdatedSummary(list.matching, searching)}
+                {remaining > 0 && ` · ${packages.length} loaded`}
+              </span>
+              <ShowMore remaining={remaining} pageSize={OUTDATED_PAGE_SIZE} loading={loadingMore} disabled={!current} onShowMore={() => void showMore()} />
             </div>
           </>
         )}
       </section>
       {deploy && <DeployDialog {...deploy} returnFocus={opener} onClose={() => setDeploy(null)} />}
+    </>
+  );
+}
+
+// The devices with an opened package outdated, a page at a time.
+function OutdatedDevices({ pkg }: { pkg: OutdatedPackage }) {
+  const { authorizedFetch } = useWorkspace();
+  const { source, package_id } = pkg;
+  const load = useCallback(() => fetchOutdatedDevices(authorizedFetch, { source, package_id }, null), [authorizedFetch, source, package_id]);
+  const { data, error, reload, setData } = useResource(load, "The devices could not be loaded.");
+  const [moreError, setMoreError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const showMore = async (after: string) => {
+    setLoading(true);
+    setMoreError(null);
+    try {
+      const page = await fetchOutdatedDevices(authorizedFetch, { source, package_id }, after);
+      setData((current) => joinDevicePage(current, after, page));
+    } catch (failure) {
+      if (!(failure instanceof AuthenticationRequired)) setMoreError(errorText(failure, "More devices could not be loaded."));
+    }
+    setLoading(false);
+  };
+
+  if (!data) {
+    return error
+      ? <p className="form-error" role="alert"><CircleAlert size={16} aria-hidden="true" />{error} <button type="button" className="link-button" onClick={reload}>Try again</button></p>
+      : <p className="field-help"><LoaderCircle size={15} className="spin" aria-hidden="true" /> Loading its devices…</p>;
+  }
+  const { next } = data;
+  return (
+    <>
+      {data.devices.length === 0 && <p className="field-help">No device has it outdated any more.</p>}
+      <ul className="run-items">
+        {data.devices.map((device) => (
+          <li key={device.device_id}>
+            <Link to={`/device?${new URLSearchParams({ id: device.device_id, tab: "applications" })}`}>{device.device_name}</Link>
+            <span>{device.version ?? "?"} → {device.available_version ?? "newer"}</span>
+            {device.outdated_since && <span title={formatDateTime(device.outdated_since)}>since {formatRelative(device.outdated_since)}</span>}
+          </li>
+        ))}
+      </ul>
+      {moreError && <p className="form-error" role="alert"><CircleAlert size={16} aria-hidden="true" />{moreError}</p>}
+      {next && (
+        <button type="button" className="secondary-button" disabled={loading} onClick={() => void showMore(next)}>
+          {loading && <LoaderCircle size={15} className="spin" />} Show more devices
+        </button>
+      )}
     </>
   );
 }

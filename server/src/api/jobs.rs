@@ -1,5 +1,6 @@
-//! Jobs from the website: a toolbox script or file, or an update scan or
-//! install, on many devices at once.
+//! Jobs from the website: a toolbox script or file, an update scan or
+//! install, or applications to install, update or uninstall, on many
+//! devices at once.
 //! Users see the jobs they started; users who manage automation see
 //! policies' jobs; users who may read the audit log see everyone's.
 use axum::{
@@ -16,6 +17,7 @@ use serde_json::json;
 use super::toolbox::toolbox_user;
 use crate::{
     agents::parse_id,
+    applications::jobs::RunAction,
     audit::{self, Target as AuditTarget},
     auth::Authorized,
     automation::jobs::{
@@ -84,6 +86,10 @@ pub struct StartJob {
     tag_ids: Vec<String>,
     #[serde(default)]
     tag_match: TagMatch,
+    /// For `outdated`: the packages, as `source:id`, whose devices it runs
+    /// on; none for the devices with any package outdated.
+    #[serde(default)]
+    packages: Vec<String>,
     offline: Offline,
     /// How long offline devices are waited for.
     #[serde(default = "default_wait_hours")]
@@ -100,21 +106,24 @@ fn viewer(actor: &Authorized) -> Result<Viewer, ApiError> {
 }
 
 /// `POST /v1/jobs`: runs one of the user's scripts, sends one of their
-/// files, or scans for or installs updates, on chosen devices, whole
-/// companies, the devices with chosen tags, or every device.
+/// files, scans for or installs updates, or installs, updates or uninstalls
+/// applications, on chosen devices, whole companies, the devices with chosen
+/// tags, or every device; an update of applications also on the devices
+/// where chosen packages, or any, are outdated as the job is created.
 pub async fn start(
     State(state): State<AppState>,
     actor: Authorized,
     JsonBody(request): JsonBody<StartJob>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let user = toolbox_user(&actor);
-    let target = Target::from_request(
+    let mut target = Target::from_request(
         request.target,
         Choice {
             device_ids: request.device_ids,
             company_ids: request.company_ids,
             tag_ids: request.tag_ids,
             tag_match: request.tag_match,
+            packages: request.packages,
         },
     )
     .map_err(|error| error.with_code("invalid_job"))?;
@@ -140,6 +149,13 @@ pub async fn start(
             let spec = crate::applications::jobs::build(&mut database, applications).await?;
             if let Some(reason) = spec.all_pinned() {
                 return Err(crate::applications::jobs::pinned(reason));
+            }
+            if let Target::Outdated { packages, except } = &mut target {
+                // The devices with any package outdated leave out those
+                // whose only outdated packages are held back.
+                if packages.is_empty() {
+                    *except = spec.held.iter().map(|held| held.package.clone()).collect();
+                }
             }
             Payload::Applications(Box::new(spec))
         }
@@ -208,6 +224,13 @@ pub async fn start(
             ));
         }
     };
+    if target.kind() == TargetKind::Outdated
+        && !matches!(&payload, Payload::Applications(spec) if spec.action == RunAction::Update)
+    {
+        return Err(jobs::invalid(
+            "only an update of applications runs where packages are outdated",
+        ));
+    }
     let plan = jobs::plan(
         &mut database,
         &state.agents,

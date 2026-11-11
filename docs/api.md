@@ -346,9 +346,24 @@ curl -fsS -H "Authorization: Bearer $MESHRMM_TOKEN" -H "Content-Type: applicatio
   "$MESHRMM/v1/agents/$DEVICE/application-runs"
 ```
 
-`GET /v1/packages/outdated` lists the fleet's outdated applications; a job
-with `"applications": {…}` installs, updates or uninstalls on many. See
-[application deployment](application-deployment.md#api).
+`GET /v1/packages/outdated` lists a page of the fleet's outdated
+applications with how many devices have each outdated, and
+`GET /v1/packages/outdated/devices?package=` a page of one's devices; a job
+with `"applications": {…}` installs, updates or uninstalls on many, and an
+update can run where packages are outdated:
+
+```sh
+# The five applications outdated on the most devices.
+curl -fsS -H "Authorization: Bearer $MESHRMM_TOKEN" "$MESHRMM/v1/packages/outdated?limit=5" |
+  jq '{matching, packages: [.packages[] | {source, package_id, available_version, devices}]}'
+# Update Firefox wherever it is outdated (applications.deploy).
+curl -fsS -H "Authorization: Bearer $MESHRMM_TOKEN" -H "Content-Type: application/json" \
+  -d '{"applications": {"action": "update", "mode": "only", "packages": ["winget:Mozilla.Firefox"]},
+       "target": "outdated", "packages": ["winget:Mozilla.Firefox"], "offline": "skip"}' \
+  "$MESHRMM/v1/jobs" | jq '{id, target_label, counts}'
+```
+
+See [application deployment](application-deployment.md#api).
 
 ### Wake-on-LAN
 
