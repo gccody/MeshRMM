@@ -421,7 +421,12 @@ async fn scans_install_update_and_uninstall_on_a_device() {
         );
         let fleet = admin.get("/v1/packages/outdated").await.body;
         assert_eq!(fleet["packages"].as_array().unwrap().len(), 1, "{name}");
-        assert_eq!(fleet["packages"][0]["devices"][0]["device_name"], "Desk");
+        assert_eq!(fleet["packages"][0]["devices"], 1, "{name}");
+        let on = admin
+            .get("/v1/packages/outdated/devices?package=winget:Mozilla.Firefox")
+            .await
+            .body;
+        assert_eq!(on["devices"][0]["device_name"], "Desk", "{name}: {on}");
 
         // A failed manager keeps what it listed; outdated_since stays.
         report_scan(
@@ -774,9 +779,7 @@ async fn scans_that_find_the_same_packages_write_only_their_status() {
 
         // Once the device's packages are removed, the same scan stores them
         // again.
-        applications::store::forget(&mut app.db(), id)
-            .await
-            .unwrap();
+        applications::store::forget(app.db(), id).await.unwrap();
         assert_eq!(
             store(&app, id, scan_at(6, &newer, updated), now + 5_000).await,
             Stored::Replaced,
@@ -1182,7 +1185,7 @@ async fn package_ids_match_as_their_manager_reads_them() {
             .filter(|package| package["source"] == "winget")
             .collect::<Vec<_>>();
         assert_eq!(winget.len(), 1, "{name}: {outdated}");
-        assert_eq!(winget[0]["devices"].as_array().unwrap().len(), 2);
+        assert_eq!(winget[0]["devices"], 2);
         assert_eq!(winget[0]["held"], true);
         let read = admin.get(&format!("/v1/applications/{firefox_id}")).await;
         assert_eq!(read.body["installed"], 2, "{name}: {:?}", read.body);
@@ -1802,6 +1805,654 @@ async fn a_scan_for_a_device_too_far_behind_is_busy_and_records_nothing() {
             })
         );
         drop(connection);
+        app.finish().await;
+    }
+}
+
+// ---- The fleet's outdated packages ----
+
+/// The ID of the `n`th device of a fleet added with [`add_fleet`].
+fn fleet_device(n: usize) -> String {
+    format!("00000000-0000-4000-8000-{n:012}")
+}
+
+/// Enrolls devices `first..first + count` behind the API's back, in the
+/// `companies` in turn (`None` for no company).
+async fn add_fleet(app: &App, first: usize, count: usize, companies: &[Option<String>], now: i64) {
+    let numbers = (first..first + count).collect::<Vec<_>>();
+    for chunk in numbers.chunks(100) {
+        let mut insert = sea_query::Query::insert();
+        insert.into_table(sea_query::Alias::new("agents")).columns(
+            [
+                "id",
+                "name",
+                "platform",
+                "auth_token_hash",
+                "company_id",
+                "created_at",
+                "updated_at",
+            ]
+            .map(sea_query::Alias::new),
+        );
+        for &n in chunk {
+            insert.values_panic([
+                fleet_device(n).into(),
+                format!("Device {n}").into(),
+                "windows".into(),
+                "a".repeat(64).into(),
+                companies[n % companies.len()].clone().into(),
+                now.into(),
+                now.into(),
+            ]);
+        }
+        app.db().execute(&insert).await.unwrap();
+    }
+}
+
+fn fleet_managers() -> Value {
+    json!([{ "source": "winget" }, { "source": "flatpak" }, { "source": "chocolatey" }])
+}
+
+/// What the `n`th device of a fleet has outdated: Firefox on even devices
+/// (offering 132 on every fourth, 131 on the others), Git on every third
+/// (listed as `git.git` on odd ones, which winget reads as the same), GIMP
+/// on every fifth, and 7-Zip on device 1 only.
+fn fleet_packages(n: usize) -> Vec<Value> {
+    let firefox = n.is_multiple_of(2).then_some(if n.is_multiple_of(4) {
+        "132.0"
+    } else {
+        "131.0"
+    });
+    let mut packages = vec![package(
+        "winget",
+        "Mozilla.Firefox",
+        "Mozilla Firefox",
+        "130.0",
+        firefox,
+    )];
+    if n.is_multiple_of(3) {
+        let id = if n % 2 == 1 { "git.git" } else { "Git.Git" };
+        packages.push(package("winget", id, "Git", "2.44", Some("2.45")));
+    }
+    if n.is_multiple_of(5) {
+        packages.push(package(
+            "flatpak",
+            "org.gimp.GIMP",
+            "GIMP",
+            "2.10",
+            Some("3.0"),
+        ));
+    }
+    packages.push(package(
+        "chocolatey",
+        "7zip",
+        "7-Zip",
+        "24.08",
+        (n == 1).then_some("24.09"),
+    ));
+    packages
+}
+
+async fn store_fleet(app: &App, numbers: std::ops::Range<usize>, now: i64) {
+    for n in numbers {
+        store(
+            app,
+            &fleet_device(n),
+            scan_at(1, &fleet_managers(), fleet_packages(n)),
+            now,
+        )
+        .await;
+    }
+}
+
+async fn outdated_page(browser: &mut Browser, query: &str) -> Value {
+    let response = browser.get(&format!("/v1/packages/outdated{query}")).await;
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "{query}: {:?}",
+        response.body
+    );
+    response.body
+}
+
+/// `(package_id, devices)` of each package on a page, in order.
+fn counted(page: &Value) -> Vec<(String, i64)> {
+    page["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|package| {
+            (
+                package["package_id"].as_str().unwrap().to_owned(),
+                package["devices"].as_i64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn owned(pairs: &[(&str, i64)]) -> Vec<(String, i64)> {
+    pairs
+        .iter()
+        .map(|(id, devices)| ((*id).to_owned(), *devices))
+        .collect()
+}
+
+async fn add_company(browser: &mut Browser, name: &str) -> String {
+    let created = browser.post("/v1/companies", json!({ "name": name })).await;
+    assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+    created.body["id"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn outdated_packages_are_counted_paged_and_searched() {
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let acme = add_company(&mut admin, "Acme").await;
+        let globex = add_company(&mut admin, "Globex").await;
+        let firefox_id = add_application(&mut admin, firefox()).await;
+        add_application(
+            &mut admin,
+            json!({
+                "name": "Archiver", "pinned_version": "24.08",
+                "sources": [{ "source": "chocolatey", "package_id": "7zip" }],
+            }),
+        )
+        .await;
+        let now = now_ms();
+        add_fleet(&app, 0, 12, &[Some(acme), Some(globex), None], now).await;
+        store_fleet(&app, 0..12, now).await;
+
+        // On the most devices first; Git once however its ID is cased.
+        let page = outdated_page(&mut admin, "").await;
+        assert_eq!(
+            counted(&page),
+            owned(&[
+                ("Mozilla.Firefox", 6),
+                ("Git.Git", 4),
+                ("org.gimp.GIMP", 3),
+                ("7zip", 1)
+            ]),
+            "{name}: {page}"
+        );
+        assert_eq!(page["matching"], 4, "{name}");
+        // The pinned 7-Zip is held back, so it is no update pending.
+        assert_eq!(
+            page["totals"],
+            json!({ "packages": 3, "updates": 13 }),
+            "{name}"
+        );
+        let firefox = &page["packages"][0];
+        assert_eq!(firefox["name"], "Mozilla Firefox", "{name}");
+        assert_eq!(firefox["application_id"], firefox_id, "{name}");
+        assert_eq!(firefox["available_version"], "132.0", "{name}: the newest");
+        assert_eq!(firefox["held"], false, "{name}");
+        assert_eq!(page["packages"][3]["held"], true, "{name}");
+        assert_eq!(page["packages"][3]["application_name"], "Archiver");
+
+        // A page at a time, each package once.
+        let mut seen = Vec::new();
+        for offset in 0..5 {
+            let page = outdated_page(&mut admin, &format!("?limit=1&offset={offset}")).await;
+            assert_eq!(page["matching"], 4, "{name}");
+            seen.extend(counted(&page));
+        }
+        assert_eq!(
+            seen,
+            counted(&outdated_page(&mut admin, "").await),
+            "{name}"
+        );
+        let counts_only = outdated_page(&mut admin, "?limit=0").await;
+        assert_eq!(counts_only["packages"], json!([]), "{name}");
+        assert_eq!(counts_only["matching"], 4, "{name}");
+
+        // By name, ID or library application, in any case; the totals stay.
+        for (query, found) in [
+            ("?query=%20fire%20", "Mozilla.Firefox"),
+            ("?query=GIT.git", "Git.Git"),
+            ("?query=archiver", "7zip"),
+        ] {
+            let page = outdated_page(&mut admin, query).await;
+            assert_eq!(page["matching"], 1, "{name}: {query}");
+            assert_eq!(page["packages"][0]["package_id"], found, "{name}: {query}");
+            assert_eq!(page["totals"]["packages"], 3, "{name}: {query}");
+        }
+        assert_eq!(
+            outdated_page(&mut admin, "?query=50%25").await["matching"],
+            0,
+            "{name}: wildcards are text"
+        );
+
+        // Whoever may see applications sees every device's: MeshRMM has no
+        // per-company access to devices. Others see none.
+        let (mut viewer, _) = user_with(
+            &app,
+            &mut admin,
+            "viewer@example.com",
+            &["applications.view"],
+        )
+        .await;
+        assert_eq!(
+            counted(&outdated_page(&mut viewer, "").await),
+            counted(&page),
+            "{name}"
+        );
+        let (mut other, _) =
+            user_with(&app, &mut admin, "other@example.com", &["devices.view"]).await;
+        assert_eq!(
+            other.get("/v1/packages/outdated").await.status,
+            StatusCode::FORBIDDEN,
+            "{name}"
+        );
+
+        // A deleted device's packages leave the counts; so does one a scan
+        // finds up to date, and a newer version offered shows.
+        let deleted = admin
+            .delete(&format!("/v1/agents/{}", fleet_device(0)))
+            .await;
+        assert_eq!(deleted.status, StatusCode::NO_CONTENT, "{name}");
+        let mut packages = fleet_packages(2);
+        packages[0] = package(
+            "winget",
+            "Mozilla.Firefox",
+            "Mozilla Firefox",
+            "132.0",
+            None,
+        );
+        store(
+            &app,
+            &fleet_device(2),
+            scan_at(2, &fleet_managers(), packages),
+            now,
+        )
+        .await;
+        let mut packages = fleet_packages(4);
+        packages[0] = package(
+            "winget",
+            "Mozilla.Firefox",
+            "Mozilla Firefox",
+            "130.0",
+            Some("133.0"),
+        );
+        store(
+            &app,
+            &fleet_device(4),
+            scan_at(2, &fleet_managers(), packages),
+            now,
+        )
+        .await;
+        let page = outdated_page(&mut admin, "").await;
+        assert_eq!(
+            counted(&page),
+            owned(&[
+                ("Mozilla.Firefox", 4),
+                ("Git.Git", 3),
+                ("org.gimp.GIMP", 2),
+                ("7zip", 1)
+            ]),
+            "{name}: {page}"
+        );
+        assert_eq!(page["packages"][0]["available_version"], "133.0", "{name}");
+        // Device 1's 7-Zip updated: nothing has it outdated, so it goes.
+        let mut packages = fleet_packages(1);
+        let last = packages.len() - 1;
+        packages[last] = package("chocolatey", "7zip", "7-Zip", "24.09", None);
+        store(
+            &app,
+            &fleet_device(1),
+            scan_at(2, &fleet_managers(), packages),
+            now,
+        )
+        .await;
+        let page = outdated_page(&mut admin, "").await;
+        assert_eq!(page["matching"], 3, "{name}: {page}");
+        assert_eq!(
+            page["totals"],
+            json!({ "packages": 3, "updates": 9 }),
+            "{name}"
+        );
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn a_packages_devices_are_paged_without_missing_or_repeating_one() {
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let now = now_ms();
+        add_fleet(&app, 0, 30, &[None], now).await;
+        store_fleet(&app, 0..30, now).await;
+        // Device 0 is deleted; device 2 is up to date again.
+        assert_eq!(
+            admin
+                .delete(&format!("/v1/agents/{}", fleet_device(0)))
+                .await
+                .status,
+            StatusCode::NO_CONTENT
+        );
+        let mut packages = fleet_packages(2);
+        packages[0] = package(
+            "winget",
+            "Mozilla.Firefox",
+            "Mozilla Firefox",
+            "131.0",
+            None,
+        );
+        store(
+            &app,
+            &fleet_device(2),
+            scan_at(2, &fleet_managers(), packages),
+            now,
+        )
+        .await;
+
+        // Asked for in another case, as winget reads IDs.
+        let mut seen: Vec<Value> = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let mut path =
+                "/v1/packages/outdated/devices?package=winget:mozilla.FIREFOX&limit=4".to_owned();
+            if let Some(after) = &after {
+                path.push_str(&format!("&after={after}"));
+            }
+            let page = admin.get(&path).await;
+            assert_eq!(page.status, StatusCode::OK, "{name}: {:?}", page.body);
+            let devices = page.body["devices"].as_array().unwrap().clone();
+            assert!(devices.len() <= 4, "{name}");
+            seen.extend(devices);
+            match page.body["next"].as_str() {
+                Some(next) => after = Some(next.to_owned()),
+                None => break,
+            }
+        }
+        let ids = seen
+            .iter()
+            .map(|device| device["device_id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        let expected = (4..30).step_by(2).map(fleet_device).collect::<Vec<_>>();
+        assert_eq!(ids, expected, "{name}: each device once, in ID order");
+        assert_eq!(seen[0]["device_name"], "Device 4", "{name}");
+        assert_eq!(seen[0]["version"], "130.0", "{name}");
+        assert_eq!(seen[0]["available_version"], "132.0", "{name}");
+        assert!(seen[0]["outdated_since"].as_i64().is_some(), "{name}");
+
+        // A whole package's devices on one page has no next one.
+        let gimp = admin
+            .get("/v1/packages/outdated/devices?package=flatpak:org.gimp.GIMP")
+            .await
+            .body;
+        assert_eq!(
+            gimp["devices"].as_array().unwrap().len(),
+            5,
+            "{name}: {gimp}"
+        );
+        assert_eq!(gimp["next"], Value::Null, "{name}");
+        // Flatpak keeps case: another case is another package.
+        let other = admin
+            .get("/v1/packages/outdated/devices?package=flatpak:org.gimp.gimp")
+            .await
+            .body;
+        assert_eq!(other["devices"], json!([]), "{name}");
+        for bad in [
+            "package=Mozilla.Firefox",
+            "package=winget:Mozilla.Firefox&after=device",
+            "package=winget:Mozilla.Firefox&cursor=1",
+        ] {
+            let refused = admin
+                .get(&format!("/v1/packages/outdated/devices?{bad}"))
+                .await;
+            assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{name}: {bad}");
+        }
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn outdated_lists_cost_the_same_for_any_fleet() {
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let now = now_ms();
+        // Authenticating the browser's first request is its own work.
+        outdated_page(&mut admin, "?limit=2").await;
+        let mut costs = Vec::new();
+        for (first, count) in [(0, 3), (3, 500)] {
+            add_fleet(&app, first, count, &[None], now).await;
+            store_fleet(&app, first..first + count, now).await;
+            // The cheapest of three reads: the app's background work counts
+            // too, and only adds to what a read costs.
+            let mut cheapest = None;
+            let (mut page, mut devices) = (Value::Null, Value::Null);
+            for _ in 0..3 {
+                let before = app.db().counts();
+                page = outdated_page(&mut admin, "?limit=2").await;
+                devices = admin
+                    .get("/v1/packages/outdated/devices?package=winget:Mozilla.Firefox&limit=2")
+                    .await
+                    .body;
+                let cost = app.db().counts() - before;
+                if cheapest.is_none_or(|cheapest: meshrmm_server::db::Counts| {
+                    cost.statements < cheapest.statements
+                }) {
+                    cheapest = Some(cost);
+                }
+            }
+            costs.push(cheapest.unwrap());
+            assert_eq!(page["packages"].as_array().unwrap().len(), 2, "{name}");
+            assert_eq!(
+                page["packages"][0]["devices"],
+                (first + count).div_ceil(2),
+                "{name}"
+            );
+            assert_eq!(devices["devices"].as_array().unwrap().len(), 2, "{name}");
+        }
+        assert_eq!(costs[0], costs[1], "{name}");
+        assert_eq!(costs[0].writes, 0, "{name}: {costs:?}");
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn a_job_on_outdated_packages_runs_on_the_devices_outdated_as_it_starts() {
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        add_application(
+            &mut admin,
+            json!({
+                "name": "GIMP", "pinned_version": "2.10",
+                "sources": [{ "source": "flatpak", "package_id": "org.gimp.GIMP" }],
+            }),
+        )
+        .await;
+        let now = now_ms();
+        // 0: Firefox, Git and GIMP outdated (deleted below). 1: 7-Zip.
+        // 2: Firefox (updated before the job). 3: Git. 4: Firefox. 5: GIMP
+        // only, which the library pins. 6: Firefox and Git. 7: nothing.
+        add_fleet(&app, 0, 8, &[None], now).await;
+        store_fleet(&app, 0..8, now).await;
+        assert_eq!(
+            admin
+                .delete(&format!("/v1/agents/{}", fleet_device(0)))
+                .await
+                .status,
+            StatusCode::NO_CONTENT
+        );
+        let mut packages = fleet_packages(2);
+        packages[0] = package(
+            "winget",
+            "Mozilla.Firefox",
+            "Mozilla Firefox",
+            "131.0",
+            None,
+        );
+        store(
+            &app,
+            &fleet_device(2),
+            scan_at(2, &fleet_managers(), packages),
+            now,
+        )
+        .await;
+
+        // Applications deploy needs no jobs.run_wide for this target.
+        let (mut technician, _) = user_with(
+            &app,
+            &mut admin,
+            "tech@example.com",
+            &["applications.view", "applications.deploy"],
+        )
+        .await;
+        let start = |packages: Value, applications: Value| {
+            json!({
+                "applications": applications,
+                "target": "outdated", "packages": packages,
+                "offline": "skip",
+            })
+        };
+        let firefox_update =
+            json!({ "action": "update", "mode": "only", "packages": ["winget:Mozilla.Firefox"] });
+        let job = technician
+            .post(
+                "/v1/jobs",
+                start(json!(["winget:mozilla.firefox"]), firefox_update.clone()),
+            )
+            .await;
+        assert_eq!(job.status, StatusCode::CREATED, "{name}: {:?}", job.body);
+        assert_eq!(job.body["target"], "outdated", "{name}");
+        assert_eq!(
+            job.body["target_label"], "Where Mozilla Firefox is outdated",
+            "{name}"
+        );
+        let job_ids = |devices: Vec<Value>| {
+            let mut ids = devices
+                .iter()
+                .map(|device| device["device_id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            ids.sort();
+            ids
+        };
+        let id = job.body["id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            job_ids(common::job_devices(&mut technician, &id, None).await),
+            [fleet_device(4), fleet_device(6)],
+            "{name}"
+        );
+        let started = &audit_events(&app, "job.start").await[0];
+        assert_eq!(started.metadata["target"], "outdated", "{name}");
+        assert_eq!(started.metadata["devices"], 2, "{name}");
+
+        // Several packages: any of them.
+        let job = admin
+            .post(
+                "/v1/jobs",
+                start(
+                    json!(["winget:Git.Git", "chocolatey:7zip"]),
+                    json!({ "action": "update", "mode": "only", "packages": ["winget:Git.Git", "chocolatey:7zip"] }),
+                ),
+            )
+            .await;
+        assert_eq!(job.status, StatusCode::CREATED, "{name}: {:?}", job.body);
+        assert_eq!(
+            job.body["target_label"], "Where any of Git and 7-Zip is outdated",
+            "{name}"
+        );
+        let id = job.body["id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            job_ids(common::job_devices(&mut admin, &id, None).await),
+            [fleet_device(1), fleet_device(3), fleet_device(6)],
+            "{name}"
+        );
+
+        // None chosen: any package outdated that the library doesn't pin, so
+        // device 5, with only GIMP outdated, is left out.
+        let job = admin
+            .post(
+                "/v1/jobs",
+                start(json!([]), json!({ "action": "update", "mode": "all" })),
+            )
+            .await;
+        assert_eq!(job.status, StatusCode::CREATED, "{name}: {:?}", job.body);
+        assert_eq!(
+            job.body["target_label"], "Where any application is outdated",
+            "{name}"
+        );
+        let id = job.body["id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            job_ids(common::job_devices(&mut admin, &id, None).await),
+            [1, 3, 4, 6].map(fleet_device),
+            "{name}"
+        );
+
+        // Nothing outdated anywhere: no devices.
+        let none = admin
+            .post(
+                "/v1/jobs",
+                start(
+                    json!(["snap:hello"]),
+                    json!({ "action": "update", "mode": "only", "packages": ["snap:hello"] }),
+                ),
+            )
+            .await;
+        assert_eq!(none.status, StatusCode::BAD_REQUEST, "{name}");
+        assert_eq!(none.body["code"], "no_devices", "{name}");
+
+        // Only an update of applications; never a policy or alert rule.
+        let script = admin
+            .post(
+                "/v1/toolbox/scripts",
+                json!({ "name": "Hi", "language": "powershell", "body": "echo hi", "timeout_seconds": 60, "shared": true }),
+            )
+            .await;
+        assert_eq!(script.status, StatusCode::CREATED, "{:?}", script.body);
+        for refused in [
+            json!({
+                "script_id": script.body["id"], "run_as": "system",
+                "target": "outdated", "packages": [], "offline": "skip",
+            }),
+            start(
+                json!([]),
+                json!({ "action": "uninstall", "packages": ["winget:Mozilla.Firefox"] }),
+            ),
+            start(json!(["Mozilla.Firefox"]), firefox_update.clone()),
+        ] {
+            let response = admin.post("/v1/jobs", refused.clone()).await;
+            assert_eq!(
+                response.status,
+                StatusCode::BAD_REQUEST,
+                "{name}: {refused}"
+            );
+        }
+        let policy = admin
+            .post(
+                "/v1/automation-policies",
+                json!({
+                    "name": "Patch", "action": "app_update",
+                    "applications": { "mode": "all" },
+                    "target": "outdated", "trigger": "daily", "time": "03:00", "time_zone": "UTC",
+                    "offline": "wait",
+                }),
+            )
+            .await;
+        assert_eq!(
+            policy.status,
+            StatusCode::BAD_REQUEST,
+            "{name}: {:?}",
+            policy.body
+        );
+        let rule = admin
+            .post(
+                "/v1/alert-rules",
+                json!({ "name": "Stale", "severity": "warning", "condition": "app_updates_pending", "days": 7, "target": "outdated" }),
+            )
+            .await;
+        assert_eq!(
+            rule.status,
+            StatusCode::BAD_REQUEST,
+            "{name}: {:?}",
+            rule.body
+        );
         app.finish().await;
     }
 }

@@ -503,7 +503,7 @@ impl RuleInput {
             }
             _ => (None, None),
         };
-        if self.target == TargetKind::Devices {
+        if matches!(self.target, TargetKind::Devices | TargetKind::Outdated) {
             return Err(invalid(
                 "a rule covers every device, chosen companies or the devices with chosen tags",
             ));
@@ -515,6 +515,7 @@ impl RuleInput {
                 company_ids: std::mem::take(&mut self.company_ids),
                 tag_ids: std::mem::take(&mut self.tag_ids),
                 tag_match: self.tag_match,
+                packages: Vec::new(),
             },
         )
         .map_err(|error| error.with_code("invalid_rule"))?;
@@ -564,7 +565,7 @@ impl RuleInput {
                 ids: self.tag_ids.clone(),
                 matching: self.tag_match,
             },
-            TargetKind::All | TargetKind::Devices => Target::All,
+            TargetKind::All | TargetKind::Devices | TargetKind::Outdated => Target::All,
         }
     }
 

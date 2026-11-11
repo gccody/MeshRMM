@@ -11,11 +11,12 @@ use sha2::{Digest, Sha256};
 
 use super::{
     library::Application,
+    outdated::{self, Delta, stored_key},
     tables::{DeviceApplicationStatus, DevicePackages},
 };
 use crate::{
     agents,
-    db::{self, Database, Executor, tables::Agents},
+    db::{self, Database, Executor},
     secrets::hex,
 };
 
@@ -192,8 +193,52 @@ pub async fn store_scan(
     })
 }
 
+/// A device's stored package, as replacing and forgetting its packages
+/// read it.
+#[derive(sqlx::FromRow)]
+struct StoredRow {
+    source: String,
+    package_id: String,
+    package_key: String,
+    name: String,
+    available_version: Option<String>,
+    outdated_since: Option<i64>,
+}
+
+fn stored_rows() -> sea_query::SelectStatement {
+    Query::select()
+        .columns([
+            DevicePackages::Source,
+            DevicePackages::PackageId,
+            DevicePackages::PackageKey,
+            DevicePackages::Name,
+            DevicePackages::AvailableVersion,
+            DevicePackages::OutdatedSince,
+        ])
+        .from(DevicePackages::Table)
+        .to_owned()
+}
+
+/// The outdated ones of a device's stored packages.
+fn outdated_of<'a>(rows: impl IntoIterator<Item = &'a StoredRow>) -> outdated::OutdatedSet {
+    outdated::set_of(
+        rows.into_iter()
+            .filter(|row| row.outdated_since.is_some())
+            .map(|row| {
+                (
+                    row.source.as_str(),
+                    row.package_id.as_str(),
+                    row.package_key.as_str(),
+                    row.name.as_str(),
+                    row.available_version.as_deref(),
+                )
+            }),
+    )
+}
+
 /// Replaces the device's packages from the `replaced` sources with
-/// `packages`, keeping when each was first found outdated.
+/// `packages`, keeping when each was first found outdated, and changes the
+/// fleet's outdated packages by the difference.
 async fn replace_packages(
     executor: &mut impl Executor,
     device_id: &str,
@@ -201,26 +246,68 @@ async fn replace_packages(
     packages: &[&ScannedPackage],
     now: i64,
 ) -> db::Result<()> {
-    let previous: Vec<(String, String, Option<i64>)> = executor
+    let previous: Vec<StoredRow> = executor
         .fetch_all(
-            &Query::select()
-                .columns([
-                    DevicePackages::Source,
-                    DevicePackages::PackageId,
-                    DevicePackages::OutdatedSince,
-                ])
-                .from(DevicePackages::Table)
+            &stored_rows()
                 .and_where(Expr::col(DevicePackages::DeviceId).eq(device_id))
                 .to_owned(),
         )
         .await?;
     let outdated_since = previous
-        .into_iter()
-        .filter_map(|(source, id, since)| {
-            let source = PackageSource::parse(&source)?;
-            Some((PackageKey { source, id }, since?))
+        .iter()
+        .filter_map(|row| {
+            let source = PackageSource::parse(&row.source)?;
+            Some((
+                PackageKey {
+                    source,
+                    id: row.package_id.clone(),
+                },
+                row.outdated_since?,
+            ))
         })
         .collect::<HashMap<_, _>>();
+    // The outdated packages the replaced sources had, and those they get.
+    let replaced_sources = replaced
+        .iter()
+        .map(|source| source.as_str())
+        .collect::<HashSet<_>>();
+    let before = outdated_of(
+        previous
+            .iter()
+            .filter(|row| replaced_sources.contains(row.source.as_str())),
+    );
+    let ids = packages
+        .iter()
+        .map(|package| storable(&package.id))
+        .collect::<Vec<_>>();
+    let names = packages
+        .iter()
+        .map(|package| storable(&package.name))
+        .collect::<Vec<_>>();
+    let keys = packages
+        .iter()
+        .zip(&ids)
+        .map(|(package, id)| stored_key(package.source.as_str(), id))
+        .collect::<Vec<_>>();
+    let available = packages
+        .iter()
+        .map(|package| package.available_version.as_deref().map(storable))
+        .collect::<Vec<_>>();
+    let after = outdated::set_of(
+        packages
+            .iter()
+            .enumerate()
+            .filter(|(_, package)| package.outdated())
+            .map(|(index, package)| {
+                (
+                    package.source.as_str(),
+                    ids[index].as_str(),
+                    keys[index].as_str(),
+                    names[index].as_str(),
+                    available[index].as_deref(),
+                )
+            }),
+    );
     executor
         .execute(
             &Query::delete()
@@ -233,24 +320,26 @@ async fn replace_packages(
                 .to_owned(),
         )
         .await?;
-    for chunk in packages.chunks(INSERT_CHUNK) {
+    let indexes = (0..packages.len()).collect::<Vec<_>>();
+    for chunk in indexes.chunks(INSERT_CHUNK) {
         let mut insert = Query::insert();
         insert.into_table(DevicePackages::Table).columns([
             DevicePackages::DeviceId,
             DevicePackages::Source,
             DevicePackages::PackageId,
+            DevicePackages::PackageKey,
             DevicePackages::Name,
             DevicePackages::Version,
             DevicePackages::AvailableVersion,
             DevicePackages::OutdatedSince,
         ]);
-        for package in chunk {
-            let id = storable(&package.id);
+        for &index in chunk {
+            let package = packages[index];
             let since = package.outdated().then(|| {
                 outdated_since
                     .get(&PackageKey {
                         source: package.source,
-                        id: id.clone(),
+                        id: ids[index].clone(),
                     })
                     .copied()
                     .unwrap_or(now)
@@ -258,14 +347,19 @@ async fn replace_packages(
             insert.values_panic([
                 device_id.into(),
                 package.source.as_str().into(),
-                id.into(),
-                storable(&package.name).into(),
+                ids[index].as_str().into(),
+                keys[index].as_str().into(),
+                names[index].as_str().into(),
                 package.version.as_deref().map(storable).into(),
-                package.available_version.as_deref().map(storable).into(),
+                available[index].clone().into(),
                 since.into(),
             ]);
         }
         executor.execute(&insert).await?;
+    }
+    let delta = Delta::between(&before, &after);
+    if !delta.is_empty() {
+        outdated::adjust(executor, &delta).await?;
     }
     Ok(())
 }
@@ -334,6 +428,19 @@ impl<'a> Matches<'a> {
         self.by_key.get(key).copied()
     }
 
+    /// The packages of the library applications `wanted` holds for, in key
+    /// order.
+    pub fn keys_where(&self, wanted: impl Fn(&Application) -> bool) -> Vec<PackageKey> {
+        let mut keys = self
+            .by_key
+            .iter()
+            .filter(|(_, application)| wanted(application))
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys
+    }
+
     pub fn held(&self, key: &PackageKey) -> bool {
         self.application(key)
             .is_some_and(|application| application.pinned_version.is_some())
@@ -399,131 +506,6 @@ pub async fn packages(
     Ok(packages)
 }
 
-/// A device with an outdated package, in the fleet's list.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct OutdatedDevice {
-    pub device_id: String,
-    pub device_name: String,
-    pub version: Option<String>,
-    pub available_version: Option<String>,
-    pub outdated_since: Option<i64>,
-}
-
-/// An outdated package, with the devices it is outdated on.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Outdated {
-    pub source: String,
-    pub package_id: String,
-    pub name: String,
-    pub application_id: Option<String>,
-    pub application_name: Option<String>,
-    pub held: bool,
-    pub devices: Vec<OutdatedDevice>,
-}
-
-#[derive(sqlx::FromRow)]
-struct OutdatedRow {
-    device_id: String,
-    device_name: String,
-    source: String,
-    package_id: String,
-    name: String,
-    version: Option<String>,
-    available_version: Option<String>,
-    outdated_since: Option<i64>,
-}
-
-/// Every outdated package on enrolled devices: most devices first.
-pub async fn outdated(
-    executor: &mut impl Executor,
-    matches: &Matches<'_>,
-) -> db::Result<Vec<Outdated>> {
-    let rows: Vec<OutdatedRow> = executor
-        .fetch_all(
-            &Query::select()
-                .column((DevicePackages::Table, DevicePackages::DeviceId))
-                .expr_as(Expr::col((Agents::Table, Agents::Name)), "device_name")
-                .columns([
-                    (DevicePackages::Table, DevicePackages::Source),
-                    (DevicePackages::Table, DevicePackages::PackageId),
-                    (DevicePackages::Table, DevicePackages::Name),
-                    (DevicePackages::Table, DevicePackages::Version),
-                    (DevicePackages::Table, DevicePackages::AvailableVersion),
-                    (DevicePackages::Table, DevicePackages::OutdatedSince),
-                ])
-                .from(DevicePackages::Table)
-                .inner_join(
-                    Agents::Table,
-                    Expr::col((Agents::Table, Agents::Id))
-                        .equals((DevicePackages::Table, DevicePackages::DeviceId)),
-                )
-                .and_where(Expr::col((Agents::Table, Agents::DeletionRequestedAt)).is_null())
-                .and_where(
-                    Expr::col((DevicePackages::Table, DevicePackages::AvailableVersion))
-                        .is_not_null(),
-                )
-                .to_owned(),
-        )
-        .await?;
-    // Devices can list a package in different cases (`Git.Git`, `git.git`)
-    // where its manager ignores case: one package.
-    let mut grouped: HashMap<PackageKey, Outdated> = HashMap::new();
-    for row in rows {
-        let Some(source) = PackageSource::parse(&row.source) else {
-            continue;
-        };
-        let key = PackageKey {
-            source,
-            id: row.package_id.clone(),
-        };
-        let entry = grouped.entry(key).or_insert_with(|| {
-            let mut package = Package {
-                source: row.source.clone(),
-                package_id: row.package_id.clone(),
-                name: row.name.clone(),
-                version: None,
-                available_version: None,
-                outdated_since: None,
-                application_id: None,
-                application_name: None,
-                held: false,
-            };
-            matches.annotate(&mut package);
-            Outdated {
-                source: package.source,
-                package_id: package.package_id,
-                name: package.name,
-                application_id: package.application_id,
-                application_name: package.application_name,
-                held: package.held,
-                devices: Vec::new(),
-            }
-        });
-        entry.devices.push(OutdatedDevice {
-            device_id: row.device_id,
-            device_name: row.device_name,
-            version: row.version,
-            available_version: row.available_version,
-            outdated_since: row.outdated_since,
-        });
-    }
-    let mut outdated = grouped.into_values().collect::<Vec<_>>();
-    for package in &mut outdated {
-        package.devices.sort_by_cached_key(|device| {
-            (device.device_name.to_lowercase(), device.device_id.clone())
-        });
-    }
-    outdated.sort_by_cached_key(|package| {
-        (
-            std::cmp::Reverse(package.devices.len()),
-            package.name.to_lowercase(),
-            package.source.clone(),
-            package.package_id.clone(),
-        )
-    });
-    Ok(outdated)
-}
-
 /// A package a device's latest scan found outdated, for alert rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutdatedPackage {
@@ -581,9 +563,32 @@ pub async fn outdated_packages(
     Ok(packages)
 }
 
-/// The device was deleted: its scan goes with it.
-pub async fn forget(executor: &mut impl Executor, device_id: &str) -> db::Result<()> {
-    executor
+/// The device was deleted: its scan goes with it, and its outdated packages
+/// leave the fleet's.
+pub async fn forget(database: &Database, device_id: &str) -> db::Result<()> {
+    let mut transaction = database.begin().await?;
+    // Waits for a scan of the device that is being stored, as storing one
+    // locks the row.
+    transaction
+        .fetch_optional::<(String,), _>(
+            &Query::select()
+                .column(DeviceApplicationStatus::DeviceId)
+                .from(DeviceApplicationStatus::Table)
+                .and_where(Expr::col(DeviceApplicationStatus::DeviceId).eq(device_id))
+                .lock(LockType::Update)
+                .to_owned(),
+        )
+        .await?;
+    let rows: Vec<StoredRow> = transaction
+        .fetch_all(
+            &stored_rows()
+                .and_where(Expr::col(DevicePackages::DeviceId).eq(device_id))
+                .and_where(Expr::col(DevicePackages::OutdatedSince).is_not_null())
+                .to_owned(),
+        )
+        .await?;
+    let delta = Delta::between(&outdated_of(&rows), &outdated::OutdatedSet::new());
+    transaction
         .execute(
             &Query::delete()
                 .from_table(DevicePackages::Table)
@@ -591,7 +596,7 @@ pub async fn forget(executor: &mut impl Executor, device_id: &str) -> db::Result
                 .to_owned(),
         )
         .await?;
-    executor
+    transaction
         .execute(
             &Query::delete()
                 .from_table(DeviceApplicationStatus::Table)
@@ -599,5 +604,9 @@ pub async fn forget(executor: &mut impl Executor, device_id: &str) -> db::Result
                 .to_owned(),
         )
         .await?;
+    if !delta.is_empty() {
+        outdated::adjust(&mut transaction, &delta).await?;
+    }
+    transaction.commit().await?;
     Ok(())
 }

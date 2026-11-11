@@ -162,6 +162,28 @@ export type DevicePackages = {
   packages: DevicePackage[];
 };
 
+// GET /v1/packages/outdated: a package outdated on some devices.
+export type OutdatedPackage = {
+  source: PackageSource;
+  package_id: string;
+  name: string;
+  application_id: string | null;
+  application_name: string | null;
+  held: boolean;
+  // The newest version a scan offered.
+  available_version: string | null;
+  // How many devices have it outdated.
+  devices: number;
+};
+
+// Of the packages that aren't pinned: how many are outdated anywhere, and
+// how many updates (a device and a package it has outdated) they make.
+export type OutdatedTotals = { packages: number; updates: number };
+
+// A page of the fleet's outdated packages, on the most devices first.
+export type OutdatedPage = { packages: OutdatedPackage[]; matching: number; totals: OutdatedTotals };
+
+// GET /v1/packages/outdated/devices: a device with a package outdated.
 export type OutdatedDevice = {
   device_id: string;
   device_name: string;
@@ -170,16 +192,14 @@ export type OutdatedDevice = {
   outdated_since: number | null;
 };
 
-// GET /v1/packages/outdated: one package and the devices it is outdated on.
-export type OutdatedPackage = {
-  source: PackageSource;
-  package_id: string;
-  name: string;
-  application_id: string | null;
-  application_name: string | null;
-  held: boolean;
-  devices: OutdatedDevice[];
-};
+// A page of a package's devices, in device ID order; `next` asks for the
+// page after it, and is null on the last.
+export type OutdatedDevicesPage = { devices: OutdatedDevice[]; next: string | null };
+
+// How many outdated packages, or devices of one, a page asks for.
+export const OUTDATED_PAGE_SIZE = 100;
+// The longest search the server takes.
+export const MAX_OUTDATED_QUERY_LENGTH = 200;
 
 // A Windows program from the device's inventory, to uninstall.
 export type InventoryProgram = { name: string; version?: string };
@@ -336,26 +356,52 @@ export function filterPackages(packages: readonly DevicePackage[], query: string
     && (!needle || [pkg.name, pkg.package_id, pkg.application_name ?? ""].some((text) => text.toLocaleLowerCase().includes(needle))));
 }
 
-// Fleet totals for the outdated view's heading. Pinned packages are held
-// back on purpose, so they count as pending nowhere: not here, not on the
-// device's tab, not for alerts.
-export function outdatedTotals(packages: readonly OutdatedPackage[]) {
-  const devices = new Set<string>();
-  let updates = 0;
-  let count = 0;
-  for (const pkg of packages) {
-    if (pkg.held) continue;
-    count += 1;
-    for (const device of pkg.devices) devices.add(device.device_id);
-    updates += pkg.devices.length;
-  }
-  return { packages: count, devices: devices.size, updates };
+// The query of a page of the fleet's outdated packages: those a search
+// matches (by name, ID or library application), from `offset`.
+export function outdatedQuery(query: string, offset: number, limit = OUTDATED_PAGE_SIZE) {
+  const params = new URLSearchParams();
+  const text = query.trim();
+  if (text) params.set("query", text);
+  params.set("limit", String(limit));
+  if (offset) params.set("offset", String(offset));
+  return params.toString();
 }
 
-// The oldest time a package became outdated on any device.
-export const oldestOutdated = (pkg: OutdatedPackage) =>
-  pkg.devices.reduce<number | null>((oldest, device) =>
-    device.outdated_since !== null && (oldest === null || device.outdated_since < oldest) ? device.outdated_since : oldest, null);
+// The query of a page of the devices with `pkg` outdated, after the device
+// `after` (the page before's `next`).
+export function outdatedDevicesQuery(pkg: Pick<OutdatedPackage, "source" | "package_id">, after: string | null, limit = OUTDATED_PAGE_SIZE) {
+  const params = new URLSearchParams({ package: packageKey(pkg), limit: String(limit) });
+  if (after) params.set("after", after);
+  return params.toString();
+}
+
+// The devices of a package shown so far, with the page after `after`
+// joined. Only the page asked after the last one shown joins; a device
+// that moved between pages stays where it was first shown.
+export function joinDevicePage(list: OutdatedDevicesPage, after: string, page: OutdatedDevicesPage): OutdatedDevicesPage {
+  if (list.next !== after) return list;
+  const shown = new Set(list.devices.map((device) => device.device_id));
+  return { devices: [...list.devices, ...page.devices.filter((device) => !shown.has(device.device_id))], next: page.next };
+}
+
+// Where an update of outdated applications runs, in words, after "the
+// devices where": "Firefox is outdated", "any of Firefox and 7-Zip is
+// outdated", or with none chosen any that isn't pinned.
+export function outdatedLabel(names: readonly string[]) {
+  if (!names.length) return "an application that isn't pinned is outdated";
+  return names.length === 1 ? `${names[0]} is outdated` : `any of ${namesText(names)} is outdated`;
+}
+
+// The outdated list's footer: "3 applications, on the most devices first".
+export function outdatedSummary(matching: number, searching: boolean) {
+  const count = `${matching} ${matching === 1 ? "application" : "applications"}`;
+  return searching ? `${count} ${matching === 1 ? "matches" : "match"}` : `${count}, on the most devices first`;
+}
+
+// How many updates the chosen packages make: each device counts once per
+// package it has outdated, so devices with several are counted again.
+export const chosenUpdates = (packages: readonly Pick<OutdatedPackage, "devices">[]) =>
+  packages.reduce((sum, pkg) => sum + pkg.devices, 0);
 
 // Windows programs from the inventory that MeshRMM can uninstall: machine
 // wide ones (per-user programs need their user signed in).

@@ -153,6 +153,23 @@ application when it matches one of the application's package sources.
 Package IDs match as their manager reads them. winget, Chocolatey and
 Homebrew ignore case, so the library's `mozilla.firefox` is a device's
 `Mozilla.Firefox` for counts, pins, updates, the fleet view and alerts.
+
+### How the fleet's outdated packages are counted
+
+The server keeps a summary, `outdated_packages`: for each package (by
+source and its ID as the manager compares it, `package_key`, lowercase where
+the manager ignores case) how many devices have it outdated and the newest
+version a scan offered. A scan that changes a device's packages changes the
+summary in the same transaction, by the difference between the outdated
+packages the device had and those it has now, and deleting a device takes
+its packages out. So the **Outdated** tab reads one page of the summary and
+its counts in two statements, however many devices there are: the counts
+read one row per outdated package, never every device's packages. A page
+of one package's devices, and a job where packages are outdated, look the
+package up in `idx_device_packages_outdated_key`, which holds only outdated
+rows, in device ID order. Library applications and pins are matched to the
+page's packages only. A device whose deletion was asked for counts until
+its packages are removed, which deleting it does at once.
 Flatpak IDs match case exactly, and snap names are lowercase.
 
 ### Custom installers
@@ -220,10 +237,22 @@ On a device's **Applications** tab:
   per-user programs aren't offered.
 
 On the **Applications** page, **Install on devices** (a library application)
-and the **Outdated** tab's **Update on their devices…** and **Update all…**
-start a job on chosen devices, companies, tags or every device, which waits
+starts a job on chosen devices, companies, tags or every device, which waits
 for offline devices or skips them. The job's page follows every device, and
 **View applications** opens a device's result.
+
+The **Outdated** tab lists the fleet's outdated packages a page at a time,
+on the most devices first: each with its source and ID, the newest version a
+scan offered, and how many devices have it outdated. The search (by name,
+ID or library application) asks the server after a pause in typing. Opening
+a package lists its devices, a page at a time. The tiles count the packages
+that aren't pinned and the updates they make (a device and a package it has
+outdated). **Update on their devices…** (chosen packages) and **Update
+all…** start a job that runs **where it is outdated**: the server finds the
+devices where a chosen package, or for **Update all…** any package that
+isn't pinned, is outdated as the job starts, so a device updated since the
+page loaded isn't part of it and the browser sends no device list. The
+dialog also offers chosen devices, companies, tags or every device instead.
 
 ### How a run works
 
@@ -371,8 +400,9 @@ log records:
 | `POST /v1/agents/{id}/application-runs` | `{action: "install", application_ids}`, `{action: "update", mode: "all"}` or `{action: "update", mode: "only" or "except", application_ids, packages}`, or `{action: "uninstall", application_ids, packages, inventory: [{name, version}]}`, with packages as `source:id`. Returns the run. `409 device_offline`, `409 application_run_running`, `409 application_pinned` when everything an update names is pinned, `400 not_applicable` when nothing is for the device. |
 | `GET /v1/application-runs?device_id=&action=&limit=` | Runs, newest first (50 by default, at most 200). |
 | `GET /v1/application-runs/{id}` | A run with each application's `outcome`, `version`, `exit_code`, `error` and `output`. |
-| `GET /v1/packages/outdated` | Every outdated package in the fleet, with the devices it's outdated on, most devices first, and whether it's `held` (pinned). The website's totals and **Update all…** leave held packages out. |
-| `POST /v1/jobs` | `{applications: {…as for a run…}}` with the [job's target](automation.md#api). `409 application_pinned` as for a run. Each of the job's devices (`GET /v1/jobs/{id}/devices`) has `applications`: `[{name, outcome, error}]` for those that failed or were skipped. |
+| `GET /v1/packages/outdated?query=&limit=&offset=` | A page of the fleet's outdated packages, on the most devices first, then by name: `{packages, matching, totals}`. Each package has `source`, `package_id`, `name`, `application_id`, `application_name`, `held` (pinned), `available_version` (the newest a scan offered) and `devices` (how many have it outdated). `query` matches part of the name, the ID or the library application's name, in any case; `matching` is how many packages it matches. `totals` is `{packages, updates}` of the packages that aren't held, whatever the search: how many, and how many devices have each outdated, added up. `limit` is 100 by default and at most 200; 0 returns only the counts. |
+| `GET /v1/packages/outdated/devices?package=&limit=&after=` | A page of the devices with `package` (`source:id`) outdated, in device ID order: `{devices: [{device_id, device_name, version, available_version, outdated_since}], next}`. `next` is the `after` of the next page, `null` on the last. `limit` is 100 by default and at most 200. |
+| `POST /v1/jobs` | `{applications: {…as for a run…}}` with the [job's target](automation.md#api). An update can also have `target: "outdated"` with `packages` (`source:id`, at most 50): the devices where any of them is outdated as the job is created, or with none, the devices with any package outdated that the library doesn't pin. It needs `applications.deploy` but not `jobs.run_wide`, since it only updates what devices have outdated; a script, file, install or uninstall can't use it (`400 invalid_job`), and neither can a policy or an alert rule. `409 application_pinned` as for a run. Each of the job's devices (`GET /v1/jobs/{id}/devices`) has `applications`: `[{name, outcome, error}]` for those that failed or were skipped. |
 
 A run reads `{id, device_id, device_name, action, summary, status, progress,
 requested_by, policy_name, job_id, error, succeeded, unchanged, skipped, failed,
@@ -431,7 +461,9 @@ application history. A deleted device's packages go with it; its runs stay.
   runs programs with timeouts and the scan's or run's deadline.
 - `server/src/applications/`:
   - `library.rs`: the library and its checks;
-  - `store.rs`: devices' packages and the fleet's outdated ones;
+  - `store.rs`: devices' packages;
+  - `outdated.rs`: the fleet's outdated packages, a page of one's devices,
+    and the devices a job where packages are outdated covers;
   - `runs.rs`: runs and their lost and history sweeps;
   - `jobs.rs`: what a run or job does on each platform;
   - `policies.rs`: application policies;

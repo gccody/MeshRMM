@@ -1,14 +1,18 @@
 //! Which devices a job, automation policy or alert rule covers: chosen
-//! devices, whole companies, the devices with chosen tags, or every device.
+//! devices, whole companies, the devices with chosen tags, or every device;
+//! and for a job that updates applications, the devices where chosen
+//! packages, or any, are outdated.
 //!
 //! A target is kept as chosen and resolved each time it is used, so a policy
 //! or rule also covers devices enrolled, moved or tagged after it was saved.
 use std::collections::HashMap;
 
+use meshrmm_protocol_types::{MAX_RUN_ITEMS, PackageKey};
 use sea_query::{Expr, ExprTrait, Func, Order, Query, SimpleExpr};
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 
 use crate::{
+    applications::outdated,
     db::{
         self, Executor,
         tables::{Agents, Companies, DeviceTags, Tags},
@@ -31,6 +35,9 @@ pub enum TargetKind {
     Tags,
     /// Every device.
     All,
+    /// The devices where chosen packages, or any, are outdated: only for a
+    /// job that updates applications, resolved when it is created.
+    Outdated,
 }
 
 impl TargetKind {
@@ -40,6 +47,7 @@ impl TargetKind {
             Self::Companies => "companies",
             Self::Tags => "tags",
             Self::All => "all",
+            Self::Outdated => "outdated",
         }
     }
 
@@ -49,14 +57,18 @@ impl TargetKind {
             "companies" => Some(Self::Companies),
             "tags" => Some(Self::Tags),
             "all" => Some(Self::All),
+            "outdated" => Some(Self::Outdated),
             _ => None,
         }
     }
 
     /// Whole companies, tags and every device can reach many devices at
     /// once, so jobs on them need [`crate::rbac::Permission::JobsRunWide`].
+    /// Outdated packages' devices are only for application updates, which
+    /// `applications.deploy` allows on any device, and only those that have
+    /// what the update is for.
     pub fn is_wide(self) -> bool {
-        self != Self::Devices
+        !matches!(self, Self::Devices | Self::Outdated)
     }
 }
 
@@ -96,6 +108,13 @@ pub enum Target {
         matching: TagMatch,
     },
     All,
+    /// The devices with any of `packages` outdated; with none chosen, the
+    /// devices with any package outdated but those in `except` (the ones
+    /// pinned library applications hold back).
+    Outdated {
+        packages: Vec<PackageKey>,
+        except: Vec<PackageKey>,
+    },
 }
 
 /// A target's fields in a request, beside its kind.
@@ -105,6 +124,9 @@ pub struct Choice {
     pub company_ids: Vec<String>,
     pub tag_ids: Vec<String>,
     pub tag_match: TagMatch,
+    /// For [`TargetKind::Outdated`]: the packages, as `source:id`; none for
+    /// any.
+    pub packages: Vec<String>,
 }
 
 impl Target {
@@ -114,6 +136,7 @@ impl Target {
             Self::Companies(_) => TargetKind::Companies,
             Self::Tags { .. } => TargetKind::Tags,
             Self::All => TargetKind::All,
+            Self::Outdated { .. } => TargetKind::Outdated,
         }
     }
 
@@ -158,11 +181,24 @@ impl Target {
                 })
             }
             TargetKind::All => Ok(Self::All),
+            TargetKind::Outdated => {
+                let packages = crate::applications::jobs::parse_packages(&choice.packages)?;
+                if packages.len() > MAX_RUN_ITEMS {
+                    return Err(ApiError::bad_request(format!(
+                        "choose at most {MAX_RUN_ITEMS} outdated packages, or none for any"
+                    )));
+                }
+                Ok(Self::Outdated {
+                    packages,
+                    except: Vec::new(),
+                })
+            }
         }
     }
 
     /// From stored rows: the kind, its tag match and its linked IDs. `None`
-    /// when the kind or match is unknown.
+    /// when the kind or match is unknown, or for outdated packages, which
+    /// nothing stores.
     pub fn from_stored(kind: &str, tag_match: &str, choice: Choice) -> Option<Self> {
         Some(match TargetKind::parse(kind)? {
             TargetKind::Devices => Self::Devices(choice.device_ids),
@@ -172,6 +208,7 @@ impl Target {
                 matching: TagMatch::parse(tag_match)?,
             },
             TargetKind::All => Self::All,
+            TargetKind::Outdated => return None,
         })
     }
 
@@ -204,9 +241,23 @@ impl Target {
         }
     }
 
-    /// Whether the target covers `device`.
+    /// An outdated packages target's packages; none for any, and for the
+    /// other kinds.
+    pub fn packages(&self) -> &[PackageKey] {
+        match self {
+            Self::Outdated { packages, .. } => packages,
+            _ => &[],
+        }
+    }
+
+    /// Whether the target covers `device`. Outdated packages' devices are
+    /// only resolved by the database when a job is created ([`condition`]),
+    /// so they cover none here.
+    ///
+    /// [`condition`]: Self::condition
     pub fn covers(&self, device: &Device) -> bool {
         match self {
+            Self::Outdated { .. } => false,
             Self::All => true,
             Self::Devices(ids) => ids.contains(&device.id),
             Self::Companies(ids) => device
@@ -235,6 +286,9 @@ impl Target {
                 Some(Expr::col((Agents::Table, Agents::CompanyId)).is_in(ids.iter().cloned()))
             }
             Self::Tags { ids, matching } => Some(id().in_subquery(tagged(ids, *matching))),
+            Self::Outdated { packages, except } => {
+                Some(id().in_subquery(outdated::devices_with_outdated(packages, except)))
+            }
         }
     }
 
@@ -242,7 +296,7 @@ impl Target {
     pub async fn check_references(&self, executor: &mut impl Executor) -> Result<(), ApiError> {
         let missing = |what: &str| ApiError::not_found(format!("a chosen {what} no longer exists"));
         match self {
-            Self::All => {}
+            Self::All | Self::Outdated { .. } => {}
             Self::Companies(ids) => {
                 let found: Vec<(String,)> = executor
                     .fetch_all(
@@ -290,8 +344,26 @@ impl Target {
     }
 
     /// The companies' or tags' names in words, such as "Acme, Globex and 2
-    /// more" or "Tagged servers and london"; `None` for the other kinds.
+    /// more" or "Tagged servers and london", or the outdated packages', such
+    /// as "Where Firefox is outdated"; `None` for the other kinds.
     pub async fn names(&self, executor: &mut impl Executor) -> db::Result<Option<String>> {
+        if let Self::Outdated { packages, .. } = self {
+            return Ok(Some(match packages.as_slice() {
+                [] => "Where any application is outdated".to_owned(),
+                [_] => format!(
+                    "Where {} is outdated",
+                    outdated::names(executor, packages).await?[0]
+                ),
+                _ => {
+                    let names =
+                        outdated::names(executor, &packages[..packages.len().min(4)]).await?;
+                    format!(
+                        "Where any of {} is outdated",
+                        list(&names, packages.len(), "and")
+                    )
+                }
+            }));
+        }
         let (names, total): (Vec<(String,)>, usize) = match self {
             Self::Companies(ids) => (
                 executor
@@ -319,7 +391,7 @@ impl Target {
                     .await?,
                 ids.len(),
             ),
-            Self::Devices(_) | Self::All => return Ok(None),
+            Self::Devices(_) | Self::All | Self::Outdated { .. } => return Ok(None),
         };
         let names = names.into_iter().map(|(name,)| name).collect::<Vec<_>>();
         Ok(Some(match self {
@@ -367,15 +439,25 @@ pub fn tagged(ids: &[String], matching: TagMatch) -> sea_query::SelectStatement 
 }
 
 /// Lists a target's kind and IDs the way requests send them:
-/// `{target, device_ids, company_ids, tag_ids, tag_match}`.
+/// `{target, device_ids, company_ids, tag_ids, tag_match}`, and for outdated
+/// packages `packages` as `source:id`.
 impl Serialize for Target {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut fields = serializer.serialize_struct("Target", 5)?;
+        let outdated = matches!(self, Self::Outdated { .. });
+        let mut fields = serializer.serialize_struct("Target", 5 + usize::from(outdated))?;
         fields.serialize_field("target", &self.kind())?;
         fields.serialize_field("device_ids", self.device_ids())?;
         fields.serialize_field("company_ids", self.company_ids())?;
         fields.serialize_field("tag_ids", self.tag_ids())?;
         fields.serialize_field("tag_match", &self.tag_match())?;
+        if outdated {
+            let packages = self
+                .packages()
+                .iter()
+                .map(PackageKey::text)
+                .collect::<Vec<_>>();
+            fields.serialize_field("packages", &packages)?;
+        }
         fields.end()
     }
 }
@@ -443,6 +525,7 @@ mod tests {
             company_ids: companies.iter().map(|id| (*id).to_owned()).collect(),
             tag_ids: tags.iter().map(|id| (*id).to_owned()).collect(),
             tag_match: TagMatch::All,
+            packages: Vec::new(),
         };
         assert!(Target::from_request(TargetKind::Devices, choice(&[], &[A], &[A])).is_err());
         assert!(Target::from_request(TargetKind::Companies, choice(&[A], &[], &[])).is_err());
@@ -460,6 +543,43 @@ mod tests {
             Target::All
         );
         assert!(TargetKind::Tags.is_wide() && !TargetKind::Devices.is_wide());
+        assert!(!TargetKind::Outdated.is_wide());
+        let outdated = |packages: &[&str]| Choice {
+            packages: packages.iter().map(|id| (*id).to_owned()).collect(),
+            ..Choice::default()
+        };
+        assert_eq!(
+            Target::from_request(
+                TargetKind::Outdated,
+                outdated(&["winget:Git.Git", "winget:git.git", "flatpak:org.gimp.GIMP"])
+            )
+            .unwrap()
+            .packages()
+            .iter()
+            .map(PackageKey::text)
+            .collect::<Vec<_>>(),
+            ["winget:Git.Git", "flatpak:org.gimp.GIMP"],
+            "one package however its ID is cased, where its manager ignores case"
+        );
+        assert!(Target::from_request(TargetKind::Outdated, outdated(&[])).is_ok());
+        assert!(Target::from_request(TargetKind::Outdated, outdated(&["Git.Git"])).is_err());
+        let many = (0..=MAX_RUN_ITEMS)
+            .map(|n| format!("winget:Package.N{n}"))
+            .collect::<Vec<_>>();
+        assert!(
+            Target::from_request(
+                TargetKind::Outdated,
+                Choice {
+                    packages: many,
+                    ..Choice::default()
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(
+            Target::from_stored("outdated", "any", Choice::default()),
+            None
+        );
     }
 
     #[test]

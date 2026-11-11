@@ -47,7 +47,7 @@ async fn device(state: &AppState, id: &str) -> Result<String, ApiError> {
 }
 
 /// A search text: trimmed, `None` when empty, and refused when too long.
-fn search_text(text: Option<String>, name: &str) -> Result<Option<String>, ApiError> {
+pub(super) fn search_text(text: Option<String>, name: &str) -> Result<Option<String>, ApiError> {
     let text = text
         .map(|text| text.trim().to_owned())
         .filter(|text| !text.is_empty());

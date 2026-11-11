@@ -14,6 +14,7 @@
 //! removes runs older than [`HISTORY_MS`].
 pub mod jobs;
 pub mod library;
+pub mod outdated;
 pub mod policies;
 pub mod runs;
 pub mod store;
@@ -334,7 +335,7 @@ pub fn busy_devices() -> sea_query::SelectStatement {
 /// The device was deleted: its scan goes with it; its runs stay in the
 /// history.
 pub async fn device_removed(state: &AppState, device_id: &str) {
-    if let Err(error) = store::forget(&mut &state.database, device_id).await {
+    if let Err(error) = store::forget(&state.database, device_id).await {
         tracing::warn!(device_id, %error, "could not remove a deleted device's applications");
     }
 }

@@ -1230,3 +1230,126 @@ async fn scim_lookups_use_their_indexes() {
     }
     assert!(misses.is_empty(), "{}", misses.join("\n\n"));
 }
+
+/// The outdated applications' reads, and what their plans must not show:
+/// the list and its counts read the summary, never every device's packages,
+/// and its page walks the summary's order in its index; a page of one
+/// package's devices, and a job's devices where packages are outdated, look
+/// the package up in `idx_device_packages_outdated_key` rather than reading
+/// every package of every device.
+fn outdated_statements() -> Vec<Checked> {
+    use meshrmm_protocol_types::PackageKey;
+    use meshrmm_server::{applications::outdated, targets::Target};
+    let firefox = PackageKey::parse("winget:Mozilla.Firefox").unwrap();
+    let git = PackageKey::parse("winget:Git.Git").unwrap();
+    let searched = outdated::ListFilter {
+        query: Some("fire".into()),
+        named: vec![firefox.clone()],
+        held: vec![git.clone()],
+    };
+    let job_target = |target: Target| {
+        Query::select()
+            .column(sea_query::Alias::new("id"))
+            .from(sea_query::Alias::new("agents"))
+            .and_where(target.condition().unwrap())
+            .to_owned()
+    };
+    let summary_only: &[&str] = &["device_packages"];
+    vec![
+        (
+            "the outdated list's counts",
+            Statement::Select(outdated::counts_query(&outdated::ListFilter::default())),
+            &["outdated_packages"],
+            summary_only,
+        ),
+        (
+            "the outdated list's counts with a search and pinned packages",
+            Statement::Select(outdated::counts_query(&searched)),
+            &["outdated_packages"],
+            summary_only,
+        ),
+        (
+            "a page of the packages outdated on the most devices",
+            Statement::Select(outdated::page_query(
+                &outdated::ListFilter::default(),
+                100,
+                200,
+            )),
+            &["idx_outdated_packages_devices"],
+            &["device_packages", "TEMP B-TREE"],
+        ),
+        (
+            "a page of the outdated packages a search matches",
+            Statement::Select(outdated::page_query(&searched, 100, 0)),
+            &["outdated_packages"],
+            summary_only,
+        ),
+        (
+            "a page of an outdated package's devices",
+            Statement::Select(outdated::devices_query(&firefox, None, 101)),
+            &["idx_device_packages_outdated_key"],
+            &[
+                "TEMP B-TREE",
+                "SCAN device_packages",
+                "Seq Scan on device_packages",
+            ],
+        ),
+        (
+            "a later page of an outdated package's devices",
+            Statement::Select(outdated::devices_query(
+                &git,
+                Some("00000000-0000-4000-8000-000000000400"),
+                101,
+            )),
+            &["idx_device_packages_outdated_key"],
+            &[
+                "TEMP B-TREE",
+                "SCAN device_packages",
+                "Seq Scan on device_packages",
+            ],
+        ),
+        (
+            "the devices of a job where packages are outdated",
+            Statement::Select(job_target(Target::Outdated {
+                packages: vec![firefox, git],
+                except: Vec::new(),
+            })),
+            &["idx_device_packages_outdated_key"],
+            &["SCAN device_packages", "Seq Scan on device_packages"],
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn outdated_applications_read_the_summary_and_one_packages_devices() {
+    let mut misses = Vec::new();
+    let mut check_all =
+        |backend: &str, query: &str, indexes: &[&str], forbidden: &[&str], plan: &str| {
+            check(&mut misses, backend, query, indexes, plan);
+            for shown in forbidden {
+                if plan.contains(shown) {
+                    misses.push(format!("on {backend}, {query} shows {shown}:\n{plan}"));
+                }
+            }
+        };
+    let sqlite = common::sqlite().await;
+    let mut connection = SqliteConnection::connect(&sqlite.url).await.unwrap();
+    for (query, statement, indexes, forbidden) in outdated_statements() {
+        let plan = sqlite_plan(&mut connection, &statement).await;
+        check_all("SQLite", query, indexes, forbidden, &plan);
+    }
+    connection.close().await.unwrap();
+    sqlite.drop_database().await;
+
+    if let Some(admin_url) = common::postgres_admin_url() {
+        let postgres = common::postgres(&admin_url).await;
+        let mut connection = PgConnection::connect(&postgres.url).await.unwrap();
+        for (query, statement, indexes, forbidden) in outdated_statements() {
+            let plan = postgres_plan(&mut connection, &statement).await;
+            check_all("PostgreSQL", query, indexes, forbidden, &plan);
+        }
+        connection.close().await.unwrap();
+        postgres.drop_database().await;
+    }
+    assert!(misses.is_empty(), "{}", misses.join("\n\n"));
+}

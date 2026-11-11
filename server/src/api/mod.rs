@@ -404,6 +404,10 @@ fn application_routes() -> Router<AppState> {
         .route("/application-runs", get(applications::list_runs))
         .route("/application-runs/{id}", get(applications::get_run))
         .route("/packages/outdated", get(applications::outdated))
+        .route(
+            "/packages/outdated/devices",
+            get(applications::outdated_devices),
+        )
 }
 
 fn toolbox_routes() -> Router<AppState> {

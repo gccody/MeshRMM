@@ -23,6 +23,9 @@ export const JOB_KIND_LABELS: Record<JobKind, string> = {
   app_uninstall: "Application uninstall",
 };
 export type TargetKind = "devices" | "companies" | "tags" | "all";
+// A job's target can also be the devices where packages were outdated as it
+// started, for an update of applications; policies and rules can't.
+export type JobTargetKind = TargetKind | "outdated";
 export type OfflineChoice = "skip" | "wait";
 export type Destination = "user" | "public";
 
@@ -54,8 +57,9 @@ export type Job = {
   categories?: UpdateCategory[];
   reboot?: RebootBehavior;
   reboot_delay_minutes?: number;
-  target: TargetKind;
-  // The device's name, the companies' or tags' names, or how many devices.
+  target: JobTargetKind;
+  // The device's name, the companies' or tags' names, how many devices, or
+  // which packages were outdated, such as "Where Firefox is outdated".
   target_label: string;
   offline: OfflineChoice;
   // When offline devices stop being waited for.

@@ -358,6 +358,13 @@ impl PolicyInput {
             },
             TriggerKind::Enroll => Trigger::Enroll,
         };
+        // Outdated packages' devices are for one job's update: an update
+        // policy already updates only what is outdated on its devices.
+        if self.target == TargetKind::Outdated {
+            return Err(invalid(
+                "a policy runs on chosen devices, companies, tags or every device",
+            ));
+        }
         let target = Target::from_request(
             self.target,
             Choice {
@@ -365,6 +372,7 @@ impl PolicyInput {
                 company_ids: self.company_ids,
                 tag_ids: self.tag_ids,
                 tag_match: self.tag_match,
+                packages: Vec::new(),
             },
         )
         .map_err(|_| invalid("choose the devices, companies or tags it runs on"))?;

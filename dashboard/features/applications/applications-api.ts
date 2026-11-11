@@ -1,7 +1,7 @@
 // Requests to the applications API.
 import { type AuthorizedFetch, expectJson, expectOk, jsonBody } from "../../lib/http";
 import type { Job, OfflineChoice } from "../automation/model";
-import type { Application, ApplicationRun, DevicePackages, OutdatedPackage, RunAction, RunRequest } from "./model";
+import { type Application, type ApplicationRun, type DevicePackages, type OutdatedDevicesPage, type OutdatedPackage, type OutdatedPage, type RunAction, type RunRequest, outdatedDevicesQuery, outdatedQuery } from "./model";
 
 export async function fetchLibrary(authorizedFetch: AuthorizedFetch) {
   const { applications } = await expectJson<{ applications: Application[] }>(await authorizedFetch("/v1/applications"), "The application library could not be loaded.");
@@ -49,17 +49,25 @@ export async function fetchApplicationRun(authorizedFetch: AuthorizedFetch, id: 
   return expectJson<ApplicationRun>(await authorizedFetch(`/v1/application-runs/${encodeURIComponent(id)}`), "The run could not be loaded.");
 }
 
-export async function fetchOutdated(authorizedFetch: AuthorizedFetch) {
-  const { packages } = await expectJson<{ packages: OutdatedPackage[] }>(await authorizedFetch("/v1/packages/outdated"), "The outdated applications could not be loaded.");
-  return packages;
+// A page of the fleet's outdated packages that `query` matches.
+export async function fetchOutdated(authorizedFetch: AuthorizedFetch, query: string, offset: number) {
+  return expectJson<OutdatedPage>(await authorizedFetch(`/v1/packages/outdated?${outdatedQuery(query, offset)}`), "The outdated applications could not be loaded.");
+}
+
+// A page of the devices with `pkg` outdated, after the device `after`.
+export async function fetchOutdatedDevices(authorizedFetch: AuthorizedFetch, pkg: Pick<OutdatedPackage, "source" | "package_id">, after: string | null) {
+  return expectJson<OutdatedDevicesPage>(await authorizedFetch(`/v1/packages/outdated/devices?${outdatedDevicesQuery(pkg, after)}`), "The devices could not be loaded.");
 }
 
 export type JobTarget = {
-  target: "devices" | "companies" | "tags" | "all";
+  // `outdated`: the devices where `packages` (as source:id), or with none
+  // any package, are outdated when the job starts; only for updates.
+  target: "devices" | "companies" | "tags" | "all" | "outdated";
   device_ids: string[];
   company_ids: string[];
   tag_ids: string[];
   tag_match: "any" | "all";
+  packages?: string[];
   offline: OfflineChoice;
   wait_hours: number;
 };

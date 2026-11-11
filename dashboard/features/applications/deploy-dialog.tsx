@@ -6,7 +6,7 @@ import { ModalDialog } from "../../lib/modal-dialog";
 import type { DevicePlatform } from "../agents/types";
 import { DevicePicker } from "../device-picker/device-picker";
 import { devicesOn, platformCounts } from "../device-picker/model";
-import { DEFAULT_WAIT_HOURS, MAX_WAIT_HOURS, type OfflineChoice, type TargetKind, coveredAgents, waitHoursProblem } from "../automation/model";
+import { DEFAULT_WAIT_HOURS, MAX_WAIT_HOURS, type JobTargetKind, type OfflineChoice, coveredAgents, waitHoursProblem } from "../automation/model";
 import type { TagMatch } from "../tags/model";
 import { TagTargetFields } from "../tags/tag-chip";
 import { useWorkspace } from "../workspace/workspace-context";
@@ -14,9 +14,16 @@ import { useCompanies, useDevices, useTags } from "../agents/use-devices";
 import { startApplicationJob } from "./applications-api";
 import type { RunRequest } from "./model";
 
+// For an update from the outdated applications: the packages (as
+// source:id) whose devices it runs on, none for any package that isn't
+// pinned; `label` says so in words, and `updates` is how many updates they
+// make now.
+export type OutdatedChoice = { packages: string[]; label: string; updates: number };
+
 // Installs, updates or uninstalls on chosen devices, companies, tagged
-// devices or every device, as a job, then opens the job's page.
-export function DeployDialog({ title, intro, request, platforms, deviceIds, returnFocus, onClose }: {
+// devices or every device, or for an update on the devices where packages
+// are outdated, as a job, then opens the job's page.
+export function DeployDialog({ title, intro, request, platforms, deviceIds, outdated, returnFocus, onClose }: {
   title: string;
   intro: string;
   request: RunRequest;
@@ -24,6 +31,8 @@ export function DeployDialog({ title, intro, request, platforms, deviceIds, retu
   platforms: readonly DevicePlatform[];
   // The devices chosen already.
   deviceIds?: readonly string[];
+  // Offered, and chosen at first, as the devices it runs on.
+  outdated?: OutdatedChoice;
   returnFocus: RefObject<HTMLElement | null>;
   onClose: () => void;
 }) {
@@ -34,7 +43,7 @@ export function DeployDialog({ title, intro, request, platforms, deviceIds, retu
   const navigate = useNavigate();
   const titleId = useId();
   const wide = can("jobs.run_wide");
-  const [target, setTarget] = useState<TargetKind>("devices");
+  const [target, setTarget] = useState<JobTargetKind>(outdated ? "outdated" : "devices");
   const [chosenDevices, setChosenDevices] = useState<readonly string[]>(deviceIds ?? []);
   const [chosenCompanies, setChosenCompanies] = useState<readonly string[]>([]);
   const [chosenTags, setChosenTags] = useState<string[]>([]);
@@ -44,8 +53,9 @@ export function DeployDialog({ title, intro, request, platforms, deviceIds, retu
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // The server finds the outdated packages' devices as the job starts.
   const covered = useMemo(
-    () => coveredAgents(agents, { kind: target, deviceIds: chosenDevices, companyIds: chosenCompanies, tagIds: chosenTags, tagMatch }),
+    () => (target === "outdated" ? [] : coveredAgents(agents, { kind: target, deviceIds: chosenDevices, companyIds: chosenCompanies, tagIds: chosenTags, tagMatch })),
     [agents, target, chosenDevices, chosenCompanies, chosenTags, tagMatch],
   );
   const { skipped, offline: offlineCount } = useMemo(() => platformCounts(covered, platforms), [covered, platforms]);
@@ -73,6 +83,7 @@ export function DeployDialog({ title, intro, request, platforms, deviceIds, retu
         company_ids: target === "companies" ? [...chosenCompanies] : [],
         tag_ids: target === "tags" ? chosenTags : [],
         tag_match: tagMatch,
+        ...(target === "outdated" && outdated ? { packages: outdated.packages } : {}),
         offline,
         wait_hours: offline === "wait" ? Number(waitHours) : DEFAULT_WAIT_HOURS,
       });
@@ -84,7 +95,10 @@ export function DeployDialog({ title, intro, request, platforms, deviceIds, retu
     }
   };
 
-  const notes = !covered.length ? ["No devices are chosen."] : [
+  const notes = target === "outdated" && outdated ? [
+    `Runs on the devices where ${outdated.label} when the job starts, which make ${outdated.updates} ${outdated.updates === 1 ? "update" : "updates"} now; devices updated by then are left out.`,
+    offline === "wait" ? `Offline devices run it if they connect within ${Number(waitHours) || DEFAULT_WAIT_HOURS} hours.` : "Offline devices are skipped.",
+  ] : !covered.length ? ["No devices are chosen."] : [
     `Runs on ${covered.length} ${covered.length === 1 ? "device" : "devices"}.`,
     skipped ? `${skipped} ${skipped === 1 ? "is" : "are"} on another operating system and will be skipped.` : null,
     offlineCount ? (offline === "wait"
@@ -101,6 +115,7 @@ export function DeployDialog({ title, intro, request, platforms, deviceIds, retu
         <fieldset className="script-editor-fields" disabled={busy}>
           <fieldset className="choice-list">
             <legend>Devices</legend>
+            {outdated && <label><input type="radio" name="deploy-target" checked={target === "outdated"} onChange={() => setTarget("outdated")} /><span><strong>Where it is outdated</strong>The devices where {outdated.label} as the job starts.</span></label>}
             <label><input type="radio" name="deploy-target" checked={target === "devices"} onChange={() => setTarget("devices")} /><span><strong>Chosen devices</strong>{chosenDevices.length ? `${chosenDevices.length} chosen` : "Choose them below."}</span></label>
             {wide && <>
               <label><input type="radio" name="deploy-target" checked={target === "companies"} onChange={() => setTarget("companies")} disabled={!companies.length} /><span><strong>Whole companies</strong>{companies.length ? "Every device in the companies chosen below, as they are when the job starts." : "There are no companies yet."}</span></label>
@@ -139,10 +154,10 @@ export function DeployDialog({ title, intro, request, platforms, deviceIds, retu
           )}
           <p className="job-preview" role="status">{notes.join(" ")}</p>
         </fieldset>
-        {(error || (problem && covered.length > 0)) && <p role="alert" className="installer-error">{error ?? problem}</p>}
+        {(error || (problem && (covered.length > 0 || target === "outdated"))) && <p role="alert" className="installer-error">{error ?? problem}</p>}
         <div className="connection-reason-actions">
           <button type="button" className="secondary-button" onClick={onClose}>Cancel</button>
-          <button className="primary-button" disabled={busy || problem !== null || covered.length === skipped}>
+          <button className="primary-button" disabled={busy || problem !== null || (target !== "outdated" && covered.length === skipped)}>
             {busy ? <LoaderCircle size={16} className="spin" /> : <Rocket size={16} />} Start job
           </button>
         </div>
