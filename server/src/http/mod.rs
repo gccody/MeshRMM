@@ -58,6 +58,7 @@ pub struct AppState {
     pub sso_discovery: Arc<crate::auth::oidc_discovery::DiscoveryCache>,
     pub storage: Storage,
     pub agents: AgentHub,
+    pub agent_timeouts: crate::agents::Timeouts,
     pub presence: Presence,
     pub metrics: Metrics,
     pub alerts: crate::alerts::Engine,

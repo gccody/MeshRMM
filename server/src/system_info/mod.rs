@@ -1,6 +1,6 @@
-//! Devices' hardware and software, from the snapshots their Agents send on
-//! the control connection when they start, every few hours, and when a user
-//! asks for a refresh.
+//! Devices' hardware and software, from the snapshots their Agents post
+//! (`POST /v1/agents/{id}/system-info`) when they start, every few hours, and
+//! when a user asks for a refresh.
 //!
 //! Each device keeps only its latest snapshot: the fields the website and the
 //! API search on as columns of `device_system_info`, its IP addresses in
@@ -11,11 +11,11 @@
 //! address a device connects from is recorded whenever its Agent connects.
 //!
 //! The server tells each Agent which list it holds, by
-//! [`applications_hash`], when it connects and after storing a list, and the
-//! Agent leaves an unchanged list out of its snapshots. The server keeps its
-//! list for such a snapshot only if the hash it names is the one stored, and
-//! otherwise asks for the list ([`Stored::Unknown`]): a disagreement can cost
-//! a whole list sent, never a wrong list kept.
+//! [`applications_hash`], when it connects and in its answer to each
+//! snapshot, and the Agent leaves an unchanged list out of its snapshots.
+//! The server keeps its list for such a snapshot only if the hash it names
+//! is the one stored, and otherwise asks for the list ([`Stored::Unknown`]):
+//! a disagreement can cost a whole list sent, never a wrong list kept.
 //!
 //! Each device's application count is kept on its `device_system_info` row,
 //! and the fleet's counts of each application in [`software`]'s summary,
@@ -136,8 +136,8 @@ fn storable_option(text: &Option<String>) -> Option<String> {
     text.as_deref().map(storable)
 }
 
-/// Stores a device's new snapshot, received on a connection from
-/// `public_ip`, replacing its last one. `applications_unchanged` is the hash
+/// Stores a device's new snapshot, posted from `public_ip`, replacing its
+/// last one. `applications_unchanged` is the hash
 /// the snapshot named instead of listing its applications, which only keeps
 /// the stored list if it is that list's. Returns `None`, storing nothing, if
 /// the device is no longer enrolled.

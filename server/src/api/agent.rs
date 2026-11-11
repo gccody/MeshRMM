@@ -1,6 +1,13 @@
 //! Routes the Agent calls with its own credential: its control connection,
-//! its screen thumbnail, and the outcome of toolbox runs and deliveries,
-//! update installs and application runs.
+//! its screen thumbnail, its system information snapshots, and the outcome
+//! of toolbox runs and deliveries, update installs and application runs.
+//!
+//! Anything large goes here rather than on the control connection: one
+//! message there holds up every other, and the server takes an Agent it has
+//! heard no whole frame from for [`crate::agents::Timeouts::silence`] as gone,
+//! so a message that takes longer than that to arrive cuts the connection
+//! however steadily it moves. A body here may take as long as it needs while
+//! it keeps moving ([`crate::agents::Timeouts::upload_stall`]).
 //!
 //! The Agent keeps each outcome until one of these routes answers it with a
 //! success, and sends it again otherwise, so an outcome the server already
@@ -8,7 +15,10 @@
 //! counted as lost (or interrupted) replaces that: the run did happen. A
 //! client error tells the Agent to drop the outcome: the device has no such
 //! run, or the report is malformed.
+use std::time::Duration;
+
 use axum::{
+    Json,
     body::{Body, Bytes},
     extract::{Path, State, WebSocketUpgrade},
     http::{HeaderMap, HeaderValue, StatusCode, header},
@@ -17,7 +27,8 @@ use axum::{
 use futures_util::StreamExt;
 use meshrmm_protocol_types::{
     ApplicationRunResult, FileDeliveryReport, FileDeliveryStatus, MAX_SCRIPT_OUTPUT_BYTES,
-    MAX_SYSTEM_INFO_BYTES, ScriptRunReport, ScriptRunStatus, UpdateInstallResult, truncate_output,
+    MAX_SYSTEM_INFO_REPORT_BYTES, ScriptRunReport, ScriptRunStatus, SystemInfoReceipt,
+    SystemInfoReport, UpdateInstallResult, truncate_output,
 };
 use sea_query::{Expr, ExprTrait, Query};
 
@@ -28,6 +39,7 @@ use crate::{
     http::{ApiError, AppState, client_ip::ClientIp},
     realtime::coordinator,
     storage::Durability,
+    system_info,
     time::now_ms,
     toolbox::{self, DELIVERY_WINDOW_MS},
 };
@@ -57,14 +69,17 @@ fn too_large(message: &'static str) -> ApiError {
     ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, message)
 }
 
-/// Reads a request body of at most `limit` bytes. Agent routes read their
-/// body only after authenticating, so nobody else can make the server buffer
-/// one.
+/// Reads a request body of at most `limit` bytes, refusing a larger one as
+/// soon as it says or sends more, and giving up on one that sends nothing for
+/// `stall`: there is no limit in total, so a slow body that keeps moving
+/// arrives. Agent routes read their body only after authenticating, so
+/// nobody else can make the server buffer one.
 async fn read_body(
     headers: &HeaderMap,
     body: Body,
     limit: usize,
     too_large_message: &'static str,
+    stall: Duration,
 ) -> Result<Bytes, ApiError> {
     let declared = headers
         .get(header::CONTENT_LENGTH)
@@ -74,7 +89,16 @@ async fn read_body(
     }
     let mut stream = body.into_data_stream();
     let mut bytes = Vec::with_capacity(declared.unwrap_or_default());
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let Ok(chunk) = tokio::time::timeout(stall, stream.next()).await else {
+            return Err(ApiError::new(
+                StatusCode::REQUEST_TIMEOUT,
+                "the request body stopped arriving",
+            ));
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
         let chunk = chunk.map_err(|_| ApiError::bad_request("the request body was interrupted"))?;
         if bytes.len() + chunk.len() > limit {
             return Err(too_large(too_large_message));
@@ -86,10 +110,18 @@ async fn read_body(
 
 /// An Agent's JSON report, read after authenticating.
 async fn read_report<T: serde::de::DeserializeOwned>(
+    state: &AppState,
     headers: &HeaderMap,
     body: Body,
 ) -> Result<T, ApiError> {
-    let bytes = read_body(headers, body, MAX_REPORT_BYTES, "the report is too large").await?;
+    let bytes = read_body(
+        headers,
+        body,
+        MAX_REPORT_BYTES,
+        "the report is too large",
+        state.agent_timeouts.upload_stall,
+    )
+    .await?;
     serde_json::from_slice(&bytes)
         .map_err(|error| ApiError::bad_request(format!("invalid report: {error}")))
 }
@@ -100,9 +132,14 @@ fn storable(text: &str) -> String {
     text.replace('\0', "\u{fffd}")
 }
 
-/// The largest message an Agent sends on its control connection: a system
-/// information snapshot at its limit, with room for the message around it.
-const MAX_CONTROL_MESSAGE_BYTES: usize = MAX_SYSTEM_INFO_BYTES + 64 * 1024;
+/// The largest message an Agent may send on its control connection, which
+/// the server buffers whole before it reads it. The largest the Agent sends
+/// are scans: an application scan lists at most 5,000 packages and an update
+/// scan at most 5,000 updates, typically 100 to 300 bytes each (this takes
+/// 5,000 at 800 bytes), then a page of a file listing, at most 1,000 entries,
+/// and monitor results, at most 512 KiB of text a message. Snapshots, which
+/// are larger, are posted over HTTPS ([`report_system_info`]).
+pub const MAX_CONTROL_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 
 /// The control connection's read buffer, which every connected Agent holds
 /// (tungstenite's default is 128 KiB). A metrics report, sent every few
@@ -146,6 +183,7 @@ pub async fn put_thumbnail(
         body,
         MAX_THUMBNAIL_BYTES,
         "the thumbnail is larger than 512 KiB",
+        state.agent_timeouts.upload_stall,
     )
     .await?;
     if let Some(problem) = thumbnail_problem(&bytes) {
@@ -169,6 +207,65 @@ pub async fn put_thumbnail(
         return Err(ApiError::conflict("the device is being removed"));
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /v1/agents/{id}/system-info`: the device's new system information
+/// snapshot, which replaces its last one. The answer says which application
+/// list the server now holds, and whether it wants a new snapshot to send
+/// the list it lacks. Taken whether or not the Agent's control connection is
+/// up: the credential is what counts.
+pub async fn report_system_info(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    ClientIp(ip): ClientIp,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Json<SystemInfoReceipt>, ApiError> {
+    let agent = agents::authenticate(&state, &headers, &id).await?;
+    let removed = || ApiError::conflict("the device is being removed");
+    if agent.deletion_requested {
+        return Err(removed());
+    }
+    let bytes = read_body(
+        &headers,
+        body,
+        MAX_SYSTEM_INFO_REPORT_BYTES,
+        "the snapshot is larger than its limit",
+        state.agent_timeouts.upload_stall,
+    )
+    .await?;
+    let report: SystemInfoReport = serde_json::from_slice(&bytes)
+        .map_err(|error| ApiError::bad_request(format!("invalid snapshot: {error}")))?;
+    drop(bytes);
+    let device_id = agent.device_id;
+    let named = report.applications_unchanged.clone();
+    let stored = system_info::store(
+        &state.database,
+        &device_id,
+        ip,
+        report.system,
+        report.applications_unchanged,
+    )
+    .await?
+    .ok_or_else(removed)?;
+    tracing::info!(device_id, applications = ?stored, "stored the device's system information");
+    // The device list shows what changed.
+    state.presence.refresh(&device_id).await;
+    Ok(Json(match stored {
+        system_info::Stored::Listed { applications_hash } => SystemInfoReceipt {
+            applications_hash: Some(applications_hash),
+            collect_again: false,
+        },
+        // The list the snapshot named.
+        system_info::Stored::Unchanged => SystemInfoReceipt {
+            applications_hash: named,
+            collect_again: false,
+        },
+        system_info::Stored::Unknown { applications_hash } => SystemInfoReceipt {
+            applications_hash,
+            collect_again: true,
+        },
+    }))
 }
 
 fn bounded(text: Option<String>, max_chars: usize) -> Option<String> {
@@ -196,7 +293,7 @@ pub async fn report_script_run(
     body: Body,
 ) -> Result<StatusCode, ApiError> {
     let (agent, run_id) = reporting_agent(&state, &headers, &device_id, &run_id, "run").await?;
-    let report: ScriptRunReport = read_report(&headers, body).await?;
+    let report: ScriptRunReport = read_report(&state, &headers, body).await?;
     if !matches!(
         report.status,
         ScriptRunStatus::Completed | ScriptRunStatus::Failed | ScriptRunStatus::TimedOut
@@ -341,7 +438,7 @@ pub async fn report_file_delivery(
 ) -> Result<StatusCode, ApiError> {
     let (agent, delivery_id) =
         reporting_agent(&state, &headers, &device_id, &delivery_id, "delivery").await?;
-    let report: FileDeliveryReport = read_report(&headers, body).await?;
+    let report: FileDeliveryReport = read_report(&state, &headers, body).await?;
     if !matches!(
         report.status,
         FileDeliveryStatus::Delivered | FileDeliveryStatus::Failed
@@ -417,7 +514,7 @@ pub async fn report_update_install(
     body: Body,
 ) -> Result<StatusCode, ApiError> {
     let (agent, run_id) = reporting_agent(&state, &headers, &device_id, &run_id, "run").await?;
-    let result: UpdateInstallResult = read_report(&headers, body).await?;
+    let result: UpdateInstallResult = read_report(&state, &headers, body).await?;
     if crate::updates::install_reported(&state, &agent.device_id, &run_id, result).await? {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -434,7 +531,7 @@ pub async fn report_application_run(
     body: Body,
 ) -> Result<StatusCode, ApiError> {
     let (agent, run_id) = reporting_agent(&state, &headers, &device_id, &run_id, "run").await?;
-    let result: ApplicationRunResult = read_report(&headers, body).await?;
+    let result: ApplicationRunResult = read_report(&state, &headers, body).await?;
     if crate::applications::result_reported(&state, &agent.device_id, &run_id, result).await? {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -445,6 +542,92 @@ pub async fn report_application_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const STALL: Duration = Duration::from_secs(60);
+
+    /// A body whose chunks the test sends, and which ends when the sender
+    /// is dropped.
+    fn gated() -> (
+        tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+        Body,
+    ) {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let stream = futures_util::stream::unfold(receiver, |mut receiver| async move {
+            receiver.recv().await.map(|chunk| (chunk, receiver))
+        });
+        (sender, Body::from_stream(stream))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_body_that_keeps_moving_arrives_however_long_it_takes() {
+        let (sender, body) = gated();
+        let reading =
+            tokio::spawn(
+                async move { read_body(&HeaderMap::new(), body, 1024, "large", STALL).await },
+            );
+        // Ten times the stall limit in all, a chunk just inside it each time.
+        for _ in 0..10 {
+            tokio::time::sleep(STALL - Duration::from_secs(1)).await;
+            sender
+                .send(Ok(Bytes::from_static(b"0123456789")))
+                .await
+                .unwrap();
+        }
+        drop(sender);
+        let bytes = reading.await.unwrap().unwrap();
+        assert_eq!(bytes.len(), 100);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_body_that_stops_is_dropped_after_the_stall_limit() {
+        let (sender, body) = gated();
+        let started = tokio::time::Instant::now();
+        let reading =
+            tokio::spawn(
+                async move { read_body(&HeaderMap::new(), body, 1024, "large", STALL).await },
+            );
+        sender
+            .send(Ok(Bytes::from_static(b"0123456789")))
+            .await
+            .unwrap();
+        // The sender stays open, sending nothing more.
+        let error = reading.await.unwrap().unwrap_err();
+        assert_eq!(error.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(started.elapsed(), STALL);
+        drop(sender);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_body_past_its_limit_is_refused_before_it_ends() {
+        let (sender, body) = gated();
+        let reading =
+            tokio::spawn(
+                async move { read_body(&HeaderMap::new(), body, 25, "large", STALL).await },
+            );
+        for _ in 0..3 {
+            sender
+                .send(Ok(Bytes::from_static(b"0123456789")))
+                .await
+                .unwrap();
+        }
+        // Refused at once, with the body still open and more to come.
+        let error = tokio::time::timeout(Duration::from_secs(1), reading)
+            .await
+            .expect("refused without waiting for the rest")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // One that says it is too large is refused before any of it is read.
+        let (sender, body) = gated();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_LENGTH, HeaderValue::from(26));
+        let error = read_body(&headers, body, 25, "large", STALL)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        drop(sender);
+    }
 
     #[test]
     fn nul_is_replaced_so_postgresql_can_store_it() {

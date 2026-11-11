@@ -232,7 +232,8 @@ curl -fsS -H "Authorization: Bearer $MESHRMM_TOKEN" "$MESHRMM/v1/software?q=fire
 
 `404 not_collected` means the device hasn't sent its first snapshot yet.
 `POST /v1/agents/{id}/system-info/refresh` asks an online device for a new
-one. `GET /v1/system-info`, `/v1/software` and `/v1/software/devices` answer
+one, which its Agent posts to `POST /v1/agents/{id}/system-info` with its own
+credential; that route takes no API token. `GET /v1/system-info`, `/v1/software` and `/v1/software/devices` answer
 a page at a time, with how many match.
 
 ### Scripts and jobs

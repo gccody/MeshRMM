@@ -112,15 +112,15 @@ pub enum AgentCommand {
     DeliverFile {
         delivery: FileDeliveryRequest,
     },
-    /// Collects a new [`crate::SystemInfo`] snapshot now.
+    /// Collects a new [`crate::SystemInfo`] snapshot now, and posts it over
+    /// HTTPS ([`crate::SystemInfoReport`]).
     CollectSystemInfo,
     /// The application list the server holds for the device, by
     /// [`crate::applications_hash`], or `None` for none. A snapshot whose
     /// list has this hash leaves it out
-    /// ([`AgentStatusMessage::SystemInfo`]'s `applications_unchanged`).
-    /// Sent when the Agent connects, when a snapshot's list is stored, and
-    /// when a snapshot named a list the server doesn't hold, before asking
-    /// for a new one.
+    /// ([`crate::SystemInfoReport::applications_unchanged`]). Sent when the
+    /// Agent connects; the answer to each snapshot says the same
+    /// ([`crate::SystemInfoReceipt`]).
     StoredApplications {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         applications_hash: Option<String>,
@@ -213,18 +213,6 @@ pub enum AgentStatusMessage {
     /// The computer's resource usage, every [`crate::METRICS_INTERVAL_SECONDS`].
     Metrics {
         metrics: crate::SystemMetrics,
-    },
-    /// The computer's hardware and software, a little after the Agent
-    /// starts, about every [`crate::SYSTEM_INFO_INTERVAL_SECONDS`] and when
-    /// the server asks. When its applications are the list the server said
-    /// it holds ([`AgentCommand::StoredApplications`]),
-    /// `applications_unchanged` names that list's hash and `system` lists
-    /// none: the server keeps its list if the hash is the one it holds, and
-    /// otherwise asks for the list.
-    SystemInfo {
-        system: Box<crate::SystemInfo>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        applications_unchanged: Option<String>,
     },
     /// The pending updates a scan found. `run_ids` are the server's scans
     /// it answers: each one asked for while it ran. The scan after an install
@@ -448,33 +436,6 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<AgentStatusMessage>(&json).unwrap(),
             metrics
-        );
-        let system = AgentStatusMessage::SystemInfo {
-            system: Box::default(),
-            applications_unchanged: None,
-        };
-        let json = serde_json::to_string(&system).unwrap();
-        assert!(
-            json.starts_with(r#"{"type":"system_info","system":{"collected_at_unix_ms":0,"#),
-            "{json}"
-        );
-        assert!(!json.contains("applications_unchanged"), "{json}");
-        assert_eq!(
-            serde_json::from_str::<AgentStatusMessage>(&json).unwrap(),
-            system
-        );
-        let unchanged = AgentStatusMessage::SystemInfo {
-            system: Box::default(),
-            applications_unchanged: Some("ab12".into()),
-        };
-        let json = serde_json::to_string(&unchanged).unwrap();
-        assert!(
-            json.ends_with(r#","applications_unchanged":"ab12"}"#),
-            "{json}"
-        );
-        assert_eq!(
-            serde_json::from_str::<AgentStatusMessage>(&json).unwrap(),
-            unchanged
         );
         assert_eq!(
             serde_json::to_string(&AgentCommand::CollectSystemInfo).unwrap(),

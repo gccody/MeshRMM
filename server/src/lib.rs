@@ -105,6 +105,7 @@ pub async fn prepare(config: Config) -> anyhow::Result<AppState> {
         sso_discovery: Arc::default(),
         storage,
         agents,
+        agent_timeouts: crate::agents::Timeouts::default(),
         website: Website::embedded(),
         downloads,
     })
