@@ -700,6 +700,13 @@ async fn start_attempt(
                 &script.name,
             )
             .await?;
+            let fields = crate::custom_fields::script_fields(
+                &mut transaction,
+                &state.instance_key,
+                &alert.device_id,
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("could not read the device's custom fields"))?;
             Started {
                 attempt_id,
                 run_id: Some(run_id.clone()),
@@ -710,6 +717,7 @@ async fn start_attempt(
                         body: script.body,
                         run_as,
                         timeout_seconds: u32::try_from(script.timeout_seconds).unwrap_or(300),
+                        fields,
                     },
                 },
             }

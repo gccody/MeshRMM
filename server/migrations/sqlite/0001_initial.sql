@@ -422,6 +422,65 @@ CREATE TABLE device_notes (
   PRIMARY KEY (device_id, revision)
 );
 
+-- Custom fields an administrator defines for devices, companies or both,
+-- such as "Contract tier" or "Backup vendor" (see docs/custom-fields.md).
+-- A field's key and type never change once it is made.
+CREATE TABLE custom_fields (
+  id TEXT NOT NULL PRIMARY KEY,
+  -- The stable slug scripts and the API know the field by.
+  field_key TEXT NOT NULL UNIQUE CHECK (length(field_key) BETWEEN 1 AND 64),
+  label TEXT NOT NULL CHECK (length(label) BETWEEN 1 AND 80),
+  description TEXT NOT NULL DEFAULT '' CHECK (length(description) <= 500),
+  field_type TEXT NOT NULL CHECK (field_type IN ('text', 'multiline', 'number', 'checkbox', 'date', 'dropdown', 'multi_select', 'url', 'secret')),
+  -- A dropdown's or multi-select's options, as a JSON array of strings.
+  options TEXT NOT NULL DEFAULT '[]',
+  applies_to_devices INTEGER NOT NULL CHECK (applies_to_devices IN (0, 1)),
+  applies_to_companies INTEGER NOT NULL CHECK (applies_to_companies IN (0, 1)),
+  -- Fields are shown in this order, lowest first.
+  position INTEGER NOT NULL,
+  -- What toolbox scripts may do with the field: 'none', 'read' or 'read_write'.
+  script_access TEXT NOT NULL CHECK (script_access IN ('none', 'read', 'read_write')),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  CHECK (applies_to_devices = 1 OR applies_to_companies = 1)
+);
+
+-- Devices' and companies' values of custom fields. A value is text in the
+-- field type's canonical form (see custom_fields::FieldType); a secret
+-- field's is in value_encrypted instead, sealed with the instance key.
+-- A change records the user who made it, or the script run that did.
+CREATE TABLE device_field_values (
+  device_id TEXT NOT NULL REFERENCES agents (id) ON DELETE CASCADE,
+  field_id TEXT NOT NULL REFERENCES custom_fields (id) ON DELETE CASCADE,
+  value TEXT,
+  value_encrypted BLOB,
+  updated_at INTEGER NOT NULL,
+  updated_by_user_id TEXT,
+  -- The run whose script set it, and the script's name, kept after the
+  -- run is purged.
+  updated_by_run_id TEXT,
+  updated_by_script TEXT,
+  PRIMARY KEY (device_id, field_id),
+  CHECK ((value IS NULL) <> (value_encrypted IS NULL))
+);
+
+CREATE INDEX idx_device_field_values_field ON device_field_values (field_id);
+
+CREATE TABLE company_field_values (
+  company_id TEXT NOT NULL REFERENCES companies (id) ON DELETE CASCADE,
+  field_id TEXT NOT NULL REFERENCES custom_fields (id) ON DELETE CASCADE,
+  value TEXT,
+  value_encrypted BLOB,
+  updated_at INTEGER NOT NULL,
+  updated_by_user_id TEXT,
+  updated_by_run_id TEXT,
+  updated_by_script TEXT,
+  PRIMARY KEY (company_id, field_id),
+  CHECK ((value IS NULL) <> (value_encrypted IS NULL))
+);
+
+CREATE INDEX idx_company_field_values_field ON company_field_values (field_id);
+
 -- Each device's resource usage, one row per minute its Agent reported in.
 -- Rates and loads are averages over the minute's samples; storage is the
 -- minute's last sample, summed across the device's volumes.

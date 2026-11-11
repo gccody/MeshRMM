@@ -200,6 +200,14 @@ device list's live updates carry each device's current notes revision.
 Note edits are recorded in the audit log as `agent.notes`, with the
 revision and the notes' length before and after, not their text.
 
+## Custom fields
+
+A device's page and a company's page have a **Fields** section with the
+[custom fields](custom-fields.md) an administrator defined: a contract
+tier, a backup vendor, a secret. A device without its own value of a field
+that applies to companies too shows its company's. The wall filters by a
+field's value, and **Set field** sets one on the devices ticked.
+
 ## The device list
 
 The **Devices** page is a wall of tiles: each device's name, whether it is

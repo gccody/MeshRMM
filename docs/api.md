@@ -319,6 +319,50 @@ Jobs, policies, alert rules and the software and update lists take
 `tag_ids` (with `tag_match` `any` or `all`) or `tag=` to work on tagged
 devices.
 
+### Custom fields
+
+```sh
+# A field for devices and companies, which scripts may read.
+curl -fsS -H "Authorization: Bearer $MESHRMM_TOKEN" -H "Content-Type: application/json" \
+  -d '{"key": "contract_tier", "label": "Contract tier", "type": "dropdown",
+       "options": ["Bronze", "Silver", "Gold"], "applies_to": "both", "script_access": "read"}' \
+  "$MESHRMM/v1/custom-fields"                                                 # custom_fields.manage
+# A company's value, which its devices take, and one device's own.
+curl -fsS -X PUT -H "Authorization: Bearer $MESHRMM_TOKEN" -H "Content-Type: application/json" \
+  -d '{"value": "Gold"}' "$MESHRMM/v1/companies/$COMPANY/custom-fields/contract_tier"   # companies.manage
+curl -fsS -X PUT -H "Authorization: Bearer $MESHRMM_TOKEN" -H "Content-Type: application/json" \
+  -d '{"value": "Silver"}' "$MESHRMM/v1/agents/$DEVICE/custom-fields/contract_tier"     # devices.edit
+# A device's fields, and the devices on Gold.
+curl -fsS -H "Authorization: Bearer $MESHRMM_TOKEN" "$MESHRMM/v1/agents/$DEVICE/custom-fields" |
+  jq '.fields[] | {key: .field.key, value, source}'
+curl -fsS -H "Authorization: Bearer $MESHRMM_TOKEN" \
+  "$MESHRMM/v1/custom-fields/contract_tier/devices?op=equals&value=Gold" | jq .device_ids
+```
+
+A field is `{id, key, label, description, type, options, applies_to,
+script_access, position, created_at, updated_at}`: `type` is `text`,
+`multiline`, `number`, `checkbox`, `date`, `dropdown`, `multi_select`,
+`url` or `secret`; `applies_to` `devices`, `companies` or `both`;
+`script_access` `none`, `read` or `read_write`. Routes take a field by its
+ID or its key. A value is JSON of its field's type: a string, a number,
+`true` or `false`, `"YYYY-MM-DD"`, an option, a list of options for a
+multi-select; `null` (or an empty string or list) clears it. See
+[custom fields](custom-fields.md).
+
+| Route | |
+|---|---|
+| `GET /v1/custom-fields` | `devices.view`. `{fields}`, in display order. |
+| `POST /v1/custom-fields` | `custom_fields.manage`. `{key, label, description?, type, options?, applies_to, script_access?}`; `201` with the field. `409 key_taken`, `409 too_many_fields` (200). |
+| `PUT /v1/custom-fields/{field}` | `custom_fields.manage`. `{label, description?, options?, applies_to, script_access}`; the key and type stay. Values of devices or companies it no longer applies to, and options no longer offered, are removed. |
+| `DELETE /v1/custom-fields/{field}` | `custom_fields.manage`. Deletes it and its values; `204`. |
+| `PUT /v1/custom-fields/order` | `custom_fields.manage`. `{ids}`, every field's ID once (`400 invalid_order`); `{fields}` in the new order. |
+| `GET /v1/agents/{id}/custom-fields` | `devices.view`. `{fields}`: each field that applies to devices, as `{field, value, set, source, inherited_from, updated_at, updated_by}`. `source` is `device` or `company` (inherited, with `inherited_from: {id, name}`), or `null` without a value; `updated_by` is `{kind: "user", user_id, name}` or `{kind: "script", run_id, script_name}`. A secret's `value` is always `null`; `set` says whether it has one. |
+| `PUT /v1/agents/{id}/custom-fields/{field}` | `devices.edit`. `{value}`; the device's fields as above. `400 invalid_value`. |
+| `POST /v1/agents/{id}/custom-fields/{field}/reveal` | `custom_fields.reveal`. A secret's value, the device's own or its company's: `{value, source}`. Recorded in the audit log. `400 not_secret`, `404 no_value`. |
+| `GET`, `PUT /v1/companies/{id}/custom-fields[/{field}]`, `POST …/{field}/reveal` | The same for a company's fields that apply to companies; setting needs `companies.manage`. |
+| `POST /v1/device-custom-fields` | `devices.edit`. `{field, device_ids, value}`: sets or clears one field on 1 to 1,000 devices (`400 invalid_devices`); `{changed}`. |
+| `GET /v1/custom-fields/{field}/devices?op=&value=` | `devices.view`. The devices whose value, their own or their company's, matches: `op` is `equals`, `contains`, `empty` or `not_empty` (`400 invalid_filter` for one the type doesn't take: a secret only takes `empty` and `not_empty`). `{field_id, device_ids, matching}`. |
+
 ### Updates
 
 ```sh

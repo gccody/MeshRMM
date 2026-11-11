@@ -61,8 +61,21 @@ impl ScriptDirectory {
 
     /// Writes the script. The folder is new and private, so the file
     /// cannot already exist; it is the user's own if the folder is.
-    fn write(&self, run: &ScriptRunRequest) -> anyhow::Result<PathBuf> {
-        let (name, contents) = script_file(run.language, &run.body);
+    /// It starts with lines that export `variables`, so they reach the
+    /// script however it is started (`sudo` drops a process's environment).
+    fn write(
+        &self,
+        run: &ScriptRunRequest,
+        variables: &[(String, String)],
+    ) -> anyhow::Result<PathBuf> {
+        let (name, script) = script_file(run.language, &run.body);
+        let folder = crate::script_fields::agent_folder();
+        let mut contents = crate::script_fields::shell_exports(
+            variables,
+            folder.as_deref().and_then(std::path::Path::to_str),
+        )
+        .into_bytes();
+        contents.extend_from_slice(&script);
         let path = self.0.join(name);
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -193,7 +206,11 @@ fn shell() -> &'static str {
     }
 }
 
-pub(super) fn execute_script(mode: ExecutionMode, run: &ScriptRunRequest) -> ScriptRunReport {
+pub(super) fn execute_script(
+    mode: ExecutionMode,
+    run: &ScriptRunRequest,
+    variables: &[(String, String)],
+) -> ScriptRunReport {
     let user = match run.run_as {
         RunAs::User => signed_in_user(mode),
         RunAs::System => None,
@@ -210,7 +227,7 @@ pub(super) fn execute_script(mode: ExecutionMode, run: &ScriptRunRequest) -> Scr
             return failed(ran_as, format!("Could not prepare the script: {error:#}"));
         }
     };
-    let script = match directory.write(run) {
+    let script = match directory.write(run, variables) {
         Ok(script) => script,
         Err(error) => return failed(ran_as, format!("Could not write the script: {error:#}")),
     };

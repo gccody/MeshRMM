@@ -10,6 +10,8 @@ import { JobsPage } from "../features/automation/jobs-page";
 import { PoliciesPage } from "../features/automation/policies-page";
 import { DevicePage } from "../features/metrics/device-page";
 import { CompaniesPanel } from "../features/companies/companies-panel";
+import { CompanyPage } from "../features/companies/company-page";
+import { CustomFieldsPage } from "../features/custom-fields/custom-fields-page";
 import { TagsPage } from "../features/tags/tags-page";
 import { MaintenancePage } from "../features/maintenance/maintenance-page";
 import { DeploymentPage } from "../features/deployment/deployment-page";
@@ -46,6 +48,8 @@ export function App() {
             <Route path="terminal" element={<TerminalPage />} />
             <Route path="files" element={<FilesPage />} />
             <Route path="companies" element={<CompaniesPanel />} />
+            <Route path="company" element={<CompanyPage />} />
+            <Route path="custom-fields" element={<CustomFieldsPage />} />
             <Route path="tags" element={<TagsPage />} />
             <Route path="maintenance" element={<MaintenancePage />} />
             <Route path="deployment" element={<DeploymentPage />} />

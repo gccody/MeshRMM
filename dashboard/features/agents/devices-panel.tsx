@@ -2,6 +2,9 @@ import { CircleAlert, X } from "lucide-react";
 import { useSearchParams } from "react-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MoveDeviceDialog } from "../companies/company-dialogs";
+import { SetFieldDialog } from "../custom-fields/field-filter";
+import { fetchDefinitions, matchingDevices } from "../custom-fields/fields-api";
+import { type FieldDefinition, type FieldFilter, sameFieldFilter } from "../custom-fields/model";
 import { EnrollmentModal } from "../enrollment/enrollment-modal";
 import { useInstallerDownload } from "../enrollment/use-installer-download";
 import { ConnectionReasonModal } from "../session/connection-reason-modal";
@@ -14,7 +17,8 @@ import { WakeDialog } from "../wake/wake-dialog";
 import { StartMaintenanceDialog } from "../maintenance/maintenance-dialog";
 import { type ActionErrorSource, listActionErrors } from "../workspace/action-errors";
 import { useWorkspace } from "../workspace/workspace-context";
-import { AgentOverview, type DeviceActions } from "./agent-overview";
+import { AuthenticationRequired, errorText } from "../../lib/http";
+import { AgentOverview, type DeviceActions, type FieldControls } from "./agent-overview";
 import { chosenAgents } from "./model";
 import type { Agent } from "./types";
 import { useCompanies, useDevices, useTags } from "./use-devices";
@@ -87,6 +91,15 @@ export function DevicesPanel() {
   // The devices whose tags are being edited, and the control that asked.
   const [tagging, setTagging] = useState<Agent[] | null>(null);
   const tagOpener = useRef<HTMLElement | null>(null);
+  // The devices a custom field is being set on, and the control that asked.
+  const [settingField, setSettingField] = useState<Agent[] | null>(null);
+  const fieldOpener = useRef<HTMLElement | null>(null);
+  const [definitions, setDefinitions] = useState<readonly FieldDefinition[]>([]);
+  // The devices the field filter matches, and the filter they are for.
+  const [fieldMatches, setFieldMatches] = useState<{ filter: FieldFilter; ids: ReadonlySet<string> } | null>(null);
+  const [fieldError, setFieldError] = useState<string | null>(null);
+  // Counts the values set here, which the filter's devices may follow.
+  const [fieldRound, setFieldRound] = useState(0);
 
   // The tiles' actions keep their identity, so a tile redraws only when its
   // own device, reading or state changes.
@@ -116,6 +129,10 @@ export function DevicesPanel() {
 
   const filters = parseDeviceFilters(searchParams);
   const { status, company, tags, tagMatch } = filters;
+  const fieldFilter = filters.field ?? null;
+  const fieldKey = fieldFilter ? `${fieldFilter.key}
+${fieldFilter.op}
+${fieldFilter.value}` : "";
   // A stable key for the chosen tags, which the URL parses afresh each render.
   const tagKey = tags.join(",");
   // The search box updates at once; the URL follows after a pause in typing.
@@ -145,9 +162,42 @@ export function DevicesPanel() {
   const changeStatus = (next: AgentStatusFilter) => writeFilters({ ...filters, query: queryInput, status: next });
   const changeCompany = (next: CompanyFilter) => writeFilters({ ...filters, query: queryInput, company: next });
   const changeTags = (next: string[], match: TagMatch) => writeFilters({ ...filters, query: queryInput, tags: next, tagMatch: match });
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchDefinitions(authorizedFetch).then((fields) => { if (!cancelled) setDefinitions(fields); }, () => {});
+    return () => { cancelled = true; };
+  }, [authorizedFetch]);
+  // The server finds the devices the field filter matches, their own values
+  // or their companies'; asked again when the filter or the fleet changes.
+  const fleetSize = agents.length;
+  useEffect(() => {
+    if (!fieldFilter) return;
+    let cancelled = false;
+    matchingDevices(authorizedFetch, fieldFilter).then(
+      (ids) => {
+        if (cancelled) return;
+        setFieldMatches({ filter: fieldFilter, ids: new Set(ids) });
+        setFieldError(null);
+      },
+      (failure: unknown) => { if (!cancelled && !(failure instanceof AuthenticationRequired)) setFieldError(errorText(failure, "The devices could not be filtered by the field.")); },
+    );
+    return () => { cancelled = true; };
+    // fieldKey stands for the filter, which the URL parses afresh each render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authorizedFetch, fieldKey, fleetSize, fieldRound]);
+  const matchedIds = fieldMatches && sameFieldFilter(fieldMatches.filter, fieldFilter) ? fieldMatches.ids : null;
+  const fieldControls = useMemo<FieldControls>(() => ({
+    definitions,
+    filter: fieldFilter,
+    onFilterChange: (next) => writeFilters({ ...filters, query: queryInput, field: next }),
+    onSet: (chosen, opener) => { fieldOpener.current = opener; setSettingField(chosen); },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }), [definitions, fieldKey, filters.query, queryInput, status, company, tagKey, tagMatch]);
   const filteredAgents = useMemo(
-    () => filterAgents(agents, { query: queryInput, status, company, tags: tagKey ? tagKey.split(",") : [], tagMatch }, deviceTags),
-    [agents, deviceTags, queryInput, status, company, tagKey, tagMatch],
+    () => filterAgents(agents, { query: queryInput, status, company, tags: tagKey ? tagKey.split(",") : [], tagMatch, field: fieldFilter }, deviceTags, matchedIds),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [agents, deviceTags, queryInput, status, company, tagKey, tagMatch, fieldKey, matchedIds],
   );
   // New devices join the company the page shows.
   const enrollInto = company && company !== NO_COMPANY && companies.some((candidate) => candidate.id === company) ? company : "";
@@ -156,6 +206,12 @@ export function DevicesPanel() {
     <>
       {remote.sessionNotice && <div className="session-notice" role="status">{remote.sessionNotice}</div>}
       {remote.launch && <ViewerLaunchNotice key={remote.launch.attempt} launch={remote.launch} offline={inventory.connection === "offline"} onRetry={() => remote.retryLaunch((id) => devices.get(id))} onDismiss={remote.dismissLaunch} />}
+      {fieldError && (
+        <div className="error-banner" role="alert">
+          <CircleAlert size={16} aria-hidden="true" /><span>{fieldError}</span>
+          <button onClick={() => setFieldError(null)} aria-label="Dismiss"><X size={16} /></button>
+        </div>
+      )}
       {listActionErrors(actionErrors, DEVICE_ACTIONS).map(({ source, message }) => (
         <div key={source} className="error-banner" role="alert">
           <CircleAlert size={16} aria-hidden="true" /><span>{message}</span>
@@ -201,7 +257,9 @@ export function DevicesPanel() {
           onClear: () => setSelected(new Set()),
           onStartJob: (kind, opener) => { jobOpener.current = opener; setStartingJob(kind); },
         }}
+        fields={fieldControls}
       />
+      {settingField && <SetFieldDialog agents={settingField} fields={definitions} returnFocus={fieldOpener} onClose={() => { setSettingField(null); setFieldRound((round) => round + 1); }} />}
       {startingJob && <StartJobModal
         kind={startingJob}
         deviceIds={chosenAgents(selected, devices).map((agent) => agent.id)}

@@ -192,12 +192,18 @@ yet.
 | Run as the system account | SYSTEM | root | root |
 | Nobody signed in | Runs as SYSTEM | Runs as root | Runs as root |
 | Timeout stops everything the script started | Yes | Yes (process group) | Yes (process group) |
+| [Custom fields](custom-fields.md) as `MESHRMM_FIELD_*` variables | In the environment block | Exported by lines at the top of the script file | Exported by lines at the top of the script file |
+| `meshrmm-agent field set` from a script | Yes | Yes | Yes |
 | File delivery, user's folder | `Documents\MeshRMM Transferred Files` | `~/Documents/MeshRMM Transferred Files` | `~/Documents/MeshRMM Transferred Files` |
 | File delivery, shared folder | `C:\Users\Public\Documents\…` | `/Users/Shared/…` | `/srv/…` |
 
 - The Agent reports its operating system when it enrolls, and the server
   refuses a script for another platform's interpreter. The website and the
   viewer offer each device only the scripts it can run.
+- Custom fields reach Mac and Linux scripts through the script file
+  because `sudo`, which starts a Mac script as the signed-in user, drops
+  the environment; a shell script's error messages count those lines.
+  Script check monitors get no fields on any platform.
 
 ## Remote terminal
 

@@ -344,6 +344,15 @@ pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
             &config,
             std::sync::Arc::clone(&results_credential),
         ));
+        // Scripts set custom fields through it; see docs/custom-fields.md.
+        let script_fields = crate::script_fields::Channel::start(crate::script_fields::Https::new(
+            &config,
+            std::sync::Arc::clone(&results_credential),
+        ))
+        .inspect_err(|error| {
+            tracing::warn!(%error, "could not open the channel scripts set custom fields through");
+        })
+        .ok();
         #[cfg(target_os = "macos")]
         if mode == ExecutionMode::Service {
             tokio::spawn(crate::macos_updater::run(
@@ -384,6 +393,7 @@ pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
             writing_application: None,
             outbox,
             results_credential,
+            script_fields,
             config,
             mode,
             link,
@@ -422,6 +432,8 @@ struct Coordinator {
     outbox: std::sync::Arc<outbox::Outbox>,
     /// The credential that thread delivers with.
     results_credential: std::sync::Arc<std::sync::Mutex<String>>,
+    /// Where running scripts set custom fields, if it could be opened.
+    script_fields: Option<std::sync::Arc<crate::script_fields::Channel>>,
     active_session: Option<ActiveSession>,
     // Outlives session tasks, which end whenever the viewer drops its
     // connection, so the close action runs only once the session ends.
@@ -678,7 +690,13 @@ impl Coordinator {
                 AgentCommand::StartBackgroundSession { request } => Some(request),
                 AgentCommand::RunScript { run } => {
                     tracing::info!(run_id = %run.run_id, language = run.language.as_str(), run_as = run.run_as.as_str(), "running a toolbox script");
-                    toolbox::run_script(&self.outbox, self.mode, run, self.link.activity());
+                    toolbox::run_script(
+                        &self.outbox,
+                        self.script_fields.as_ref(),
+                        self.mode,
+                        run,
+                        self.link.activity(),
+                    );
                     return Ok(ControlFlow::Continue(()));
                 }
                 AgentCommand::DeliverFile { delivery } => {

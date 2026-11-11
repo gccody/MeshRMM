@@ -6,6 +6,7 @@ const GROUP_LABELS: Record<string, string> = {
   devices: "Devices",
   companies: "Companies",
   tags: "Tags",
+  custom_fields: "Custom fields",
   sessions: "Remote sessions",
   scripts: "Scripts",
   files: "Files",

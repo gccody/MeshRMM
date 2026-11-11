@@ -11,6 +11,7 @@ pub mod audit;
 pub mod auth;
 pub mod automation;
 pub mod config;
+pub mod custom_fields;
 pub mod db;
 pub mod downloads;
 pub mod files;

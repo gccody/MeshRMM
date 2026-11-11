@@ -10,6 +10,7 @@ import {
   FolderOpen,
   Laptop,
   Layers,
+  ListPlus,
   LoaderCircle,
   Monitor,
   MonitorOff,
@@ -35,6 +36,8 @@ import { DeviceUsage } from "../metrics/usage-meter";
 import { MAINTENANCE_FORMAT } from "../maintenance/device-maintenance";
 import { maintenanceLine } from "../maintenance/model";
 import { HeaderActions } from "../workspace/header-actions";
+import { FieldFilterMenu } from "../custom-fields/field-filter";
+import { type FieldDefinition, type FieldFilter, appliesToDevices } from "../custom-fields/model";
 import { type TagMatch, matchesTagName, tagLookup } from "../tags/model";
 import { TagChip, TagChips } from "../tags/tag-chip";
 import { type AgentStatusFilter, type CompanyFilter, NO_COMPANY } from "./device-filters";
@@ -93,6 +96,15 @@ type Props = {
   onMaintenance: (agents: Agent[], opener: HTMLElement) => void;
   // The devices chosen for a job, and what to do with them.
   selection: DeviceSelection;
+  // Custom fields: the filter by one, and setting one on the chosen devices.
+  fields: FieldControls;
+};
+
+export type FieldControls = {
+  definitions: readonly FieldDefinition[];
+  filter: FieldFilter | null;
+  onFilterChange: (filter: FieldFilter | null) => void;
+  onSet: (agents: Agent[], opener: HTMLElement) => void;
 };
 
 // Devices chosen on the wall for a job. `ids` may name devices since
@@ -219,11 +231,13 @@ export function AgentOverview({
   onWake,
   onMaintenance,
   selection,
+  fields,
 }: Props) {
   const { devices, thumbnails } = inventory;
   const { total, online, maintenance } = useDeviceCounts(devices);
   const counts: Record<AgentStatusFilter, number> = { all: total, online, offline: total - online, maintenance };
-  const hasFilters = Boolean(query.trim() || status !== "all" || company || tagFilter.length);
+  const hasFilters = Boolean(query.trim() || status !== "all" || company || tagFilter.length || fields.filter);
+  const deviceFields = fields.definitions.filter(appliesToDevices);
   const hasData = inventory.status !== "loading";
   const stale = inventory.status === "stale";
   const browserOffline = inventory.connection === "offline";
@@ -259,13 +273,14 @@ export function AgentOverview({
         </div>
         {(companies.length > 0 || company) && <CompanyFilterMenu companies={companies} company={company} onChange={onCompanyChange} />}
         {(tags.length > 0 || tagFilter.length > 0) && <TagFilterMenu tags={tags} chosen={tagFilter} match={tagMatch} onChange={onTagsChange} />}
+        {(deviceFields.length > 0 || fields.filter) && <FieldFilterMenu fields={deviceFields} filter={fields.filter} onChange={fields.onFilterChange} />}
         <label className="search-field"><Search size={16} aria-hidden="true" /><input type="search" aria-label="Search devices" value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="Search devices" title="Searches names, tags, operating systems, models, serial numbers and IP addresses" /></label>
         <RefreshButton refreshing={inventory.isRefreshing} onRefresh={onRefresh} />
         {allowed.enroll && <button type="button" className="primary-button" onClick={(event) => onAddDevice(event.currentTarget)} aria-haspopup="dialog"><Plus size={16} /> Add device</button>}
       </HeaderActions>
 
       <InventoryStrip inventory={inventory} onReconnect={onReconnect} />
-      {selectable && selectedCount > 0 && <SelectionBar count={selectedCount} allowed={allowed} selection={selection} shown={filteredAgents} chosen={chosen} onWake={onWake} onMaintenance={onMaintenance} onEditTags={onEditTags} />}
+      {selectable && selectedCount > 0 && <SelectionBar count={selectedCount} allowed={allowed} selection={selection} shown={filteredAgents} chosen={chosen} onWake={onWake} onMaintenance={onMaintenance} onEditTags={onEditTags} onSetField={deviceFields.length > 0 ? fields.onSet : null} />}
 
       {filteredAgents.length > 0 ? (
         <DeviceWall agents={filteredAgents} className={`device-wall${stale ? " stale" : ""}${selectedCount > 0 ? " selecting" : ""}`}>
@@ -335,7 +350,7 @@ function DeviceWall({ agents, className, children }: {
 }
 
 // What to do with the devices chosen on the wall.
-function SelectionBar({ count, allowed, selection, shown, chosen, onWake, onMaintenance, onEditTags }: {
+function SelectionBar({ count, allowed, selection, shown, chosen, onWake, onMaintenance, onEditTags, onSetField }: {
   count: number;
   allowed: DeviceActions;
   selection: DeviceSelection;
@@ -345,6 +360,8 @@ function SelectionBar({ count, allowed, selection, shown, chosen, onWake, onMain
   onWake: (agents: Agent[], opener: HTMLElement) => void;
   onMaintenance: (agents: Agent[], opener: HTMLElement) => void;
   onEditTags: (agents: Agent[], opener: HTMLElement) => void;
+  // Null without device fields to set.
+  onSetField: ((agents: Agent[], opener: HTMLElement) => void) | null;
 }) {
   const allShown = shown.every((agent) => selection.ids.has(agent.id));
   const offline = chosen.filter((agent) => !agent.connected);
@@ -359,6 +376,7 @@ function SelectionBar({ count, allowed, selection, shown, chosen, onWake, onMain
         {allowed.wake && offline.length > 0 && <button type="button" className="secondary-button" onClick={(event) => onWake(offline, event.currentTarget)} aria-haspopup="dialog"><Power size={16} aria-hidden="true" />Wake {offline.length} offline</button>}
         {allowed.maintenance && <button type="button" className="secondary-button" onClick={(event) => onMaintenance(chosen, event.currentTarget)} aria-haspopup="dialog"><Wrench size={16} aria-hidden="true" />Maintenance</button>}
         {allowed.editTags && <button type="button" className="secondary-button" onClick={(event) => onEditTags(chosen, event.currentTarget)} aria-haspopup="dialog"><TagIcon size={16} aria-hidden="true" />Tag</button>}
+        {allowed.editTags && onSetField && <button type="button" className="secondary-button" onClick={(event) => onSetField(chosen, event.currentTarget)} aria-haspopup="dialog"><ListPlus size={16} aria-hidden="true" />Set field</button>}
       </span>
     </div>
   );

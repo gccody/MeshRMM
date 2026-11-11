@@ -27,6 +27,8 @@ export type Permission =
   | "devices.rotate_credentials"
   | "companies.manage"
   | "tags.manage"
+  | "custom_fields.manage"
+  | "custom_fields.reveal"
   | "devices.wake"
   | "devices.maintenance"
   | "sessions.connect"

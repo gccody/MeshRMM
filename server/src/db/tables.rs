@@ -1018,3 +1018,39 @@ pub enum MaintenanceWindows {
     CreatedAt,
     UpdatedAt,
 }
+
+#[derive(Iden, Clone, Copy)]
+pub enum CustomFields {
+    Table,
+    Id,
+    FieldKey,
+    Label,
+    Description,
+    FieldType,
+    Options,
+    AppliesToDevices,
+    AppliesToCompanies,
+    Position,
+    ScriptAccess,
+    CreatedAt,
+    UpdatedAt,
+}
+
+/// `device_field_values` and `company_field_values`, which name their
+/// columns alike but for whose value each row holds.
+#[derive(Iden, Clone, Copy)]
+pub enum FieldValues {
+    #[iden = "device_field_values"]
+    DeviceTable,
+    #[iden = "company_field_values"]
+    CompanyTable,
+    DeviceId,
+    CompanyId,
+    FieldId,
+    Value,
+    ValueEncrypted,
+    UpdatedAt,
+    UpdatedByUserId,
+    UpdatedByRunId,
+    UpdatedByScript,
+}

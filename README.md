@@ -85,6 +85,9 @@ MeshRMM is in heavy development and not production ready.
   policies, alert rules and the Updates and Software pages at them.
 - Notes on each device, with who last edited them, a short history, and a
   warning instead of a silent overwrite when two people edit at once.
+- Custom fields on devices and companies: text, numbers, dates, options,
+  web addresses and encrypted secrets, which devices inherit from their
+  company, the wall filters by, and toolbox scripts read and write.
 - Resource monitoring: CPU, memory, network, uptime and disk space, live and
   as charts for the last hour, day or week.
 - Hardware and software: operating system, model, serial number, processor,
@@ -233,6 +236,8 @@ For developers:
   installing local builds
 - [Devices](docs/devices.md): enrollment, companies, tags, notes, the
   device list, resource monitoring, updates and removal
+- [Custom fields](docs/custom-fields.md): fields on devices and companies,
+  secrets, and reading and writing them from scripts
 - [Wake-on-LAN](docs/wake-on-lan.md): waking offline devices through online
   ones on their network, and what the sleeping computer needs
 - [Maintenance windows](docs/maintenance-windows.md): putting devices in
