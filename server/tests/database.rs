@@ -246,7 +246,7 @@ async fn maintenance_purges_only_expired_rows_and_old_history() {
                         .columns([
                             "device_id",
                             "minute",
-                            "samples",
+                            "covered_ms",
                             "cpu_percent",
                             "cpu_percent_max",
                             "memory_used_bytes",
@@ -515,7 +515,7 @@ async fn insert_metrics(database: &Database, rows: impl IntoIterator<Item = (Str
     insert.into_table("device_metrics").columns([
         "device_id",
         "minute",
-        "samples",
+        "covered_ms",
         "cpu_percent",
         "cpu_percent_max",
         "memory_used_bytes",

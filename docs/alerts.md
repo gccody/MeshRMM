@@ -2,8 +2,10 @@
 
 Alert rules watch the devices and raise alerts; notification channels tell
 people about them by email or webhook. Most rules are judged on the server,
-from what Agents already report: their connection, their resource usage every
-five seconds, the toolbox runs they finish, and their
+from what Agents already report: their connection, their resource usage
+(every 5 seconds while someone watches the device, once a minute otherwise;
+see [resource monitoring](devices.md#resource-monitoring)), the toolbox runs
+they finish, and their
 [update scans and installs](patch-management.md). [Monitor](monitors.md)
 rules are checked by the device's Agent itself, and any rule whose alerts
 resolve themselves, but device offline, can try to fix them automatically
@@ -51,9 +53,15 @@ Its condition can't change after it's created.
 | Monitors: service, process, event log, ping, TCP port, website, certificate, script check | the device's Agent finds the check failing N times in a row; see [Monitors](monitors.md) | a check passes |
 
 The loads are averages so that a brief spike or dip neither raises nor
-clears an alert. A load rule needs readings covering its whole window, from
-a connection that hasn't dropped: until then, and while the device is
-offline, its alerts stay as they are. The server keeps each device's
+clears an alert. A load rule judges the M minutes up to the device's latest
+reading, each reading weighted by the time it covers (the time since the
+previous one), so the average is the same whether or not someone had the
+device's page open during them. It needs readings covering its whole window,
+from a connection that hasn't dropped, and a latest reading at most two
+minutes old: until then, while the device is offline, and once it stops
+reporting, its alerts stay as they are. A device nobody watches reports once
+a minute, so its alert can come up to about a minute after the load
+crossed the threshold. The server keeps each device's
 readings only as far back as the longest window of the enabled CPU and
 memory rules, and none while there is no such rule, so a rule created,
 turned on or lengthened to look further back than that waits for its window
@@ -97,7 +105,8 @@ the maintenance task deletes them.
 ## Evaluation and restarts
 
 `server/src/alerts/` holds it all. The engine's task
-(`alerts::spawn`) takes in new resource readings every five seconds and
+(`alerts::spawn`) takes in new resource readings every five seconds, as
+often as a watched device reports, and
 judges the device-state rules every 15 seconds (`EVALUATION_INTERVAL`), at
 once after a rule is saved, and soon after a device reports an update or
 application scan, unless the scan found what the last one did (the same

@@ -35,7 +35,7 @@ use std::{
 };
 
 use axum::extract::ws::Utf8Bytes;
-use meshrmm_protocol_types::METRICS_INTERVAL_SECONDS;
+use meshrmm_protocol_types::METRICS_WATCHED_INTERVAL_SECONDS;
 use tokio::{
     sync::broadcast::{self, error::RecvError},
     time::{Duration, Instant, MissedTickBehavior},
@@ -46,8 +46,9 @@ use super::{
     watched::{WatchSet, Watched},
 };
 
-/// How often new readings are sent: as often as Agents report.
-pub const FEED_INTERVAL: Duration = Duration::from_secs(METRICS_INTERVAL_SECONDS);
+/// How often new readings are sent: as often as the Agents of watched
+/// devices report, which are the only ones sent.
+pub const FEED_INTERVAL: Duration = Duration::from_secs(METRICS_WATCHED_INTERVAL_SECONDS);
 /// The most devices one socket watches: more than a wall of the smallest
 /// tiles shows on a 4K screen at half zoom (about 30 columns by 15 rows,
 /// with the rows drawn either side). A watch message naming more watches
@@ -358,21 +359,21 @@ impl Subscription {
 mod tests {
     use std::collections::{BTreeMap, HashSet};
 
-    use meshrmm_protocol_types::SystemMetrics;
+    use meshrmm_protocol_types::MetricsReport;
     use serde_json::Value;
 
     use super::*;
     use crate::{db::Database, time::SECOND_MS};
 
-    fn usage(cpu: f32) -> SystemMetrics {
-        SystemMetrics {
+    fn usage(cpu: f32) -> MetricsReport {
+        MetricsReport {
             cpu_percent: cpu,
             memory_used_bytes: 1,
             memory_total_bytes: 2,
             network_received_bytes_per_second: 0,
             network_sent_bytes_per_second: 0,
             uptime_seconds: 60,
-            volumes: Vec::new(),
+            volumes: Some(Vec::new()),
         }
     }
 
@@ -640,7 +641,7 @@ mod tests {
         let reading = Reading {
             device_id: "a".into(),
             at: 5,
-            metrics: usage(3.0),
+            metrics: usage(3.0).with_volumes(Vec::new()),
             sequence: 9,
         };
         let one = serialize(&reading);

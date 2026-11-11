@@ -239,17 +239,35 @@ connection at once. It is safe to repeat and is recorded in the audit log.
 
 ## Resource monitoring
 
-Every five seconds an online Agent reports, over the control connection it
-already keeps open:
+An online Agent reports, over the control connection it already keeps open:
 
 - CPU load and memory use;
 - network throughput through its physical adapters;
 - uptime;
 - the capacity and free space of its local fixed volumes.
 
+It reports every 5 seconds while a website tab shows the device's readings
+(a tile on the device wall, or the device's page), and once a minute
+otherwise. Loads and rates are averages since the Agent's previous reading,
+so a reading a minute still accounts for the whole minute. The server tells
+each Agent its interval when it connects (until then the Agent reports once
+a minute) and whenever that changes: at once when a tab starts watching the
+device, and 25 seconds after the last tab stops, so scrolling the wall or
+reloading a page does not switch Agents back and forth
+(`server/src/realtime/metrics/interval.rs`). Each Agent starts its first
+reading after a change at a random point of the new interval, so devices
+don't report together. Volumes are read again about once a minute, and
+travel only in the first report after each read and the first on each
+connection; the server keeps the device's list and shows it with every
+reading. A device shown for the first time shows a reading up to a minute
+old until the next arrives, within 5 seconds.
+
 A device's tile or name opens its own page. Its **Usage** tab shows the latest reading, every volume's free
 space, and charts of the last 15 minutes live, or the last hour, 24 hours or
-7 days.
+7 days. The live chart has a point a minute from before the page opened,
+while nobody watched the device, and one every 5 seconds since; it draws a
+line through both, and breaks it where readings stop for longer than three
+times their spacing before, as when the device went offline.
 
 The event socket sends a tab live readings only of the devices it shows.
 The tab sends `{"type":"watch","devices":[...]}` with the devices whose
@@ -272,7 +290,12 @@ if no `{"type":"pong"}` comes within 5 seconds.
 
 The server keeps the live readings in memory
 (`server/src/realtime/metrics.rs`) and averages each minute into the
-database, where history is kept for 7 days. Finished minutes wait in memory
+database, where history is kept for 7 days. Averages weight each reading by
+the time it covers, the time since the previous one (at most two minutes,
+and 5 seconds for a connection's first), so a minute someone watched counts
+as much as one nobody did, and a minute's average is the same however often
+the device reported in it. A device nobody watches has one reading a minute
+in its history and live chart. Finished minutes wait in memory
 and are stored together every 5 seconds, so a minute appears in the history
 up to 5 seconds after it ends; a graceful stop stores the ones waiting. While
 the database can't keep up, at most 250,000 minutes wait and the oldest are

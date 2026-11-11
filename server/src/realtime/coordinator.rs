@@ -4,10 +4,11 @@
 //! registers with the [`super::AgentHub`], publishes the device's presence,
 //! gives the Agent its live remote session and any rotated credential it
 //! hasn't used yet, says which application list it holds and asks for a
-//! system information snapshot if the one it has is old, then forwards what
-//! the API sends, and records the resource usage and snapshots the Agent
-//! reports, until the Agent disconnects or a newer connection from the device
-//! replaces it.
+//! system information snapshot if the one it has is old, and how often to
+//! report its resource usage, then forwards what the API sends, tells the
+//! Agent when that interval changes, and records the resource usage and
+//! snapshots the Agent reports, until the Agent disconnects or a newer
+//! connection from the device replaces it.
 use std::{net::IpAddr, time::Instant};
 
 use axum::extract::ws::{Message, WebSocket};
@@ -36,6 +37,9 @@ pub async fn serve(
     // asked for before it are the ones its Agent may not have.
     let connected_at = crate::time::now_ms();
     let mut connection = state.agents.connect(&device_id);
+    // How often the Agent reports follows whether a website tab watches the
+    // device, from before the Agent is greeted with it.
+    let mut reporting = state.metrics.reporting_interval(&device_id);
     // Before presence, so a page that sees the device come online reads it
     // as woken.
     wake::device_connected(&state, &device_id).await;
@@ -56,7 +60,9 @@ pub async fn serve(
     // Jobs waiting for the device start now.
     state.automation.device_connected(&device_id);
     tracing::info!(device_id, "Agent connected");
-    if let Ok(replayed) = greet(&state, &device_id, system, &mut socket).await {
+    if let Ok(replayed) = greet(&state, &device_id, system, &mut socket).await
+        && send(&mut socket, command(reporting.greeting())).await
+    {
         let mut last_session = replayed;
         let mut last_heard = Instant::now();
         loop {
@@ -70,6 +76,14 @@ pub async fn serve(
                         continue;
                     }
                     if !send(&mut socket, Message::Text(outgoing.to_json().into())).await {
+                        break;
+                    }
+                }
+                interval = reporting.next() => {
+                    // A replaced connection's Agent is going away.
+                    if state.agents.is_current(&device_id, connection.id)
+                        && !send(&mut socket, command(interval)).await
+                    {
                         break;
                     }
                 }
@@ -176,6 +190,10 @@ pub async fn serve(
     state.presence.disconnected(&device_id).await;
     updates::publish_device(&state, &device_id).await;
     tracing::info!(device_id, "Agent disconnected");
+}
+
+fn command(command: AgentCommand) -> Message {
+    Message::Text(ToAgent::Command(command).to_json().into())
 }
 
 /// Stores a snapshot and shows the device list what changed. Returns what

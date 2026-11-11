@@ -219,7 +219,13 @@ task.
   each device, dropping a device when its last socket stops watching it or
   closes, however it closes. A task can follow one device being watched
   with `Watched::listen`, a `tokio::sync::watch` channel set on each change
-  between watched and not; nothing listens yet. While any event socket is
+  between watched and not. Each Agent connection's task listens for its
+  device (`ReportingInterval`, `server/src/realtime/metrics/interval.rs`)
+  and tells the Agent to report every 5 seconds while it is watched and
+  once a minute otherwise, 25 seconds after it stops being watched; the
+  registry keeps the watched devices in a set of their own, so the feed's
+  scan costs what is watched though every online device has a listener.
+  Averages weight each reading by the time it covers. While any event socket is
   open, one feed task (`server/src/realtime/metrics/feed.rs`) scans every 5
   seconds for the watched devices' readings since its last scan, looking
   through the watched devices or the online ones, whichever are fewer, and

@@ -1,5 +1,7 @@
-//! Devices' resource usage, as their Agents report it every few seconds on
-//! the control connection.
+//! Devices' resource usage, as their Agents report it on the control
+//! connection: every few seconds while a website tab shows the device's
+//! readings, about once a minute otherwise ([`ReportingInterval`],
+//! `metrics/interval.rs`).
 //!
 //! Each online device's latest reading and its readings from the last
 //! [`LIVE_WINDOW_MS`] stay in memory for the website's live view. Each
@@ -7,6 +9,16 @@
 //! next minute's first reading arrives or the Agent disconnects, and rows are
 //! kept for [`HISTORY_MS`]. Readings are stamped with the server's clock, so
 //! an Agent's wrong clock can't misplace them.
+//!
+//! A reading's loads and rates are averages over the time since the
+//! previous one, which is five seconds while someone watches and a minute
+//! otherwise, so averages weight each reading by the time it covers
+//! ([`covered_ms`]): a minute someone watched for a while counts as much as
+//! any other, not twelve times as much.
+//!
+//! An Agent sends its volumes only when it read them again and in the first
+//! report on each connection. The device's last list is kept with its
+//! latest reading and given to every reading, so readings always carry it.
 //!
 //! Finished minutes wait in memory and the writer task stores them every
 //! [`FLUSH_INTERVAL`], all in one transaction, so a minute reaches the history
@@ -20,6 +32,7 @@
 //! sockets send it. Which devices any socket watches is the [`Watched`]
 //! registry (`metrics/watched.rs`).
 mod feed;
+mod interval;
 mod watched;
 
 use std::{
@@ -28,12 +41,16 @@ use std::{
     time::Duration,
 };
 
-use meshrmm_protocol_types::{METRICS_INTERVAL_SECONDS, SystemMetrics};
+use meshrmm_protocol_types::{
+    METRICS_IDLE_INTERVAL_SECONDS, METRICS_WATCHED_INTERVAL_SECONDS, MetricsReport, SystemMetrics,
+    VolumeUsage,
+};
 use sea_query::{Expr, ExprTrait, InsertStatement, OnConflict, Order, Query};
 use serde::{Deserialize, Serialize};
 
 pub use self::{
     feed::{FEED_INTERVAL, FeedWork, MAX_WATCHED, Subscription},
+    interval::{ReportingInterval, UNWATCHED_LINGER},
     watched::{Watched, WatchedSignal},
 };
 use crate::{
@@ -43,14 +60,42 @@ use crate::{
 
 /// How far back the live view reaches.
 pub const LIVE_WINDOW_MS: i64 = 15 * MINUTE_MS;
-/// Points a live window has room for before it has to grow: one per
-/// reporting interval, and a few more for jitter.
-const LIVE_ROOM: usize =
-    (LIVE_WINDOW_MS / (METRICS_INTERVAL_SECONDS as i64 * SECOND_MS)) as usize + 4;
+/// The interval an Agent reports at while someone watches its device.
+pub const WATCHED_INTERVAL_MS: i64 = METRICS_WATCHED_INTERVAL_SECONDS as i64 * SECOND_MS;
+/// The interval an Agent reports at while nobody does.
+pub const IDLE_INTERVAL_MS: i64 = METRICS_IDLE_INTERVAL_SECONDS as i64 * SECOND_MS;
+/// Points a live window has room for before it has to grow: one per idle
+/// interval, which is what most devices report at, and a few more for
+/// jitter and for interval changes, whose first reading comes early. A
+/// watched device's window grows to hold a reading every few seconds, and
+/// shrinks back once the window no longer holds them.
+const LIVE_ROOM: usize = (LIVE_WINDOW_MS / IDLE_INTERVAL_MS) as usize + 4;
+/// The time a connection's first reading counts as covering. It is the
+/// average since the Agent's previous sample, which may be seconds ago or
+/// from before the connection: the server can't tell, so it counts for as
+/// little as any reading does.
+pub const FIRST_READING_COVERS_MS: i64 = WATCHED_INTERVAL_MS;
+/// The most time a reading counts as covering: two idle intervals, so one
+/// late reading counts in full, but one after a long silence does not
+/// outweigh everything around it.
+pub const LONGEST_READING_COVERS_MS: i64 = 2 * IDLE_INTERVAL_MS;
+
+/// The time a reading taken at `at` covers, after the connection's previous
+/// one at `previous`, for weighting averages: the time between them, at most
+/// [`LONGEST_READING_COVERS_MS`], or [`FIRST_READING_COVERS_MS`] for the
+/// first. Never less than a millisecond.
+pub fn covered_ms(previous: Option<i64>, at: i64) -> i64 {
+    previous
+        .map_or(FIRST_READING_COVERS_MS, |previous| at - previous)
+        .clamp(1, LONGEST_READING_COVERS_MS)
+}
 /// How long per-minute history is kept.
 pub const HISTORY_MS: i64 = 7 * DAY_MS;
 /// Readings closer together than this are dropped, which bounds what an
-/// Agent that reports too often can make the server keep.
+/// Agent that reports too often can make the server keep. Agents report at
+/// least five seconds apart, but the first reading after an interval change
+/// comes at a random point of the new one, so now and then one is dropped;
+/// its volumes are kept, and the next reading covers its time.
 const MIN_SPACING_MS: i64 = 2 * SECOND_MS;
 /// How often the writer task stores the finished minutes.
 pub const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
@@ -120,12 +165,12 @@ impl Point {
     }
 }
 
-/// Points of one period, weighted by how many readings each stands for.
-/// Loads and rates average; capacities and storage take the latest point.
+/// Points of one period, each weighted by the milliseconds it covers. Loads
+/// and rates average; capacities and storage take the latest point.
 #[derive(Debug, Clone, Copy)]
 struct Totals {
     start: i64,
-    samples: i64,
+    covered_ms: i64,
     cpu: f64,
     memory_used: f64,
     received: f64,
@@ -134,23 +179,23 @@ struct Totals {
 }
 
 impl Totals {
-    fn new(start: i64, point: &Point, samples: i64) -> Self {
+    fn new(start: i64, point: &Point, covered_ms: i64) -> Self {
         let mut totals = Self {
             start,
-            samples: 0,
+            covered_ms: 0,
             cpu: 0.0,
             memory_used: 0.0,
             received: 0.0,
             sent: 0.0,
             last: *point,
         };
-        totals.add(point, samples);
+        totals.add(point, covered_ms);
         totals
     }
 
-    fn add(&mut self, point: &Point, samples: i64) {
-        let weight = samples as f64;
-        self.samples += samples;
+    fn add(&mut self, point: &Point, covered_ms: i64) {
+        let weight = covered_ms as f64;
+        self.covered_ms += covered_ms;
         self.cpu += point.cpu_percent * weight;
         self.memory_used += point.memory_used_bytes as f64 * weight;
         self.received += point.network_received_bytes_per_second as f64 * weight;
@@ -161,13 +206,13 @@ impl Totals {
     }
 
     fn point(&self) -> Point {
-        let samples = Ord::max(self.samples, 1) as f64;
+        let covered = Ord::max(self.covered_ms, 1) as f64;
         Point {
             at: self.start,
-            cpu_percent: self.cpu / samples,
-            memory_used_bytes: (self.memory_used / samples).round() as i64,
-            network_received_bytes_per_second: (self.received / samples).round() as i64,
-            network_sent_bytes_per_second: (self.sent / samples).round() as i64,
+            cpu_percent: self.cpu / covered,
+            memory_used_bytes: (self.memory_used / covered).round() as i64,
+            network_received_bytes_per_second: (self.received / covered).round() as i64,
+            network_sent_bytes_per_second: (self.sent / covered).round() as i64,
             ..self.last
         }
     }
@@ -195,10 +240,13 @@ impl Range {
         }
     }
 
-    /// How long each point covers: a few hundred points at most.
+    /// How long each point covers: a few hundred points at most. Live
+    /// points are readings, which cover the time since the previous one:
+    /// this long while the device is watched, as when its page is open, and
+    /// up to an idle interval before.
     pub fn step_ms(self) -> i64 {
         match self {
-            Self::Live => i64::try_from(METRICS_INTERVAL_SECONDS).unwrap_or(5) * SECOND_MS,
+            Self::Live => WATCHED_INTERVAL_MS,
             Self::Hour => MINUTE_MS,
             Self::Day => 5 * MINUTE_MS,
             Self::Week => 30 * MINUTE_MS,
@@ -251,6 +299,13 @@ impl LiveWindow {
             && oldest <= at - LIVE_WINDOW_MS
         {
             self.points.pop_front();
+        }
+        // A device no longer watched gives back the room its readings every
+        // few seconds took as they leave the window: a quarter full, or back
+        // to the idle room's worth, it keeps twice what it holds.
+        let (held, room) = (self.points.len(), self.points.capacity());
+        if room > 2 * LIVE_ROOM && (held * 4 <= room || held <= LIVE_ROOM) {
+            self.points.shrink_to(Ord::max(LIVE_ROOM, held * 2));
         }
         match self.points.front().map(|point| point.offset) {
             None => {
@@ -353,6 +408,9 @@ pub struct Held {
 #[derive(Debug, Default)]
 struct Device {
     latest: Option<Reading>,
+    /// The volumes the Agent last sent on this connection: none until it
+    /// sends a list, as for a computer whose disks can't be read.
+    volumes: Vec<VolumeUsage>,
     live: LiveWindow,
     minute: Option<Totals>,
 }
@@ -388,7 +446,7 @@ impl Pending {
     fn insert(&mut self, device_id: &str, minute: Totals) {
         match self.minutes.entry((minute.start, device_id.to_owned())) {
             Entry::Occupied(mut waiting) => {
-                waiting.get_mut().add(&minute.point(), minute.samples);
+                waiting.get_mut().add(&minute.point(), minute.covered_ms);
             }
             Entry::Vacant(slot) => {
                 slot.insert(minute);
@@ -459,6 +517,9 @@ pub struct Metrics {
     feed: Arc<feed::Feed>,
     /// The devices the event sockets watch.
     watched: Watched,
+    /// How long an Agent keeps reporting at the watched interval after its
+    /// device stops being watched.
+    unwatched_linger: Duration,
 }
 
 impl Metrics {
@@ -474,7 +535,20 @@ impl Metrics {
             writer: Arc::default(),
             feed: Arc::default(),
             watched: Watched::default(),
+            unwatched_linger: UNWATCHED_LINGER,
         }
+    }
+
+    /// Lingers `linger` instead of [`UNWATCHED_LINGER`] before slowing an
+    /// Agent whose device stopped being watched; for tests.
+    pub fn set_unwatched_linger(&mut self, linger: Duration) {
+        self.unwatched_linger = linger;
+    }
+
+    /// Follows whether the device is watched, for its Agent connection to
+    /// tell the Agent how often to report.
+    pub fn reporting_interval(&self, device_id: &str) -> ReportingInterval {
+        ReportingInterval::new(self.watched.listen(device_id), self.unwatched_linger)
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -491,16 +565,17 @@ impl Metrics {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Records a reading from the device's connected Agent, and queues the
-    /// previous minute for storing when this one starts the next.
-    pub fn record(&self, device_id: &str, metrics: SystemMetrics) {
-        let finished = self.record_at(device_id, metrics.sanitized(), now_ms());
+    /// Records a report from the device's connected Agent, and queues the
+    /// previous minute for storing when this one starts the next. A report
+    /// without volumes has the device's last list.
+    pub fn record(&self, device_id: &str, report: MetricsReport) {
+        let finished = self.record_at(device_id, report.sanitized(), now_ms());
         if let Some(finished) = finished {
             self.pending().insert(device_id, finished);
         }
     }
 
-    fn record_at(&self, device_id: &str, metrics: SystemMetrics, at: i64) -> Option<Totals> {
+    fn record_at(&self, device_id: &str, mut report: MetricsReport, at: i64) -> Option<Totals> {
         let mut state = self.state();
         state.sequence += 1;
         let sequence = state.sequence;
@@ -510,13 +585,17 @@ impl Metrics {
                 .insert(device_id.to_owned(), Device::default());
         }
         let device = state.devices.get_mut(device_id)?;
-        if device
-            .latest
-            .as_ref()
-            .is_some_and(|latest| at - latest.at < MIN_SPACING_MS)
-        {
+        // Kept even from a reading dropped for coming too soon, as the Agent
+        // does not send them again until it reads them again.
+        if let Some(volumes) = report.volumes.take() {
+            device.volumes = volumes;
+        }
+        let previous = device.latest.as_ref().map(|latest| latest.at);
+        if previous.is_some_and(|previous| at - previous < MIN_SPACING_MS) {
             return None;
         }
+        let covered = covered_ms(previous, at);
+        let metrics = report.with_volumes(device.volumes.clone());
         let point = Point::of(at, &metrics);
         device.live.push(at, &metrics);
         // The previous reading's copy of the id is reused.
@@ -533,10 +612,10 @@ impl Metrics {
         let start = at - at.rem_euclid(MINUTE_MS);
         match &mut device.minute {
             Some(minute) if minute.start == start => {
-                minute.add(&point, 1);
+                minute.add(&point, covered);
                 None
             }
-            minute => minute.replace(Totals::new(start, &point, 1)),
+            minute => minute.replace(Totals::new(start, &point, covered)),
         }
     }
 
@@ -588,7 +667,7 @@ impl Metrics {
         let state = self.state();
         let watched = self.watched.lock();
         let newer = |reading: &&Reading| reading.sequence > sequence;
-        let readings = if watched.len() < state.devices.len() {
+        let readings = if watched::watched_count(&watched) < state.devices.len() {
             watched::watched_ids(&watched)
                 .filter_map(|id| state.devices.get(id)?.latest.as_ref())
                 .filter(newer)
@@ -832,12 +911,13 @@ impl HistoryWriter {
 }
 
 /// Inserts the minutes, merging each into one already stored for its device
-/// and minute, as when a reconnect within the minute stores it again.
+/// and minute, as when a reconnect within the minute stores it again, by the
+/// time each covers.
 fn upsert(minutes: &[Queued]) -> InsertStatement {
     let weighted = |column: &str| {
         Expr::cust(format!(
-            "(device_metrics.{column} * device_metrics.samples + excluded.{column} * excluded.samples) \
-             / (device_metrics.samples + excluded.samples)"
+            "(device_metrics.{column} * device_metrics.covered_ms + excluded.{column} * excluded.covered_ms) \
+             / (device_metrics.covered_ms + excluded.covered_ms)"
         ))
     };
     let mut statement = Query::insert()
@@ -849,7 +929,7 @@ fn upsert(minutes: &[Queued]) -> InsertStatement {
         statement.values_panic([
             device_id.as_str().into(),
             (*start).into(),
-            minute.samples.into(),
+            minute.covered_ms.into(),
             point.cpu_percent.into(),
             point.cpu_percent_max.into(),
             point.memory_used_bytes.into(),
@@ -884,8 +964,8 @@ fn upsert(minutes: &[Queued]) -> InsertStatement {
                     ),
                 ),
                 (
-                    DeviceMetrics::Samples,
-                    Expr::cust("device_metrics.samples + excluded.samples"),
+                    DeviceMetrics::CoveredMs,
+                    Expr::cust("device_metrics.covered_ms + excluded.covered_ms"),
                 ),
             ])
             .update_columns([
@@ -901,7 +981,7 @@ fn upsert(minutes: &[Queued]) -> InsertStatement {
 const ROW_COLUMNS: [DeviceMetrics; 11] = [
     DeviceMetrics::DeviceId,
     DeviceMetrics::Minute,
-    DeviceMetrics::Samples,
+    DeviceMetrics::CoveredMs,
     DeviceMetrics::CpuPercent,
     DeviceMetrics::CpuPercentMax,
     DeviceMetrics::MemoryUsedBytes,
@@ -915,7 +995,7 @@ const ROW_COLUMNS: [DeviceMetrics; 11] = [
 #[derive(Debug, sqlx::FromRow)]
 struct Row {
     minute: i64,
-    samples: i64,
+    covered_ms: i64,
     cpu_percent: f64,
     cpu_percent_max: f64,
     memory_used_bytes: i64,
@@ -943,8 +1023,8 @@ fn buckets(rows: Vec<Row>, step: i64) -> Vec<Point> {
         };
         let start = row.minute - row.minute.rem_euclid(step);
         match points.last_mut() {
-            Some(totals) if totals.start == start => totals.add(&point, row.samples),
-            _ => points.push(Totals::new(start, &point, row.samples)),
+            Some(totals) if totals.start == start => totals.add(&point, row.covered_ms),
+            _ => points.push(Totals::new(start, &point, row.covered_ms)),
         }
     }
     points.iter().map(Totals::point).collect()
@@ -956,7 +1036,12 @@ mod tests {
 
     use super::*;
 
-    fn sample(cpu: f32, memory: u64) -> SystemMetrics {
+    /// A report with its volumes.
+    fn sample(cpu: f32, memory: u64) -> MetricsReport {
+        MetricsReport::new(usage(cpu, memory), true)
+    }
+
+    fn usage(cpu: f32, memory: u64) -> SystemMetrics {
         SystemMetrics {
             cpu_percent: cpu,
             memory_used_bytes: memory,
@@ -1000,7 +1085,8 @@ mod tests {
             .record_at("a", sample(50.0, 50), minute + MINUTE_MS)
             .expect("the next minute finishes the first");
         assert_eq!(finished.start, minute);
-        assert_eq!(finished.samples, 2);
+        // The connection's first reading, and the five seconds to the next.
+        assert_eq!(finished.covered_ms, FIRST_READING_COVERS_MS + 5 * SECOND_MS);
         let point = finished.point();
         assert_eq!(point.at, minute);
         assert_eq!(point.cpu_percent, 20.0);
@@ -1094,7 +1180,7 @@ mod tests {
             {
                 expected.pop_front();
             }
-            metrics.record_at("a", reading, at);
+            metrics.record_at("a", MetricsReport::new(reading, true), at);
             let state = metrics.state();
             let live = &state.devices["a"].live;
             assert_eq!(live.points(i64::MIN), Vec::from(expected.clone()));
@@ -1118,7 +1204,7 @@ mod tests {
         let mut at = start;
         // Past the 49 days a `u32` of milliseconds counts.
         while at < start + i64::from(u32::MAX) + 2 * LIVE_WINDOW_MS {
-            let reading = sample((at / SECOND_MS % 100) as f32, (at / SECOND_MS) as u64 % 997);
+            let reading = usage((at / SECOND_MS % 100) as f32, (at / SECOND_MS) as u64 % 997);
             expected.push_back(Point::of(at, &reading));
             if expected.len() > 30 {
                 expected.pop_front();
@@ -1134,21 +1220,161 @@ mod tests {
     async fn a_live_window_holds_its_points_in_40_bytes_each() {
         assert_eq!(size_of::<LivePoint>(), 40);
         let metrics = store().await;
-        for second in (0..=2 * LIVE_WINDOW_MS / SECOND_MS).step_by(5) {
-            metrics.record_at("a", sample(1.0, 1), second * SECOND_MS);
-        }
+        // Unwatched, a reading a minute.
+        let mut at = 0;
+        let report = |at: &mut i64, every: i64, for_ms: i64| {
+            let end = *at + for_ms;
+            while *at < end {
+                metrics.record_at("a", sample(1.0, 1), *at);
+                *at += every;
+            }
+        };
+        report(&mut at, IDLE_INTERVAL_MS, 2 * LIVE_WINDOW_MS);
+        let held = metrics.held("a").unwrap();
+        assert_eq!(held.points, 15);
+        // The room for 19 points and one set of capacities, which it never
+        // outgrew.
+        assert_eq!(LIVE_ROOM, 19);
+        let idle = size_of::<LiveWindow>() + 19 * 40 + size_of::<Capacities>();
+        assert_eq!((held.bytes, idle), (idle, 856));
+        // Watched, it grows to hold a reading every five seconds.
+        report(&mut at, WATCHED_INTERVAL_MS, LIVE_WINDOW_MS);
         let held = metrics.held("a").unwrap();
         assert_eq!(held.points, 180);
-        // The room for 184 points and one set of capacities, which it never
-        // outgrew.
-        assert_eq!(LIVE_ROOM, 184);
-        assert_eq!(
-            held.bytes,
-            size_of::<LiveWindow>() + 184 * 40 + size_of::<Capacities>()
-        );
-        assert_eq!(held.bytes, 7_456);
+        assert!(held.bytes >= idle + (180 - 19) * 40, "{held:?}");
+        // Unwatched again, it gives most of that back once they are gone.
+        report(&mut at, IDLE_INTERVAL_MS, 2 * LIVE_WINDOW_MS);
+        let held = metrics.held("a").unwrap();
+        assert_eq!(held.points, 15);
+        assert!(held.bytes <= idle + LIVE_ROOM * 40, "{held:?}");
         metrics.disconnected("a");
         assert_eq!(metrics.held("a"), None);
+    }
+
+    #[tokio::test]
+    async fn readings_without_volumes_have_the_devices_last_list() {
+        let metrics = store().await;
+        let without = |cpu: f32| MetricsReport::new(usage(cpu, 10), false);
+        // Before any list: none, as for a computer whose disks can't be read.
+        metrics.record_at("a", without(1.0), 0);
+        let latest = metrics.latest("a").unwrap();
+        assert!(latest.metrics.volumes.is_empty());
+        assert_eq!(latest.metrics.storage(), (0, 0));
+        metrics.record_at("a", sample(2.0, 10), 5 * SECOND_MS);
+        let listed = metrics.latest("a").unwrap().metrics.volumes;
+        assert_eq!(listed.len(), 1);
+        metrics.record_at("a", without(3.0), 10 * SECOND_MS);
+        let latest = metrics.latest("a").unwrap();
+        assert_eq!(
+            (latest.metrics.cpu_percent, &latest.metrics.volumes),
+            (3.0, &listed)
+        );
+        let point = metrics.state().devices["a"].live.points(i64::MIN)[2];
+        assert_eq!(
+            (point.storage_used_bytes, point.storage_total_bytes),
+            (10, 1000)
+        );
+        // A list in a reading dropped for coming too soon is still taken.
+        let mut changed = usage(4.0, 10);
+        changed.volumes[0].name = "D:".into();
+        metrics.record_at("a", MetricsReport::new(changed, true), 11 * SECOND_MS);
+        metrics.record_at("a", without(5.0), 15 * SECOND_MS);
+        let latest = metrics.latest("a").unwrap();
+        assert_eq!(latest.metrics.cpu_percent, 5.0);
+        assert_eq!(latest.metrics.volumes[0].name, "D:");
+        // A new connection starts without a list.
+        metrics.disconnected("a");
+        metrics.record_at("a", without(6.0), 20 * SECOND_MS);
+        assert!(metrics.latest("a").unwrap().metrics.volumes.is_empty());
+    }
+
+    #[test]
+    fn readings_cover_the_time_since_the_previous_one_within_bounds() {
+        assert_eq!(covered_ms(None, 1_000), FIRST_READING_COVERS_MS);
+        assert_eq!(covered_ms(Some(0), 5 * SECOND_MS), 5 * SECOND_MS);
+        assert_eq!(covered_ms(Some(0), MINUTE_MS), MINUTE_MS);
+        assert_eq!(covered_ms(Some(0), 10 * MINUTE_MS), 2 * MINUTE_MS);
+        assert_eq!(covered_ms(Some(5), 5), 1);
+    }
+
+    #[tokio::test]
+    async fn a_minute_that_mixes_spacings_stores_the_time_weighted_average() {
+        let metrics = store().await;
+        let minute = 1_000 * MINUTE_MS;
+        // Unwatched: a reading a minute.
+        metrics.record_at("a", sample(0.0, 0), minute - 2 * MINUTE_MS + 10 * SECOND_MS);
+        metrics.record_at("a", sample(0.0, 0), minute - MINUTE_MS + 10 * SECOND_MS);
+        // This minute's first reading covers the minute before it, at 80%;
+        // then someone opens the device's page: nine readings five seconds
+        // apart, at 20%.
+        metrics.record_at("a", sample(80.0, 80), minute + 10 * SECOND_MS);
+        for n in 1..=9 {
+            metrics.record_at("a", sample(20.0, 20), minute + (10 + 5 * n) * SECOND_MS);
+        }
+        let finished = metrics
+            .record_at("a", sample(20.0, 20), minute + MINUTE_MS)
+            .unwrap();
+        assert_eq!(finished.covered_ms, (60 + 45) * SECOND_MS);
+        let point = finished.point();
+        // Not (80 + 9 × 20) / 10 = 26, as counting readings would have it.
+        let weighted = (80.0 * 60.0 + 20.0 * 45.0) / 105.0;
+        assert!((point.cpu_percent - weighted).abs() < 1e-9, "{point:?}");
+        assert_eq!(point.memory_used_bytes, weighted.round() as i64);
+        assert_eq!(point.cpu_percent_max, 80.0);
+    }
+
+    #[tokio::test]
+    async fn a_watched_minute_counts_as_much_as_an_unwatched_one() {
+        let metrics = store().await;
+        let start = 1_000 * MINUTE_MS;
+        let mut minutes = Vec::new();
+        let mut record = |at: i64, cpu: f32| {
+            minutes.extend(metrics.record_at("a", sample(cpu, 10), at));
+        };
+        // Nine minutes unwatched at 10%, one a minute.
+        record(start - 30 * SECOND_MS, 10.0);
+        for n in 0..9 {
+            record(start + n * MINUTE_MS + 30 * SECOND_MS, 10.0);
+        }
+        // The tenth watched at 90%: twelve readings.
+        for n in 0..12 {
+            record(start + 9 * MINUTE_MS + (2 + 5 * n) * SECOND_MS, 90.0);
+        }
+        record(start + 10 * MINUTE_MS + 30 * SECOND_MS, 0.0);
+        let rows = minutes
+            .iter()
+            .filter(|minute| minute.start >= start)
+            .map(|minute| {
+                let point = minute.point();
+                Row {
+                    minute: minute.start,
+                    covered_ms: minute.covered_ms,
+                    cpu_percent: point.cpu_percent,
+                    cpu_percent_max: point.cpu_percent_max,
+                    memory_used_bytes: point.memory_used_bytes,
+                    memory_total_bytes: point.memory_total_bytes,
+                    network_received_bytes_per_second: point.network_received_bytes_per_second,
+                    network_sent_bytes_per_second: point.network_sent_bytes_per_second,
+                    storage_used_bytes: point.storage_used_bytes,
+                    storage_total_bytes: point.storage_total_bytes,
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 10);
+        // Each minute covers a minute, watched or not; the tenth's first
+        // reading covers the 32 seconds since the ninth minute's.
+        assert!(rows[..9].iter().all(|row| row.covered_ms == MINUTE_MS));
+        assert_eq!(rows[9].covered_ms, (32 + 11 * 5) * SECOND_MS);
+        let points = buckets(rows, 30 * MINUTE_MS);
+        assert_eq!(points.len(), 1);
+        let weighted = (10.0 * 9.0 * 60.0 + 90.0 * 87.0) / (9.0 * 60.0 + 87.0);
+        // Counting readings would make it (9 × 10 + 12 × 90) / 21 = 55.7.
+        assert!(
+            (points[0].cpu_percent - weighted).abs() < 1e-9,
+            "{:?}",
+            points[0]
+        );
+        assert!(points[0].cpu_percent < 22.0);
     }
 
     #[tokio::test]
@@ -1206,22 +1432,22 @@ mod tests {
         assert!(json.get("sequence").is_none());
     }
 
-    async fn stored_samples(metrics: &Metrics) -> Vec<i64> {
+    async fn stored_coverage(metrics: &Metrics) -> Vec<i64> {
         let rows: Vec<(i64,)> = metrics
             .database
             .fetch_all(
                 &Query::select()
-                    .column(DeviceMetrics::Samples)
+                    .column(DeviceMetrics::CoveredMs)
                     .from(DeviceMetrics::Table)
                     .to_owned(),
             )
             .await
             .unwrap();
-        rows.into_iter().map(|(samples,)| samples).collect()
+        rows.into_iter().map(|(covered,)| covered).collect()
     }
 
     fn minute(start: i64, cpu: f64) -> Totals {
-        Totals::new(start * MINUTE_MS, &Point::of(0, &sample(cpu as f32, 10)), 1)
+        Totals::new(start * MINUTE_MS, &Point::of(0, &usage(cpu as f32, 10)), 1)
     }
 
     #[test]
@@ -1234,7 +1460,7 @@ mod tests {
         assert_eq!(waiting.len(), 2);
         let ((start, device_id), merged) = &waiting[0];
         assert_eq!((*start, device_id.as_str()), (MINUTE_MS, "a"));
-        assert_eq!(merged.samples, 2);
+        assert_eq!(merged.covered_ms, 2);
         assert_eq!(merged.point().cpu_percent, 20.0);
         assert_eq!(merged.point().cpu_percent_max, 30.0);
         assert!(pending.take().is_empty());
@@ -1269,7 +1495,7 @@ mod tests {
         let waiting = pending.take();
         assert_eq!(waiting.len(), 3);
         assert_eq!(waiting[0].0.0, 3 * MINUTE_MS);
-        assert_eq!(waiting[1].1.samples, 2, "minute 4 merged");
+        assert_eq!(waiting[1].1.covered_ms, 2, "minute 4 merged");
     }
 
     #[tokio::test]
@@ -1293,7 +1519,7 @@ mod tests {
             }
         );
         assert!(!metrics.writer.lock().await.failing);
-        assert_eq!(stored_samples(&metrics).await, [1]);
+        assert_eq!(stored_coverage(&metrics).await, [FIRST_READING_COVERS_MS]);
     }
 
     #[tokio::test]
@@ -1316,7 +1542,7 @@ mod tests {
         metrics.database.migrate().await.unwrap();
         let flushed = metrics.flush().await.unwrap();
         assert_eq!((flushed.minutes, flushed.statements), (waiting, 1));
-        assert_eq!(stored_samples(&metrics).await.len(), waiting);
+        assert_eq!(stored_coverage(&metrics).await.len(), waiting);
     }
 
     #[tokio::test]
@@ -1328,14 +1554,14 @@ mod tests {
         metrics.disconnected("a");
         writer.stop().await;
         assert!(metrics.pending().minutes.is_empty());
-        assert_eq!(stored_samples(&metrics).await, [1]);
+        assert_eq!(stored_coverage(&metrics).await, [FIRST_READING_COVERS_MS]);
     }
 
     #[test]
     fn rows_merge_into_weighted_buckets() {
-        let row = |minute: i64, samples: i64, cpu: f64| Row {
+        let row = |minute: i64, covered_ms: i64, cpu: f64| Row {
             minute: minute * MINUTE_MS,
-            samples,
+            covered_ms,
             cpu_percent: cpu,
             cpu_percent_max: cpu + 5.0,
             memory_used_bytes: 10,

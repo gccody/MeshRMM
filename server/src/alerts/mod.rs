@@ -24,6 +24,12 @@
 //! looking further back waits for its window to fill too. It keeps what
 //! devices' scans found while update or application rules judge it, and
 //! reads it again only for devices that reported (see [`facts`]).
+//!
+//! A load rule judges the window that ends at the device's latest reading,
+//! weighting each reading by the time it covers (see [`evaluate`]). A device
+//! nobody watches reports once a minute, so its verdict can come up to about
+//! a minute after the load changed; a watched one reports every few
+//! seconds.
 pub mod applications;
 mod evaluate;
 mod facts;
@@ -83,9 +89,11 @@ pub const REPORT_SPACING_FACTOR: u32 = 5;
 /// shows within this long.
 pub const FACTS_REFRESH_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// How often the engine takes in new resource usage readings: as often as
-/// Agents report.
+/// a watched device's Agent reports, since each take has only each device's
+/// latest. A device nobody watches reports once a minute, so most takes find
+/// nothing new of it.
 const FEED_INTERVAL: Duration =
-    Duration::from_secs(meshrmm_protocol_types::METRICS_INTERVAL_SECONDS);
+    Duration::from_secs(meshrmm_protocol_types::METRICS_WATCHED_INTERVAL_SECONDS);
 /// How long resolved alerts are kept.
 pub const RESOLVED_RETENTION_MS: i64 = 90 * DAY_MS;
 /// Changes a subscriber may fall behind by before it gets the counts again.

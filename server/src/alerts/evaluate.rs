@@ -1,21 +1,37 @@
 //! Judging device-state rules: what the engine remembers about each device
 //! (its recent CPU and memory readings and since when it has been offline)
 //! and whether a rule's condition holds for a device now.
+//!
+//! A load rule judges the device's readings over the window of the rule's
+//! minutes that ends at its latest reading. A device reports every few
+//! seconds while someone watches it and about once a minute otherwise, and
+//! each reading's load is an average over the time since the previous one,
+//! so the window's average weights each reading by the time it covers
+//! ([`covered_ms`]), within the window: "above 90% for 10 minutes" means the
+//! same whether or not someone opened the device's page during them. The
+//! window is covered when those times add up to it.
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use meshrmm_protocol_types::{METRICS_INTERVAL_SECONDS, SystemMetrics, UpdateCategory};
+use meshrmm_protocol_types::{SystemMetrics, UpdateCategory};
 
-use super::rules::{Condition, MAX_SUSTAINED_MINUTES, Rule, ThresholdUnit, format_number, plural};
-use crate::time::{DAY_MS, MINUTE_MS, SECOND_MS};
+use super::rules::{Condition, Rule, ThresholdUnit, format_number, plural};
+use crate::{
+    realtime::metrics::{IDLE_INTERVAL_MS, LONGEST_READING_COVERS_MS, covered_ms},
+    time::{DAY_MS, MINUTE_MS, SECOND_MS},
+};
 
-/// Readings this far apart still cover a window without a gap: two of the
-/// Agent's reporting intervals.
+/// How much of a window its readings may leave uncovered and still judge
+/// it: a window that starts a few seconds before the connection's first
+/// reading is covered.
 const COVERAGE_SLACK_MS: i64 = 10 * SECOND_MS;
 /// A device whose latest reading is older than this has stopped reporting,
-/// so its loads are unknown.
-const STALE_MS: i64 = 30 * SECOND_MS;
-/// Room for readings beyond one per reporting interval, for jitter, before
-/// a device's readings have to grow.
+/// so its loads are unknown: two of the intervals a device nobody watches
+/// reports at, the longest a reading counts as covering.
+const STALE_MS: i64 = LONGEST_READING_COVERS_MS;
+/// Room for readings beyond one per idle interval, for jitter and the early
+/// first readings after interval changes, before a device's readings have
+/// to grow. A watched device's grow to a reading every few seconds, and
+/// shrink back once the window no longer holds them.
 const SPARE_READINGS: usize = 4;
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
@@ -37,18 +53,15 @@ struct Readings {
     /// The Unix milliseconds that offsets count from.
     base: i64,
     /// When the newest reading dropped for being older than the window was
-    /// taken: the device has reported since then, and every reading after
-    /// it is here.
+    /// taken: the oldest kept covers the time since then, and every reading
+    /// after it is here.
     dropped: Option<i64>,
     samples: VecDeque<Sample>,
 }
 
-/// How many readings a window of `minutes` holds at the Agent's interval.
+/// How many readings a window of `minutes` holds at the idle interval.
 fn room(minutes: i64) -> usize {
-    let interval = i64::try_from(METRICS_INTERVAL_SECONDS).unwrap_or(5) * SECOND_MS;
-    usize::try_from((minutes * MINUTE_MS + COVERAGE_SLACK_MS) / interval).unwrap_or(0)
-        + 1
-        + SPARE_READINGS
+    usize::try_from(minutes * MINUTE_MS / IDLE_INTERVAL_MS).unwrap_or(0) + 1 + SPARE_READINGS
 }
 
 impl Readings {
@@ -68,10 +81,11 @@ impl Readings {
         self.samples.back().map(|sample| self.at(sample))
     }
 
-    /// Drops the readings taken before `oldest`.
-    fn drop_before(&mut self, oldest: i64) {
+    /// Drops the readings taken at or before `oldest`, which no window
+    /// ending at a later reading includes.
+    fn drop_through(&mut self, oldest: i64) {
         while let Some(first) = self.samples.front().map(|sample| self.at(sample))
-            && first < oldest
+            && first <= oldest
         {
             self.dropped = Some(first);
             self.samples.pop_front();
@@ -79,14 +93,14 @@ impl Readings {
     }
 
     /// Keeps the readings of the `minutes` before the latest, with room for
-    /// as many.
+    /// as many at the idle interval.
     fn keep(&mut self, minutes: i64) {
         if let Some(latest) = self.latest() {
-            self.drop_before(latest - minutes * MINUTE_MS - COVERAGE_SLACK_MS);
+            self.drop_through(latest - minutes * MINUTE_MS);
         }
         let room = room(minutes);
         if self.samples.capacity() > room {
-            self.samples.shrink_to(room);
+            self.samples.shrink_to(Ord::max(room, self.samples.len()));
         } else {
             self.samples
                 .reserve_exact(room.saturating_sub(self.samples.len()));
@@ -96,7 +110,14 @@ impl Readings {
     /// Adds a reading taken at `at`, after the others, keeping those of the
     /// `minutes` before it.
     fn push(&mut self, at: i64, cpu_percent: f32, memory_percent: f32, minutes: i64) {
-        self.drop_before(at - minutes * MINUTE_MS - COVERAGE_SLACK_MS);
+        self.drop_through(at - minutes * MINUTE_MS);
+        // A device no longer watched gives back the room its readings every
+        // few seconds took as they leave the window: a quarter full, or back
+        // to the idle room's worth, it keeps twice what it holds.
+        let (room, held, capacity) = (room(minutes), self.samples.len(), self.samples.capacity());
+        if capacity > 2 * room && (held * 4 <= capacity || held <= room) {
+            self.samples.shrink_to(Ord::max(room, held * 2));
+        }
         let Some(first) = self.samples.front().map(|sample| sample.offset) else {
             self.base = at;
             self.samples.push_back(Sample {
@@ -245,8 +266,9 @@ impl Tracker {
         self.offline_since.get(device_id).copied()
     }
 
-    /// The device's average of `value` over the last `minutes`, if its
-    /// readings cover all of them.
+    /// The device's average of `value` over the `minutes` up to its latest
+    /// reading, each reading weighted by the time it covers within them, if
+    /// they are covered and the latest reading is recent at `now`.
     fn sustained(
         &self,
         device_id: &str,
@@ -256,34 +278,32 @@ impl Tracker {
     ) -> Option<f64> {
         let readings = self.readings.get(device_id)?;
         let latest = readings.latest()?;
-        let from = now - minutes * MINUTE_MS;
-        let covered = match readings.dropped {
-            // A reading inside the window was dropped: the rule's window is
-            // longer than what was kept until it was saved.
-            Some(dropped) if dropped > from => false,
-            // The device reported before the window. One quiet for longer
-            // than any window, while connected, starts over instead.
-            Some(dropped)
-                if dropped >= latest - MAX_SUSTAINED_MINUTES * MINUTE_MS - COVERAGE_SLACK_MS =>
-            {
-                true
-            }
-            _ => readings.at(readings.samples.front()?) <= from + COVERAGE_SLACK_MS,
-        };
-        if !covered || latest < now - STALE_MS {
+        if latest < now - STALE_MS {
             return None;
         }
+        let from = latest - minutes * MINUTE_MS;
         let first = readings
             .samples
             .partition_point(|sample| readings.at(sample) <= from);
-        let window = || {
-            readings
+        // The reading before the window's first: one kept, or the newest
+        // dropped, or none if the first is the connection's first.
+        let mut previous = match first {
+            0 => readings.dropped,
+            n => readings
                 .samples
-                .range(first..)
-                .map(|sample| f64::from(value(sample)))
+                .get(n - 1)
+                .map(|sample| readings.at(sample)),
         };
-        let count = window().count();
-        (count > 0).then(|| window().sum::<f64>() / count as f64)
+        let (mut covered, mut total) = (0, 0.0);
+        for sample in readings.samples.range(first..) {
+            let at = readings.at(sample);
+            let weight = covered_ms(previous, at).min(at - from);
+            covered += weight;
+            total += f64::from(value(sample)) * weight as f64;
+            previous = Some(at);
+        }
+        (covered > 0 && covered >= minutes * MINUTE_MS - COVERAGE_SLACK_MS)
+            .then(|| total / covered as f64)
     }
 }
 
@@ -640,21 +660,107 @@ mod tests {
         ));
         // Stale readings say nothing, and a disconnect forgets them.
         assert_eq!(
-            judge(&cpu, online(None), &tracker, at + MINUTE_MS),
+            judge(&cpu, online(None), &tracker, at + STALE_MS),
             Verdict::Unknown
         );
         tracker.presence(&["d".to_owned()], &connected(&[]), at);
         assert_eq!(judge(&cpu, online(None), &tracker, at), Verdict::Unknown);
     }
 
-    /// Feeds the tracker a reading every five seconds over `minutes` from
-    /// `at`, and returns when the next would be.
-    fn report(tracker: &mut Tracker, mut at: i64, minutes: i64, cpu: f32) -> i64 {
-        for _ in 0..minutes * 12 {
+    /// Feeds the tracker a reading every five seconds, as a watched device
+    /// reports, over `minutes` from `at`, and returns when the next would be.
+    fn report(tracker: &mut Tracker, at: i64, minutes: i64, cpu: f32) -> i64 {
+        report_every(tracker, at, minutes, cpu, 5 * SECOND_MS)
+    }
+
+    /// Feeds the tracker a reading a minute, as a device nobody watches
+    /// reports.
+    fn report_idle(tracker: &mut Tracker, at: i64, minutes: i64, cpu: f32) -> i64 {
+        report_every(tracker, at, minutes, cpu, IDLE_INTERVAL_MS)
+    }
+
+    fn report_every(tracker: &mut Tracker, mut at: i64, minutes: i64, cpu: f32, every: i64) -> i64 {
+        for _ in 0..minutes * MINUTE_MS / every {
             tracker.observe("d", at, &metrics(cpu, 40));
-            at += 5 * SECOND_MS;
+            at += every;
         }
         at
+    }
+
+    #[test]
+    fn a_device_reporting_once_a_minute_is_judged() {
+        let mut tracker = Tracker::default();
+        let cpu = rule(Condition::Cpu, Some(80.0), Some(10));
+        tracker.keep_for(std::slice::from_ref(&cpu));
+        let at = report_idle(&mut tracker, START, 9, 95.0);
+        assert_eq!(judge(&cpu, online(None), &tracker, at), Verdict::Unknown);
+        let at = report_idle(&mut tracker, at, 2, 95.0);
+        // Judged up to a minute after its latest reading, as it reports once
+        // a minute.
+        for now in [at - IDLE_INTERVAL_MS, at, at + 15 * SECOND_MS] {
+            let Verdict::Known(breaches) = judge(&cpu, online(None), &tracker, now) else {
+                panic!("a device reporting once a minute is judged at {now}");
+            };
+            assert_eq!(breaches[0].detail, "CPU averaged 95% over 10 minutes");
+        }
+        // One that stopped reporting goes stale.
+        assert_eq!(
+            judge(
+                &cpu,
+                online(None),
+                &tracker,
+                at - IDLE_INTERVAL_MS + STALE_MS + 1
+            ),
+            Verdict::Unknown
+        );
+    }
+
+    #[test]
+    fn a_window_mixing_spacings_averages_by_the_time_each_reading_covers() {
+        let mut tracker = Tracker::default();
+        let cpu = rule(Condition::Cpu, Some(50.0), Some(10));
+        tracker.keep_for(std::slice::from_ref(&cpu));
+        // Nine minutes nobody watched at 30%, then a minute someone did at
+        // 100%: twelve readings in it.
+        let at = report_idle(&mut tracker, START, 10, 30.0);
+        let at = report(&mut tracker, at, 1, 100.0);
+        let latest = at - 5 * SECOND_MS;
+        let Verdict::Known(breaches) = judge(&cpu, online(None), &tracker, latest) else {
+            panic!("ten minutes are covered");
+        };
+        // The busy minute's first reading covers the minute before it; the
+        // window's first reading only its last five seconds.
+        let busy = 60.0 + 11.0 * 5.0;
+        let expected = (30.0 * (600.0 - busy) + 100.0 * busy) / 600.0;
+        assert_eq!(breaches, vec![]);
+        let average = tracker.sustained("d", 10, latest, |sample| sample.cpu_percent);
+        assert!((average.unwrap() - expected).abs() < 1e-9, "{average:?}");
+        // Counting readings, the twelve would outweigh the nine: 70%.
+        assert!(expected < 50.0, "{expected}");
+    }
+
+    #[test]
+    fn a_watched_devices_readings_grow_and_give_back_their_room() {
+        let mut tracker = Tracker::default();
+        let cpu = rule(Condition::Cpu, Some(80.0), Some(10));
+        tracker.keep_for(std::slice::from_ref(&cpu));
+        let idle = Held {
+            readings: 10,
+            bytes: size_of::<Readings>() + room(10) * size_of::<Sample>(),
+        };
+        let at = report_idle(&mut tracker, START, 30, 90.0);
+        assert_eq!(tracker.held("d"), idle);
+        let at = report(&mut tracker, at, 10, 90.0);
+        let watched = tracker.held("d");
+        assert_eq!(watched.readings, 120);
+        assert!(watched.bytes >= size_of::<Readings>() + 120 * size_of::<Sample>());
+        report_idle(&mut tracker, at, 15, 90.0);
+        let held = tracker.held("d");
+        assert_eq!(held.readings, 10);
+        assert!(
+            held.bytes <= size_of::<Readings>() + 2 * room(10) * size_of::<Sample>(),
+            "{held:?}"
+        );
     }
 
     #[test]
@@ -691,14 +797,15 @@ mod tests {
                 ..hour.clone()
             },
         ]);
-        let mut at = report(&mut tracker, START, 120, 90.0);
+        let mut at = report_idle(&mut tracker, START, 120, 90.0);
         let ten_minutes = Held {
-            // Ten minutes and the coverage slack, at one every five seconds.
-            readings: 123,
+            // Ten minutes at one a minute, with room for a few more.
+            readings: 10,
             bytes: size_of::<Readings>() + room(10) * size_of::<Sample>(),
         };
+        assert_eq!(room(10), 15);
         assert_eq!(tracker.held("d"), ten_minutes);
-        assert_eq!(ten_minutes.bytes, 1_580);
+        assert_eq!(ten_minutes.bytes, 236);
         assert!(matches!(
             judge(&cpu, online(None), &tracker, at),
             Verdict::Known(breaches) if breaches.len() == 1
@@ -709,19 +816,19 @@ mod tests {
         // more.
         tracker.keep_also_for(&hour);
         assert_eq!(judge(&hour, online(None), &tracker, at), Verdict::Unknown);
-        at = report(&mut tracker, at, 49, 90.0);
+        at = report_idle(&mut tracker, at, 49, 90.0);
         assert_eq!(judge(&hour, online(None), &tracker, at), Verdict::Unknown);
-        at = report(&mut tracker, at, 1, 90.0);
+        at = report_idle(&mut tracker, at, 1, 90.0);
         assert!(matches!(
             judge(&hour, online(None), &tracker, at),
             Verdict::Known(breaches) if breaches.len() == 1
         ));
         let an_hour = Held {
-            readings: 723,
+            readings: 60,
             bytes: size_of::<Readings>() + room(60) * size_of::<Sample>(),
         };
         assert_eq!(tracker.held("d"), an_hour);
-        assert_eq!(an_hour.bytes, 8_780);
+        assert_eq!(an_hour.bytes, 836);
         // Keeping more for one rule doesn't change another's verdict.
         assert!(matches!(
             judge(&cpu, online(None), &tracker, at),
@@ -822,16 +929,24 @@ mod tests {
             let devices = ["d".to_owned()];
             let threshold = rules[0].threshold.unwrap() as f32;
             let mut connected = true;
+            let mut watched = random.below(2) == 0;
             let mut at = START + random.below(MINUTE_MS as u64) as i64;
             let end = at + (30 + random.below(150) as i64) * MINUTE_MS;
             while at < end {
+                // Stretches watched and not, as people open and leave the
+                // device's page.
+                if random.below(100) == 0 {
+                    watched = !watched;
+                }
                 at += match random.below(200) {
-                    // Readings spaced irregularly, as when a feed skips one.
-                    0..=29 => 2 + random.below(19) as i64,
+                    // Readings spaced irregularly, as when a feed skips one
+                    // or the interval just changed.
+                    0..=29 => 2 + random.below(70) as i64,
                     // Quiet for a while without disconnecting, up to well
                     // past the longest window.
                     30..=31 => 21 + random.below(100 * 60) as i64,
-                    _ => 5,
+                    _ if watched => 5,
+                    _ => 60,
                 } * SECOND_MS;
                 match random.below(400) {
                     // A disconnect the engine notices, then a reconnect.
@@ -864,7 +979,7 @@ mod tests {
                 tracker.observe("d", at, &reading);
                 reference.observe("d", at, &reading);
                 if random.below(3) == 0 {
-                    let now = at + random.below(40 * SECOND_MS as u64) as i64;
+                    let now = at + random.below(150 * SECOND_MS as u64) as i64;
                     let device = DeviceState {
                         connected,
                         ..online(None)
@@ -880,11 +995,12 @@ mod tests {
                         known += usize::from(matches!(verdict, Verdict::Known(_)));
                     }
                 }
-                let held = tracker.held("d").readings;
+                // It holds what the longest window needs, and no more.
                 let longest = rules.iter().filter_map(|rule| rule.duration_minutes).max();
-                assert!(
-                    held <= room(longest.unwrap()),
-                    "case {case}: {held} readings"
+                assert_eq!(
+                    tracker.held("d").readings,
+                    reference.within("d", longest.unwrap()),
+                    "case {case}"
                 );
             }
         }
@@ -924,9 +1040,9 @@ mod tests {
         connected(&["d"])
     }
 
-    /// The tracker as it was when it kept an hour of every device's readings
-    /// whatever the rules, and how it judged loads: the reference the
-    /// tracker's verdicts must match.
+    /// A tracker that keeps every device's readings for hours whatever the
+    /// rules, and judges loads the plain way: the reference the tracker's
+    /// verdicts must match.
     mod before {
         use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -935,6 +1051,7 @@ mod tests {
         use super::super::{Breach, COVERAGE_SLACK_MS, STALE_MS, Verdict, round2};
         use crate::{
             alerts::rules::{Condition, MAX_SUSTAINED_MINUTES, Rule, format_number, plural},
+            realtime::metrics::covered_ms,
             time::MINUTE_MS,
         };
 
@@ -966,10 +1083,23 @@ mod tests {
                     cpu_percent: f64::from(metrics.cpu_percent),
                     memory_percent,
                 });
-                let oldest = at - MAX_SUSTAINED_MINUTES * MINUTE_MS - COVERAGE_SLACK_MS;
-                while samples.front().is_some_and(|sample| sample.at < oldest) {
+                // Keeping the reading before any a window can include.
+                let oldest = at - 3 * MAX_SUSTAINED_MINUTES * MINUTE_MS;
+                while samples.get(1).is_some_and(|sample| sample.at <= oldest) {
                     samples.pop_front();
                 }
+            }
+
+            /// How many readings the `minutes` up to the latest hold.
+            pub fn within(&self, device_id: &str, minutes: i64) -> usize {
+                let Some(samples) = self.samples.get(device_id) else {
+                    return 0;
+                };
+                let latest = samples.back().map_or(0, |sample| sample.at);
+                samples
+                    .iter()
+                    .filter(|sample| sample.at > latest - minutes * MINUTE_MS)
+                    .count()
             }
 
             pub fn presence(&mut self, devices: &[String], connected: &HashSet<String>, _now: i64) {
@@ -988,18 +1118,23 @@ mod tests {
                 value: fn(&Sample) -> f64,
             ) -> Option<f64> {
                 let samples = self.samples.get(device_id)?;
-                let from = now - minutes * MINUTE_MS;
-                if samples.front()?.at > from + COVERAGE_SLACK_MS
-                    || samples.back()?.at < now - STALE_MS
-                {
+                let latest = samples.back()?.at;
+                if latest < now - STALE_MS {
                     return None;
                 }
-                let window = samples
-                    .iter()
-                    .filter(|sample| sample.at > from)
-                    .map(value)
-                    .collect::<Vec<_>>();
-                (!window.is_empty()).then(|| window.iter().sum::<f64>() / window.len() as f64)
+                let from = latest - minutes * MINUTE_MS;
+                let (mut covered, mut total) = (0, 0.0);
+                for (n, sample) in samples.iter().enumerate() {
+                    if sample.at <= from {
+                        continue;
+                    }
+                    let previous = n.checked_sub(1).map(|previous| samples[previous].at);
+                    let weight = covered_ms(previous, sample.at).min(sample.at - from);
+                    covered += weight;
+                    total += value(sample) * weight as f64;
+                }
+                (covered > 0 && covered >= minutes * MINUTE_MS - COVERAGE_SLACK_MS)
+                    .then(|| total / covered as f64)
             }
         }
 

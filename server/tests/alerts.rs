@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use axum::http::{HeaderMap, StatusCode};
 use common::{App, Browser, FakeSmtp, apps, audit_events, receive_any_json, set_up};
-use meshrmm_protocol_types::{SystemMetrics, VolumeUsage};
+use meshrmm_protocol_types::{MetricsReport, SystemMetrics, VolumeUsage};
 use meshrmm_server::{
     alerts,
     time::{MINUTE_MS, SECOND_MS, now_ms},
@@ -171,7 +171,9 @@ async fn device_state_rules_raise_and_resolve_alerts_and_notify() {
 
         let now = now_ms();
         observe(&app, &desk.device_id, now, 70, 95.0);
-        app.state.metrics.record(&desk.device_id, reading(95.0, 4));
+        app.state
+            .metrics
+            .record(&desk.device_id, MetricsReport::new(reading(95.0, 4), true));
         alerts::evaluate(&app.state, now).await.unwrap();
         let open = alerts_of(&mut admin, "").await;
         assert_eq!(open.len(), 2, "{name}: {open:?}");
@@ -285,6 +287,91 @@ async fn device_state_rules_raise_and_resolve_alerts_and_notify() {
     }
 }
 
+/// Feeds the engine a reading at each of `times`.
+fn observe_at(app: &App, device_id: &str, times: impl IntoIterator<Item = i64>, cpu: f32) {
+    for at in times {
+        app.state.alerts.observe(device_id, at, &reading(cpu, 50));
+    }
+}
+
+#[tokio::test]
+async fn load_rules_judge_devices_that_report_once_a_minute() {
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let idle = app.enroll(&mut admin, "Idle").await;
+        let quiet = app.enroll(&mut admin, "Quiet").await;
+        let mixed = app.enroll(&mut admin, "Mixed").await;
+        let _connections =
+            [&idle, &quiet, &mixed].map(|agent| app.state.agents.connect(&agent.device_id));
+        create_rule(
+            &mut admin,
+            json!({
+                "name": "Busy CPU", "severity": "warning", "condition": "cpu",
+                "threshold": 80, "duration_minutes": 10,
+            }),
+        )
+        .await;
+        let now = now_ms();
+        // Older than the 30 seconds after which a reading used to count as
+        // stale, though the next is not due for a quarter of a minute.
+        let latest = now - 45 * SECOND_MS;
+        // Nobody watches it: a reading a minute.
+        observe_at(
+            &app,
+            &idle.device_id,
+            (0..12).rev().map(|n| latest - n * MINUTE_MS),
+            95.0,
+        );
+        // Connected, but its readings stopped three minutes ago.
+        observe_at(
+            &app,
+            &quiet.device_id,
+            (0..12).rev().map(|n| now - 3 * MINUTE_MS - n * MINUTE_MS),
+            95.0,
+        );
+        // Nine minutes nobody watched at 90%, then a minute someone did at
+        // 50%: twelve readings five seconds apart.
+        observe_at(
+            &app,
+            &mixed.device_id,
+            (1..=10).rev().map(|n| latest - n * MINUTE_MS),
+            90.0,
+        );
+        observe_at(
+            &app,
+            &mixed.device_id,
+            (0..12).rev().map(|n| latest - n * 5 * SECOND_MS),
+            50.0,
+        );
+        alerts::evaluate(&app.state, now).await.unwrap();
+        let mut open = alerts_of(&mut admin, "").await;
+        open.sort_by_key(|alert| alert["device_name"].as_str().unwrap().to_owned());
+        let raised: Vec<_> = open
+            .iter()
+            .map(|alert| {
+                (
+                    alert["device_name"].as_str().unwrap(),
+                    alert["detail"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        // Weighted by the time each reading covers, the mixed device
+        // averaged (9 × 90 + 1 × 50) / 10; counting readings it would be
+        // (9 × 90 + 12 × 50) / 21, about 67, and no alert.
+        assert_eq!(
+            raised,
+            [
+                ("Idle", "CPU averaged 95% over 10 minutes"),
+                ("Mixed", "CPU averaged 86% over 10 minutes"),
+            ],
+            "{name}"
+        );
+        assert_eq!(open[1]["value"], 86.0, "{name}");
+        app.finish().await;
+    }
+}
+
 #[tokio::test]
 async fn the_engine_keeps_readings_only_as_far_back_as_load_rules_look() {
     for app in apps().await {
@@ -319,7 +406,7 @@ async fn the_engine_keeps_readings_only_as_far_back_as_load_rules_look() {
         let rule_id = create_rule(&mut admin, rule.clone()).await;
         at += 60 * MINUTE_MS;
         observe(&app, device, at, 3_595, 95.0);
-        assert_eq!(app.state.alerts.held(device).readings, 123, "{name}");
+        assert_eq!(app.state.alerts.held(device).readings, 120, "{name}");
         alerts::evaluate(&app.state, at).await.unwrap();
         let open = alerts_of(&mut admin, "").await;
         assert_eq!(open.len(), 1, "{name}: {open:?}");
@@ -340,7 +427,7 @@ async fn the_engine_keeps_readings_only_as_far_back_as_load_rules_look() {
         observe(&app, device, at, 1_195, 5.0);
         alerts::evaluate(&app.state, at).await.unwrap();
         assert!(alerts_of(&mut admin, "").await.is_empty(), "{name}");
-        assert_eq!(app.state.alerts.held(device).readings, 723, "{name}");
+        assert_eq!(app.state.alerts.held(device).readings, 720, "{name}");
 
         // Turned off, nothing is kept again.
         rule["enabled"] = json!(false);

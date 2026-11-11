@@ -331,7 +331,7 @@ pub enum DeviceMetrics {
     Table,
     DeviceId,
     Minute,
-    Samples,
+    CoveredMs,
     CpuPercent,
     CpuPercentMax,
     MemoryUsedBytes,

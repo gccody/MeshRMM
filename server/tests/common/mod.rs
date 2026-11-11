@@ -1045,6 +1045,7 @@ fn incidental(value: &serde_json::Value) -> bool {
         || value["type"] == "collect_system_info"
         || value["type"] == "stored_applications"
         || value["type"] == "set_update_scan_schedule"
+        || reporting_interval(value)
         || value["type"] == "device_updates"
 }
 
@@ -1058,7 +1059,16 @@ pub async fn receive(socket: &mut Ws) -> Received {
     }
 }
 
-/// What a socket received next, ignoring pings and pongs only.
+/// Whether the message tells an Agent how often to report its resource
+/// usage, which every Agent is told on connecting and again as website tabs
+/// start and stop watching its device: only [`metrics_interval_within`]
+/// reads them.
+fn reporting_interval(value: &serde_json::Value) -> bool {
+    value["type"] == "set_metrics_interval"
+}
+
+/// What a socket received next, ignoring pings and pongs and how often an
+/// Agent is told to report only.
 pub async fn receive_any(socket: &mut Ws) -> Received {
     use futures_util::StreamExt;
     use tokio_tungstenite::tungstenite::Message;
@@ -1069,7 +1079,10 @@ pub async fn receive_any(socket: &mut Ws) -> Received {
             .expect("the socket said nothing");
         match frame {
             Some(Ok(Message::Text(text))) => {
-                return Received::Json(serde_json::from_str(&text).unwrap());
+                let value = serde_json::from_str(&text).unwrap();
+                if !reporting_interval(&value) {
+                    return Received::Json(value);
+                }
             }
             Some(Ok(Message::Close(frame))) => {
                 return Received::Close(frame.map_or(1005, |frame| u16::from(frame.code)));
@@ -1121,6 +1134,29 @@ pub async fn quiet(socket: &mut Ws, wait: std::time::Duration) {
             Ok(Some(Ok(Message::Text(text))))
                 if serde_json::from_str(&text).is_ok_and(|value| incidental(&value)) => {}
             Ok(other) => panic!("expected nothing, got {other:?}"),
+        }
+    }
+}
+
+/// The interval, in seconds, the server next tells the Agent on `socket` to
+/// report at, skipping everything else, or `None` if it tells none within
+/// `wait`.
+pub async fn metrics_interval_within(socket: &mut Ws, wait: std::time::Duration) -> Option<u64> {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        match tokio::time::timeout_at(deadline, socket.next()).await {
+            Err(_) => return None,
+            Ok(Some(Ok(Message::Text(text)))) => {
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if reporting_interval(&value) {
+                    return Some(value["seconds"].as_u64().expect("an interval in seconds"));
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(_)) | None) => panic!("the socket ended"),
         }
     }
 }

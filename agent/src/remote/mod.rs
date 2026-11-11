@@ -201,21 +201,21 @@ async fn announce_update(socket: &SignalingConnection, version: String) {
     }
 }
 
-/// Sends the computer's resource usage without waiting for it to be written.
-/// A report that does not fit in the send queue is dropped; the next one
-/// follows within seconds.
+/// Sends the computer's resource usage without waiting for it to be written,
+/// and returns whether it was queued. A report that does not fit in the send
+/// queue is dropped; the next one follows within the interval.
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-fn report_metrics(socket: &SignalingConnection, metrics: meshrmm_protocol::SystemMetrics) {
-    let status = AgentStatusMessage::Metrics {
-        metrics: metrics.sanitized(),
-    };
-    let queued = match serde_json::to_string(&status) {
+fn report_metrics(socket: &SignalingConnection, metrics: &meshrmm_protocol::MetricsReport) -> bool {
+    let queued = match serde_json::to_string(&AgentStatusMessage::Metrics {
+        metrics: metrics.clone(),
+    }) {
         Ok(text) => socket.queue(Message::Text(text.into())),
         Err(error) => Err(error.into()),
     };
-    if let Err(error) = queued {
+    if let Err(error) = &queued {
         tracing::debug!(error = %error, "dropped a resource usage report");
     }
+    queued.is_ok()
 }
 
 /// Reports what became of the server's wake packets, without waiting for it
@@ -568,6 +568,8 @@ impl Coordinator {
         self.thumbnails.connected();
         // The server sends this connection's schedule first thing.
         self.update_schedule.connected();
+        // And how often to report, which is idle until it says.
+        self.metrics.connected();
         // And the application list it holds.
         self.system_info.connected();
         loop {
@@ -598,7 +600,10 @@ impl Coordinator {
                     }
                 }
                 () = self.thumbnails.due() => self.thumbnails.refresh(&self.config),
-                metrics = self.metrics.next() => report_metrics(socket, metrics),
+                report = self.metrics.next() => {
+                    let queued = report_metrics(socket, &report);
+                    self.metrics.reported(&report, queued);
+                }
                 system = self.system_info.next() => report_system_info(socket, &self.system_info, system),
                 results = self.wake.next() => report_wake_results(socket, results),
                 (request_id, reply) = self.files.next() => report_file_reply(socket, request_id, reply),
@@ -702,6 +707,10 @@ impl Coordinator {
                     let now = updates::now_unix_ms();
                     self.update_schedule
                         .set(schedule, now, metrics::booted_at_unix_ms(now));
+                    return Ok(ControlFlow::Continue(()));
+                }
+                AgentCommand::SetMetricsInterval { seconds } => {
+                    self.metrics.set_interval_seconds(seconds);
                     return Ok(ControlFlow::Continue(()));
                 }
                 AgentCommand::InstallUpdates { install } => {

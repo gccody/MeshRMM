@@ -138,6 +138,15 @@ pub enum AgentCommand {
     SetUpdateScanSchedule {
         schedule: crate::UpdateScanSchedule,
     },
+    /// How often the Agent reports its resource usage
+    /// ([`AgentStatusMessage::Metrics`]), in seconds: every
+    /// [`crate::METRICS_WATCHED_INTERVAL_SECONDS`] while a website tab shows
+    /// the device's readings, every [`crate::METRICS_IDLE_INTERVAL_SECONDS`]
+    /// otherwise. Sent when the Agent connects and when that changes. The
+    /// Agent keeps what it is told within a range of its own.
+    SetMetricsInterval {
+        seconds: u32,
+    },
     /// Installs pending operating system updates, then scans again.
     InstallUpdates {
         install: crate::UpdateInstallRequest,
@@ -210,9 +219,11 @@ pub enum AgentStatusMessage {
     Updating {
         version: String,
     },
-    /// The computer's resource usage, every [`crate::METRICS_INTERVAL_SECONDS`].
+    /// The computer's resource usage, as often as the server set
+    /// ([`AgentCommand::SetMetricsInterval`]), with its volumes when they
+    /// were read again or not yet sent on this connection.
     Metrics {
-        metrics: crate::SystemMetrics,
+        metrics: crate::MetricsReport,
     },
     /// The computer's hardware and software, a little after the Agent
     /// starts, about every [`crate::SYSTEM_INFO_INTERVAL_SECONDS`] and when
@@ -430,14 +441,14 @@ mod tests {
             r#"{"type":"updating","version":"0.3.1"}"#
         );
         let metrics = AgentStatusMessage::Metrics {
-            metrics: crate::SystemMetrics {
+            metrics: crate::MetricsReport {
                 cpu_percent: 50.0,
                 memory_used_bytes: 1,
                 memory_total_bytes: 2,
                 network_received_bytes_per_second: 3,
                 network_sent_bytes_per_second: 4,
                 uptime_seconds: 5,
-                volumes: vec![],
+                volumes: None,
             },
         };
         let json = serde_json::to_string(&metrics).unwrap();
@@ -532,6 +543,13 @@ mod tests {
             })
             .unwrap(),
             r#"{"type":"set_update_scan_schedule","schedule":{}}"#
+        );
+        let interval = AgentCommand::SetMetricsInterval { seconds: 60 };
+        let json = serde_json::to_string(&interval).unwrap();
+        assert_eq!(json, r#"{"type":"set_metrics_interval","seconds":60}"#);
+        assert_eq!(
+            serde_json::from_str::<AgentCommand>(&json).unwrap(),
+            interval
         );
         let install = AgentCommand::InstallUpdates {
             install: crate::UpdateInstallRequest {

@@ -8,8 +8,9 @@ use std::{
 };
 
 use common::{
-    Agent, App, Received, SOCKET_WAIT, Server, Ws, apps, apps_with, quiet, receive,
-    receive_any_json, receive_close, receive_json, send_json, send_text, set_up, user_with,
+    Agent, App, Received, SOCKET_WAIT, Server, Ws, apps, apps_with, metrics_interval_within, quiet,
+    receive, receive_any_json, receive_close, receive_json, send_json, send_text, set_up,
+    user_with,
 };
 use meshrmm_server::realtime::{
     metrics::WatchedSignal,
@@ -593,13 +594,14 @@ fn metrics_report(cpu: f64, memory: u64) -> Value {
     })
 }
 
-/// The device's stored minutes, as (samples, average CPU, peak CPU).
+/// The device's stored minutes, as (milliseconds covered, average CPU, peak
+/// CPU).
 async fn stored_minutes(app: &App, device_id: &str) -> Vec<(i64, f64, f64)> {
     use sea_query::{Expr, ExprTrait, Query};
     app.db()
         .fetch_all(
             &Query::select()
-                .columns(["samples", "cpu_percent", "cpu_percent_max"])
+                .columns(["covered_ms", "cpu_percent", "cpu_percent_max"])
                 .from("device_metrics")
                 .and_where(Expr::col("device_id").eq(device_id))
                 .to_owned(),
@@ -659,7 +661,8 @@ async fn agents_report_resource_usage_to_the_website_and_history() {
             app.name
         );
         let stored = stored_minutes(&app, &agent.device_id).await;
-        assert_eq!(stored, [(1, 20.0, 20.0)], "{}", app.name);
+        // A connection's first reading covers five seconds.
+        assert_eq!(stored, [(5_000, 20.0, 20.0)], "{}", app.name);
         assert!(admin.get(&path).await.body["latest"].is_null());
 
         // A second connection's readings in the same minute merge into it.
@@ -673,7 +676,7 @@ async fn agents_report_resource_usage_to_the_website_and_history() {
         let stored = stored_minutes(&app, &agent.device_id).await;
         // Unless the minute turned between the two readings.
         if stored.len() == 1 {
-            assert_eq!(stored, [(2, 40.0, 60.0)], "{}", app.name);
+            assert_eq!(stored, [(10_000, 40.0, 60.0)], "{}", app.name);
         } else {
             assert_eq!(stored.len(), 2, "{stored:?}");
         }
@@ -704,15 +707,15 @@ async fn agents_report_resource_usage_to_the_website_and_history() {
     }
 }
 
-fn usage(cpu: f32, received: u64) -> meshrmm_protocol_types::SystemMetrics {
-    meshrmm_protocol_types::SystemMetrics {
+fn usage(cpu: f32, received: u64) -> meshrmm_protocol_types::MetricsReport {
+    meshrmm_protocol_types::MetricsReport {
         cpu_percent: cpu,
         memory_used_bytes: 4_000,
         memory_total_bytes: 16_000,
         network_received_bytes_per_second: received,
         network_sent_bytes_per_second: 500,
         uptime_seconds: 3_600,
-        volumes: Vec::new(),
+        volumes: Some(Vec::new()),
     }
 }
 
@@ -738,7 +741,7 @@ async fn finished_minutes_reach_the_history_in_few_statements() {
         let first = stored_minutes(&app, &devices[0]).await;
         // Unless the minute turned between the two reports.
         let expected = if first.len() == 1 {
-            assert_eq!(first, [(2, 20.0, 30.0)], "{}", app.name);
+            assert_eq!(first, [(10_000, 20.0, 30.0)], "{}", app.name);
             2_500
         } else {
             2_501
@@ -748,7 +751,7 @@ async fn finished_minutes_reach_the_history_in_few_statements() {
         assert_eq!(flushed.refused, 0);
         assert_eq!(
             stored_minutes(&app, &devices[2_499]).await,
-            [(1, 10.0, 10.0)]
+            [(5_000, 10.0, 10.0)]
         );
         assert_eq!(app.state.metrics.flush().await.unwrap().statements, 0);
         app.finish().await;
@@ -763,7 +766,7 @@ async fn a_deleted_devices_waiting_minutes_are_dropped_and_the_rest_stored() {
         app.state.metrics.forget("deleted").await.unwrap();
         let flushed = app.state.metrics.flush().await.unwrap();
         assert_eq!(flushed.minutes, 1, "{}", app.name);
-        assert_eq!(stored_minutes(&app, "kept").await, [(1, 10.0, 10.0)]);
+        assert_eq!(stored_minutes(&app, "kept").await, [(5_000, 10.0, 10.0)]);
         assert!(stored_minutes(&app, "deleted").await.is_empty());
         app.finish().await;
     }
@@ -786,7 +789,7 @@ async fn a_minute_the_database_refuses_loses_only_itself() {
                         .columns([
                             "device_id",
                             "minute",
-                            "samples",
+                            "covered_ms",
                             "cpu_percent",
                             "cpu_percent_max",
                             "memory_used_bytes",
@@ -822,11 +825,11 @@ async fn a_minute_the_database_refuses_loses_only_itself() {
         let flushed = app.state.metrics.flush().await.unwrap();
         assert_eq!(
             stored_minutes(&app, "before").await,
-            [(1, 10.0, 10.0)],
+            [(5_000, 10.0, 10.0)],
             "{}",
             app.name
         );
-        assert_eq!(stored_minutes(&app, "after").await, [(1, 30.0, 30.0)]);
+        assert_eq!(stored_minutes(&app, "after").await, [(5_000, 30.0, 30.0)]);
         if app.name == "postgres" {
             assert_eq!((flushed.minutes, flushed.refused), (2, 1));
         }
@@ -1512,6 +1515,174 @@ async fn the_registry_counts_the_sockets_watching_a_device_until_they_close() {
         assert_eq!(watched.entries(), 2, "{name}");
         drop((desk_signal, laptop_signal));
         assert_eq!(watched.entries(), 0, "{name}");
+        app.finish().await;
+    }
+}
+
+/// How long an Agent keeps the watched interval after its device stops
+/// being watched, in these tests.
+const LINGER: Duration = Duration::from_millis(1_500);
+
+fn short_linger(state: &mut meshrmm_server::http::AppState) {
+    state.metrics.set_unwatched_linger(LINGER);
+}
+
+#[tokio::test]
+async fn agents_report_often_only_while_a_tab_watches_their_device() {
+    for app in apps_with(short_linger).await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let desk = app.enroll(&mut admin, "Desk").await;
+        let laptop = app.enroll(&mut admin, "Laptop").await;
+        let (d, l) = (desk.device_id.as_str(), laptop.device_id.as_str());
+        let mut events = admin.events(&server).await.unwrap();
+        assert_eq!(receive_json(&mut events).await["type"], "snapshot");
+
+        // Nobody watches the desk: it reports once a minute.
+        let mut control = desk.connect(&server).await.unwrap();
+        let told = |seconds: u64| Some(seconds);
+        assert_eq!(
+            metrics_interval_within(&mut control, SOCKET_WAIT).await,
+            told(60),
+            "{name}"
+        );
+        // A tab watching it has it report every five seconds, at once.
+        watch(&mut events, &[d]).await;
+        until_pong(&mut events).await;
+        assert_eq!(
+            metrics_interval_within(&mut control, SOCKET_WAIT).await,
+            told(5),
+            "{name}"
+        );
+        // An Agent connecting while a tab watches its device is told so.
+        watch(&mut events, &[d, l]).await;
+        until_pong(&mut events).await;
+        let mut laptop_control = laptop.connect(&server).await.unwrap();
+        assert_eq!(
+            metrics_interval_within(&mut laptop_control, SOCKET_WAIT).await,
+            told(5),
+            "{name}"
+        );
+
+        // A second tab watching the desk, and leaving, changes nothing.
+        let mut second = admin.events(&server).await.unwrap();
+        receive_json(&mut second).await;
+        watch(&mut second, &[d]).await;
+        until_pong(&mut second).await;
+        drop(second);
+        assert_eq!(
+            metrics_interval_within(&mut control, 2 * LINGER).await,
+            None,
+            "{name}"
+        );
+
+        // Unwatched, it is slowed down only after the linger.
+        let left = Instant::now();
+        watch(&mut events, &[l]).await;
+        until_pong(&mut events).await;
+        assert_eq!(
+            metrics_interval_within(&mut control, SOCKET_WAIT).await,
+            told(60),
+            "{name}"
+        );
+        assert!(left.elapsed() >= LINGER, "{name}: {:?}", left.elapsed());
+        // Watched again within the linger, as when a tab reloads, it is told
+        // nothing.
+        watch(&mut events, &[d, l]).await;
+        until_pong(&mut events).await;
+        assert_eq!(
+            metrics_interval_within(&mut control, SOCKET_WAIT).await,
+            told(5),
+            "{name}"
+        );
+        watch(&mut events, &[l]).await;
+        watch(&mut events, &[d, l]).await;
+        until_pong(&mut events).await;
+        assert_eq!(
+            metrics_interval_within(&mut control, 2 * LINGER).await,
+            None,
+            "{name}"
+        );
+        // The laptop, watched all along, was told nothing more.
+        assert_eq!(
+            metrics_interval_within(&mut laptop_control, Duration::ZERO).await,
+            None,
+            "{name}"
+        );
+        drop((control, laptop_control));
+        app.finish().await;
+    }
+}
+
+/// Waits until the server takes another reading from the device: readings
+/// closer together than two seconds, by its clock, are dropped.
+async fn after_spacing(app: &App, device_id: &str) {
+    let latest = app.state.metrics.latest(device_id).expect("a reading").at;
+    while meshrmm_server::time::now_ms() < latest + 2_000 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The device's next reading the event socket sends.
+async fn next_reading(events: &mut Ws, device_id: &str) -> Value {
+    loop {
+        let message = receive_json(events).await;
+        if message["type"] != "metrics" {
+            continue;
+        }
+        if let Some(reading) = message["readings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|reading| reading["device_id"] == device_id)
+        {
+            return reading.clone();
+        }
+    }
+}
+
+#[tokio::test]
+async fn readings_keep_the_volumes_an_agent_leaves_out() {
+    for app in apps().await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let desk = app.enroll(&mut admin, "Desk").await;
+        let d = desk.device_id.as_str();
+        let mut events = admin.events(&server).await.unwrap();
+        assert_eq!(receive_json(&mut events).await["type"], "snapshot");
+        watch(&mut events, &[d]).await;
+        until_pong(&mut events).await;
+        let mut control = desk.connect(&server).await.unwrap();
+        let without_volumes = |cpu: f64| {
+            let mut report = metrics_report(cpu, 4_000);
+            report["metrics"].as_object_mut().unwrap().remove("volumes");
+            report
+        };
+
+        // A report without volumes before any with them: the device has
+        // none until a list arrives, as one whose disks can't be read.
+        send_json(&mut control, without_volumes(10.0)).await;
+        let reading = next_reading(&mut events, d).await;
+        assert_eq!(reading["cpu_percent"], 10.0, "{name}");
+        assert_eq!(reading["volumes"], json!([]), "{name}");
+        after_spacing(&app, d).await;
+        send_json(&mut control, metrics_report(20.0, 4_000)).await;
+        let listed = next_reading(&mut events, d).await;
+        assert_eq!(listed["volumes"][0]["name"], "C:", "{name}");
+        // Later reports leave them out, and the website still gets them.
+        after_spacing(&app, d).await;
+        send_json(&mut control, without_volumes(30.0)).await;
+        let reading = next_reading(&mut events, d).await;
+        assert_eq!(reading["cpu_percent"], 30.0, "{name}");
+        assert_eq!(reading["volumes"], listed["volumes"], "{name}");
+        let live = admin.get(&format!("/v1/agents/{d}/metrics")).await.body;
+        assert_eq!(live["latest"]["volumes"], listed["volumes"], "{name}");
+        let points = live["points"].as_array().unwrap();
+        assert_eq!(points.len(), 3, "{name}");
+        assert_eq!(points[2]["storage_used_bytes"], 750, "{name}");
+        drop(control);
         app.finish().await;
     }
 }
