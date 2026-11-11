@@ -71,6 +71,11 @@ refused. Failed, timed-out and lost runs can raise
   window opens with the outcome and output, which can be selected and copied.
   Runs from the viewer also appear in the website's run history.
 
+A script reads the device's [custom fields](custom-fields.md) that
+scripts may read as `MESHRMM_FIELD_<KEY>` variables, and sets the ones
+they may write with `meshrmm-agent field set <key> <value>`, recorded as
+its run's change.
+
 ## Files
 
 Library files are uploaded from the browser into a folder, private or shared,

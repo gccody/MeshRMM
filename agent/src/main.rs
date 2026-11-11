@@ -23,6 +23,8 @@ mod power;
 #[cfg(windows)]
 mod private_directory;
 mod remote;
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+mod script_fields;
 #[cfg(windows)]
 mod service;
 #[cfg(windows)]
@@ -45,6 +47,22 @@ use remote::config::{Config, ExecutionMode};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> anyhow::Result<()> {
+    // A toolbox script reading or setting a custom field; see
+    // docs/custom-fields.md.
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == "field")
+    {
+        let arguments = std::env::args_os()
+            .skip(1)
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        if let Some(code) = script_fields::command(&arguments) {
+            std::process::exit(code);
+        }
+    }
+
     if std::env::args_os()
         .nth(1)
         .is_some_and(|argument| argument == "--third-party-notices")

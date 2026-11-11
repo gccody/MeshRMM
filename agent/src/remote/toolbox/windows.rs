@@ -53,7 +53,11 @@ use crate::win32::{HandleListAttribute, OwnedHandle, create_pipe, wide};
 /// started in the background can hold its output open indefinitely.
 const OUTPUT_DRAIN: Duration = Duration::from_secs(2);
 
-pub(super) fn execute_script(mode: ExecutionMode, run: &ScriptRunRequest) -> ScriptRunReport {
+pub(super) fn execute_script(
+    mode: ExecutionMode,
+    run: &ScriptRunRequest,
+    variables: &[(String, String)],
+) -> ScriptRunReport {
     let user = match run.run_as {
         RunAs::User => signed_in_user(mode),
         RunAs::System => None,
@@ -90,6 +94,7 @@ pub(super) fn execute_script(mode: ExecutionMode, run: &ScriptRunRequest) -> Scr
             &command_line,
             &working_directory,
             user.as_ref(),
+            variables,
             Duration::from_secs(u64::from(run.timeout_seconds)),
         )
     });
@@ -337,6 +342,7 @@ fn execute(
     command_line: &str,
     working_directory: &Path,
     user: Option<&UserLogon>,
+    variables: &[(String, String)],
     timeout: Duration,
 ) -> anyhow::Result<Outcome> {
     let (child_input, parent_input) = create_pipe()?;
@@ -348,6 +354,7 @@ fn execute(
         command_line,
         working_directory,
         user,
+        variables,
         [child_input, child_output, child_error],
     )?;
     // A job lets a timeout stop what the script started, too. It is not
@@ -401,6 +408,7 @@ fn create_suspended(
     command_line: &str,
     working_directory: &Path,
     user: Option<&UserLogon>,
+    variables: &[(String, String)],
     [child_input, child_output, child_error]: [OwnedHandle; 3],
 ) -> anyhow::Result<(OwnedHandle, OwnedHandle)> {
     // Pipes start non-inheritable. Only the child's ends become
@@ -435,11 +443,29 @@ fn create_suspended(
         unsafe { CreateEnvironmentBlock(&mut environment, Some(user.token.0), false) }
             .context("could not load the user's environment")?;
     }
+    // The script's variables go on top of the user's environment, or the
+    // Agent's own for SYSTEM.
+    let merged = (!variables.is_empty()).then(|| {
+        let base = if environment.is_null() {
+            std::env::vars_os().collect()
+        } else {
+            unsafe { read_environment_block(environment.cast_const().cast()) }
+        };
+        environment_block(
+            base,
+            variables,
+            crate::script_fields::agent_folder().as_deref(),
+        )
+    });
+    let block = match &merged {
+        Some(block) => block.as_ptr().cast::<std::ffi::c_void>(),
+        None => environment.cast_const(),
+    };
     let application = wide(application.as_os_str());
     let mut command_line = wide(command_line);
     let working_directory = wide(working_directory.as_os_str());
     let mut flags = CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED;
-    if !environment.is_null() {
+    if !block.is_null() {
         flags |= CREATE_UNICODE_ENVIRONMENT;
     }
     let mut information = PROCESS_INFORMATION::default();
@@ -453,7 +479,7 @@ fn create_suspended(
                 None,
                 true,
                 flags,
-                (!environment.is_null()).then_some(environment.cast_const()),
+                (!block.is_null()).then_some(block),
                 PCWSTR(working_directory.as_ptr()),
                 &startup.StartupInfo,
                 &mut information,
@@ -465,7 +491,7 @@ fn create_suspended(
                 None,
                 true,
                 flags,
-                None,
+                (!block.is_null()).then_some(block),
                 PCWSTR(working_directory.as_ptr()),
                 &startup.StartupInfo,
                 &mut information,
@@ -485,6 +511,76 @@ fn create_suspended(
         OwnedHandle(information.hProcess),
         OwnedHandle(information.hThread),
     ))
+}
+
+/// The variables of an environment block: `NAME=value` strings, each ended
+/// by a NUL, then one more NUL.
+///
+/// # Safety
+///
+/// `block` must be such a block, as `CreateEnvironmentBlock` makes.
+unsafe fn read_environment_block(block: *const u16) -> Vec<(OsString, OsString)> {
+    let mut variables = Vec::new();
+    let mut at = block;
+    loop {
+        let mut length = 0;
+        while unsafe { *at.add(length) } != 0 {
+            length += 1;
+        }
+        if length == 0 {
+            return variables;
+        }
+        let entry = unsafe { std::slice::from_raw_parts(at, length) };
+        // Names such as `=C:` start with `=`; the first one after that ends the name.
+        let split = entry
+            .iter()
+            .skip(1)
+            .position(|&unit| unit == u16::from(b'='))
+            .map_or(length, |position| position + 1);
+        variables.push((
+            OsString::from_wide(&entry[..split]),
+            OsString::from_wide(entry.get(split + 1..).unwrap_or_default()),
+        ));
+        at = unsafe { at.add(length + 1) };
+    }
+}
+
+/// A Unicode environment block of `base` with `variables` set over it
+/// (names compared ignoring case, as Windows does) and `folder` added to the
+/// end of `Path`, sorted by name as `CreateProcess` expects.
+fn environment_block(
+    base: Vec<(OsString, OsString)>,
+    variables: &[(String, String)],
+    folder: Option<&Path>,
+) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    let key = |name: &OsString| name.to_string_lossy().to_uppercase();
+    let mut merged: std::collections::BTreeMap<String, (OsString, OsString)> = base
+        .into_iter()
+        .map(|(name, value)| (key(&name), (name, value)))
+        .collect();
+    for (name, value) in variables {
+        let name = OsString::from(name);
+        merged.insert(key(&name), (name, OsString::from(value)));
+    }
+    if let Some(folder) = folder {
+        let path = merged
+            .entry("PATH".to_owned())
+            .or_insert_with(|| (OsString::from("Path"), OsString::new()));
+        if !path.1.is_empty() {
+            path.1.push(";");
+        }
+        path.1.push(folder.as_os_str());
+    }
+    let mut block = Vec::new();
+    for (name, value) in merged.into_values() {
+        block.extend(name.encode_wide());
+        block.push(u16::from(b'='));
+        block.extend(value.encode_wide());
+        block.push(0);
+    }
+    block.push(0);
+    block
 }
 
 /// Copies each pipe into its output on a thread of its own. The returned
@@ -681,5 +777,57 @@ impl Drop for Impersonation {
             tracing::error!(%error, "could not stop acting as the signed-in user");
             std::process::abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::windows::ffi::OsStrExt;
+
+    use super::*;
+
+    #[test]
+    fn scripts_get_their_variables_over_the_environment() {
+        let base = vec![
+            (OsString::from("=C:"), OsString::from(r"C:\Windows")),
+            (
+                OsString::from("Path"),
+                OsString::from(r"C:\Windows\System32"),
+            ),
+            (OsString::from("meshrmm_field_tier"), OsString::from("old")),
+            (OsString::from("TEMP"), OsString::from(r"C:\Temp")),
+        ];
+        let block = environment_block(
+            base,
+            &[
+                ("MESHRMM_FIELD_TIER".into(), "Gold".into()),
+                ("MESHRMM_RUN_ID".into(), "run-1".into()),
+            ],
+            Some(Path::new(r"C:\Program Files\MeshRMM\Agent")),
+        );
+        assert_eq!(block.last(), Some(&0));
+        let read = unsafe { read_environment_block(block.as_ptr()) };
+        let text = read
+            .iter()
+            .map(|(name, value)| format!("{}={}", name.to_string_lossy(), value.to_string_lossy()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            text,
+            [
+                r"=C:=C:\Windows",
+                "MESHRMM_FIELD_TIER=Gold",
+                "MESHRMM_RUN_ID=run-1",
+                r"Path=C:\Windows\System32;C:\Program Files\MeshRMM\Agent",
+                r"TEMP=C:\Temp",
+            ],
+            "sorted, the field set over the old one ignoring case, the Agent's folder last on Path"
+        );
+        let wide: Vec<u16> = OsString::from("A=1").encode_wide().collect();
+        let mut single = wide.clone();
+        single.extend([0, 0]);
+        assert_eq!(
+            unsafe { read_environment_block(single.as_ptr()) },
+            [(OsString::from("A"), OsString::from("1"))]
+        );
     }
 }

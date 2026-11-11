@@ -116,6 +116,55 @@ pub struct ScriptRunRequest {
     pub body: String,
     pub run_as: RunAs,
     pub timeout_seconds: u32,
+    /// The device's custom fields the script may read, each with its value,
+    /// and whether it may write them. See docs/custom-fields.md.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<ScriptField>,
+}
+
+/// A field key is a lowercase letter, then up to 63 lowercase letters,
+/// digits and underscores, so upper-cased it is an environment variable
+/// name every shell takes.
+pub const MAX_FIELD_KEY_CHARS: usize = 64;
+/// The prefix of the environment variable that carries a field's value.
+pub const FIELD_VARIABLE_PREFIX: &str = "MESHRMM_FIELD_";
+/// The most a script may write to a field, in bytes; no field type takes
+/// more.
+pub const MAX_SCRIPT_FIELD_VALUE_BYTES: usize = 64 * 1024;
+
+pub fn valid_field_key(key: &str) -> bool {
+    let mut bytes = key.bytes();
+    bytes.next().is_some_and(|first| first.is_ascii_lowercase())
+        && key.len() <= MAX_FIELD_KEY_CHARS
+        && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+/// The environment variable a script reads the field `key` from, such as
+/// `MESHRMM_FIELD_CONTRACT_TIER`.
+pub fn field_variable(key: &str) -> String {
+    format!("{FIELD_VARIABLE_PREFIX}{}", key.to_ascii_uppercase())
+}
+
+/// A custom field as a script sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScriptField {
+    pub key: String,
+    /// The device's value, or else its company's, as text: a number in
+    /// decimal, a checkbox `true` or `false`, a date `YYYY-MM-DD`, and a
+    /// multi-select's options one per line. `None` without a value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// The script may set the device's value.
+    #[serde(default)]
+    pub writable: bool,
+}
+
+/// What the Agent posts when a running script sets one of its device's
+/// fields. An empty value clears it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScriptFieldWrite {
+    pub key: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

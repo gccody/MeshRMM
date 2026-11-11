@@ -107,8 +107,8 @@ export function CompaniesPanel() {
             <tbody>
               {shown.map((company) => (
                 <tr key={company.id}>
-                  <td><strong><Link to={devicesIn(company.id)}>{company.name}</Link></strong></td>
-                  <td>{describe(countOf(company.id))}</td>
+                  <td><strong><Link to={`/company?id=${encodeURIComponent(company.id)}`}>{company.name}</Link></strong></td>
+                  <td><Link to={devicesIn(company.id)}>{describe(countOf(company.id))}</Link></td>
                   <td className="row-actions">
                     {canManage && <>
                       <button type="button" className="close-session-button" onClick={(event) => open(company, event.currentTarget)} aria-haspopup="dialog" aria-label={`Rename ${company.name}`} title="Rename company"><Pencil size={16} /></button>

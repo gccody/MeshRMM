@@ -50,7 +50,7 @@ origin as its API. Nothing runs on Node in production.
   device's reading, the list, the counts, the companies or the tags. A
   device's tile on the wall redraws for its own device and reading only.
 - **One bundle, one lazy chunk.** Every page hydrates from a single entry
-  script (kept under 800 kB by `tests/prerender.test.mjs`). Only the
+  script (kept under 1,000 kB by `tests/prerender.test.mjs`). Only the
   [terminal](../docs/terminal.md)'s xterm.js is split out, loaded with
   `React.lazy` when a terminal opens (`features/terminal/terminal-view.tsx`).
   xterm adds `<style>` elements, which the Content-Security-Policy refuses,

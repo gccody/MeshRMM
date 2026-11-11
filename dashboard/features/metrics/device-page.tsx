@@ -1,5 +1,5 @@
 import { Activity, AppWindow, ArrowLeft, Building2, CircleAlert, Cpu, FolderOpen, Gauge, Laptop, LoaderCircle, MonitorOff, Network, Package, Radar, ShieldCheck, Tag, Terminal } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import { NO_COMPANY, DEFAULT_DEVICE_FILTERS, serializeDeviceFilters } from "../agents/device-filters";
 import { companyName } from "../agents/model";
@@ -7,6 +7,8 @@ import { DeviceAlerts } from "../alerts/device-alerts";
 import { MoveDeviceDialog } from "../companies/company-dialogs";
 import { DeviceMonitors } from "../monitors/device-monitors";
 import { DeviceNotes } from "../notes/device-notes";
+import { FieldValues } from "../custom-fields/field-values";
+import type { FieldOwner } from "../custom-fields/fields-api";
 import { DeviceSystem, type SystemTab } from "../system-info/device-system";
 import { tagsOf } from "../tags/model";
 import { TagChips } from "../tags/tag-chip";
@@ -84,6 +86,7 @@ export function DevicePage() {
   const tabs = TABS.filter(({ id }) => allowed(id));
   const tab: DeviceTab = isTab(requestedTab) && allowed(requestedTab) ? requestedTab : "usage";
   const agent = useDevice(inventory.devices, deviceId);
+  const fieldOwner = useMemo<FieldOwner>(() => ({ kind: "device", id: deviceId }), [deviceId]);
   const live = useDeviceReading(inventory.devices, deviceId);
   const companies = useCompanies(inventory.devices);
   const tags = useTags(inventory.devices);
@@ -182,6 +185,7 @@ export function DevicePage() {
         {agent && <DeviceMaintenance key={agent.id} agent={agent} />}
         {agent && <DeviceWake key={agent.id} agent={agent} />}
         {agent && <DeviceNotes key={agent.id} agent={agent} />}
+        {agent && <FieldValues key={agent.id} owner={fieldOwner} canEdit={can("devices.edit")} />}
 
         <nav className="toolbox-tabs area-tabs device-tabs" aria-label="Device">
           {tabs.map(({ id, label, icon: Icon }) => (

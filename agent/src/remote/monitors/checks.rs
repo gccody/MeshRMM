@@ -419,6 +419,7 @@ fn script(
         body: body.to_owned(),
         run_as,
         timeout_seconds: context.timeout.as_secs().max(1) as u32,
+        fields: Vec::new(),
     };
     let report = crate::remote::toolbox::run_check(context.mode, &run);
     let mut output = report.stdout;

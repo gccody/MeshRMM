@@ -195,28 +195,37 @@ mod shared {
     }
 
     /// Runs `run` on its own thread and hands how it went to `outbox`.
-    /// `activity` keeps the Agent from updating until it is stored.
+    /// `activity` keeps the Agent from updating until it is stored. A
+    /// script that may write custom fields does so through `fields`.
     pub(crate) fn run_script(
         outbox: &Arc<Outbox>,
+        fields: Option<&Arc<crate::script_fields::Channel>>,
         mode: ExecutionMode,
         run: ScriptRunRequest,
         activity: ActivityGuard,
     ) {
         let outbox = Arc::clone(outbox);
-        start_script(mode, run, activity, move |run_id, report| {
-            outbox.add(
-                Final::ScriptRun {
-                    run_id: run_id.to_owned(),
-                    report: report.clone(),
-                },
-                now_unix_ms(),
-            );
-        });
+        start_script(
+            fields.cloned(),
+            mode,
+            run,
+            activity,
+            move |run_id, report| {
+                outbox.add(
+                    Final::ScriptRun {
+                        run_id: run_id.to_owned(),
+                        report: report.clone(),
+                    },
+                    now_unix_ms(),
+                );
+            },
+        );
     }
 
     /// Runs `run` on its own thread and hands how it went to `send`,
     /// holding `activity` until that returns.
     pub(super) fn start_script(
+        fields: Option<Arc<crate::script_fields::Channel>>,
         mode: ExecutionMode,
         run: ScriptRunRequest,
         activity: ActivityGuard,
@@ -234,7 +243,12 @@ mod shared {
                             run.language.label()
                         ),
                     ),
-                    Some(_slot) => platform::execute_script(mode, &run),
+                    Some(_slot) => {
+                        // The token works only while the script runs.
+                        let grant = fields.as_ref().and_then(|fields| fields.grant(&run));
+                        let variables = crate::script_fields::variables(&run, grant.as_ref());
+                        platform::execute_script(mode, &run, &variables)
+                    }
                     None => failed(
                         platform::own_account(),
                         format!(
@@ -271,7 +285,7 @@ mod shared {
                 ),
             );
         }
-        platform::execute_script(mode, run)
+        platform::execute_script(mode, run, &[])
     }
 
     /// Saves `delivery`'s file on its own thread and hands how it went to
@@ -469,7 +483,9 @@ mod tests {
                 body: body.into(),
                 run_as: meshrmm_protocol::RunAs::User,
                 timeout_seconds,
+                fields: Vec::new(),
             },
+            &[],
         )
     }
 
@@ -601,6 +617,7 @@ mod tests {
         let (sending, sent) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel::<()>();
         shared::start_script(
+            None,
             crate::remote::config::ExecutionMode::Console,
             meshrmm_protocol::ScriptRunRequest {
                 run_id: "run".into(),
@@ -608,6 +625,7 @@ mod tests {
                 body: String::new(),
                 run_as: meshrmm_protocol::RunAs::User,
                 timeout_seconds: 30,
+                fields: Vec::new(),
             },
             link.activity(),
             move |run_id, report| {

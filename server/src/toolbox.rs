@@ -518,6 +518,9 @@ pub async fn start_script_run(
         }),
     )
     .await?;
+    let fields =
+        crate::custom_fields::script_fields(&mut transaction, &state.instance_key, device_id)
+            .await?;
     transaction.commit().await?;
     let timeout_seconds =
         u32::try_from(script.timeout_seconds).map_err(|_| ApiError::internal())?;
@@ -528,6 +531,7 @@ pub async fn start_script_run(
             body: script.body,
             run_as,
             timeout_seconds,
+            fields,
         },
     };
     if !place.is_some_and(|place| place.send(command)) {

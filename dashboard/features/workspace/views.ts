@@ -3,12 +3,14 @@
 // Imports carry the .ts extension so node:test can load this module directly.
 import { type Account, type Permission, canAny } from "../auth/types.ts";
 
-export type View = "devices" | "device" | "companies" | "tags" | "maintenance" | "deployment" | "software" | "updates" | "applications" | "toolbox" | "alerts" | "alert-rules" | "reports" | "notification-channels" | "users" | "roles" | "authentication" | "settings" | "audit" | "account" | "jobs" | "job" | "policies" | "terminal" | "files";
+export type View = "devices" | "device" | "companies" | "company" | "custom-fields" | "tags" | "maintenance" | "deployment" | "software" | "updates" | "applications" | "toolbox" | "alerts" | "alert-rules" | "reports" | "notification-channels" | "users" | "roles" | "authentication" | "settings" | "audit" | "account" | "jobs" | "job" | "policies" | "terminal" | "files";
 
 export const VIEW_PATHS: Record<View, string> = {
   devices: "/",
   device: "/device",
   companies: "/companies",
+  company: "/company",
+  "custom-fields": "/custom-fields",
   tags: "/tags",
   maintenance: "/maintenance",
   deployment: "/deployment",
@@ -40,6 +42,8 @@ export const VIEW_COPY: Record<View, { title: string }> = {
   devices: { title: "Devices" },
   device: { title: "Device" },
   companies: { title: "Companies" },
+  company: { title: "Company" },
+  "custom-fields": { title: "Custom fields" },
   tags: { title: "Tags" },
   maintenance: { title: "Maintenance" },
   deployment: { title: "Deployment tokens" },
@@ -73,6 +77,8 @@ const VIEW_ACCESS: Record<View, readonly Permission[]> = {
   devices: ["devices.view"],
   device: ["devices.view"],
   companies: ["devices.view"],
+  company: ["devices.view"],
+  "custom-fields": ["custom_fields.manage"],
   tags: ["devices.view"],
   maintenance: ["devices.view"],
   deployment: ["devices.enroll"],
@@ -113,11 +119,11 @@ export function homeView(account: Pick<Account, "permissions" | "is_administrato
 }
 
 // The navigation entry a page sits under: a device, its terminals and files under
-// Devices, tags, maintenance and deployment tokens under Companies, the alert rules and channels under Alerts,
+// Devices, a company, custom fields, tags, maintenance and deployment tokens under Companies, the alert rules and channels under Alerts,
 // and a job and the policies under Jobs.
 export function navViewFor(view: View): View {
   if (view === "device" || view === "terminal" || view === "files") return "devices";
-  if (view === "tags" || view === "maintenance" || view === "deployment") return "companies";
+  if (view === "company" || view === "custom-fields" || view === "tags" || view === "maintenance" || view === "deployment") return "companies";
   if (view === "job" || view === "policies") return "jobs";
   if (view === "alert-rules" || view === "notification-channels") return "alerts";
   return view;

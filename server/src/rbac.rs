@@ -58,13 +58,15 @@ macro_rules! permissions {
 
 permissions! {
     DevicesView = "devices.view": "See devices, their status and inventory.",
-    DevicesEdit = "devices.edit": "Add and remove devices' tags and edit their notes.",
+    DevicesEdit = "devices.edit": "Add and remove devices' tags, edit their notes, and set their custom field values, one device or many.",
     DevicesEnroll = "devices.enroll": "Create Agent installers and deployment tokens to enroll devices, and see and revoke deployment tokens.",
     DevicesDelete = "devices.delete": "Delete devices and uninstall their Agents.",
     DevicesRotateCredentials = "devices.rotate_credentials": "Rotate a device's Agent credential.",
     DevicesWake = "devices.wake": "Wake offline devices with Wake-on-LAN, through online devices on their network.",
     DevicesMaintenance = "devices.maintenance": "Put devices in maintenance, which silences their alerts and holds back their scheduled automation, and end it.",
-    CompaniesManage = "companies.manage": "Create, rename and delete companies and move devices between them.",
+    CompaniesManage = "companies.manage": "Create, rename and delete companies, move devices between them, and set companies' custom field values, which their devices inherit.",
+    CustomFieldsManage = "custom_fields.manage": "Create, change, reorder and delete custom fields, including which fields toolbox scripts may read and write.",
+    CustomFieldsReveal = "custom_fields.reveal": "Reveal the values of secret custom fields. Each reveal is recorded in the audit log.",
     TagsManage = "tags.manage": "Create, rename, recolor and delete tags.",
     SessionsConnect = "sessions.connect": "Start remote sessions.",
     SessionsConnectBackground = "sessions.connect_background": "Start remote sessions in the background, without the user seeing them.",

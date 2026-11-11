@@ -135,6 +135,10 @@ input.
   and Developer ID signing of the macOS builds.
 - `secrets`: the instance key, which encrypts secrets in the database and
   signs TURN credentials.
+- `custom_fields`: fields' types and the checks of their values, sealing
+  secret values with the instance key, devices taking their company's
+  values, and the fields a script run gets. See
+  [custom fields](custom-fields.md).
 - `storage`: files in the data directory (thumbnails, toolbox library),
   written atomically. Library files are flushed to disk before they take
   their name; thumbnails, which Agents send again when they reconnect,
@@ -358,7 +362,7 @@ Roles are built from these permissions (`server/src/rbac.rs`):
 `devices.view`, `devices.edit`, `devices.enroll`, `devices.delete`,
 `devices.rotate_credentials`, `devices.wake`, `devices.maintenance`,
 `companies.manage`,
-`tags.manage`, `sessions.connect`,
+`tags.manage`, `custom_fields.manage`, `custom_fields.reveal`, `sessions.connect`,
 `sessions.connect_background`, `sessions.close_any`, `terminal.connect`,
 `terminal.connect_system`, `scripts.run`,
 `scripts.manage_shared`, `files.deliver`, `files.manage_shared`,
@@ -417,7 +421,7 @@ committed:
 - SCIM requests that change or delete a user, or change the members of, or
   delete, a group that grants a role.
 
-Everything else (devices, tags, notes, companies, scripts, files, alerts,
+Everything else (devices, tags, notes, custom fields, companies, scripts, files, alerts,
 automation, applications) changes no one's access and doesn't signal, so a
 busy server doesn't make every open socket check its access for nothing.
 Deleting a device ends its remote session directly. A change made outside

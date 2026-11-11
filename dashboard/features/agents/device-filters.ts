@@ -1,3 +1,4 @@
+import { type FieldFilter, parseFieldFilter, writeFieldFilter } from "../custom-fields/model.ts";
 import { type TagMatch, hasTags, tagsOf } from "../tags/model.ts";
 import type { Agent, Tag } from "./types.ts";
 
@@ -11,7 +12,9 @@ export type CompanyFilter = string;
 export const NO_COMPANY = "none";
 
 // Tags' IDs (devices with any, or all, of them), or none for every device.
-export type DeviceFilters = { query: string; status: AgentStatusFilter; company: CompanyFilter; tags: string[]; tagMatch: TagMatch };
+// `field` keeps the devices whose custom field matches, which the server
+// finds (see filterAgents).
+export type DeviceFilters = { query: string; status: AgentStatusFilter; company: CompanyFilter; tags: string[]; tagMatch: TagMatch; field?: FieldFilter | null };
 
 export const DEFAULT_DEVICE_FILTERS: DeviceFilters = { query: "", status: "all", company: "", tags: [], tagMatch: "any" };
 export const MAX_DEVICE_QUERY_LENGTH = 200;
@@ -33,7 +36,9 @@ export function parseDeviceFilters(params: { get(name: string): string | null } 
   const status = params?.get("status");
   const company = params?.get("company") ?? "";
   const tags = (params?.get("tags") ?? "").split(",").filter((id) => id && id.length <= MAX_TAG_ID_LENGTH);
+  const field = parseFieldFilter(params);
   return {
+    ...(field ? { field } : {}),
     query: clampDeviceQuery(params?.get("q") ?? ""),
     status: isAgentStatusFilter(status) ? status : "all",
     company: company.length <= MAX_COMPANY_LENGTH ? company : "",
@@ -43,7 +48,7 @@ export function parseDeviceFilters(params: { get(name: string): string | null } 
 }
 
 // Returns "" for the defaults, otherwise a "?…" search string.
-export function serializeDeviceFilters({ query, status, company, tags, tagMatch }: DeviceFilters) {
+export function serializeDeviceFilters({ query, status, company, tags, tagMatch, field }: DeviceFilters) {
   const params = new URLSearchParams();
   if (query) params.set("q", clampDeviceQuery(query));
   if (status !== "all") params.set("status", status);
@@ -52,6 +57,7 @@ export function serializeDeviceFilters({ query, status, company, tags, tagMatch 
     params.set("tags", tags.slice(0, MAX_FILTER_TAGS).join(","));
     if (tagMatch === "all") params.set("tag_match", "all");
   }
+  writeFieldFilter(params, field ?? null);
   const search = params.toString();
   return search ? `?${search}` : "";
 }
@@ -68,8 +74,10 @@ export function searchText(agent: Pick<Agent, "id" | "name" | "system" | "tag_id
   return parts.join("\n").toLowerCase();
 }
 
-// `tags` are the inventory's, whose names the search matches.
-export function filterAgents<T extends Pick<Agent, "id" | "name" | "connected" | "company_id" | "system" | "tag_ids"> & Partial<Pick<Agent, "maintenance">>>(agents: readonly T[], filters: DeviceFilters, tags: readonly Tag[] = []) {
+// `tags` are the inventory's, whose names the search matches. With a field
+// filter, `fieldMatches` holds the IDs of the devices the server found it
+// matches; none match until it has answered.
+export function filterAgents<T extends Pick<Agent, "id" | "name" | "connected" | "company_id" | "system" | "tag_ids"> & Partial<Pick<Agent, "maintenance">>>(agents: readonly T[], filters: DeviceFilters, tags: readonly Tag[] = [], fieldMatches: ReadonlySet<string> | null = null) {
   const { query, status, company, tagMatch } = filters;
   const search = query.trim().toLowerCase();
   return agents.filter((agent) => {
@@ -77,6 +85,7 @@ export function filterAgents<T extends Pick<Agent, "id" | "name" | "connected" |
     const matchesStatus = status === "all"
       || (status === "maintenance" ? Boolean(agent.maintenance?.current) : status === "online" ? agent.connected : !agent.connected);
     const matchesCompany = !company || (company === NO_COMPANY ? !agent.company_id : agent.company_id === company);
-    return matchesSearch && matchesStatus && matchesCompany && hasTags(agent, filters.tags, tagMatch);
+    const matchesField = !filters.field || (fieldMatches?.has(agent.id) ?? false);
+    return matchesSearch && matchesStatus && matchesCompany && matchesField && hasTags(agent, filters.tags, tagMatch);
   });
 }

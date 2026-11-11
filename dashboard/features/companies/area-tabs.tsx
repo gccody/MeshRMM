@@ -1,4 +1,4 @@
-import { Building2, KeyRound, Tags, Wrench } from "lucide-react";
+import { Building2, KeyRound, ListPlus, Tags, Wrench } from "lucide-react";
 import { Link } from "react-router";
 import { useWorkspace } from "../workspace/workspace-context";
 import { VIEW_PATHS, type View, canView } from "../workspace/views";
@@ -7,6 +7,7 @@ const TABS: { view: View; label: string; icon: typeof Building2 }[] = [
   { view: "companies", label: "Companies", icon: Building2 },
   { view: "tags", label: "Tags", icon: Tags },
   { view: "maintenance", label: "Maintenance", icon: Wrench },
+  { view: "custom-fields", label: "Custom fields", icon: ListPlus },
   { view: "deployment", label: "Deployment tokens", icon: KeyRound },
 ];
 

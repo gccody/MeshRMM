@@ -680,12 +680,57 @@ mod tests {
                 body: "Get-Date".into(),
                 run_as: crate::RunAs::User,
                 timeout_seconds: 300,
+                fields: Vec::new(),
             },
         };
         let json = serde_json::to_string(&run).unwrap();
         assert_eq!(
             json,
             r#"{"type":"run_script","run":{"run_id":"run-1","language":"powershell","body":"Get-Date","run_as":"user","timeout_seconds":300}}"#
+        );
+        let with_fields = ScriptRunRequest {
+            run_id: "run-2".into(),
+            language: crate::ScriptLanguage::Shell,
+            body: "env".into(),
+            run_as: crate::RunAs::System,
+            timeout_seconds: 60,
+            fields: vec![
+                crate::ScriptField {
+                    key: "tier".into(),
+                    value: Some("Gold".into()),
+                    writable: false,
+                },
+                crate::ScriptField {
+                    key: "last_backup".into(),
+                    value: None,
+                    writable: true,
+                },
+            ],
+        };
+        let fields_json = serde_json::to_string(&with_fields).unwrap();
+        assert!(
+            fields_json.ends_with(r#""fields":[{"key":"tier","value":"Gold","writable":false},{"key":"last_backup","writable":true}]}"#),
+            "{fields_json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<ScriptRunRequest>(&fields_json).unwrap(),
+            with_fields
+        );
+        assert!(crate::valid_field_key("contract_tier2"));
+        for key in [
+            "",
+            "Tier",
+            "2tier",
+            "_tier",
+            "tier-x",
+            "tïer",
+            &"a".repeat(65),
+        ] {
+            assert!(!crate::valid_field_key(key), "{key}");
+        }
+        assert_eq!(
+            crate::field_variable("contract_tier"),
+            "MESHRMM_FIELD_CONTRACT_TIER"
         );
         assert_eq!(serde_json::from_str::<AgentCommand>(&json).unwrap(), run);
         let delivery = AgentCommand::DeliverFile {

@@ -8,6 +8,7 @@ mod applications;
 mod audit_log;
 mod automation;
 mod companies;
+mod custom_fields;
 mod deployment_tokens;
 mod devices;
 mod enrollment;
@@ -87,6 +88,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .merge(application_routes())
         .merge(report_routes())
         .merge(maintenance_window_routes())
+        .merge(custom_field_routes())
         .layer(middleware::from_fn_with_state(state, csrf::check))
         // Responses carry account data; browsers and proxies must not keep them.
         .layer(SetResponseHeaderLayer::if_not_present(
@@ -420,6 +422,54 @@ fn application_routes() -> Router<AppState> {
         .route(
             "/packages/outdated/devices",
             get(applications::outdated_devices),
+        )
+}
+
+/// Custom field definitions, devices' and companies' values, and the values
+/// running scripts write through their Agent.
+fn custom_field_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/custom-fields",
+            get(custom_fields::list).post(custom_fields::create),
+        )
+        .route("/custom-fields/order", put(custom_fields::reorder))
+        .route(
+            "/custom-fields/{id}",
+            put(custom_fields::update).delete(custom_fields::delete),
+        )
+        .route(
+            "/custom-fields/{id}/devices",
+            get(custom_fields::matching_devices),
+        )
+        .route("/device-custom-fields", post(custom_fields::bulk_set))
+        .route(
+            "/agents/{id}/custom-fields",
+            get(custom_fields::device_values),
+        )
+        .route(
+            "/agents/{id}/custom-fields/{field}",
+            put(custom_fields::set_device_value),
+        )
+        .route(
+            "/agents/{id}/custom-fields/{field}/reveal",
+            post(custom_fields::reveal_device_value),
+        )
+        .route(
+            "/companies/{id}/custom-fields",
+            get(custom_fields::company_values),
+        )
+        .route(
+            "/companies/{id}/custom-fields/{field}",
+            put(custom_fields::set_company_value),
+        )
+        .route(
+            "/companies/{id}/custom-fields/{field}/reveal",
+            post(custom_fields::reveal_company_value),
+        )
+        .route(
+            "/agents/{id}/script-runs/{run_id}/custom-fields",
+            post(custom_fields::script_write),
         )
 }
 

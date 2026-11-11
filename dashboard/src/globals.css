@@ -1221,3 +1221,26 @@ button.outcome-chip:hover { color: var(--text); background: var(--raised); }
 .report-opened ul { margin: 10px 0 0; padding: 0; display: grid; gap: 6px; list-style: none; font-size: 13px; }
 .report-opened li a { display: inline-flex; align-items: center; gap: 6px; }
 .report-opened li span { color: var(--text-3); }
+
+/* Custom fields on a device's or company's page, the wall's field filter. */
+.custom-field-list { display: grid; margin: 0; border: 1px solid var(--rule); border-radius: 8px; background: var(--panel); }
+.custom-field-row { display: grid; grid-template-columns: minmax(140px, 220px) 1fr; gap: 12px; padding: 10px 12px; border-top: 1px solid var(--rule); }
+.custom-field-row:first-child { border-top: 0; }
+.custom-field-row dt { display: grid; gap: 2px; color: var(--text); font-size: 13.5px; font-weight: 560; }
+.custom-field-row dt small { color: var(--text-3); font-size: 12px; font-weight: 400; }
+.custom-field-row dd { display: grid; gap: 4px; min-width: 0; margin: 0; color: var(--text); font-size: 13.5px; }
+.custom-field-value { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; overflow-wrap: anywhere; }
+.custom-field-value .link-button { display: inline-flex; align-items: center; gap: 4px; }
+.custom-field-value .notes-text { width: 100%; }
+.custom-field-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; }
+.custom-field-editor { display: grid; gap: 8px; }
+.custom-field-editor input, .custom-field-editor select, .custom-field-editor textarea { width: 100%; }
+.field-options { display: grid; gap: 6px; margin: 0; padding: 0; border: 0; }
+.field-secret { font-family: ui-monospace, monospace; letter-spacing: 0.04em; }
+.field-filter-menu { display: grid; gap: 10px; width: min(320px, calc(100vw - 32px)); padding: 12px; }
+.field-filter-menu label { display: grid; gap: 4px; color: var(--text-2); font-size: 12.5px; }
+.company-page { display: grid; gap: 8px; }
+@media (max-width: 640px) {
+  .custom-field-row { grid-template-columns: 1fr; gap: 4px; }
+}
+.form-stack-field { display: grid; gap: 6px; }

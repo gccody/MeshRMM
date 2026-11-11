@@ -111,6 +111,12 @@ const ACTION_LABELS: Record<string, string> = {
   "agent.wake": "Woke a device",
   "agent.tag": "Changed a device's tags",
   "agent.notes": "Edited a device's notes",
+  "custom_field.create": "Created a custom field",
+  "custom_field.update": "Changed a custom field",
+  "custom_field.delete": "Deleted a custom field",
+  "custom_field.reorder": "Reordered the custom fields",
+  "custom_field.set": "Changed a custom field's value",
+  "custom_field.reveal": "Revealed a secret custom field",
   "tag.create": "Created a tag",
   "tag.update": "Changed a tag",
   "tag.delete": "Deleted a tag",
@@ -181,6 +187,10 @@ export function eventLabel(event: Pick<AuditEvent, "action" | "metadata">) {
   if (event.action === "auth.sign_in" && typeof method === "string" && SIGN_IN_METHODS[method]) return `${label} ${SIGN_IN_METHODS[method]}`;
   if (event.action === "auth.sign_in_failed" && typeof reason === "string" && SIGN_IN_FAILURES[reason]) return `${label}: ${SIGN_IN_FAILURES[reason]}`;
   if (event.action === "user.provision" && source === "sso") return `${label} with SSO`;
+  if ((event.action === "custom_field.set" || event.action === "custom_field.reveal") && typeof event.metadata.label === "string") {
+    const cleared = event.action === "custom_field.set" && event.metadata.cleared === true;
+    return event.action === "custom_field.reveal" ? `${label}: ${event.metadata.label}` : cleared ? `Cleared “${event.metadata.label}”` : `Set “${event.metadata.label}”`;
+  }
   if (event.action === "agent.tag") {
     const names = (value: unknown) => (Array.isArray(value) ? value.filter((name): name is string => typeof name === "string") : []);
     const parts = [
@@ -205,6 +215,7 @@ const TARGET_LABELS: Record<string, string> = {
   deployment_token: "Deployment token",
   company: "Company",
   tag: "Tag",
+  custom_field: "Custom field",
   toolbox_script: "Script",
   toolbox_file: "File",
   scim_group: "SCIM group",

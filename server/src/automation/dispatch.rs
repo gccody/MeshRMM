@@ -1154,6 +1154,13 @@ async fn start(state: &AppState, job: &JobRow, device_id: &str, now: i64) -> any
                     body: body.clone(),
                     run_as,
                     timeout_seconds: u32::try_from(timeout_seconds)?,
+                    fields: crate::custom_fields::script_fields(
+                        &mut transaction,
+                        &state.instance_key,
+                        device_id,
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("could not read the device's custom fields"))?,
                 },
             })
         }
