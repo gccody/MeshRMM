@@ -37,9 +37,25 @@ fn default_account() -> RunAs {
     RunAs::System
 }
 
-/// The enrolled device `id`, checked.
-async fn device(state: &AppState, id: &str) -> Result<String, ApiError> {
+/// The enrolled device `id`, checked, if `needed` and the account's
+/// permission reach it.
+async fn device(
+    state: &AppState,
+    actor: &Authorized,
+    needed: Permission,
+    run_as: RunAs,
+    id: &str,
+) -> Result<String, ApiError> {
     let device_id = parse_id(id, "device")?;
+    let mut database = &state.database;
+    actor
+        .require_device(&mut database, needed, &device_id)
+        .await?;
+    if let Some(account) = files::account_permission(run_as) {
+        actor
+            .require_device(&mut database, account, &device_id)
+            .await?;
+    }
     agents::active_platform(&mut &state.database, &device_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Device not found"))?;
@@ -116,7 +132,7 @@ pub async fn roots(
 ) -> Result<Json<FileRoots>, ApiError> {
     let AccountQuery { run_as } = parameters(query)?;
     files::require(&actor, Permission::FilesBrowse, run_as)?;
-    let device_id = device(&state, &id).await?;
+    let device_id = device(&state, &actor, Permission::FilesBrowse, run_as, &id).await?;
     match files::ask(&state, &actor, &device_id, run_as, FileOperation::Roots).await? {
         FileReply::Roots(roots) => Ok(Json(roots)),
         _ => Err(unexpected()),
@@ -158,7 +174,7 @@ pub async fn list(
 ) -> Result<Json<FileListing>, ApiError> {
     let query = parameters(query)?;
     files::require(&actor, Permission::FilesBrowse, query.run_as)?;
-    let device_id = device(&state, &id).await?;
+    let device_id = device(&state, &actor, Permission::FilesBrowse, query.run_as, &id).await?;
     let sort = match query.sort.as_deref() {
         None => FileSort::Name,
         Some(sort) => FileSort::parse(sort)
@@ -215,7 +231,7 @@ pub async fn create_folder(
     JsonBody(request): JsonBody<CreateFolder>,
 ) -> Result<(StatusCode, Json<EntryView>), ApiError> {
     files::require(&actor, Permission::FilesManage, request.run_as)?;
-    let device_id = device(&state, &id).await?;
+    let device_id = device(&state, &actor, Permission::FilesManage, request.run_as, &id).await?;
     let asked = json!({ "path": request.path });
     let operation = FileOperation::CreateFolder { path: request.path };
     let view = entry_view(
@@ -259,7 +275,7 @@ pub async fn rename(
     JsonBody(request): JsonBody<Rename>,
 ) -> Result<Json<EntryView>, ApiError> {
     files::require(&actor, Permission::FilesManage, request.run_as)?;
-    let device_id = device(&state, &id).await?;
+    let device_id = device(&state, &actor, Permission::FilesManage, request.run_as, &id).await?;
     // Not `name`, which the audit log reads as the target's.
     let asked = json!({ "path": request.path, "new_name": request.name });
     let operation = FileOperation::Rename {
@@ -320,7 +336,7 @@ pub async fn move_entries(
 ) -> Result<Json<FileBatch>, ApiError> {
     files::require(&actor, Permission::FilesManage, request.run_as)?;
     check_paths(&request.paths)?;
-    let device_id = device(&state, &id).await?;
+    let device_id = device(&state, &actor, Permission::FilesManage, request.run_as, &id).await?;
     let mut asked = asked_paths(&request.paths);
     asked["destination"] = request.destination.clone().into();
     let operation = FileOperation::Move {
@@ -369,7 +385,7 @@ pub async fn delete(
 ) -> Result<Json<FileBatch>, ApiError> {
     files::require(&actor, Permission::FilesManage, request.run_as)?;
     check_paths(&request.paths)?;
-    let device_id = device(&state, &id).await?;
+    let device_id = device(&state, &actor, Permission::FilesManage, request.run_as, &id).await?;
     let mut asked = asked_paths(&request.paths);
     asked["trash"] = request.trash.into();
     let operation = FileOperation::Delete {
@@ -439,7 +455,7 @@ pub async fn create_download(
 ) -> Result<(StatusCode, Json<DownloadView>), ApiError> {
     files::require(&actor, Permission::FilesBrowse, request.run_as)?;
     check_paths(&request.paths)?;
-    let device_id = device(&state, &id).await?;
+    let device_id = device(&state, &actor, Permission::FilesBrowse, request.run_as, &id).await?;
     let max_bytes = files::transfer_limit(&state).await?;
     let operation = FileOperation::PrepareDownload {
         paths: request.paths.clone(),
@@ -548,7 +564,7 @@ pub async fn create_upload(
     JsonBody(request): JsonBody<NewUpload>,
 ) -> Result<(StatusCode, Json<UploadView>), ApiError> {
     files::require(&actor, Permission::FilesManage, request.run_as)?;
-    let device_id = device(&state, &id).await?;
+    let device_id = device(&state, &actor, Permission::FilesManage, request.run_as, &id).await?;
     let limit = files::transfer_limit(&state).await?;
     if request.size > limit {
         return Err(ApiError::new(

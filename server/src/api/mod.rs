@@ -853,6 +853,43 @@ fn ensure_within(
     }
 }
 
+/// Like [`ensure_within`], for permissions granted on `companies`: the
+/// actor must hold each of them on every one of those companies, so someone
+/// limited to some companies can't grant access beyond them.
+fn ensure_grants_within(
+    actor: &Authorized,
+    permissions: &Permissions,
+    companies: &crate::access::CompanySet,
+    what: &str,
+) -> Result<(), ApiError> {
+    let missing = permissions
+        .iter()
+        .filter(|permission| !actor.access.grants_on(**permission, companies))
+        .map(|permission| permission.as_str())
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let reach = if companies.is_all() {
+        "in every company"
+    } else {
+        "in its companies"
+    };
+    Err(ApiError::forbidden(format!(
+        "you can't {what} because it includes permissions you don't have {reach}: {}",
+        missing.join(", ")
+    ))
+    .with_code("permission_escalation"))
+}
+
+/// [`ensure_grants_within`] for each of `roles`.
+fn ensure_roles_within(actor: &Authorized, roles: &[Role], what: &str) -> Result<(), ApiError> {
+    for role in roles {
+        ensure_grants_within(actor, &role.permissions, &role.companies(), what)?;
+    }
+    Ok(())
+}
+
 /// For changes as powerful as the Administrator role itself.
 fn require_administrator(actor: &Authorized) -> Result<(), ApiError> {
     if actor.is_administrator() {

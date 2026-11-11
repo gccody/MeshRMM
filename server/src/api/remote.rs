@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 
 use super::require_any;
 use crate::{
+    access,
     agents::{self, bearer_token, parse_id},
     audit::{self, Actor, Target},
     auth::Authorized,
@@ -25,7 +26,7 @@ use crate::{
     http::{ApiError, AppState, JsonBody, client_ip::ClientIp},
     rbac::Permission,
     realtime::sessions::{
-        self, MAX_SIGNAL_BYTES, NewSession, Refusal, Role, SessionHandle, ended, user_permissions,
+        self, MAX_SIGNAL_BYTES, NewSession, Refusal, Role, SessionHandle, ended, user_access,
     },
     secrets::token_hash,
     time::now_ms,
@@ -99,9 +100,9 @@ pub async fn redeem(
     }
     transaction.commit().await?;
     let mut database = &state.database;
-    if !agents::is_active(&mut database, &handoff.device_id).await? {
-        return Err(ApiError::not_found("Device not found"));
-    }
+    let Some(company_id) = access::device_company(&mut database, &handoff.device_id).await? else {
+        return Err(access::device_not_found());
+    };
     let user = users::by_id(&mut database, &handoff.user_id)
         .await?
         .filter(|user| !user.disabled)
@@ -110,19 +111,26 @@ pub async fn redeem(
         })?;
     // The website checked when it made the handoff; roles may have changed
     // since.
-    let permissions = user_permissions(&mut database, &user.id).await?;
+    let access = user_access(&mut database, &user.id).await?;
     let mut required = vec![Permission::SessionsConnect];
     if handoff.start_in_background {
         required.push(Permission::SessionsConnectBackground);
     }
     if let Some(missing) = required
-        .into_iter()
-        .find(|permission| !permissions.contains(permission))
+        .iter()
+        .find(|permission| !access.holds(**permission))
     {
         return Err(
             ApiError::forbidden(format!("you don't have the {missing} permission"))
                 .with_code("permission_denied"),
         );
+    }
+    // The device may have moved out of the technician's companies since.
+    if !required
+        .iter()
+        .all(|permission| access.covers(*permission, company_id.as_deref()))
+    {
+        return Err(access::device_not_found());
     }
     let bootstrap = state
         .sessions
@@ -223,14 +231,26 @@ pub async fn close(
         &[Permission::SessionsConnect, Permission::SessionsCloseAny],
     )?;
     let device_id = parse_id(&device_id, "device")?;
-    if !agents::is_active(&mut &state.database, &device_id).await? {
-        return Err(ApiError::not_found("Device not found"));
+    let Some(company_id) = access::device_company(&mut &state.database, &device_id).await? else {
+        return Err(access::device_not_found());
+    };
+    if ![Permission::SessionsConnect, Permission::SessionsCloseAny]
+        .iter()
+        .any(|permission| actor.covers(*permission, company_id.as_deref()))
+    {
+        return Err(access::device_not_found());
     }
     let Some(session) = state.sessions.for_device(&state, &device_id).await? else {
         return Ok(Json(json!({ "closed": false })));
     };
-    if session.user_id != actor.user.id {
+    if session.user_id != actor.user.id
+        && !actor.covers(Permission::SessionsCloseAny, company_id.as_deref())
+    {
         actor.require(Permission::SessionsCloseAny)?;
+        return Err(ApiError::forbidden(
+            "you can end other users' sessions only in some companies",
+        )
+        .with_code("permission_denied"));
     }
     session
         .handle
@@ -262,12 +282,13 @@ async fn session_user(
         .await?
         .filter(|user| !user.disabled)
         .ok_or_else(ended)?;
-    let permissions = user_permissions(&mut database, &user.id).await?;
+    let access = user_access(&mut database, &user.id).await?;
     Ok((
         ToolboxUser {
             actor: Actor::user(&user.id, &user.email, Some(ip)),
             user_id: user.id,
-            permissions,
+            permissions: access.permissions(),
+            access,
         },
         identity.device_id,
     ))

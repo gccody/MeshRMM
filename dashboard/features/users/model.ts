@@ -55,10 +55,16 @@ export type Role = {
   // "administrator" or "technician" for the built-in roles.
   builtin: string | null;
   permissions: Permission[];
+  // Whether its permissions reach every company's devices, and devices in no
+  // company; otherwise only those of `company_ids`.
+  all_companies: boolean;
+  company_ids: string[];
   member_count: number;
 };
 
-export type PermissionInfo = { name: Permission; description: string };
+// `instance` permissions act on what the whole server shares, so only roles
+// for every company grant them.
+export type PermissionInfo = { name: Permission; description: string; reach?: "company" | "instance" };
 
 export const ADMINISTRATOR_ROLE_ID = "administrator";
 

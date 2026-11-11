@@ -36,6 +36,7 @@ use super::{
     tables::{DevicePackages, OutdatedPackages},
 };
 use crate::{
+    access::CompanySet,
     db::{self, Executor, tables::Agents},
     system_info::search::column_contains,
 };
@@ -358,6 +359,9 @@ pub struct ListFilter {
     pub named: Vec<PackageKey>,
     /// The packages pinned library applications hold back.
     pub held: Vec<PackageKey>,
+    /// Only devices in these companies. The summary counts every device,
+    /// so for some companies the counts come from their devices' rows.
+    pub within: CompanySet,
 }
 
 impl ListFilter {
@@ -374,6 +378,7 @@ impl ListFilter {
             query,
             named,
             held: matches.held_keys(),
+            within: CompanySet::All,
         }
     }
 
@@ -404,6 +409,53 @@ impl ListFilter {
     }
 }
 
+/// Adds the summary to `select` as its table: `outdated_packages` itself, or
+/// for devices in some companies the same columns grouped from those
+/// devices' rows, named `outdated_packages`. Grouped, a package's newest
+/// version is the greatest as text, where the summary compares versions.
+fn from_summary(select: &mut SelectStatement, within: &CompanySet) {
+    let Some(companies) = within.company_condition((Agents::Table, Agents::CompanyId)) else {
+        select.from(OutdatedPackages::Table);
+        return;
+    };
+    let column = |column| Expr::col((DevicePackages::Table, column));
+    let grouped = Query::select()
+        .column((DevicePackages::Table, DevicePackages::Source))
+        .column((DevicePackages::Table, DevicePackages::PackageKey))
+        .expr_as(
+            Func::min(column(DevicePackages::PackageId)),
+            OutdatedPackages::PackageId,
+        )
+        .expr_as(
+            Func::min(column(DevicePackages::Name)),
+            OutdatedPackages::Name,
+        )
+        .expr_as(
+            Func::max(column(DevicePackages::AvailableVersion)),
+            OutdatedPackages::AvailableVersion,
+        )
+        .expr_as(
+            Func::cast_as(
+                Func::count(column(DevicePackages::DeviceId)),
+                Alias::new("BIGINT"),
+            ),
+            OutdatedPackages::Devices,
+        )
+        .from(DevicePackages::Table)
+        .inner_join(
+            Agents::Table,
+            Expr::col((Agents::Table, Agents::Id))
+                .equals((DevicePackages::Table, DevicePackages::DeviceId)),
+        )
+        .and_where(column(DevicePackages::OutdatedSince).is_not_null())
+        .and_where(Expr::col((Agents::Table, Agents::DeletionRequestedAt)).is_null())
+        .and_where(companies)
+        .group_by_col((DevicePackages::Table, DevicePackages::Source))
+        .group_by_col((DevicePackages::Table, DevicePackages::PackageKey))
+        .to_owned();
+    select.from_subquery(grouped, OutdatedPackages::Table);
+}
+
 /// `SUM(CASE WHEN condition THEN value ELSE 0 END)` as a BIGINT, never NULL.
 fn sum_where(condition: Option<Condition>, value: Expr) -> Expr {
     let summed = match condition {
@@ -422,7 +474,8 @@ fn sum_where(condition: Option<Condition>, value: Expr) -> Expr {
 /// one read of the summary, one row per package rather than per device.
 pub fn counts_query(filter: &ListFilter) -> SelectStatement {
     let not_held = filter.held().map(Condition::not);
-    Query::select()
+    let mut select = Query::select();
+    select
         .expr_as(sum_where(filter.matches(), Expr::cust("1")), "matching")
         .expr_as(sum_where(not_held.clone(), Expr::cust("1")), "packages")
         .expr_as(
@@ -431,9 +484,9 @@ pub fn counts_query(filter: &ListFilter) -> SelectStatement {
                 Expr::col((OutdatedPackages::Table, OutdatedPackages::Devices)),
             ),
             "updates",
-        )
-        .from(OutdatedPackages::Table)
-        .to_owned()
+        );
+    from_summary(&mut select, &filter.within);
+    select
 }
 
 /// The page of `limit` packages from `offset` that the filter matches,
@@ -442,15 +495,14 @@ pub fn counts_query(filter: &ListFilter) -> SelectStatement {
 /// index on (devices, name, source, package_key) gives this order.
 pub fn page_query(filter: &ListFilter, limit: u64, offset: u64) -> SelectStatement {
     let mut select = Query::select();
-    select
-        .columns([
-            OutdatedPackages::Source,
-            OutdatedPackages::PackageId,
-            OutdatedPackages::Name,
-            OutdatedPackages::AvailableVersion,
-            OutdatedPackages::Devices,
-        ])
-        .from(OutdatedPackages::Table);
+    select.columns([
+        OutdatedPackages::Source,
+        OutdatedPackages::PackageId,
+        OutdatedPackages::Name,
+        OutdatedPackages::AvailableVersion,
+        OutdatedPackages::Devices,
+    ]);
+    from_summary(&mut select, &filter.within);
     if let Some(condition) = filter.matches() {
         select.cond_where(condition);
     }
@@ -568,7 +620,12 @@ pub struct DevicePage {
 /// the device `after`, in device ID order: read from
 /// `idx_device_packages_outdated_key` in that order, so about as many
 /// entries as the page holds, joined to their devices by key.
-pub fn devices_query(package: &PackageKey, after: Option<&str>, limit: u64) -> SelectStatement {
+pub fn devices_query(
+    package: &PackageKey,
+    within: &CompanySet,
+    after: Option<&str>,
+    limit: u64,
+) -> SelectStatement {
     let mut select = Query::select();
     select
         .column((DevicePackages::Table, DevicePackages::DeviceId))
@@ -592,7 +649,8 @@ pub fn devices_query(package: &PackageKey, after: Option<&str>, limit: u64) -> S
                 .eq(package.folded().into_owned()),
         )
         .and_where(Expr::col((DevicePackages::Table, DevicePackages::OutdatedSince)).is_not_null())
-        .and_where(Expr::col((Agents::Table, Agents::DeletionRequestedAt)).is_null());
+        .and_where(Expr::col((Agents::Table, Agents::DeletionRequestedAt)).is_null())
+        .and_where_option(within.company_condition((Agents::Table, Agents::CompanyId)));
     if let Some(after) = after {
         select.and_where(Expr::col((DevicePackages::Table, DevicePackages::DeviceId)).gt(after));
     }
@@ -611,6 +669,7 @@ pub fn devices_query(package: &PackageKey, after: Option<&str>, limit: u64) -> S
 pub async fn devices(
     executor: &mut impl Executor,
     package: &PackageKey,
+    within: &CompanySet,
     after: Option<&str>,
     limit: u64,
 ) -> db::Result<DevicePage> {
@@ -622,7 +681,7 @@ pub async fn devices(
     }
     // One more than the page says whether another follows.
     let mut devices: Vec<OutdatedDevice> = executor
-        .fetch_all(&devices_query(package, after, limit + 1))
+        .fetch_all(&devices_query(package, within, after, limit + 1))
         .await?;
     let more = devices.len() as u64 > limit;
     devices.truncate(usize::try_from(limit).unwrap_or(usize::MAX));

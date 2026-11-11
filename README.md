@@ -150,7 +150,9 @@ MeshRMM is in heavy development and not production ready.
 
 - Built-in accounts with passwords, authenticator apps, recovery codes and
   passkeys, plus optional single sign-on (OIDC) and SCIM provisioning.
-- Custom roles built from a list of permissions, and an audit log of
+- Custom roles built from a list of permissions, each covering every
+  company or only chosen ones, so a team of technicians sees and works on
+  its own customers' devices alone, and an audit log of
   sign-ins, changes, sessions, terminals, file transfers and changes, script
   runs, file deliveries,
   update installs, application installs, updates and uninstalls, wakes and
@@ -246,6 +248,8 @@ For developers:
   device list, resource monitoring, updates and removal
 - [Custom fields](docs/custom-fields.md): fields on devices and companies,
   secrets, and reading and writing them from scripts
+- [Users and roles](docs/users-and-roles.md): roles, permissions and
+  roles limited to some companies
 - [Wake-on-LAN](docs/wake-on-lan.md): waking offline devices through online
   ones on their network, and what the sleeping computer needs
 - [Maintenance windows](docs/maintenance-windows.md): putting devices in

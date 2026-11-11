@@ -16,6 +16,7 @@ use serde_json::json;
 
 use super::toolbox::toolbox_user;
 use crate::{
+    access::CompanySet,
     agents::parse_id,
     applications::jobs::RunAction,
     audit::{self, Target as AuditTarget},
@@ -99,13 +100,60 @@ pub struct StartJob {
     wait_hours: i64,
 }
 
+/// The companies whose devices a job may run on: those where the actor
+/// holds what the payload needs, and for a wide target `jobs.run_wide` too.
+/// Every device needs both in every company. Chosen companies out of reach
+/// are left out, as missing ones cover no device, and chosen devices out of
+/// reach are left out when the job resolves its devices.
+fn reach(
+    actor: &Authorized,
+    payload: &Payload,
+    target: &mut Target,
+) -> Result<CompanySet, ApiError> {
+    let needed = match payload {
+        Payload::Script { .. } => Permission::ScriptsRun,
+        Payload::File { .. } => Permission::FilesDeliver,
+        Payload::UpdateScan => Permission::UpdatesView,
+        Payload::UpdateInstall { .. } => Permission::UpdatesInstall,
+        Payload::Applications(_) => Permission::ApplicationsDeploy,
+        Payload::Wake => Permission::DevicesWake,
+    };
+    let mut within = actor.companies(needed);
+    // An install that puts its devices in maintenance needs that too.
+    if matches!(
+        payload,
+        Payload::UpdateInstall {
+            maintenance: true,
+            ..
+        }
+    ) {
+        within = within.intersection(&actor.companies(Permission::DevicesMaintenance));
+    }
+    if target.kind().is_wide() {
+        within = within.intersection(&actor.companies(Permission::JobsRunWide));
+    }
+    if target.kind() == TargetKind::All && !within.is_all() {
+        return Err(ApiError::forbidden(
+            "you can run jobs on every device only with permissions for every company; choose companies, tags or devices instead",
+        )
+        .with_code("permission_denied"));
+    }
+    if let (Target::Companies(ids), CompanySet::Only(reached)) = (&mut *target, &within) {
+        ids.retain(|id| reached.contains(id));
+        if ids.is_empty() {
+            return Err(jobs::no_devices());
+        }
+    }
+    Ok(within)
+}
+
 fn viewer(actor: &Authorized) -> Result<Viewer, ApiError> {
     if !Viewer::may_list(&actor.permissions) {
         return Err(actor
             .require(Permission::ScriptsRun)
             .expect_err("users without the permission are refused"));
     }
-    Ok(Viewer::new(&actor.user.id, &actor.permissions))
+    Ok(Viewer::new(&actor.user.id, &actor.access))
 }
 
 /// `POST /v1/jobs`: runs one of the user's scripts, sends one of their
@@ -238,6 +286,7 @@ pub async fn start(
             "only an update of applications runs where packages are outdated",
         ));
     }
+    let within = reach(&actor, &payload, &mut target)?;
     let plan = jobs::plan(
         &mut database,
         &state.agents,
@@ -251,6 +300,7 @@ pub async fn start(
             actor: user.actor.clone(),
             // A person started it: devices in maintenance run it too.
             scheduled: None,
+            within,
         },
     )
     .await?;
@@ -314,6 +364,9 @@ async fn visible(
         .await?
         .filter(|job| viewer.sees(job))
         .ok_or_else(|| ApiError::not_found("Job not found"))?;
+    if !viewer.reaches(&mut &state.database, id).await? {
+        return Err(ApiError::not_found("Job not found"));
+    }
     Ok((viewer, job))
 }
 
@@ -365,8 +418,9 @@ pub async fn devices(
     // Refused, like any other mistake, as an error the website can show.
     let QueryParameters(parameters) =
         parameters.map_err(|rejection| ApiError::bad_request(rejection.body_text()))?;
-    let (_, job) = visible(&state, &actor, &id).await?;
+    let (viewer, job) = visible(&state, &actor, &id).await?;
     let page = DevicePage {
+        within: viewer.within.clone(),
         outcome: parameters.outcome,
         after: parameters
             .after
@@ -380,12 +434,14 @@ pub async fn devices(
             .min(MAX_LIMIT),
     };
     let devices = jobs::devices(&mut &state.database, &id, &page, now_ms()).await?;
-    Ok(Json(DevicesPage {
-        devices,
+    let matching = if page.within.is_all() {
         // The counts the job was just read with: no second read of its
         // devices.
-        matching: job.counts.of(page.outcome),
-    }))
+        job.counts.of(page.outcome)
+    } else {
+        jobs::count_devices(&mut &state.database, &id, &page, now_ms()).await?
+    };
+    Ok(Json(DevicesPage { devices, matching }))
 }
 
 /// `POST /v1/jobs/{id}/cancel`: devices that haven't started don't. Runs
@@ -403,6 +459,9 @@ pub async fn cancel(
         .await?
         .filter(|job| viewer.sees(job))
         .ok_or_else(|| ApiError::not_found("Job not found"))?;
+    if !viewer.reaches(&mut transaction, &id).await? {
+        return Err(ApiError::not_found("Job not found"));
+    }
     if !viewer.may_cancel(&job) {
         return Err(ApiError::forbidden(
             "only the user who started a job, or for a policy's job users who manage automation, can cancel it",

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use super::rules::Severity;
 use crate::{
+    access::CompanySet,
     audit::Actor,
     db::{
         self, Executor,
@@ -199,6 +200,8 @@ pub struct Filter {
     /// A company, or `Some(None)` for devices in no company.
     pub company_id: Option<Option<String>>,
     pub device_id: Option<String>,
+    /// Only alerts of devices in these companies.
+    pub within: CompanySet,
 }
 
 /// Alerts matching `filter`: open ones first, then acknowledged, then
@@ -231,6 +234,11 @@ pub async fn list(
     if let Some(device_id) = &filter.device_id {
         select.and_where(Expr::col((Alerts::Table, Alerts::DeviceId)).eq(device_id.as_str()));
     }
+    select.and_where_option(
+        filter
+            .within
+            .company_condition((Agents::Table, Agents::CompanyId)),
+    );
     select
         .order_by_expr(
             Expr::cust(
@@ -256,9 +264,21 @@ pub struct Counts {
 }
 
 pub async fn counts(executor: &mut impl Executor) -> db::Result<Counts> {
+    counts_within(executor, &CompanySet::All).await
+}
+
+/// How many alerts of devices in `within` are unresolved.
+pub async fn counts_within(
+    executor: &mut impl Executor,
+    within: &CompanySet,
+) -> db::Result<Counts> {
+    let mut select = Query::select();
+    if let Some(condition) = within.device_condition((Alerts::Table, Alerts::DeviceId)) {
+        select.and_where(condition);
+    }
     let rows: Vec<(String, String, i64)> = executor
         .fetch_all(
-            &Query::select()
+            &select
                 .column((Alerts::Table, Alerts::State))
                 .column((AlertRules::Table, AlertRules::Severity))
                 .expr(Func::count(Expr::col((Alerts::Table, Alerts::Id))))

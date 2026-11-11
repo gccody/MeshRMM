@@ -1,17 +1,26 @@
 //! Permissions and the roles that grant them.
 //!
-//! A role is a named set of permissions; a user holds the union of their
-//! roles' permissions. The built-in Administrator role holds every permission
-//! implicitly, including ones added by later releases, so it can't be emptied.
+//! A role is a named set of permissions and the companies they reach: every
+//! company (the default), or chosen ones. A user holds a permission on a
+//! device when one of their roles grants it and reaches the device's
+//! company; [`crate::access::Access`] works that out. A device in no company
+//! is reached only by roles that reach every company. The built-in
+//! Administrator role holds every permission implicitly, including ones
+//! added by later releases, so it can't be emptied, and it always reaches
+//! every company.
 use std::{collections::BTreeSet, fmt, str::FromStr};
 
 use sea_query::{Cond, Expr, ExprTrait, LockType, Order, Query};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::db::{
-    self, Executor,
-    tables::{
-        EffectiveUserRoles, OidcProvider, RolePermissions, Roles, Settings, UserPasskeys, Users,
+use crate::{
+    access::{Access, CompanySet},
+    db::{
+        self, Executor,
+        tables::{
+            EffectiveUserRoles, OidcProvider, RoleCompanies, RolePermissions, Roles, Settings,
+            UserPasskeys, Users,
+        },
     },
 };
 
@@ -20,8 +29,24 @@ pub const ADMINISTRATOR_ROLE_ID: &str = "administrator";
 /// The ID (and `builtin` value) of the editable default role.
 pub const TECHNICIAN_ROLE_ID: &str = "technician";
 
+/// What a permission acts on, and so whether a role limited to some
+/// companies can grant it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reach {
+    /// Devices, or what belongs to a company (a deployment token): it is
+    /// judged for each device or company, and a role limited to some
+    /// companies grants it on their devices only.
+    Company,
+    /// Something the whole instance shares (users, roles, settings, the
+    /// toolbox's shared items, the application library, policies, alert
+    /// rules, companies and tags themselves, the audit log): only roles
+    /// that reach every company grant it.
+    Instance,
+}
+
 macro_rules! permissions {
-    ($($variant:ident = $name:literal: $description:literal,)+) => {
+    ($($variant:ident = $name:literal, $reach:ident: $description:literal,)+) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub enum Permission {
             $($variant,)+
@@ -41,6 +66,12 @@ macro_rules! permissions {
                     $(Permission::$variant => $description,)+
                 }
             }
+
+            pub fn reach(self) -> Reach {
+                match self {
+                    $(Permission::$variant => Reach::$reach,)+
+                }
+            }
         }
 
         impl FromStr for Permission {
@@ -56,54 +87,78 @@ macro_rules! permissions {
     };
 }
 
+// Each permission's name, its [`Reach`] and what it allows. `Company`
+// permissions are judged per device (or, for deployment tokens, per
+// company), so a role limited to some companies grants them on those
+// companies' devices only. `Instance` permissions act on what the whole
+// instance shares, so only roles that reach every company grant them; one
+// on a limited role would let its holder act beyond its companies (change
+// who holds which role, edit a shared script every company runs, or read
+// every company's audit trail).
+//
+// `jobs.run_wide` is `Company`: from a limited role it runs jobs on its own
+// companies, or on tags resolved within them, but never on every device.
+// `applications.view` is `Company` though it also shows the library, which
+// every holder may read; the packages it shows are those of devices in reach.
+// `alerts.view` likewise shows every rule but only the alerts of devices in
+// reach.
+// `custom_fields.manage` is `Instance`: field definitions (and which scripts may
+// use them) are shared by every company. Values are set per device under
+// `devices.edit` and per company under `companies.manage`, and a secret is
+// revealed under `custom_fields.reveal`, which is `Company`. The `tools.*`
+// permissions act on one device each, so they are `Company`.
+// `reports.view` is `Company`: from a limited role it makes reports only of
+// its companies' devices and sees only the reports it made. Schedules
+// (`reports.manage`, `Instance`) run on any device and email anyone, so only
+// roles over every company manage them.
 permissions! {
-    DevicesView = "devices.view": "See devices, their status and inventory.",
-    DevicesEdit = "devices.edit": "Add and remove devices' tags, edit their notes, and set their custom field values, one device or many.",
-    DevicesEnroll = "devices.enroll": "Create Agent installers and deployment tokens to enroll devices, and see and revoke deployment tokens.",
-    DevicesDelete = "devices.delete": "Delete devices and uninstall their Agents.",
-    DevicesRotateCredentials = "devices.rotate_credentials": "Rotate a device's Agent credential.",
-    DevicesWake = "devices.wake": "Wake offline devices with Wake-on-LAN, through online devices on their network.",
-    DevicesMaintenance = "devices.maintenance": "Put devices in maintenance, which silences their alerts and holds back their scheduled automation, and end it.",
-    CompaniesManage = "companies.manage": "Create, rename and delete companies, move devices between them, and set companies' custom field values, which their devices inherit.",
-    CustomFieldsManage = "custom_fields.manage": "Create, change, reorder and delete custom fields, including which fields toolbox scripts may read and write.",
-    CustomFieldsReveal = "custom_fields.reveal": "Reveal the values of secret custom fields. Each reveal is recorded in the audit log.",
-    TagsManage = "tags.manage": "Create, rename, recolor and delete tags.",
-    SessionsConnect = "sessions.connect": "Start remote sessions.",
-    SessionsConnectBackground = "sessions.connect_background": "Start remote sessions in the background, without the user seeing them.",
-    SessionsCloseAny = "sessions.close_any": "End other users' remote sessions.",
-    TerminalConnect = "terminal.connect": "Open terminals on devices as the signed-in user.",
-    TerminalConnectSystem = "terminal.connect_system": "Open terminals on devices as SYSTEM or root, the Agent's own account.",
-    ScriptsRun = "scripts.run": "Run toolbox scripts on devices.",
-    ScriptsManageShared = "scripts.manage_shared": "Create, edit and delete shared toolbox scripts.",
-    FilesDeliver = "files.deliver": "Deliver toolbox files to devices.",
-    FilesManageShared = "files.manage_shared": "Upload, edit and delete shared toolbox files.",
-    FilesBrowse = "files.browse": "Browse devices' folders and download their files in the website's file browser.",
-    FilesManage = "files.manage": "Upload files to devices, and create, rename, move and delete their files and folders, in the website's file browser.",
-    FilesSystem = "files.system": "Use the file browser as SYSTEM or root, the Agent's own account, which reaches every file on a device; without it, only as the signed-in user.",
-    ToolsProcessesView = "tools.processes.view": "See the processes running on devices, with their users and command lines, in the website's remote tools.",
-    ToolsProcessesManage = "tools.processes.manage": "End processes and process trees on devices, as SYSTEM or root, in the website's remote tools.",
-    ToolsServicesView = "tools.services.view": "See devices' services, their state, how they start and the accounts they run as, in the website's remote tools.",
-    ToolsServicesManage = "tools.services.manage": "Start, stop and restart devices' services and change how they start, in the website's remote tools.",
-    ToolsRegistryView = "tools.registry.view": "Browse Windows devices' registries, their keys and values, in the website's remote tools.",
-    ToolsRegistryManage = "tools.registry.manage": "Create, change, rename and delete keys and values in Windows devices' registries, in the website's remote tools.",
-    JobsRunWide = "jobs.run_wide": "Run scripts and send files on whole companies or on every device at once.",
-    AutomationManage = "automation.manage": "Create, edit and delete automation policies, which run shared scripts, scan for or install updates and wake devices on a schedule, or run on newly enrolled devices.",
-    UpdatesView = "updates.view": "See devices' pending operating system updates, scans and update history, and ask devices to scan.",
-    UpdatesInstall = "updates.install": "Install operating system updates on devices and restart them to finish.",
-    ApplicationsView = "applications.view": "See the application library, the third-party packages installed and outdated on devices and their application history, and ask devices to scan.",
-    ApplicationsDeploy = "applications.deploy": "Install, update and uninstall third-party applications on devices.",
-    ApplicationsManage = "applications.manage": "Add, edit and delete applications in the library, including custom installers, which run as SYSTEM or root.",
-    AlertsView = "alerts.view": "See alerts and the rules that raise them.",
-    AlertsRespond = "alerts.respond": "Acknowledge and resolve alerts.",
-    AlertsManage = "alerts.manage": "Create, edit and delete alert rules and notification channels.",
-    ReportsView = "reports.view": "See report templates, schedules and generated reports, and run and download reports.",
-    ReportsManage = "reports.manage": "Create, edit, run and delete report schedules and choose who they are emailed to, and delete generated reports.",
-    UsersManage = "users.manage": "Invite, disable and remove users and assign their roles.",
-    RolesManage = "roles.manage": "Create, edit and delete roles.",
-    SettingsManage = "settings.manage": "Change the instance name, remote session policy and how new Agent releases roll out to devices.",
-    AuthenticationManage = "authentication.manage": "Change the sign-in policy: two-factor requirement, password length, session lifetime and whether API tokens work.",
-    ApiTokensManage = "api_tokens.manage": "See and revoke every user's API tokens.",
-    AuditView = "audit.view": "Read the audit log.",
+    DevicesView = "devices.view", Company: "See devices, their status and inventory.",
+    DevicesEdit = "devices.edit", Company: "Add and remove devices' tags, edit their notes, and set their custom field values, one device or many.",
+    DevicesEnroll = "devices.enroll", Company: "Create Agent installers and deployment tokens to enroll devices, and see and revoke deployment tokens.",
+    DevicesDelete = "devices.delete", Company: "Delete devices and uninstall their Agents.",
+    DevicesRotateCredentials = "devices.rotate_credentials", Company: "Rotate a device's Agent credential.",
+    DevicesWake = "devices.wake", Company: "Wake offline devices with Wake-on-LAN, through online devices on their network.",
+    DevicesMaintenance = "devices.maintenance", Company: "Put devices in maintenance, which silences their alerts and holds back their scheduled automation, and end it.",
+    CompaniesManage = "companies.manage", Instance: "Create, rename and delete companies, move devices between them, and set companies' custom field values, which their devices inherit.",
+    CustomFieldsManage = "custom_fields.manage", Instance: "Create, change, reorder and delete custom fields, including which fields toolbox scripts may read and write.",
+    CustomFieldsReveal = "custom_fields.reveal", Company: "Reveal the values of secret custom fields. Each reveal is recorded in the audit log.",
+    TagsManage = "tags.manage", Instance: "Create, rename, recolor and delete tags.",
+    SessionsConnect = "sessions.connect", Company: "Start remote sessions.",
+    SessionsConnectBackground = "sessions.connect_background", Company: "Start remote sessions in the background, without the user seeing them.",
+    SessionsCloseAny = "sessions.close_any", Company: "End other users' remote sessions.",
+    TerminalConnect = "terminal.connect", Company: "Open terminals on devices as the signed-in user.",
+    TerminalConnectSystem = "terminal.connect_system", Company: "Open terminals on devices as SYSTEM or root, the Agent's own account.",
+    ScriptsRun = "scripts.run", Company: "Run toolbox scripts on devices.",
+    ScriptsManageShared = "scripts.manage_shared", Instance: "Create, edit and delete shared toolbox scripts.",
+    FilesDeliver = "files.deliver", Company: "Deliver toolbox files to devices.",
+    FilesManageShared = "files.manage_shared", Instance: "Upload, edit and delete shared toolbox files.",
+    FilesBrowse = "files.browse", Company: "Browse devices' folders and download their files in the website's file browser.",
+    FilesManage = "files.manage", Company: "Upload files to devices, and create, rename, move and delete their files and folders, in the website's file browser.",
+    FilesSystem = "files.system", Company: "Use the file browser as SYSTEM or root, the Agent's own account, which reaches every file on a device; without it, only as the signed-in user.",
+    ToolsProcessesView = "tools.processes.view", Company: "See the processes running on devices, with their users and command lines, in the website's remote tools.",
+    ToolsProcessesManage = "tools.processes.manage", Company: "End processes and process trees on devices, as SYSTEM or root, in the website's remote tools.",
+    ToolsServicesView = "tools.services.view", Company: "See devices' services, their state, how they start and the accounts they run as, in the website's remote tools.",
+    ToolsServicesManage = "tools.services.manage", Company: "Start, stop and restart devices' services and change how they start, in the website's remote tools.",
+    ToolsRegistryView = "tools.registry.view", Company: "Browse Windows devices' registries, their keys and values, in the website's remote tools.",
+    ToolsRegistryManage = "tools.registry.manage", Company: "Create, change, rename and delete keys and values in Windows devices' registries, in the website's remote tools.",
+    JobsRunWide = "jobs.run_wide", Company: "Run scripts and send files on whole companies or on every device at once.",
+    AutomationManage = "automation.manage", Instance: "Create, edit and delete automation policies, which run shared scripts, scan for or install updates and wake devices on a schedule, or run on newly enrolled devices.",
+    UpdatesView = "updates.view", Company: "See devices' pending operating system updates, scans and update history, and ask devices to scan.",
+    UpdatesInstall = "updates.install", Company: "Install operating system updates on devices and restart them to finish.",
+    ApplicationsView = "applications.view", Company: "See the application library, the third-party packages installed and outdated on devices and their application history, and ask devices to scan.",
+    ApplicationsDeploy = "applications.deploy", Company: "Install, update and uninstall third-party applications on devices.",
+    ApplicationsManage = "applications.manage", Instance: "Add, edit and delete applications in the library, including custom installers, which run as SYSTEM or root.",
+    AlertsView = "alerts.view", Company: "See alerts and the rules that raise them.",
+    AlertsRespond = "alerts.respond", Company: "Acknowledge and resolve alerts.",
+    AlertsManage = "alerts.manage", Instance: "Create, edit and delete alert rules and notification channels.",
+    ReportsView = "reports.view", Company: "See report templates, schedules and generated reports, and run and download reports.",
+    ReportsManage = "reports.manage", Instance: "Create, edit, run and delete report schedules and choose who they are emailed to, and delete generated reports.",
+    UsersManage = "users.manage", Instance: "Invite, disable and remove users and assign their roles.",
+    RolesManage = "roles.manage", Instance: "Create, edit and delete roles.",
+    SettingsManage = "settings.manage", Instance: "Change the instance name, remote session policy and how new Agent releases roll out to devices.",
+    AuthenticationManage = "authentication.manage", Instance: "Change the sign-in policy: two-factor requirement, password length, session lifetime and whether API tokens work.",
+    ApiTokensManage = "api_tokens.manage", Instance: "See and revoke every user's API tokens.",
+    AuditView = "audit.view", Instance: "Read the audit log.",
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -144,11 +199,36 @@ pub struct Role {
     /// `"administrator"` or `"technician"` for the built-in roles.
     pub builtin: Option<String>,
     pub permissions: Permissions,
+    /// Whether the permissions reach every company's devices, and devices
+    /// in no company.
+    pub all_companies: bool,
+    /// The companies they reach otherwise, sorted; empty with
+    /// `all_companies`.
+    pub company_ids: BTreeSet<String>,
 }
 
 impl Role {
     pub fn is_administrator(&self) -> bool {
         self.builtin.as_deref() == Some(ADMINISTRATOR_ROLE_ID)
+    }
+
+    /// The companies the role's permissions reach.
+    pub fn companies(&self) -> CompanySet {
+        if self.all_companies {
+            CompanySet::All
+        } else {
+            CompanySet::Only(self.company_ids.clone())
+        }
+    }
+
+    /// The permissions the role grants: on a role limited to some
+    /// companies, only those of [`Reach::Company`]. The API refuses to save
+    /// others on one, so this only matters for rows written otherwise.
+    pub fn grants(&self) -> impl Iterator<Item = Permission> + '_ {
+        self.permissions
+            .iter()
+            .copied()
+            .filter(|permission| self.all_companies || permission.reach() == Reach::Company)
     }
 }
 
@@ -158,35 +238,50 @@ struct RoleRow {
     name: String,
     description: String,
     builtin: Option<String>,
+    all_companies: bool,
 }
 
-/// Loads roles with their permissions: every role, or only `ids`.
+/// Loads roles with their permissions and companies: every role, or only
+/// `ids`.
 pub async fn load_roles(
     executor: &mut impl Executor,
     ids: Option<&[String]>,
 ) -> db::Result<Vec<Role>> {
     let mut select = Query::select();
     select
-        .columns([Roles::Id, Roles::Name, Roles::Description, Roles::Builtin])
+        .columns([
+            Roles::Id,
+            Roles::Name,
+            Roles::Description,
+            Roles::Builtin,
+            Roles::AllCompanies,
+        ])
         .from(Roles::Table)
         .order_by(Roles::Name, Order::Asc);
     let mut grants = Query::select();
     grants
         .columns([RolePermissions::RoleId, RolePermissions::Permission])
         .from(RolePermissions::Table);
+    let mut reached = Query::select();
+    reached
+        .columns([RoleCompanies::RoleId, RoleCompanies::CompanyId])
+        .from(RoleCompanies::Table);
     if let Some(ids) = ids {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
         select.and_where(Expr::col(Roles::Id).is_in(ids.iter().cloned()));
         grants.and_where(Expr::col(RolePermissions::RoleId).is_in(ids.iter().cloned()));
+        reached.and_where(Expr::col(RoleCompanies::RoleId).is_in(ids.iter().cloned()));
     }
     let rows: Vec<RoleRow> = executor.fetch_all(&select).await?;
     let grants: Vec<(String, String)> = executor.fetch_all(&grants).await?;
+    let reached: Vec<(String, String)> = executor.fetch_all(&reached).await?;
     Ok(rows
         .into_iter()
         .map(|row| {
-            let permissions = if row.builtin.as_deref() == Some(ADMINISTRATOR_ROLE_ID) {
+            let administrator = row.builtin.as_deref() == Some(ADMINISTRATOR_ROLE_ID);
+            let permissions = if administrator {
                 all_permissions()
             } else {
                 grants
@@ -196,12 +291,24 @@ pub async fn load_roles(
                     .filter_map(|(_, name)| name.parse().ok())
                     .collect()
             };
+            let all_companies = administrator || row.all_companies;
+            let company_ids = if all_companies {
+                BTreeSet::new()
+            } else {
+                reached
+                    .iter()
+                    .filter(|(role_id, _)| *role_id == row.id)
+                    .map(|(_, company_id)| company_id.clone())
+                    .collect()
+            };
             Role {
                 id: row.id,
                 name: row.name,
                 description: row.description,
                 builtin: row.builtin,
                 permissions,
+                all_companies,
+                company_ids,
             }
         })
         .collect())
@@ -326,12 +433,9 @@ fn enabled_administrators() -> sea_query::SelectStatement {
         .to_owned()
 }
 
-/// Every permission any of `roles` grants.
-pub fn permissions_of(roles: &[Role]) -> Permissions {
-    roles
-        .iter()
-        .flat_map(|role| role.permissions.iter().copied())
-        .collect()
+/// What `roles` grant, and where; see [`Access`].
+pub fn access_of(roles: &[Role]) -> Access {
+    Access::of(roles)
 }
 
 #[cfg(test)]
@@ -366,27 +470,15 @@ mod tests {
     }
 
     #[test]
-    fn a_users_permissions_are_the_union_of_their_roles() {
-        let role = |id: &str, builtin: Option<&str>, permissions: &[Permission]| Role {
-            id: id.to_owned(),
-            name: id.to_owned(),
-            description: String::new(),
-            builtin: builtin.map(str::to_owned),
-            permissions: permissions.iter().copied().collect(),
-        };
-        let roles = [
-            role("a", None, &[Permission::DevicesView]),
-            role(
-                "b",
-                None,
-                &[Permission::DevicesView, Permission::ScriptsRun],
-            ),
-        ];
-        assert_eq!(
-            permissions_of(&roles),
-            [Permission::DevicesView, Permission::ScriptsRun].into()
-        );
-        assert!(permissions_of(&[]).is_empty());
-        assert!(role("administrator", Some(ADMINISTRATOR_ROLE_ID), &[]).is_administrator());
+    fn every_permission_has_a_reach() {
+        let instance = Permission::ALL
+            .iter()
+            .filter(|permission| permission.reach() == Reach::Instance)
+            .map(|permission| permission.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(instance.contains("users.manage"));
+        assert!(instance.contains("audit.view"));
+        assert!(!instance.contains("devices.view"));
+        assert!(!instance.contains("jobs.run_wide"));
     }
 }

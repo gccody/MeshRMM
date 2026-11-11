@@ -3,18 +3,33 @@
 //! the report is made.
 //!
 //! Every query a report makes takes its devices from [`Scope::devices`], so
-//! what a report may cover is decided here and nowhere else.
+//! what a report may cover is decided here and nowhere else. A report made
+//! by a user whose `reports.view` reaches only some companies keeps those
+//! companies (`within`), and covers only their devices whatever it chose.
 use sea_query::{Expr, ExprTrait, IntoColumnRef, SelectStatement, SimpleExpr};
 use serde::Deserialize;
 
 use crate::{
-    db::{self, Executor},
+    access::CompanySet,
+    db::{self, Executor, tables::Agents},
     http::ApiError,
     targets::{Choice, TagMatch, Target, TargetKind},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Scope(Target);
+pub struct Scope {
+    target: Target,
+    /// The companies its devices are taken from: those its maker reached.
+    within: CompanySet,
+}
+
+/// The part of a stored scope that says which companies its maker reached;
+/// absent for every company.
+#[derive(Deserialize)]
+struct StoredReach {
+    #[serde(default)]
+    within: Option<Vec<String>>,
+}
 
 /// A scope as requests send it and reports store it.
 #[derive(Debug, Clone, Deserialize)]
@@ -30,7 +45,25 @@ pub struct ScopeInput {
 
 impl Scope {
     pub fn all() -> Self {
-        Self(Target::All)
+        Self::of(Target::All)
+    }
+
+    fn of(target: Target) -> Self {
+        Self {
+            target,
+            within: CompanySet::All,
+        }
+    }
+
+    /// The scope, covering only the devices of companies in `within`.
+    pub fn within(mut self, within: CompanySet) -> Self {
+        self.within = within;
+        self
+    }
+
+    /// The companies its devices are taken from.
+    pub fn reach(&self) -> &CompanySet {
+        &self.within
     }
 
     /// From a request: every device, companies or tags; chosen devices and
@@ -54,7 +87,7 @@ impl Scope {
                 ..Choice::default()
             },
         )
-        .map(Self)
+        .map(Self::of)
         .map_err(|error| error.with_code("invalid_report"))
     }
 
@@ -78,38 +111,52 @@ impl Scope {
             target,
             Target::All | Target::Companies(_) | Target::Tags { .. }
         )
-        .then_some(Self(target))
+        .then_some(Self::of(target))
     }
 
     /// From the JSON a report keeps.
     pub fn from_json(text: &str) -> Option<Self> {
         let input: ScopeInput = serde_json::from_str(text).ok()?;
-        Self::from_stored(
+        let reach: StoredReach = serde_json::from_str(text).ok()?;
+        let scope = Self::from_stored(
             input.target.as_str(),
             input.tag_match.as_str(),
             input.company_ids,
             input.tag_ids,
-        )
+        )?;
+        Some(scope.within(match reach.within {
+            None => CompanySet::All,
+            Some(ids) => CompanySet::Only(ids.into_iter().collect()),
+        }))
     }
 
     pub fn to_json(&self) -> String {
-        serde_json::json!({
-            "target": self.0.kind(),
-            "company_ids": self.0.company_ids(),
-            "tag_ids": self.0.tag_ids(),
-            "tag_match": self.0.tag_match(),
-        })
-        .to_string()
+        let mut json = serde_json::json!({
+            "target": self.target.kind(),
+            "company_ids": self.target.company_ids(),
+            "tag_ids": self.target.tag_ids(),
+            "tag_match": self.target.tag_match(),
+        });
+        if let CompanySet::Only(ids) = &self.within {
+            json["within"] = ids.iter().cloned().collect::<Vec<_>>().into();
+        }
+        json.to_string()
     }
 
     pub fn target(&self) -> &Target {
-        &self.0
+        &self.target
     }
 
     /// The IDs of the enrolled devices the report covers, as a subquery.
     pub fn devices(&self) -> SelectStatement {
         let mut devices = crate::agents::active();
-        if let Some(condition) = self.0.condition() {
+        if let Some(condition) = self.target.condition() {
+            devices.and_where(condition);
+        }
+        if let Some(condition) = self
+            .within
+            .company_condition((Agents::Table, Agents::CompanyId))
+        {
             devices.and_where(condition);
         }
         devices
@@ -122,14 +169,14 @@ impl Scope {
 
     /// Checks that the chosen companies and tags exist.
     pub async fn check_references(&self, executor: &mut impl Executor) -> Result<(), ApiError> {
-        self.0.check_references(executor).await
+        self.target.check_references(executor).await
     }
 
     /// The scope in words: "Every device", "Acme and Globex" or "Tagged
     /// servers or london".
     pub async fn label(&self, executor: &mut impl Executor) -> db::Result<String> {
         Ok(self
-            .0
+            .target
             .names(executor)
             .await?
             .unwrap_or_else(|| "Every device".to_owned()))
@@ -164,5 +211,14 @@ mod tests {
             Scope::from_json(&Scope::all().to_json()),
             Some(Scope::all())
         );
+        // The companies a limited maker reached are kept, and stored only
+        // when limited.
+        let limited = tags.clone().within(CompanySet::Only([A.to_owned()].into()));
+        assert_eq!(Scope::from_json(&limited.to_json()), Some(limited.clone()));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&limited.to_json()).unwrap()["within"],
+            serde_json::json!([A])
+        );
+        assert_ne!(limited, tags);
     }
 }

@@ -587,7 +587,19 @@ async fn access(
         let typed = shared.typed.swap(false, Ordering::Relaxed);
         match session::load(state, token, ip, typed).await {
             Ok(signed_in) => match Authorized::new(signed_in) {
-                Ok(authorized) if authorized.has(needed) => {}
+                Ok(authorized) if authorized.has(needed) => {
+                    // The device may have moved out of the user's companies.
+                    if !authorized.everywhere(needed) {
+                        match authorized
+                            .require_device(&mut &state.database, needed, &requested.device_id)
+                            .await
+                        {
+                            Ok(()) => {}
+                            Err(error) if error.status().is_server_error() => {}
+                            Err(_) => return End::PermissionRemoved,
+                        }
+                    }
+                }
                 Ok(_) => return End::PermissionRemoved,
                 Err(_) => return End::SignedOut,
             },

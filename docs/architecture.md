@@ -376,6 +376,13 @@ Roles are built from these permissions (`server/src/rbac.rs`):
 `alerts.view`, `alerts.respond`, `alerts.manage`, `reports.view`, `reports.manage`, `users.manage`, `roles.manage`, `settings.manage`, `authentication.manage`,
 `api_tokens.manage`, `audit.view`.
 
+Each role covers every company or only chosen ones. `server/src/access.rs`
+judges permissions per device: a user holds one on a device when a role
+grants it and covers the device's company, and permissions that act on the
+whole instance count only from roles over every company. `Authorized`
+carries the result (`Access`) with `require_device`, `require_company` and
+SQL conditions for lists; see [Users and roles](users-and-roles.md).
+
 Administrator holds every permission and can't be deleted or emptied;
 Technician is an editable default. Single sign-on, SCIM and email settings
 are limited to administrators, because whoever controls them can sign in as
@@ -423,9 +430,12 @@ committed:
 - an SSO sign-in (`GET /v1/auth/sso/callback`), which reads the user's
   groups again;
 - SCIM requests that change or delete a user, or change the members of, or
-  delete, a group that grants a role.
+  delete, a group that grants a role;
+- moving a device to another company, or deleting a company, which changes
+  who reaches its devices through roles limited to some companies.
 
-Everything else (devices, tags, notes, custom fields, companies, scripts, files, alerts,
+Everything else (devices, tags, notes, custom fields, creating and renaming
+companies, scripts, files, alerts,
 automation, applications) changes no one's access and doesn't signal, so a
 busy server doesn't make every open socket check its access for nothing.
 Deleting a device ends its remote session directly. A change made outside

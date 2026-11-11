@@ -291,6 +291,8 @@ pub struct Filter {
     /// A company's ID, or `Some(None)` for devices in none.
     pub company: Option<Option<String>>,
     pub policy_id: Option<String>,
+    /// Only devices in these companies: those the reader may see.
+    pub within: crate::access::CompanySet,
 }
 
 /// Windows that `filter` shows at `now`, up to `limit`: open ones by when
@@ -341,6 +343,11 @@ pub async fn list(
     if let Some(policy_id) = &filter.policy_id {
         select.and_where(column(MaintenanceWindows::PolicyId).eq(policy_id.as_str()));
     }
+    select.and_where_option(
+        filter
+            .within
+            .company_condition((Agents::Table, Agents::CompanyId)),
+    );
     match filter.showing {
         Showing::Past | Showing::All => {
             select

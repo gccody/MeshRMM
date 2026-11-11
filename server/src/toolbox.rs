@@ -22,6 +22,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::{
+    access::Access,
     agents,
     audit::{self, Actor, Target},
     db::{
@@ -71,6 +72,9 @@ impl Kind {
 pub struct ToolboxUser {
     pub user_id: String,
     pub permissions: Permissions,
+    /// The companies each permission reaches: scripts and files go only to
+    /// devices in them.
+    pub access: Access,
     /// Recorded as the actor of what the user does.
     pub actor: Actor,
 }
@@ -472,6 +476,9 @@ pub async fn start_script_run(
     let script = visible_script(&mut transaction, user, script_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Script not found"))?;
+    user.access
+        .require_device(&mut transaction, Permission::ScriptsRun, device_id)
+        .await?;
     let platform = agents::active_platform(&mut transaction, device_id)
         .await?
         .ok_or_else(device_not_found)?;
@@ -572,9 +579,9 @@ pub async fn start_file_delivery(
     let file = visible_file(&mut transaction, user, file_id)
         .await?
         .ok_or_else(|| ApiError::not_found("File not found"))?;
-    if !agents::is_active(&mut transaction, device_id).await? {
-        return Err(device_not_found());
-    }
+    user.access
+        .require_device(&mut transaction, Permission::FilesDeliver, device_id)
+        .await?;
     let place = hold_place(state, device_id)?;
     let delivery_id = new_id();
     let now = now_ms();
@@ -899,6 +906,7 @@ mod tests {
         ToolboxUser {
             user_id: "me".to_owned(),
             permissions: permissions.iter().copied().collect(),
+            access: Access::default(),
             actor: Actor::cli(),
         }
     }

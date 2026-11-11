@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    RoleRef, create_reset, ensure_within, password_resets::ADMIN_RESET_TTL_MS,
+    RoleRef, create_reset, ensure_roles_within, password_resets::ADMIN_RESET_TTL_MS,
     require_administrator,
 };
 use crate::{
@@ -213,7 +213,7 @@ async fn manageable(
     if roles.iter().any(Role::is_administrator) {
         require_administrator(actor)?;
     }
-    ensure_within(actor, &rbac::permissions_of(&roles), "manage this user")?;
+    ensure_roles_within(actor, &roles, "manage this user")?;
     Ok((user, roles))
 }
 
@@ -278,7 +278,7 @@ pub(super) async fn grantable_roles(
     if roles.iter().any(Role::is_administrator) {
         require_administrator(actor)?;
     }
-    ensure_within(actor, &rbac::permissions_of(&roles), "grant these roles")?;
+    ensure_roles_within(actor, &roles, "grant these roles")?;
     Ok(roles)
 }
 

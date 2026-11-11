@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
+    access::CompanySet,
     agents::parse_id,
     audit::{self, Target},
     auth::Authorized,
@@ -41,10 +42,11 @@ pub struct TagView {
 }
 
 /// How many rows of `table` name each tag; for device tags, only those of
-/// devices that aren't deleted.
+/// devices that aren't deleted, in `within`.
 async fn counts(
     executor: &mut impl Executor,
     table: &'static str,
+    within: &CompanySet,
 ) -> Result<HashMap<String, i64>, ApiError> {
     let column = || Expr::col((Alias::new(table), Alias::new("tag_id")));
     let mut select = Query::select();
@@ -58,15 +60,21 @@ async fn counts(
             Expr::col((DeviceTags::Table, DeviceTags::DeviceId))
                 .in_subquery(crate::agents::active()),
         );
+        select.and_where_option(within.device_condition((DeviceTags::Table, DeviceTags::DeviceId)));
     }
     let rows: Vec<(String, i64)> = executor.fetch_all(&select).await?;
     Ok(rows.into_iter().collect())
 }
 
-async fn views(executor: &mut impl Executor, tags: Vec<Tag>) -> Result<Vec<TagView>, ApiError> {
-    let devices = counts(executor, "device_tags").await?;
-    let policies = counts(executor, "automation_policy_tags").await?;
-    let rules = counts(executor, "alert_rule_tags").await?;
+/// The tags with their counts; of devices, only those in `within`.
+async fn views(
+    executor: &mut impl Executor,
+    tags: Vec<Tag>,
+    within: &CompanySet,
+) -> Result<Vec<TagView>, ApiError> {
+    let devices = counts(executor, "device_tags", within).await?;
+    let policies = counts(executor, "automation_policy_tags", &CompanySet::All).await?;
+    let rules = counts(executor, "alert_rule_tags", &CompanySet::All).await?;
     Ok(tags
         .into_iter()
         .map(|tag| TagView {
@@ -95,7 +103,14 @@ pub async fn list(
     actor.require(Permission::DevicesView)?;
     let mut database = &state.database;
     let tags = tags::load(&mut database, None).await?;
-    Ok(Json(views(&mut database, tags).await?))
+    Ok(Json(
+        views(
+            &mut database,
+            tags,
+            &actor.companies(Permission::DevicesView),
+        )
+        .await?,
+    ))
 }
 
 fn validate_name(raw: &str) -> Result<String, ApiError> {
@@ -252,7 +267,7 @@ pub async fn update(
         )
         .await?;
     }
-    let view = views(&mut transaction, vec![tag])
+    let view = views(&mut transaction, vec![tag], &CompanySet::All)
         .await?
         .pop()
         .expect("one tag in, one out");
@@ -375,6 +390,9 @@ pub async fn change(
                     &crate::agents::active()
                         .column(Agents::Name)
                         .and_where(Expr::col(Agents::Id).is_in(chunk.iter().cloned()))
+                        .and_where_option(
+                            actor.companies_condition(Permission::DevicesEdit, Agents::CompanyId),
+                        )
                         .to_owned(),
                 )
                 .await?,

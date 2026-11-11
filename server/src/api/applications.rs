@@ -125,7 +125,9 @@ fn require_installers(
     valid: &library::Valid,
     old: Option<&Application>,
 ) -> Result<(), ApiError> {
-    if valid.changes_installers(old) && !actor.has(Permission::ScriptsRun) {
+    // Policies install it on devices in every company, so scripts.run must
+    // reach every company.
+    if valid.changes_installers(old) && !actor.everywhere(Permission::ScriptsRun) {
         return Err(ApiError::forbidden(
             "adding or changing a custom installer needs the scripts.run permission too, as it runs as SYSTEM or root",
         )
@@ -278,11 +280,16 @@ pub async fn delete(
 }
 
 /// The active device named by a path.
-async fn device(state: &AppState, id: &str) -> Result<String, ApiError> {
+async fn device(
+    state: &AppState,
+    actor: &Authorized,
+    permission: Permission,
+    id: &str,
+) -> Result<String, ApiError> {
     let id = parse_id(id, "device")?;
-    if !agents::is_active(&mut &state.database, &id).await? {
-        return Err(ApiError::not_found("Device not found"));
-    }
+    actor
+        .require_device(&mut &state.database, permission, &id)
+        .await?;
     Ok(id)
 }
 
@@ -327,7 +334,7 @@ pub async fn device_packages(
     Path(id): Path<String>,
 ) -> Result<Json<DevicePackages>, ApiError> {
     actor.require(Permission::ApplicationsView)?;
-    let id = device(&state, &id).await?;
+    let id = device(&state, &actor, Permission::ApplicationsView, &id).await?;
     let mut database = &state.database;
     // The status first: a scan stores its status and packages together, so
     // the packages read after it are from that scan or a newer one. (Read
@@ -361,7 +368,7 @@ pub async fn scan(
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<Run>), ApiError> {
     actor.require(Permission::ApplicationsView)?;
-    let id = device(&state, &id).await?;
+    let id = device(&state, &actor, Permission::ApplicationsView, &id).await?;
     let place = hold_place(&state, &id)?;
     let mut database = &state.database;
     if let Some(run_id) = runs::pending(&mut database, &id, true).await?
@@ -440,7 +447,7 @@ pub async fn start_run(
     JsonBody(request): JsonBody<Request>,
 ) -> Result<(StatusCode, Json<Run>), ApiError> {
     actor.require(Permission::ApplicationsDeploy)?;
-    let id = device(&state, &id).await?;
+    let id = device(&state, &actor, Permission::ApplicationsDeploy, &id).await?;
     let place = hold_place(&state, &id)?;
     let mut transaction = state.database.begin().await?;
     if applications::busy(&mut transaction, &id).await? {
@@ -529,6 +536,7 @@ pub async fn list_runs(
         &Filter {
             device_id,
             action: filter.action,
+            within: actor.companies(Permission::ApplicationsView),
         },
         limit,
     )
@@ -544,10 +552,18 @@ pub async fn get_run(
 ) -> Result<Json<Run>, ApiError> {
     actor.require(Permission::ApplicationsView)?;
     let id = parse_id(&id, "application run")?;
-    runs::get(&mut &state.database, &id, true)
+    let run = runs::get(&mut &state.database, &id, true)
         .await?
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found("Application run not found"))
+        .ok_or_else(|| ApiError::not_found("Application run not found"))?;
+    if !actor.everywhere(Permission::ApplicationsView) {
+        let company = crate::access::device_company(&mut &state.database, &run.device_id).await?;
+        if !company
+            .is_some_and(|company| actor.covers(Permission::ApplicationsView, company.as_deref()))
+        {
+            return Err(ApiError::not_found("Application run not found"));
+        }
+    }
+    Ok(Json(run))
 }
 
 /// The most outdated packages, or devices of one, a page holds.
@@ -591,7 +607,10 @@ pub async fn outdated(
     let mut database = &state.database;
     let library = library::load(&mut database, None).await?;
     let matches = Matches::new(&library);
-    let filter = outdated::ListFilter::new(text, &matches);
+    let filter = outdated::ListFilter {
+        within: actor.companies(Permission::ApplicationsView),
+        ..outdated::ListFilter::new(text, &matches)
+    };
     Ok(Json(
         outdated::page(
             &mut database,
@@ -637,7 +656,14 @@ pub async fn outdated_devices(
         .unwrap_or(DEFAULT_OUTDATED_PAGE)
         .min(MAX_OUTDATED_PAGE);
     Ok(Json(
-        outdated::devices(&mut &state.database, &package, after.as_deref(), limit).await?,
+        outdated::devices(
+            &mut &state.database,
+            &package,
+            &actor.companies(Permission::ApplicationsView),
+            after.as_deref(),
+            limit,
+        )
+        .await?,
     ))
 }
 

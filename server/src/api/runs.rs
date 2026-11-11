@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{require_any, toolbox::toolbox_user};
 use crate::{
+    access::CompanySet,
     agents::parse_id,
     auth::Authorized,
     automation::jobs::{self, Viewer},
@@ -83,22 +84,44 @@ fn require_history(actor: &Authorized, permission: Permission) -> Result<bool, A
     Ok(actor.has(Permission::AuditView))
 }
 
-/// Whether the user may read a run or delivery: theirs, everyone's, or one
-/// of a job they may see.
+/// The companies whose devices' runs or deliveries the actor reads, when
+/// they don't read everyone's.
+fn history_reach(actor: &Authorized, permission: Permission) -> CompanySet {
+    actor.access.companies_of_any(&[
+        permission,
+        Permission::AuditView,
+        Permission::AutomationManage,
+    ])
+}
+
+/// Whether the user may read a run or delivery: everyone's, or on a device
+/// in their companies theirs or one of a job they may see.
 async fn visible(
     state: &AppState,
     actor: &Authorized,
+    permission: Permission,
     everyone: bool,
+    device_id: &str,
     requested_by_user_id: &str,
     job_id: Option<&str>,
 ) -> Result<bool, ApiError> {
-    if everyone || requested_by_user_id == actor.user.id {
+    if everyone {
+        return Ok(true);
+    }
+    let reach = history_reach(actor, permission);
+    if !reach.is_all() {
+        let company = crate::access::device_company(&mut &state.database, device_id).await?;
+        if !company.is_some_and(|company| reach.covers(company.as_deref())) {
+            return Ok(false);
+        }
+    }
+    if requested_by_user_id == actor.user.id {
         return Ok(true);
     }
     let Some(job_id) = job_id else {
         return Ok(false);
     };
-    let viewer = Viewer::new(&actor.user.id, &actor.permissions);
+    let viewer = Viewer::new(&actor.user.id, &actor.access);
     Ok(jobs::sees_job(&mut &state.database, &viewer, job_id).await?)
 }
 
@@ -127,6 +150,10 @@ pub async fn list_runs(
     }
     if !everyone {
         select.and_where(Expr::col(ScriptRuns::RequestedByUserId).eq(actor.user.id.as_str()));
+        select.and_where_option(
+            history_reach(&actor, Permission::ScriptsRun)
+                .device_condition((ScriptRuns::Table, ScriptRuns::DeviceId)),
+        );
     }
     let rows: Vec<RunRow> = state.database.fetch_all(&select).await?;
     let now = now_ms();
@@ -158,7 +185,9 @@ pub async fn get_run(
             if visible(
                 &state,
                 &actor,
+                Permission::ScriptsRun,
                 everyone,
+                &row.device_id,
                 &row.requested_by_user_id,
                 row.job_id.as_deref(),
             )
@@ -229,6 +258,10 @@ pub async fn list_deliveries(
     }
     if !everyone {
         select.and_where(Expr::col(FileDeliveries::RequestedByUserId).eq(actor.user.id.as_str()));
+        select.and_where_option(
+            history_reach(&actor, Permission::FilesDeliver)
+                .device_condition((FileDeliveries::Table, FileDeliveries::DeviceId)),
+        );
     }
     let rows: Vec<DeliveryRow> = state.database.fetch_all(&select).await?;
     let now = now_ms();
@@ -260,7 +293,9 @@ pub async fn get_delivery(
             if visible(
                 &state,
                 &actor,
+                Permission::FilesDeliver,
                 everyone,
+                &row.device_id,
                 &row.requested_by_user_id,
                 row.job_id.as_deref(),
             )

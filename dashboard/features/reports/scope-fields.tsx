@@ -3,8 +3,10 @@ import { TagTargetFields } from "../tags/tag-chip";
 import type { ScopeDraft } from "./model";
 
 // Which devices a report covers: every one, chosen companies' or tagged ones.
-export function ScopeFields({ name, draft, companies, tags, onChange }: {
+// Without reports.view in every company there is no "every device".
+export function ScopeFields({ name, draft, companies, tags, onChange, everyDevice = true }: {
   name: string;
+  everyDevice?: boolean;
   draft: ScopeDraft;
   companies: readonly Company[];
   tags: readonly Tag[];
@@ -15,7 +17,7 @@ export function ScopeFields({ name, draft, companies, tags, onChange }: {
     <>
       <fieldset className="choice-list">
         <legend>Devices</legend>
-        <label><input type="radio" name={name} checked={draft.target === "all"} onChange={() => onChange({ target: "all" })} /><span><strong>Every device</strong>As they are when the report is made.</span></label>
+        {everyDevice && <label><input type="radio" name={name} checked={draft.target === "all"} onChange={() => onChange({ target: "all" })} /><span><strong>Every device</strong>As they are when the report is made.</span></label>}
         <label><input type="radio" name={name} checked={draft.target === "companies"} onChange={() => onChange({ target: "companies" })} disabled={!companies.length && draft.target !== "companies"} /><span><strong>Devices of chosen companies</strong>{companies.length ? "Choose them below." : "There are no companies yet."}</span></label>
         <label><input type="radio" name={name} checked={draft.target === "tags"} onChange={() => onChange({ target: "tags" })} disabled={!tags.length && draft.target !== "tags"} /><span><strong>Devices with chosen tags</strong>{tags.length ? "The devices that have them when the report is made." : "There are no tags yet."}</span></label>
       </fieldset>

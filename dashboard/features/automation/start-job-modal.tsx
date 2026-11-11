@@ -7,6 +7,7 @@ import { LANGUAGE_LABELS, RUN_AS_LABELS, type RunAs, type Toolbox, formatBytes, 
 import type { TagMatch } from "../tags/model";
 import { TagTargetFields } from "../tags/tag-chip";
 import { fetchToolbox } from "../toolbox/toolbox-api";
+import { canEverywhere } from "../auth/types";
 import { useWorkspace } from "../workspace/workspace-context";
 import { useCompanies, useDevices, useTags } from "../agents/use-devices";
 import { startJob } from "./automation-api";
@@ -35,7 +36,7 @@ type Props = {
  * devices with chosen tags or every device, then opens the job's page.
  */
 export function StartJobModal({ kind: initialKind, itemId, deviceIds, toolbox: givenToolbox, onClose, returnFocus }: Props) {
-  const { authorizedFetch, inventory, can } = useWorkspace();
+  const { account, authorizedFetch, inventory, can } = useWorkspace();
   const agents = useDevices(inventory.devices);
   const companies = useCompanies(inventory.devices);
   const tags = useTags(inventory.devices);
@@ -51,6 +52,8 @@ export function StartJobModal({ kind: initialKind, itemId, deviceIds, toolbox: g
   const [runAs, setRunAs] = useState<RunAs>("user");
   const [destination, setDestination] = useState<Destination>("user");
   const wide = can("jobs.run_wide");
+  // Every device at once needs both permissions in every company.
+  const everyDevice = canEverywhere(account, "jobs.run_wide") && canEverywhere(account, kind === "script" ? "scripts.run" : "files.deliver");
   const [target, setTarget] = useState<TargetKind>("devices");
   const [chosenDevices, setChosenDevices] = useState<readonly string[]>(deviceIds ?? []);
   const [chosenCompanies, setChosenCompanies] = useState<readonly string[]>([]);
@@ -181,7 +184,7 @@ export function StartJobModal({ kind: initialKind, itemId, deviceIds, toolbox: g
             {wide && <>
               <label><input type="radio" name="job-target" checked={target === "companies"} onChange={() => setTarget("companies")} disabled={!companies.length} /><span><strong>Whole companies</strong>{companies.length ? "Every device in the companies chosen below, as they are when the job starts." : "There are no companies yet."}</span></label>
               <label><input type="radio" name="job-target" checked={target === "tags"} onChange={() => setTarget("tags")} disabled={!tags.length} /><span><strong>Tagged devices</strong>{tags.length ? "Every device with the tags chosen below, as they are when the job starts." : "There are no tags yet."}</span></label>
-              <label><input type="radio" name="job-target" checked={target === "all"} onChange={() => setTarget("all")} /><span><strong>Every device</strong>All {agents.length} devices.</span></label>
+              {everyDevice && <label><input type="radio" name="job-target" checked={target === "all"} onChange={() => setTarget("all")} /><span><strong>Every device</strong>All {agents.length} devices.</span></label>}
             </>}
           </fieldset>
           {target === "devices" && <DevicePicker agents={agents} chosen={chosenDevices} onChange={setChosenDevices} language={language} />}

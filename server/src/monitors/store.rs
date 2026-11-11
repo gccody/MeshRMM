@@ -3,7 +3,10 @@ use meshrmm_protocol_types::KnownMonitorResult;
 use sea_query::{Expr, ExprTrait, OnConflict, Order, Query};
 use serde::Serialize;
 
-use crate::db::{self, Executor, tables::MonitorStates};
+use crate::{
+    access::CompanySet,
+    db::{self, Executor, tables::MonitorStates},
+};
 
 /// A monitor's latest result on a device.
 #[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
@@ -140,14 +143,19 @@ pub async fn for_device(
 }
 
 /// A monitor's results on every device, failing ones first.
+/// A rule's latest result on each device in `within`.
 pub async fn for_rule(
     executor: &mut impl Executor,
     rule_id: &str,
+    within: &CompanySet,
 ) -> db::Result<Vec<MonitorState>> {
     executor
         .fetch_all(
             &select()
                 .and_where(Expr::col(MonitorStates::RuleId).eq(rule_id))
+                .and_where_option(
+                    within.device_condition((MonitorStates::Table, MonitorStates::DeviceId)),
+                )
                 .order_by(MonitorStates::Passing, Order::Asc)
                 .order_by(MonitorStates::CheckedAt, Order::Desc)
                 .to_owned(),

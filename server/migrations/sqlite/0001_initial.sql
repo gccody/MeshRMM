@@ -156,8 +156,13 @@ CREATE TABLE roles (
   description TEXT NOT NULL DEFAULT '' CHECK (length(description) <= 500),
   -- 'administrator' or 'technician' for the two roles every install starts with.
   builtin TEXT UNIQUE CHECK (builtin IS NULL OR builtin IN ('administrator', 'technician')),
+  -- 1 when the role's permissions reach every company's devices, and
+  -- devices in no company; 0 when they reach only the companies in
+  -- role_companies. The Administrator role always reaches every company.
+  all_companies INTEGER NOT NULL DEFAULT 1 CHECK (all_companies IN (0, 1)),
   created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  CHECK (all_companies = 1 OR builtin IS NOT 'administrator')
 );
 
 CREATE TABLE role_permissions (
@@ -369,6 +374,16 @@ CREATE TABLE companies (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+
+-- The companies a role limited to some companies (all_companies = 0)
+-- reaches. A deleted company leaves the roles that reached it.
+CREATE TABLE role_companies (
+  role_id TEXT NOT NULL REFERENCES roles (id) ON DELETE CASCADE,
+  company_id TEXT NOT NULL REFERENCES companies (id) ON DELETE CASCADE,
+  PRIMARY KEY (role_id, company_id)
+);
+
+CREATE INDEX idx_role_companies_company ON role_companies (company_id);
 
 CREATE TABLE agents (
   id TEXT NOT NULL PRIMARY KEY,
@@ -1554,6 +1569,9 @@ CREATE INDEX idx_reports_created ON reports (created_at);
 CREATE INDEX idx_reports_expires ON reports (expires_at);
 CREATE INDEX idx_reports_status ON reports (status, created_at);
 CREATE INDEX idx_reports_delivery ON reports (delivery);
+-- A user's own reports, newest first: what a user whose reports.view reaches
+-- only some companies lists.
+CREATE INDEX idx_reports_requester ON reports (requested_by_user_id, created_at);
 
 -- Maintenance windows: a device in one raises no alerts, and its scheduled
 -- automation skips it as automation says ('skip' everything, 'scans' all

@@ -3,7 +3,8 @@ import test from "node:test";
 import { defaultPasskeyName, twoFactorSummary } from "../features/account/model.ts";
 import { actionLabel, eventLabel, targetLabel } from "../features/audit/model.ts";
 import { ssoForm, ssoFormProblem, ssoUpdate } from "../features/authentication/model.ts";
-import { groupPermissions } from "../features/roles/permissions.ts";
+import { canEverywhere } from "../features/auth/types.ts";
+import { companyScopeLabel, grantableOnSomeCompanies, groupPermissions, savedPermissions } from "../features/roles/permissions.ts";
 import { toolboxAccess } from "../features/toolbox/access.ts";
 import { groupRoleLabel, matchesUser, sortRoles, sortUsers } from "../features/users/model.ts";
 import { describeUserAgent, formatRelative } from "../lib/format.ts";
@@ -211,4 +212,34 @@ test("the single sign-on form trims, defaults and checks its fields", () => {
   assert.match(ssoFormProblem({ ...grouped, groupRoles: [{ group: " ", role_id: "t" }] }), /group name/);
   assert.deepEqual(ssoUpdate({ ...grouped, groupRoles: [{ group: " IT ", role_id: "t" }] }).group_roles, [{ group: "IT", role_id: "t" }]);
   assert.match(ssoFormProblem({ ...form, displayName: "x".repeat(81) }), /80/);
+});
+
+test("a role limited to some companies saves only the permissions it can grant", () => {
+  const permissions = [
+    { name: "devices.view", description: "", reach: "company" },
+    { name: "users.manage", description: "", reach: "instance" },
+    { name: "scripts.run", description: "", reach: "company" },
+  ];
+  assert.equal(grantableOnSomeCompanies(permissions[0]), true);
+  assert.equal(grantableOnSomeCompanies(permissions[1]), false);
+  const ticked = ["users.manage", "devices.view"];
+  assert.deepEqual(savedPermissions(ticked, permissions, true), ["devices.view", "users.manage"]);
+  assert.deepEqual(savedPermissions(ticked, permissions, false), ["devices.view"]);
+});
+
+test("a role's companies read in words", () => {
+  const names = new Map([["a", "Acme"], ["g", "Globex"], ["i", "Initech"]]);
+  assert.equal(companyScopeLabel({ all_companies: true, company_ids: [] }, names), "Every company");
+  assert.equal(companyScopeLabel({ all_companies: false, company_ids: ["a"] }, names), "Acme");
+  assert.equal(companyScopeLabel({ all_companies: false, company_ids: ["a", "g"] }, names), "Acme and Globex");
+  assert.equal(companyScopeLabel({ all_companies: false, company_ids: ["a", "g", "i"] }, names), "3 companies");
+  assert.equal(companyScopeLabel({ all_companies: false, company_ids: ["x"] }, names), "1 company");
+  assert.equal(companyScopeLabel({ all_companies: false, company_ids: [] }, names), "No companies");
+});
+
+test("acting on every device needs a permission in every company", () => {
+  const account = { permissions: ["jobs.run_wide", "scripts.run"], limited_permissions: ["scripts.run"] };
+  assert.equal(canEverywhere(account, "jobs.run_wide"), true);
+  assert.equal(canEverywhere(account, "scripts.run"), false);
+  assert.equal(canEverywhere(account, "files.deliver"), false);
 });

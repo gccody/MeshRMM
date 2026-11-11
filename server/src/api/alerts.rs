@@ -79,6 +79,7 @@ pub async fn list(
         severity: parameters.severity,
         company_id,
         device_id,
+        within: actor.companies(Permission::AlertsView),
     };
     let limit = parameters
         .limit
@@ -90,7 +91,7 @@ pub async fn list(
     alerts.truncate(limit as usize);
     Ok(Json(AlertList {
         alerts,
-        counts: store::counts(&mut database).await?,
+        counts: store::counts_within(&mut database, &filter.within).await?,
         truncated,
     }))
 }
@@ -101,12 +102,26 @@ pub async fn counts(
     actor: Authorized,
 ) -> Result<Json<Counts>, ApiError> {
     actor.require(Permission::AlertsView)?;
-    Ok(Json(store::counts(&mut &state.database).await?))
+    Ok(Json(
+        store::counts_within(
+            &mut &state.database,
+            &actor.companies(Permission::AlertsView),
+        )
+        .await?,
+    ))
 }
 
-async fn find(executor: &mut impl Executor, id: &str) -> Result<Alert, ApiError> {
+/// The alert, if `permission` reaches its device's company: one out of
+/// reach answers 404 as a missing one does.
+async fn find(
+    executor: &mut impl Executor,
+    actor: &Authorized,
+    permission: Permission,
+    id: &str,
+) -> Result<Alert, ApiError> {
     store::get(executor, &parse_id(id, "alert")?)
         .await?
+        .filter(|alert| actor.covers(permission, alert.company_id.as_deref()))
         .ok_or_else(|| ApiError::not_found("Alert not found"))
 }
 
@@ -117,7 +132,9 @@ pub async fn get(
     Path(id): Path<String>,
 ) -> Result<Json<Alert>, ApiError> {
     actor.require(Permission::AlertsView)?;
-    Ok(Json(find(&mut &state.database, &id).await?))
+    Ok(Json(
+        find(&mut &state.database, &actor, Permission::AlertsView, &id).await?,
+    ))
 }
 
 fn audit_metadata(alert: &Alert) -> serde_json::Value {
@@ -139,7 +156,7 @@ pub async fn acknowledge(
 ) -> Result<Json<Alert>, ApiError> {
     actor.require(Permission::AlertsRespond)?;
     let mut transaction = state.database.begin().await?;
-    let alert = find(&mut transaction, &id).await?;
+    let alert = find(&mut transaction, &actor, Permission::AlertsRespond, &id).await?;
     if !store::acknowledge(&mut transaction, &alert.id, &actor.actor(), now_ms()).await? {
         return Err(ApiError::conflict(format!(
             "the alert is already {}",
@@ -156,7 +173,15 @@ pub async fn acknowledge(
     .await?;
     transaction.commit().await?;
     alerts::changed(&state, &alert.id).await?;
-    Ok(Json(find(&mut &state.database, &alert.id).await?))
+    Ok(Json(
+        find(
+            &mut &state.database,
+            &actor,
+            Permission::AlertsRespond,
+            &alert.id,
+        )
+        .await?,
+    ))
 }
 
 /// `POST /v1/alerts/{id}/resolve`
@@ -167,7 +192,7 @@ pub async fn resolve(
 ) -> Result<Json<Alert>, ApiError> {
     actor.require(Permission::AlertsRespond)?;
     let mut database = &state.database;
-    let alert = find(&mut database, &id).await?;
+    let alert = find(&mut database, &actor, Permission::AlertsRespond, &id).await?;
     let rule = rules::by_id(&mut database, &alert.rule_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Alert not found"))?;
@@ -192,7 +217,9 @@ pub async fn resolve(
         audit_metadata(&alert),
     )
     .await?;
-    Ok(Json(find(&mut database, &alert.id).await?))
+    Ok(Json(
+        find(&mut database, &actor, Permission::AlertsRespond, &alert.id).await?,
+    ))
 }
 
 #[derive(Debug, Serialize)]
@@ -261,7 +288,9 @@ fn same_but_off(previous: &Rule, saved: &Rule) -> bool {
 /// `scripts.run`: they run with the saver's access.
 fn require_access(actor: &Authorized, input: &RuleInput) -> Result<(), ApiError> {
     if input.acts_on_devices() {
-        actor.require(Permission::ScriptsRun)?;
+        // A rule reaches devices in every company, and so must the access
+        // it borrows.
+        actor.require_everywhere(Permission::ScriptsRun)?;
     }
     Ok(())
 }
@@ -365,7 +394,7 @@ pub async fn update_rule(
     // still be turned off, which only takes power away: it keeps its owner,
     // and nothing else may change.
     let only_turning_off =
-        input.acts_on_devices() && !input.enabled && !actor.has(Permission::ScriptsRun);
+        input.acts_on_devices() && !input.enabled && !actor.everywhere(Permission::ScriptsRun);
     if !only_turning_off {
         require_access(&actor, &input)?;
     }
@@ -391,7 +420,7 @@ pub async fn update_rule(
         .ok_or_else(ApiError::internal)?;
     if only_turning_off && !same_but_off(&previous, &rule) {
         // Dropping the transaction undoes the save.
-        actor.require(Permission::ScriptsRun)?;
+        actor.require_everywhere(Permission::ScriptsRun)?;
     }
     let mut metadata = rule_metadata(&input, &rule);
     metadata["previous_name"] = json!(previous.name);

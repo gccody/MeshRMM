@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    agents::{self, parse_id},
+    agents::parse_id,
     auth::Authorized,
     http::{ApiError, AppState},
     rbac::Permission,
@@ -37,12 +37,12 @@ const DEFAULT_SOFTWARE: u64 = 200;
 const MAX_DEVICES: u64 = 200;
 const DEFAULT_DEVICES: u64 = 100;
 
-/// The active device named by a path.
-async fn device(state: &AppState, id: &str) -> Result<String, ApiError> {
+/// The active device named by a path, if the actor may see it.
+async fn device(state: &AppState, actor: &Authorized, id: &str) -> Result<String, ApiError> {
     let id = parse_id(id, "device")?;
-    if !agents::is_active(&mut &state.database, &id).await? {
-        return Err(ApiError::not_found("Device not found"));
-    }
+    actor
+        .require_device(&mut &state.database, Permission::DevicesView, &id)
+        .await?;
     Ok(id)
 }
 
@@ -64,9 +64,14 @@ pub(super) fn search_text(text: Option<String>, name: &str) -> Result<Option<Str
 }
 
 /// The devices in `company` (`none` for no company, or a company's ID)
-/// with the tag `tag`.
-fn scope(company: Option<String>, tag: Option<String>) -> Result<Scope, ApiError> {
+/// with the tag `tag`, of those the actor may see.
+fn scope(
+    actor: &Authorized,
+    company: Option<String>,
+    tag: Option<String>,
+) -> Result<Scope, ApiError> {
     Ok(Scope {
+        within: actor.companies(Permission::DevicesView),
         company: company_filter(company)?,
         tag: tag
             .as_deref()
@@ -100,7 +105,7 @@ pub async fn get(
     Path(id): Path<String>,
 ) -> Result<Json<Snapshot>, ApiError> {
     actor.require(Permission::DevicesView)?;
-    let id = device(&state, &id).await?;
+    let id = device(&state, &actor, &id).await?;
     system_info::load(&state.database, &id)
         .await?
         .map(Json)
@@ -119,7 +124,7 @@ pub async fn refresh(
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     actor.require(Permission::DevicesView)?;
-    let id = device(&state, &id).await?;
+    let id = device(&state, &actor, &id).await?;
     state
         .agents
         .send(&id, AgentCommand::CollectSystemInfo)
@@ -150,7 +155,7 @@ pub async fn applications(
     Path(id): Path<String>,
 ) -> Result<Json<ApplicationList>, ApiError> {
     actor.require(Permission::DevicesView)?;
-    let id = device(&state, &id).await?;
+    let id = device(&state, &actor, &id).await?;
     Ok(Json(ApplicationList {
         applications: system_info::applications(&state.database, &id).await?,
     }))
@@ -177,7 +182,7 @@ pub async fn changes(
 ) -> Result<Json<ChangeList>, ApiError> {
     actor.require(Permission::DevicesView)?;
     let parameters = parameters(query)?;
-    let id = device(&state, &id).await?;
+    let id = device(&state, &actor, &id).await?;
     let limit = parameters
         .limit
         .unwrap_or(DEFAULT_CHANGES)
@@ -222,7 +227,7 @@ pub async fn search_devices(
         serial_number: search_text(parameters.serial, "serial")?,
         ip: search_text(parameters.ip, "ip")?,
         application: search_text(parameters.application, "application")?,
-        scope: scope(parameters.company, parameters.tag)?,
+        scope: scope(&actor, parameters.company, parameters.tag)?,
     };
     let limit = parameters.limit.unwrap_or(DEFAULT_DEVICES).min(MAX_DEVICES);
     Ok(Json(
@@ -258,7 +263,7 @@ pub async fn software(
     actor.require(Permission::DevicesView)?;
     let parameters = parameters(query)?;
     let query = search_text(parameters.q, "q")?;
-    let scope = scope(parameters.company, parameters.tag)?;
+    let scope = scope(&actor, parameters.company, parameters.tag)?;
     let limit = parameters
         .limit
         .unwrap_or(DEFAULT_SOFTWARE)
@@ -313,7 +318,7 @@ pub async fn software_devices(
         (None, true) => Some(None),
         (None, false) => None,
     };
-    let scope = scope(parameters.company, parameters.tag)?;
+    let scope = scope(&actor, parameters.company, parameters.tag)?;
     let limit = parameters.limit.unwrap_or(DEFAULT_DEVICES).min(MAX_DEVICES);
     Ok(Json(
         search::installed_on(

@@ -49,7 +49,9 @@ fn field_not_found() -> ApiError {
     ApiError::not_found("no such custom field")
 }
 
-/// The device a request is about, once the caller holds `permission`.
+/// The device a request is about, once the caller holds `permission` on it:
+/// a device in a company the permission doesn't reach is `404`, as a
+/// missing one is.
 async fn authorized_device(
     executor: &mut impl Executor,
     actor: &Authorized,
@@ -60,19 +62,21 @@ async fn authorized_device(
     let device_id = parse_id(device_id, "device")?;
     custom_fields::device(executor, &device_id)
         .await?
-        .ok_or_else(|| ApiError::not_found("Device not found"))
+        .filter(|device| actor.covers(permission, device.company_id.as_deref()))
+        .ok_or_else(crate::access::device_not_found)
 }
 
 /// The company a request is about, with its name, once the caller holds
-/// `permission`.
+/// `permission` in it: a company out of its reach is `404`, as a missing
+/// one is.
 async fn authorized_company(
     executor: &mut impl Executor,
     actor: &Authorized,
     company_id: &str,
     permission: Permission,
 ) -> Result<(String, String), ApiError> {
-    actor.require(permission)?;
     let company_id = parse_id(company_id, "company")?;
+    actor.require_company(permission, &company_id)?;
     let name = custom_fields::company_name(executor, &company_id)
         .await?
         .ok_or_else(|| ApiError::not_found("no such company"))?;
@@ -743,6 +747,10 @@ pub async fn reveal_device_value(
     actor.require(Permission::CustomFieldsReveal)?;
     let mut transaction = state.database.begin().await?;
     let device = authorized_device(&mut transaction, &actor, &id, Permission::DevicesView).await?;
+    // Revealing needs its own permission in the device's company too.
+    if !actor.covers(Permission::CustomFieldsReveal, device.company_id.as_deref()) {
+        return Err(crate::access::device_not_found());
+    }
     let field = field_for(&mut transaction, &field, false).await?;
     if field.field_type != FieldType::Secret {
         return Err(not_secret());
@@ -786,6 +794,7 @@ pub async fn reveal_company_value(
     let mut transaction = state.database.begin().await?;
     let (company_id, name) =
         authorized_company(&mut transaction, &actor, &id, Permission::DevicesView).await?;
+    actor.require_company(Permission::CustomFieldsReveal, &company_id)?;
     let field = field_for(&mut transaction, &field, true).await?;
     if field.field_type != FieldType::Secret {
         return Err(not_secret());
@@ -860,6 +869,10 @@ pub async fn bulk_set(
                     &agents::active()
                         .column(Agents::Name)
                         .and_where(Expr::col(Agents::Id).is_in(chunk.iter().cloned()))
+                        // A device out of reach is as missing as a deleted one.
+                        .and_where_option(
+                            actor.companies_condition(Permission::DevicesEdit, Agents::CompanyId),
+                        )
                         .to_owned(),
                 )
                 .await?,
@@ -940,7 +953,15 @@ pub async fn matching_devices(
         );
     }
     let devices: Vec<(String, Option<String>)> = database
-        .fetch_all(&agents::active().column(Agents::CompanyId).to_owned())
+        .fetch_all(
+            &agents::active()
+                .column(Agents::CompanyId)
+                // Only the devices the caller sees.
+                .and_where_option(
+                    actor.companies_condition(Permission::DevicesView, Agents::CompanyId),
+                )
+                .to_owned(),
+        )
         .await?;
     let own =
         values_by_owner(custom_fields::stored_of_field(&mut database, &field.id, false).await?);

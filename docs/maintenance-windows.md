@@ -155,6 +155,15 @@ As above, the install's own failure still raises its alert.
 | `devices.view` | Seeing windows: the Maintenance page, a device's windows and its maintenance on the wall. |
 | `devices.maintenance` | Putting devices in maintenance, changing and ending windows, saving maintenance policies and asking an install to put its devices in maintenance. With `devices.view`. The Technician role has it. |
 
+Both are judged for each device's company (see [Users and
+roles](users-and-roles.md#company-scope)). A user whose role covers only
+some companies sees and changes only the windows of devices in them, puts
+chosen devices, companies or tags in maintenance (tags resolve to the
+tagged devices in reach), never every device (`403 permission_denied`),
+and a device, company or window out of reach answers `404` like a missing
+one. Saving a maintenance policy, or an install policy that sets windows,
+needs `devices.maintenance` in every company, as policies run on any device.
+
 ## Audit
 
 Every change is audited against the device, one event for each window:

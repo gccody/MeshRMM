@@ -6,7 +6,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    agents::{self, parse_id},
+    agents::parse_id,
     auth::Authorized,
     http::{ApiError, AppState},
     rbac::Permission,
@@ -45,9 +45,9 @@ pub async fn get(
     let Query(query) =
         query.map_err(|_| ApiError::bad_request("range must be live, hour, day or week"))?;
     let id = parse_id(&id, "device")?;
-    if !agents::is_active(&mut &state.database, &id).await? {
-        return Err(ApiError::not_found("Device not found"));
-    }
+    actor
+        .require_device(&mut &state.database, Permission::DevicesView, &id)
+        .await?;
     let points = state.metrics.history(&id, query.range).await?;
     Ok(Json(DeviceMetrics {
         range: query.range,

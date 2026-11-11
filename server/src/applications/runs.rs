@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::tables::{ApplicationRunItems, ApplicationRuns};
 use crate::{
+    access::CompanySet,
     automation::jobs::{self, Changed, RunTable},
     db::{
         self, Database, Executor,
@@ -401,6 +402,8 @@ async fn items_of(
 pub struct Filter {
     pub device_id: Option<String>,
     pub action: Option<Action>,
+    /// Only runs on devices in these companies.
+    pub within: CompanySet,
 }
 
 /// Runs matching `filter`, newest first, with their items but not their
@@ -416,6 +419,11 @@ pub async fn list(
             Expr::col((ApplicationRuns::Table, ApplicationRuns::DeviceId)).eq(device_id.as_str()),
         );
     }
+    select.and_where_option(
+        filter
+            .within
+            .device_condition((ApplicationRuns::Table, ApplicationRuns::DeviceId)),
+    );
     if let Some(action) = filter.action {
         select.and_where(
             Expr::col((ApplicationRuns::Table, ApplicationRuns::Action)).eq(action.as_str()),

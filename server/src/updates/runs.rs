@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::store;
 use crate::{
+    access::CompanySet,
     automation::jobs::{self, Changed, RunTable},
     db::{
         self, Database, Executor,
@@ -448,6 +449,8 @@ async fn items_of(executor: &mut impl Executor, run_id: &str) -> db::Result<Vec<
 pub struct Filter {
     pub device_id: Option<String>,
     pub kind: Option<Kind>,
+    /// Only runs on devices in these companies.
+    pub within: CompanySet,
 }
 
 /// Runs matching `filter`, newest first, installs with their items.
@@ -464,6 +467,11 @@ pub async fn list(
     if let Some(kind) = filter.kind {
         select.and_where(Expr::col((UpdateRuns::Table, UpdateRuns::Kind)).eq(kind.as_str()));
     }
+    select.and_where_option(
+        filter
+            .within
+            .device_condition((UpdateRuns::Table, UpdateRuns::DeviceId)),
+    );
     select
         .order_by((UpdateRuns::Table, UpdateRuns::CreatedAt), Order::Desc)
         .order_by((UpdateRuns::Table, UpdateRuns::Id), Order::Desc)

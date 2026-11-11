@@ -2,18 +2,20 @@
 //! network, one or many at once, and the wake requests' outcomes. Waking
 //! needs `devices.wake`; seeing wake requests needs `devices.view`. Each
 //! device woken is recorded in the audit log as `agent.wake`.
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use axum::{
     Json,
     extract::{Path, Query, State, rejection::QueryRejection},
     http::StatusCode,
 };
+use sea_query::{Expr, ExprTrait};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     agents::{self, parse_id},
     auth::Authorized,
+    db::tables::Agents,
     http::{ApiError, AppState, JsonBody},
     rbac::Permission,
     wake::{self, MAX_DEVICES, Requester, Wake},
@@ -53,7 +55,62 @@ async fn wake(
         .filter_map(|device| ids.get(device).cloned())
         .collect::<Vec<_>>();
     wake::wait_for_relays(state, &mut changes, &ids, RELAY_WAIT).await?;
-    Ok(wake::by_ids(&mut &state.database, &ids).await?)
+    let wakes = wake::by_ids(&mut &state.database, &ids).await?;
+    in_reach(state, actor, Permission::DevicesWake, wakes).await
+}
+
+/// The devices among `ids` that are enrolled, undeleted, and in a company
+/// `permission` reaches, in one query a chunk.
+async fn reached(
+    state: &AppState,
+    actor: &Authorized,
+    permission: Permission,
+    ids: &[String],
+) -> Result<HashSet<String>, ApiError> {
+    let mut found = HashSet::new();
+    for chunk in ids.chunks(500) {
+        let rows: Vec<(String,)> = state
+            .database
+            .fetch_all(
+                &agents::active()
+                    .and_where(Expr::col(Agents::Id).is_in(chunk.iter().cloned()))
+                    .and_where_option(actor.companies_condition(permission, Agents::CompanyId))
+                    .to_owned(),
+            )
+            .await?;
+        found.extend(rows.into_iter().map(|(id,)| id));
+    }
+    Ok(found)
+}
+
+/// The wake requests of devices the actor may see, without the relays they
+/// may not: a relay can be any online device on the woken one's network,
+/// even another company's.
+async fn in_reach(
+    state: &AppState,
+    actor: &Authorized,
+    permission: Permission,
+    mut wakes: Vec<Wake>,
+) -> Result<Vec<Wake>, ApiError> {
+    if actor.everywhere(permission) {
+        return Ok(wakes);
+    }
+    let mut ids = wakes
+        .iter()
+        .flat_map(|wake| {
+            std::iter::once(wake.device_id.clone())
+                .chain(wake.relays.iter().map(|relay| relay.device_id.clone()))
+        })
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    let visible = reached(state, actor, permission, &ids).await?;
+    wakes.retain(|wake| visible.contains(&wake.device_id));
+    for wake in &mut wakes {
+        wake.relays
+            .retain(|relay| visible.contains(&relay.device_id));
+    }
+    Ok(wakes)
 }
 
 /// `POST /v1/agents/{id}/wake`: wakes the offline device through online
@@ -68,9 +125,9 @@ pub async fn wake_device(
 ) -> Result<(StatusCode, Json<Wake>), ApiError> {
     actor.require(Permission::DevicesWake)?;
     let id = parse_id(&id, "device")?;
-    if !agents::is_active(&mut &state.database, &id).await? {
-        return Err(ApiError::not_found("Device not found"));
-    }
+    actor
+        .require_device(&mut &state.database, Permission::DevicesWake, &id)
+        .await?;
     if state.agents.is_connected(&id) {
         return Err(online());
     }
@@ -123,10 +180,12 @@ pub async fn wake_many(
     }
     ids.sort();
     ids.dedup();
+    // One out of reach is skipped as unknown, like one that isn't enrolled.
+    let enrolled = reached(&state, &actor, Permission::DevicesWake, &ids).await?;
     let mut skipped = Vec::new();
     let mut offline = Vec::new();
     for id in ids {
-        if !agents::is_active(&mut &state.database, &id).await? {
+        if !enrolled.contains(&id) {
             skipped.push(Skipped {
                 device_id: id,
                 reason: "not_found",
@@ -185,8 +244,9 @@ pub async fn list(
             "ask for at most {MAX_DEVICES} wake requests"
         )));
     }
+    let wakes = wake::by_ids(&mut &state.database, &ids).await?;
     Ok(Json(WakeList {
-        wakes: wake::by_ids(&mut &state.database, &ids).await?,
+        wakes: in_reach(&state, &actor, Permission::DevicesView, wakes).await?,
     }))
 }
 
@@ -206,11 +266,12 @@ pub async fn recent(
     actor.require(Permission::DevicesView)?;
     let Recent { limit } = parameters(query)?;
     let id = parse_id(&id, "device")?;
-    if !agents::is_active(&mut &state.database, &id).await? {
-        return Err(ApiError::not_found("Device not found"));
-    }
+    actor
+        .require_device(&mut &state.database, Permission::DevicesView, &id)
+        .await?;
     let limit = limit.unwrap_or(DEFAULT_RECENT).clamp(1, MAX_RECENT);
+    let wakes = wake::recent(&mut &state.database, &id, limit).await?;
     Ok(Json(WakeList {
-        wakes: wake::recent(&mut &state.database, &id, limit).await?,
+        wakes: in_reach(&state, &actor, Permission::DevicesView, wakes).await?,
     }))
 }

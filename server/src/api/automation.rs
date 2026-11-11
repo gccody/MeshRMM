@@ -43,8 +43,10 @@ fn require_manage(actor: &Authorized) -> Result<(), ApiError> {
 /// Saving a policy hands it the saver's access, which must do what it does.
 fn require_save(actor: &Authorized, action: &Action) -> Result<(), ApiError> {
     require_manage(actor)?;
+    // A policy reaches devices in every company, so the access it
+    // borrows must reach every company too.
     for permission in action.permissions() {
-        actor.require(permission)?;
+        actor.require_everywhere(permission)?;
     }
     Ok(())
 }
@@ -66,7 +68,7 @@ pub async fn list(
         .filter_map(|policy| policy.last_job_id.clone())
         .collect::<Vec<_>>();
     let jobs = jobs::by_ids(&mut database, &job_ids, now_ms()).await?;
-    let viewer = Viewer::new(&actor.user.id, &actor.permissions);
+    let viewer = Viewer::new(&actor.user.id, &actor.access);
     let mut listed = Vec::with_capacity(policies.len());
     for policy in policies {
         let last_job = policy
@@ -328,7 +330,7 @@ pub async fn run(
     // Its job may have replaced the waits of the policy's older ones.
     state.automation.job_changed(&job_id);
     state.automation.reconcile();
-    let viewer = Viewer::new(&actor.user.id, &actor.permissions);
+    let viewer = Viewer::new(&actor.user.id, &actor.access);
     let job = jobs::get(&mut database, &job_id, now)
         .await?
         .ok_or_else(ApiError::internal)?;

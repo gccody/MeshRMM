@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    access::CompanySet,
     agents,
     db::{
         self, Database, Executor,
@@ -526,6 +527,9 @@ pub struct FleetFilter {
     pub tag_id: Option<String>,
     pub platform: Option<DevicePlatform>,
     pub status: Option<FleetStatus>,
+    /// Only devices in these companies, totals included: those the reader
+    /// may see.
+    pub within: CompanySet,
 }
 
 /// How many devices the fleet has, and how many are in each state.
@@ -545,7 +549,7 @@ pub struct FleetPage {
     pub devices: Vec<DeviceSummary>,
     /// Devices the filter matches, on this page or not.
     pub matching: i64,
-    /// The whole fleet's, whatever the filter.
+    /// The whole fleet's the reader sees, whatever the other filters.
     pub totals: FleetTotals,
 }
 
@@ -770,6 +774,11 @@ fn count_where(condition: Condition) -> Expr {
 pub fn fleet_counts_query(filter: &FleetFilter, now: i64) -> SelectStatement {
     let state = |status| count_where(in_status(status, now));
     devices_select()
+        .and_where_option(
+            filter
+                .within
+                .company_condition((Agents::Table, Agents::CompanyId)),
+        )
         .expr_as(Expr::cust("CAST(COUNT(*) AS BIGINT)"), "devices")
         .expr_as(count_where(matches(filter, now)), "matching")
         .expr_as(state(FleetStatus::Pending), "pending")
@@ -791,6 +800,11 @@ pub fn fleet_page_query(
 ) -> SelectStatement {
     summary_select()
         .and_where(matches(filter, now).into())
+        .and_where_option(
+            filter
+                .within
+                .company_condition((Agents::Table, Agents::CompanyId)),
+        )
         .order_by_expr(
             Expr::cust(
                 "COALESCE(device_update_status.security_count, 0) \

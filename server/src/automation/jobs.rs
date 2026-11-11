@@ -36,6 +36,7 @@ use serde_json::json;
 
 use super::{Creating, Engine, dispatch::QUEUE_CHUNK};
 use crate::{
+    access::{Access, CompanySet},
     applications::{
         jobs::RunAction,
         tables::{ApplicationRunItems, ApplicationRuns},
@@ -725,6 +726,18 @@ impl Job {
     }
 }
 
+/// The permissions that let a user see jobs.
+const LISTING: &[Permission] = &[
+    Permission::ScriptsRun,
+    Permission::FilesDeliver,
+    Permission::UpdatesView,
+    Permission::UpdatesInstall,
+    Permission::ApplicationsView,
+    Permission::ApplicationsDeploy,
+    Permission::AutomationManage,
+    Permission::AuditView,
+];
+
 /// What a user may see and do with jobs.
 #[derive(Debug, Clone)]
 pub struct Viewer {
@@ -733,31 +746,31 @@ pub struct Viewer {
     pub everyone: bool,
     /// Policies' jobs.
     pub policies: bool,
+    /// The companies whose devices' jobs the user sees: a job with none of
+    /// its devices in them is hidden, and so are its other devices.
+    pub within: CompanySet,
 }
 
 impl Viewer {
-    pub fn new(user_id: &str, permissions: &Permissions) -> Self {
+    pub fn new(user_id: &str, access: &Access) -> Self {
+        let everyone = access.everywhere(Permission::AuditView);
         Self {
             user_id: user_id.to_owned(),
-            everyone: permissions.contains(&Permission::AuditView),
-            policies: permissions.contains(&Permission::AutomationManage),
+            everyone,
+            policies: access.everywhere(Permission::AutomationManage),
+            within: if everyone {
+                CompanySet::All
+            } else {
+                access.companies_of_any(LISTING)
+            },
         }
     }
 
     /// Whether the user may see any jobs at all.
     pub fn may_list(permissions: &Permissions) -> bool {
-        [
-            Permission::ScriptsRun,
-            Permission::FilesDeliver,
-            Permission::UpdatesView,
-            Permission::UpdatesInstall,
-            Permission::ApplicationsView,
-            Permission::ApplicationsDeploy,
-            Permission::AutomationManage,
-            Permission::AuditView,
-        ]
-        .iter()
-        .any(|permission| permissions.contains(permission))
+        LISTING
+            .iter()
+            .any(|permission| permissions.contains(permission))
     }
 
     pub fn sees(&self, job: &Job) -> bool {
@@ -782,7 +795,49 @@ impl Viewer {
         if self.policies {
             condition = condition.add(Expr::col((Jobs::Table, Jobs::PolicyId)).is_not_null());
         }
+        let mut condition = sea_query::Cond::all().add(condition);
+        if let Some(reach) = self.reach() {
+            condition = condition.add(reach);
+        }
         Some(condition)
+    }
+
+    /// A condition on `jobs` that holds for jobs with a device in
+    /// [`Self::within`]; `None` when that is every company.
+    fn reach(&self) -> Option<sea_query::SimpleExpr> {
+        let devices = self
+            .within
+            .device_condition((JobDevices::Table, JobDevices::DeviceId))?;
+        Some(Expr::exists(
+            Query::select()
+                .expr(Expr::val(1))
+                .from(JobDevices::Table)
+                .and_where(
+                    Expr::col((JobDevices::Table, JobDevices::JobId))
+                        .equals((Jobs::Table, Jobs::Id)),
+                )
+                .and_where(devices)
+                .to_owned(),
+        ))
+    }
+
+    /// Whether the job has a device the viewer reaches; always for viewers
+    /// who reach every company. Check it besides [`Self::sees`].
+    pub async fn reaches(&self, executor: &mut impl Executor, job_id: &str) -> db::Result<bool> {
+        let Some(reach) = self.reach() else {
+            return Ok(true);
+        };
+        let row: Option<(String,)> = executor
+            .fetch_optional(
+                &Query::select()
+                    .column((Jobs::Table, Jobs::Id))
+                    .from(Jobs::Table)
+                    .and_where(Expr::col((Jobs::Table, Jobs::Id)).eq(job_id))
+                    .and_where(reach)
+                    .to_owned(),
+            )
+            .await?;
+        Ok(row.is_some())
     }
 
     pub fn view<'a>(&self, job: &'a Job) -> JobView<'a> {
@@ -824,6 +879,9 @@ pub struct NewJob {
     pub policy: Option<(String, String)>,
     /// Recorded in the audit log as starting it.
     pub actor: Actor,
+    /// Only the target's devices in these companies: those its starter may
+    /// run it on.
+    pub within: CompanySet,
     /// Set for a job a policy's schedule or a device's enrollment starts,
     /// rather than a person: its devices in maintenance are skipped.
     pub scheduled: Option<Scheduled>,
@@ -856,7 +914,11 @@ struct DeviceRow {
 /// The devices `target` covers that are enrolled and not deleted, in no
 /// particular order: the dispatcher starts a job's devices by ID, and the
 /// job's page sorts them by name.
-async fn resolve(executor: &mut impl Executor, target: &Target) -> db::Result<Vec<DeviceRow>> {
+async fn resolve(
+    executor: &mut impl Executor,
+    target: &Target,
+    within: &CompanySet,
+) -> db::Result<Vec<DeviceRow>> {
     let select = || {
         Query::select()
             .columns([
@@ -872,6 +934,7 @@ async fn resolve(executor: &mut impl Executor, target: &Target) -> db::Result<Ve
                     .equals((Agents::Table, Agents::Id)),
             )
             .and_where(Expr::col((Agents::Table, Agents::DeletionRequestedAt)).is_null())
+            .and_where_option(within.company_condition((Agents::Table, Agents::CompanyId)))
             .to_owned()
     };
     let mut rows: Vec<DeviceRow> = Vec::new();
@@ -992,7 +1055,7 @@ impl Plan {
     }
 }
 
-fn no_devices() -> ApiError {
+pub fn no_devices() -> ApiError {
     ApiError::bad_request("there are no devices to run on").with_code("no_devices")
 }
 
@@ -1007,7 +1070,7 @@ pub async fn plan(
     agents: &AgentHub,
     job: NewJob,
 ) -> Result<Plan, ApiError> {
-    let devices = resolve(executor, &job.target).await?;
+    let devices = resolve(executor, &job.target, &job.within).await?;
     if devices.is_empty() {
         return Err(no_devices());
     }
@@ -2072,6 +2135,8 @@ pub struct DevicePage {
     pub after: Option<String>,
     pub offset: u64,
     pub limit: u64,
+    /// Only devices in these companies.
+    pub within: CompanySet,
 }
 
 /// Whether a job's device has `outcome` at `now`, from its row of
@@ -2137,6 +2202,10 @@ pub fn page_query(job_id: &str, page: &DevicePage, now: i64) -> sea_query::Selec
     if let Some(after) = &page.after {
         rows.and_where(Expr::col((JobDevices::Table, JobDevices::DeviceId)).gt(after.as_str()));
     }
+    rows.and_where_option(
+        page.within
+            .device_condition((JobDevices::Table, JobDevices::DeviceId)),
+    );
     rows.order_by((JobDevices::Table, JobDevices::DeviceId), Order::Asc)
         .limit(page.limit)
         .offset(page.offset)
@@ -2330,6 +2399,33 @@ pub async fn devices(
     Ok(devices)
 }
 
+/// How many of the job's devices have the page's outcome, or any, in its
+/// companies, on any page.
+pub async fn count_devices(
+    executor: &mut impl Executor,
+    job_id: &str,
+    page: &DevicePage,
+    now: i64,
+) -> db::Result<i64> {
+    let mut select = Query::select();
+    select
+        .expr(sea_query::Func::count(Expr::col((
+            JobDevices::Table,
+            JobDevices::DeviceId,
+        ))))
+        .from(JobDevices::Table)
+        .and_where(Expr::col((JobDevices::Table, JobDevices::JobId)).eq(job_id))
+        .and_where_option(
+            page.within
+                .device_condition((JobDevices::Table, JobDevices::DeviceId)),
+        );
+    if let Some(outcome) = page.outcome {
+        select.cond_where(has_outcome(outcome, now));
+    }
+    let (count,): (i64,) = executor.fetch_one(&select).await?;
+    Ok(count)
+}
+
 /// Whether the viewer may see the job a run or delivery belongs to.
 pub async fn sees_job(
     executor: &mut impl Executor,
@@ -2345,11 +2441,12 @@ pub async fn sees_job(
                 .to_owned(),
         )
         .await?;
-    Ok(row.is_some_and(|(requested_by, policy_id)| {
+    let sees = row.is_some_and(|(requested_by, policy_id)| {
         viewer.everyone
             || requested_by == viewer.user_id
             || (viewer.policies && policy_id.is_some())
-    }))
+    });
+    Ok(sees && viewer.reaches(executor, job_id).await?)
 }
 
 /// Cancels what the job hasn't started. Returns how many devices it cancelled.

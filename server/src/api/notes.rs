@@ -138,7 +138,9 @@ pub async fn get(
     actor.require(Permission::DevicesView)?;
     let id = parse_id(&id, "device")?;
     let mut database = &state.database;
-    device_name(&mut database, &id).await?;
+    actor
+        .require_device(&mut database, Permission::DevicesView, &id)
+        .await?;
     Ok(Json(notes(&mut database, &id).await?))
 }
 
@@ -158,7 +160,9 @@ pub async fn revision(
     actor.require(Permission::DevicesView)?;
     let id = parse_id(&id, "device")?;
     let mut database = &state.database;
-    device_name(&mut database, &id).await?;
+    actor
+        .require_device(&mut database, Permission::DevicesView, &id)
+        .await?;
     let found = revisions(&mut database, &id, Some(revision))
         .await?
         .pop()
@@ -202,6 +206,9 @@ pub async fn save(
         );
     }
     let mut transaction = state.database.begin().await?;
+    actor
+        .require_device(&mut transaction, Permission::DevicesEdit, &id)
+        .await?;
     let name = device_name(&mut transaction, &id).await?;
     let current = notes(&mut transaction, &id).await?;
     if current.revision != edit.revision {

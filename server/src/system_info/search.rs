@@ -12,6 +12,7 @@ use serde::Serialize;
 
 use super::{SNAPSHOT_COLUMNS, Snapshot, snapshot, software::from_key_text};
 use crate::{
+    access::CompanySet,
     db::{
         self, Database,
         tables::{
@@ -33,15 +34,22 @@ pub enum CompanyFilter {
 }
 
 /// Which devices a fleet-wide search looks at: those in a company, or in
-/// none, and those with a tag.
+/// none, and those with a tag, among those in the companies the
+/// searcher reaches.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Scope {
     pub company: Option<CompanyFilter>,
     pub tag: Option<String>,
+    /// The companies whose devices the searcher may see.
+    pub within: CompanySet,
 }
 
 impl Scope {
     fn apply(&self, select: &mut SelectStatement) {
+        select.and_where_option(
+            self.within
+                .company_condition((Agents::Table, Agents::CompanyId)),
+        );
         if let Some(company) = &self.company {
             select.and_where(company_matches(company));
         }

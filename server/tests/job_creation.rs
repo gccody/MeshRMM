@@ -79,6 +79,7 @@ async fn update_scan(app: &App) -> jobs::NewJob {
             api_token: None,
         },
         scheduled: None,
+        within: meshrmm_server::access::CompanySet::All,
     }
 }
 

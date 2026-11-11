@@ -1817,6 +1817,7 @@ fn update_scan(target: automation::jobs::Target) -> automation::jobs::NewJob {
             api_token: None,
         },
         scheduled: None,
+        within: meshrmm_server::access::CompanySet::All,
     }
 }
 

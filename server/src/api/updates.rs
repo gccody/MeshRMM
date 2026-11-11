@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    agents::{self, parse_id},
+    agents::parse_id,
     audit::{self, Target as AuditTarget},
     auth::Authorized,
     http::{ApiError, AppState, JsonBody},
@@ -34,12 +34,17 @@ const MAX_LIMIT: u64 = 200;
 /// The most updates an install may choose one by one.
 const MAX_CHOSEN_UPDATES: usize = 5_000;
 
-/// The active device named by a path.
-async fn device(state: &AppState, id: &str) -> Result<String, ApiError> {
+/// The active device named by a path, if `permission` reaches it.
+async fn device(
+    state: &AppState,
+    actor: &Authorized,
+    permission: Permission,
+    id: &str,
+) -> Result<String, ApiError> {
     let id = parse_id(id, "device")?;
-    if !agents::is_active(&mut &state.database, &id).await? {
-        return Err(ApiError::not_found("Device not found"));
-    }
+    actor
+        .require_device(&mut &state.database, permission, &id)
+        .await?;
     Ok(id)
 }
 
@@ -60,7 +65,7 @@ pub async fn get(
     Path(id): Path<String>,
 ) -> Result<Json<DeviceUpdates>, ApiError> {
     actor.require(Permission::UpdatesView)?;
-    let id = device(&state, &id).await?;
+    let id = device(&state, &actor, Permission::UpdatesView, &id).await?;
     let mut database = &state.database;
     let summary = store::summary(&mut database, &id, state.agents.is_connected(&id))
         .await?
@@ -164,7 +169,7 @@ pub async fn scan(
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<Run>), ApiError> {
     actor.require(Permission::UpdatesView)?;
-    let id = device(&state, &id).await?;
+    let id = device(&state, &actor, Permission::UpdatesView, &id).await?;
     if !state.agents.is_connected(&id) {
         return Err(offline());
     }
@@ -210,7 +215,7 @@ pub async fn install(
     JsonBody(request): JsonBody<InstallRequest>,
 ) -> Result<(StatusCode, Json<Run>), ApiError> {
     actor.require(Permission::UpdatesInstall)?;
-    let id = device(&state, &id).await?;
+    let id = device(&state, &actor, Permission::UpdatesInstall, &id).await?;
     if !(1..=MAX_REBOOT_DELAY_MINUTES).contains(&request.reboot_delay_minutes) {
         return Err(invalid(format!(
             "the restart can wait 1 to {MAX_REBOOT_DELAY_MINUTES} minutes"
@@ -302,6 +307,7 @@ pub async fn list_runs(
         &Filter {
             device_id,
             kind: filter.kind,
+            within: actor.companies(Permission::UpdatesView),
         },
         limit,
     )
@@ -317,10 +323,17 @@ pub async fn get_run(
 ) -> Result<Json<Run>, ApiError> {
     actor.require(Permission::UpdatesView)?;
     let id = parse_id(&id, "update run")?;
-    runs::get(&mut &state.database, &id, true)
+    let run = runs::get(&mut &state.database, &id, true)
         .await?
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found("Update run not found"))
+        .ok_or_else(|| ApiError::not_found("Update run not found"))?;
+    if !actor.everywhere(Permission::UpdatesView) {
+        let company = crate::access::device_company(&mut &state.database, &run.device_id).await?;
+        if !company.is_some_and(|company| actor.covers(Permission::UpdatesView, company.as_deref()))
+        {
+            return Err(ApiError::not_found("Update run not found"));
+        }
+    }
+    Ok(Json(run))
 }
 
 const DEFAULT_FLEET_LIMIT: u64 = 100;
@@ -342,7 +355,7 @@ pub struct FleetParameters {
 
 /// `GET /v1/updates/devices?query=&company=&tag=&platform=&status=&limit=&offset=`:
 /// a page of the devices' updates at a glance, most urgent first, with how
-/// many devices match and the whole fleet's totals.
+/// many devices match and the totals of every device the user sees.
 pub async fn devices(
     State(state): State<AppState>,
     actor: Authorized,
@@ -365,6 +378,7 @@ pub async fn devices(
         },
         platform: parameters.platform,
         status: parameters.status,
+        within: actor.companies(Permission::UpdatesView),
     };
     let limit = parameters
         .limit

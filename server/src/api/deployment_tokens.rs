@@ -199,6 +199,10 @@ pub async fn list(
         .database
         .fetch_all(
             &token_select()
+                .and_where_option(actor.companies_condition(
+                    Permission::DevicesEnroll,
+                    (DeploymentTokens::Table, DeploymentTokens::CompanyId),
+                ))
                 .order_by(
                     (DeploymentTokens::Table, DeploymentTokens::CreatedAt),
                     Order::Desc,
@@ -271,6 +275,7 @@ pub async fn create(
     let expires_at = now + i64::from(lifetime_days) * DAY_MS;
     let mut transaction = state.database.begin().await?;
     let company_id = companies::ensure_exists(&mut transaction, &request.company_id).await?;
+    actor.require_company(Permission::DevicesEnroll, &company_id)?;
     transaction
         .execute(
             &Query::insert()
@@ -342,6 +347,7 @@ pub async fn revoke(
     let mut transaction = state.database.begin().await?;
     let token = by_id(&mut transaction, &id)
         .await?
+        .filter(|token| actor.covers(Permission::DevicesEnroll, Some(&token.company_id)))
         .ok_or_else(|| ApiError::not_found("no such deployment token"))?;
     let revoked = transaction
         .execute(

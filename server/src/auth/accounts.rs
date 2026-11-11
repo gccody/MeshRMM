@@ -27,6 +27,7 @@ use std::{
 use tokio::sync::watch;
 
 use crate::{
+    access::Access,
     db::{self, Database},
     rbac::{self, Permissions, Role},
     users::{self, SecondFactors, User},
@@ -44,8 +45,10 @@ const MAX_ENTRIES: usize = 1000;
 pub struct Account {
     pub user: User,
     pub roles: Vec<Role>,
-    /// Every permission the roles grant.
+    /// Every permission the roles grant somewhere.
     pub permissions: Permissions,
+    /// The companies each one reaches.
+    pub access: Access,
     pub second_factors: SecondFactors,
 }
 
@@ -58,8 +61,10 @@ impl Account {
         };
         let roles = rbac::user_roles(&mut database, user_id).await?;
         let second_factors = users::second_factors(&mut database, user_id).await?;
+        let access = Access::of(&roles);
         Ok(Some(Self {
-            permissions: rbac::permissions_of(&roles),
+            permissions: access.permissions(),
+            access,
             user,
             roles,
             second_factors,
@@ -187,6 +192,7 @@ mod tests {
             },
             roles: Vec::new(),
             permissions: Permissions::new(),
+            access: Access::default(),
             second_factors: SecondFactors::default(),
         })
     }

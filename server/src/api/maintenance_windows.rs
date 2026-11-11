@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 
 use super::double_option;
 use crate::{
+    access::CompanySet,
     agents::parse_id,
     audit::{self, Target as AuditTarget},
     auth::Authorized,
@@ -55,15 +56,44 @@ fn require_change(actor: &Authorized) -> Result<(), ApiError> {
     actor.require(Permission::DevicesMaintenance)
 }
 
-/// The devices `target` covers that `actor` may act on. A device chosen by
-/// ID that isn't there, or that the actor may not act on, is `404`.
+/// The companies whose devices `actor` may put in maintenance.
+fn changeable(actor: &Authorized) -> CompanySet {
+    actor
+        .companies(Permission::DevicesMaintenance)
+        .intersection(&actor.companies(Permission::DevicesView))
+}
+
+/// The devices `target` covers that `actor` may act on. A device or company
+/// chosen by ID that isn't there, or that the actor may not act on, is
+/// `404`; every device needs the permissions in every company.
 async fn devices_for(
     state: &AppState,
-    _actor: &Authorized,
+    actor: &Authorized,
     target: &Target,
 ) -> Result<Vec<Device>, ApiError> {
     target.check_references(&mut &state.database).await?;
-    let devices = maintenance_windows::resolve(&mut &state.database, target).await?;
+    let within = changeable(actor);
+    match (target, &within) {
+        (_, CompanySet::All) => {}
+        (Target::All, _) => {
+            return Err(ApiError::forbidden(
+                "you can put every device in maintenance only with permissions for every company; choose companies, tags or devices instead",
+            )
+            .with_code("permission_denied"));
+        }
+        (Target::Companies(ids), CompanySet::Only(reached))
+            if ids.iter().any(|id| !reached.contains(id)) =>
+        {
+            return Err(ApiError::not_found("a chosen company no longer exists"));
+        }
+        _ => {}
+    }
+    let devices = maintenance_windows::resolve(&mut &state.database, target, &within).await?;
+    if let Target::Devices(ids) = target
+        && devices.len() < ids.len()
+    {
+        return Err(ApiError::not_found("a chosen device no longer exists"));
+    }
     if devices.is_empty() {
         return Err(
             ApiError::bad_request("there are no devices to put in maintenance")
@@ -90,9 +120,24 @@ async fn window_for(
     Ok(window)
 }
 
-/// Whether `actor` may see a window, by its device.
-fn visible(_actor: &Authorized, _window: &Window) -> bool {
-    true
+/// Whether `actor` may see a window, by its device's company.
+fn visible(actor: &Authorized, window: &Window) -> bool {
+    actor.covers(Permission::DevicesView, window.company_id.as_deref())
+}
+
+/// The window `id` if `actor` may change it: `404` like a missing one when
+/// they may see it but not put its device in maintenance.
+async fn changeable_window(
+    state: &AppState,
+    actor: &Authorized,
+    id: &str,
+    now: i64,
+) -> Result<Window, ApiError> {
+    let window = window_for(state, actor, id, now).await?;
+    if !changeable(actor).covers(window.company_id.as_deref()) {
+        return Err(window_not_found());
+    }
+    Ok(window)
 }
 
 /// A request's target: its kind and the IDs it uses.
@@ -167,6 +212,7 @@ pub async fn list(
             .as_deref()
             .map(|id| parse_id(id, "policy"))
             .transpose()?,
+        within: actor.companies(Permission::DevicesView),
     };
     let limit = parameters
         .limit
@@ -198,8 +244,10 @@ pub async fn device_windows(
 ) -> Result<Json<Value>, ApiError> {
     require_view(&actor)?;
     let id = parse_id(&id, "device")?;
-    let target = Target::Devices(vec![id.clone()]);
-    target.check_references(&mut &state.database).await?;
+    // A device out of reach answers as a missing one.
+    actor
+        .require_device(&mut &state.database, Permission::DevicesView, &id)
+        .await?;
     let now = now_ms();
     let filter = |showing| Filter {
         showing,
@@ -444,7 +492,7 @@ pub async fn end(
 ) -> Result<Json<Window>, ApiError> {
     require_change(&actor)?;
     let now = now_ms();
-    let window = window_for(&state, &actor, &id, now).await?;
+    let window = changeable_window(&state, &actor, &id, now).await?;
     if !matches!(window.state, WindowState::Current | WindowState::Upcoming)
         || end_windows(&state, &actor, std::slice::from_ref(&window), now).await? == 0
     {
@@ -483,7 +531,7 @@ pub async fn update(
 ) -> Result<Json<Window>, ApiError> {
     require_change(&actor)?;
     let now = now_ms();
-    let window = window_for(&state, &actor, &id, now).await?;
+    let window = changeable_window(&state, &actor, &id, now).await?;
     if !matches!(window.state, WindowState::Current | WindowState::Upcoming) {
         return Err(over());
     }
