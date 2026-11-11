@@ -100,6 +100,30 @@ impl GrabSchedule {
     }
 }
 
+/// Whether a display server's reports of drawing can be relied on. A grab
+/// that no hint asked for, made only as a safety net, and that finds the
+/// screen changed means drawing went unreported. One such grab can be a
+/// report still on its way, so the reports are given up on at the second.
+#[derive(Default)]
+pub(super) struct DamageTrust {
+    misses: u32,
+}
+
+impl DamageTrust {
+    const MISSES: u32 = 2;
+
+    /// Records a grab after the first: whether a hint asked for it, and
+    /// whether it found a change. Returns whether the reports have just
+    /// stopped being trusted, which it does once.
+    pub(super) fn grabbed(&mut self, hinted: bool, changed: bool) -> bool {
+        if hinted || !changed || self.misses >= Self::MISSES {
+            return false;
+        }
+        self.misses += 1;
+        self.misses == Self::MISSES
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +293,23 @@ mod tests {
         assert_eq!(grabs, 2);
         // Damage grabs at once.
         assert!(schedule.due(start + interval * 91, true));
+    }
+
+    #[test]
+    fn damage_reports_that_miss_drawing_twice_are_no_longer_trusted() {
+        let mut trust = DamageTrust::default();
+        // Changes a hint asked for, and safety-net grabs that find nothing,
+        // say nothing against the reports.
+        for _ in 0..10 {
+            assert!(!trust.grabbed(true, true));
+            assert!(!trust.grabbed(true, false));
+            assert!(!trust.grabbed(false, false));
+        }
+        // One unreported change may be a report on its way; the second is not.
+        assert!(!trust.grabbed(false, true));
+        assert!(!trust.grabbed(true, true));
+        assert!(trust.grabbed(false, true));
+        // Told once.
+        assert!(!trust.grabbed(false, true));
     }
 }

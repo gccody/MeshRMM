@@ -8,7 +8,8 @@
 //! drawing, when the drawn-in pointer moves or changes, and once a second
 //! in case drawing went unreported; without DAMAGE, at the frame rate until
 //! the screen has stayed the same for half a second, then every 250 ms
-//! until a grab finds a change.
+//! until a grab finds a change. An X server whose DAMAGE turns out to miss
+//! drawing is polled that way too.
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,7 +26,7 @@ use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat};
 use x11rb::rust_connection::RustConnection;
 
-use super::pacing::GrabSchedule;
+use super::pacing::{DamageTrust, GrabSchedule};
 use super::{Backend, CaptureSettings, FrameSink, Stream};
 use crate::remote::linux::display::Output;
 use crate::remote::linux::encoder::{PixelLayout, RawFrame};
@@ -296,6 +297,7 @@ impl Grabber {
             Some(_) => GrabSchedule::new(interval, 0, DAMAGE_IDLE),
             None => GrabSchedule::new(interval, POLL_IDLE_AFTER, POLL_IDLE),
         };
+        let mut trust = DamageTrust::default();
         // The pointer as drawn into the last grab: where, and which image.
         let mut drawn = None;
         let mut next = Instant::now();
@@ -326,9 +328,11 @@ impl Grabber {
                 .as_ref()
                 .filter(|_| shared.capture_cursor.load(Ordering::SeqCst));
             let pointer_state = pointer.map(|cursor| (cursor.x, cursor.y, cursor.cursor_serial));
-            if !schedule.due(Instant::now(), damaged || pointer_state != drawn) {
+            let hinted = damaged || pointer_state != drawn;
+            if !schedule.due(Instant::now(), hinted) {
                 continue;
             }
+            let first = self.previous.is_empty();
             if let Some(damage) = self.damage {
                 // Drawing after this reports damage again, and drawing before
                 // it is in the grab, which the X server reads after it.
@@ -344,6 +348,16 @@ impl Grabber {
             drawn = pointer_state;
             let changed = self.frame != self.previous;
             schedule.grabbed(Instant::now(), changed);
+            if self.damage.is_some() && !first && trust.grabbed(hinted, changed) {
+                // Some drivers and compositors draw past the X server's
+                // DAMAGE. Its reports still bring a grab forward, but the
+                // screen is polled as where there is no DAMAGE, so the
+                // picture does not stay at one frame a second.
+                tracing::warn!(
+                    "the X server's DAMAGE did not report drawing; polling the screen as well"
+                );
+                schedule = GrabSchedule::new(interval, POLL_IDLE_AFTER, POLL_IDLE);
+            }
             if !changed {
                 continue;
             }
