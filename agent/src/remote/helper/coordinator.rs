@@ -45,9 +45,93 @@ const KEYFRAME_RETRY: Duration = Duration::from_secs(1);
 static REGISTRY: OnceLock<Arc<Registry>> = OnceLock::new();
 
 /// Connected helpers, newest last.
-#[derive(Default)]
 pub(crate) struct Registry {
     helpers: Mutex<Vec<Arc<Connection>>>,
+    /// Who holds the console: the platform's answer, or a test's.
+    console: Box<dyn Fn() -> Console + Send + Sync>,
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self {
+            helpers: Mutex::default(),
+            console: Box::new(Console::now),
+        }
+    }
+}
+
+/// Who holds the console, whose helper a remote session uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Console {
+    /// The logind session active on seat0, a login screen's included.
+    #[cfg(target_os = "linux")]
+    Session(String),
+    /// Seat0 shows no graphical session, such as a text console.
+    #[cfg(target_os = "linux")]
+    Nobody,
+    /// The signed-in user whose session is on the console.
+    #[cfg(target_os = "macos")]
+    User(u32),
+    /// The login window, as when fast user switching shows it.
+    #[cfg(target_os = "macos")]
+    LoginWindow,
+}
+
+impl Console {
+    /// The session supervisor's reading of logind, taken every second.
+    #[cfg(target_os = "linux")]
+    fn now() -> Self {
+        super::platform::sessions::console_session().map_or(Self::Nobody, Self::Session)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn now() -> Self {
+        super::platform::session_close::console_user().map_or(Self::LoginWindow, Self::User)
+    }
+
+    /// Whether `helper` runs in the session on the console.
+    fn served_by(&self, helper: &Connection) -> bool {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Session(id) => helper.login_session.as_deref() == Some(id.as_str()),
+            #[cfg(target_os = "linux")]
+            Self::Nobody => false,
+            #[cfg(target_os = "macos")]
+            Self::User(uid) => helper.uid == *uid && !helper.login_window,
+            #[cfg(target_os = "macos")]
+            Self::LoginWindow => helper.login_window,
+        }
+    }
+
+    fn no_helper(&self) -> anyhow::Error {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Session(id) => anyhow::anyhow!("no session helper is running in session {id}"),
+            #[cfg(target_os = "linux")]
+            Self::Nobody => anyhow::anyhow!("no graphical session is on the console"),
+            #[cfg(target_os = "macos")]
+            Self::User(uid) => {
+                anyhow::anyhow!("no session helper is running for the console user {uid}")
+            }
+            #[cfg(target_os = "macos")]
+            Self::LoginWindow => {
+                anyhow::anyhow!("no session helper is running at the login window")
+            }
+        }
+    }
+
+    /// What the technician is told while the console's session has no helper.
+    fn waiting_notice(&self) -> String {
+        #[cfg(target_os = "linux")]
+        if *self == Self::Nobody {
+            return "No graphical session is on the console. The remote session shows the \
+                console again when one is."
+                .to_owned();
+        }
+        "Another session took the console and the Agent cannot show it yet. The remote \
+            session moves to it as soon as it can."
+            .to_owned()
+    }
 }
 
 /// Starts accepting helpers on `path`. Only processes running this Agent's
@@ -195,46 +279,20 @@ impl Registry {
     }
 
     /// The helper of the session on the console.
-    #[cfg(target_os = "linux")]
     fn console_helper(&self) -> anyhow::Result<Arc<Connection>> {
-        let console = super::platform::sessions::console_session()
-            .context("no graphical session is on the console")?;
-        self.session_helper(&console)
+        let console = (self.console)();
+        self.helper_of(&console).ok_or_else(|| console.no_helper())
     }
 
-    /// The helper of logind session `id`.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn session_helper(&self, id: &str) -> anyhow::Result<Arc<Connection>> {
+    /// The newest connected helper of the session `console` names.
+    fn helper_of(&self, console: &Console) -> Option<Arc<Connection>> {
         self.helpers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
             .rev()
-            .find(|helper| {
-                helper.login_session.as_deref() == Some(id) && !helper.closed.load(Ordering::SeqCst)
-            })
+            .find(|helper| console.served_by(helper) && !helper.closed.load(Ordering::SeqCst))
             .cloned()
-            .with_context(|| format!("no session helper is running in session {id}"))
-    }
-
-    /// The helper of the session on the console.
-    #[cfg(target_os = "macos")]
-    fn console_helper(&self) -> anyhow::Result<Arc<Connection>> {
-        let console = super::platform::session_close::console_user();
-        self.helpers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .rev()
-            .find(|helper| match console {
-                Some(uid) => helper.uid == uid && !helper.login_window,
-                None => helper.login_window,
-            })
-            .cloned()
-            .with_context(|| match console {
-                Some(uid) => format!("no session helper is running for the console user {uid}"),
-                None => "no session helper is running at the login window".to_owned(),
-            })
     }
 }
 
@@ -567,34 +625,66 @@ struct Desired {
     display_border: bool,
 }
 
-/// A remote session's view of the console's helper.
+/// A remote session's view of the console's helper. The session follows the
+/// console: when another session takes it, the session leaves the helper it
+/// used, undoing there what it changed, and moves to the console's helper, or
+/// waits for one while the console's session has none.
 pub(crate) struct Remote {
     registry: Arc<Registry>,
     current: Mutex<Option<Arc<Connection>>>,
+    /// The helper capture last started on, until it stops.
+    capturing: Mutex<Option<Arc<Connection>>>,
     events: Arc<SessionEvents>,
     desired: Mutex<Desired>,
     /// What every helper the session uses shows; the notification only once.
     ui: Mutex<SessionUi>,
+    /// Set when the session left a session that lost the console, until
+    /// capture starts in another: a display chosen there does not carry over.
+    moved: AtomicBool,
+    /// The console whose session the remote session waits to have a helper.
+    waiting: Mutex<Option<Console>>,
+    /// What the technician is still to be told.
+    notice: Mutex<Option<String>>,
     /// The locked GNOME session the remote session unlocked, locked again
-    /// when the remote session ends.
+    /// when the remote session ends or leaves it.
     #[cfg(target_os = "linux")]
     unlocked: Mutex<Option<String>>,
+    /// Locks a logind session, through logind outside tests.
+    #[cfg(target_os = "linux")]
+    lock_session: LockSession,
 }
+
+#[cfg(target_os = "linux")]
+type LockSession = Box<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>;
 
 impl Remote {
     pub(crate) fn new(ui: SessionUi) -> anyhow::Result<Arc<Self>> {
-        Ok(Arc::new(Self {
-            registry: registry()?,
+        Ok(Arc::new(Self::with_registry(registry()?, ui)))
+    }
+
+    fn with_registry(registry: Arc<Registry>, ui: SessionUi) -> Self {
+        Self {
+            registry,
             current: Mutex::default(),
+            capturing: Mutex::default(),
             events: Arc::default(),
             desired: Mutex::default(),
             ui: Mutex::new(ui),
+            moved: AtomicBool::new(false),
+            waiting: Mutex::default(),
+            notice: Mutex::default(),
             #[cfg(target_os = "linux")]
             unlocked: Mutex::default(),
-        }))
+            #[cfg(target_os = "linux")]
+            lock_session: Box::new(|session| {
+                super::platform::sessions::Logind::connect()?.lock_session(session)
+            }),
+        }
     }
 
-    /// The console's helper, moving the session to it when the console changed.
+    /// The helper the session uses, or the console's when it has none or
+    /// its helper left. Input stays with the helper the session uses until
+    /// capture's next check, at most 100 ms, sees the console move.
     fn helper(&self) -> anyhow::Result<Arc<Connection>> {
         let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(helper) = current
@@ -603,8 +693,51 @@ impl Remote {
         {
             return Ok(Arc::clone(helper));
         }
-        let helper = self.registry.console_helper()?;
-        self.detach(current.take());
+        let console = (self.registry.console)();
+        self.leave(current.take(), &console);
+        self.attach(&mut current, console)
+    }
+
+    /// The console's helper, leaving the one the session uses when its
+    /// session no longer has the console.
+    fn follow_console(&self) -> anyhow::Result<Arc<Connection>> {
+        let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
+        let console = (self.registry.console)();
+        if let Some(helper) = current
+            .as_ref()
+            .filter(|helper| !helper.closed.load(Ordering::SeqCst) && console.served_by(helper))
+        {
+            return Ok(Arc::clone(helper));
+        }
+        self.leave(current.take(), &console);
+        self.attach(&mut current, console)
+    }
+
+    /// Begins the session in the helper of `console`'s session, or, when it
+    /// has none yet, tells the technician once that the session waits for it.
+    fn attach(
+        &self,
+        current: &mut Option<Arc<Connection>>,
+        console: Console,
+    ) -> anyhow::Result<Arc<Connection>> {
+        let Some(helper) = self.registry.helper_of(&console) else {
+            let error = console.no_helper();
+            let mut waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
+            if waiting.as_ref() != Some(&console) {
+                tracing::info!(
+                    ?console,
+                    "the console's session has no session helper yet; waiting for it"
+                );
+                *self.notice.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(console.waiting_notice());
+                *waiting = Some(console);
+            }
+            return Err(error);
+        };
+        self.waiting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         *helper.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&self.events));
         let ui = {
             let mut ui = self.ui.lock().unwrap_or_else(|e| e.into_inner());
@@ -642,34 +775,100 @@ impl Remote {
         Ok(helper)
     }
 
-    fn detach(&self, helper: Option<Arc<Connection>>) {
-        if let Some(helper) = helper {
-            let _ = helper
-                .session
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take();
-            if !helper.closed.load(Ordering::SeqCst) {
-                let _ = helper.call(Request::EndSession);
+    /// Stops using `helper`, whose session's helper left or which is not on
+    /// `console` any more. Ending the session there stops its capture and
+    /// audio and releases what the session held or changed in it: keys and
+    /// buttons, the idle-lock inhibition, the wallpaper, a Mac's blackout and
+    /// blocked input, chat and file transfers. A Linux computer's keyboard
+    /// and pointer are blocked by the coordinator, for the whole computer,
+    /// and stay blocked. A session unlocked for the technician is locked
+    /// again once it lost the console.
+    fn leave(&self, helper: Option<Arc<Connection>>, console: &Console) {
+        let Some(helper) = helper else {
+            return;
+        };
+        let lost_console = !console.served_by(&helper);
+        self.detach(&helper);
+        *self
+            .events
+            .input_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = InputState::default();
+        if !lost_console {
+            return;
+        }
+        self.moved.store(true, Ordering::SeqCst);
+        tracing::info!(
+            uid = helper.uid,
+            login_window = helper.login_window,
+            login_session = helper.login_session.as_deref(),
+            ?console,
+            "remote session left a session helper whose session lost the console"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let mut unlocked = self.unlocked.lock().unwrap_or_else(|e| e.into_inner());
+            if unlocked.is_some() && *unlocked == helper.login_session {
+                self.lock_again(unlocked.take());
             }
         }
     }
 
-    fn call(&self, request: Request) -> anyhow::Result<Reply> {
-        self.helper()?.call(request)
+    fn detach(&self, helper: &Connection) {
+        let _ = helper
+            .session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if !helper.closed.load(Ordering::SeqCst) {
+            let _ = helper.call(Request::EndSession);
+        }
     }
 
+    /// Locks `session` again, which the remote session unlocked.
+    #[cfg(target_os = "linux")]
+    fn lock_again(&self, session: Option<String>) {
+        let Some(session) = session else {
+            return;
+        };
+        match (self.lock_session)(&session) {
+            Ok(()) => tracing::info!(session, "locked the GNOME session the technician unlocked"),
+            Err(error) => {
+                tracing::warn!(session, error = ?error, "could not lock the session again");
+            }
+        }
+    }
+
+    /// Runs `request` in the session's helper. While the console's session
+    /// has no helper yet, the request has nowhere to go and is dropped:
+    /// what the session must restore in the next helper is in `desired`.
     fn done(&self, request: Request) -> anyhow::Result<()> {
-        self.call(request).map(|_| ())
+        match self.helper() {
+            Ok(helper) => helper.run(request),
+            Err(error)
+                if self
+                    .waiting
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_some() =>
+            {
+                tracing::debug!(error = ?error, "dropped a request while the console's session has no helper");
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
+    /// Starts capture in the console's helper. After the session moved to
+    /// another session, capture shows that session's main display.
     pub(crate) fn start(
         self: &Arc<Self>,
         display_id: Option<DisplayId>,
         settings: StreamSettings,
         publish: impl Fn(Frame) + Send + 'static,
     ) -> anyhow::Result<Started> {
-        let helper = self.helper()?;
+        let helper = self.follow_console()?;
+        let display_id = display_id.filter(|_| !self.moved.load(Ordering::SeqCst));
         *self.events.frames.lock().unwrap_or_else(|e| e.into_inner()) =
             Some(FrameSink::new(publish));
         *self
@@ -688,11 +887,15 @@ impl Remote {
                 displays,
                 active_display,
                 format,
-            } => Ok(Started {
-                displays,
-                active_display,
-                format,
-            }),
+            } => {
+                self.moved.store(false, Ordering::SeqCst);
+                *self.capturing.lock().unwrap_or_else(|e| e.into_inner()) = Some(helper);
+                Ok(Started {
+                    displays,
+                    active_display,
+                    format,
+                })
+            }
             _ => bail!("the session helper did not start capture"),
         }
     }
@@ -747,6 +950,10 @@ impl Remote {
 
     pub(crate) fn stop(&self) -> anyhow::Result<()> {
         *self.events.frames.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.capturing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         let current = self
             .current
             .lock()
@@ -760,8 +967,13 @@ impl Remote {
         }
     }
 
-    /// Why capture must restart: the helper stopped capturing or left, or
-    /// another session took the console.
+    /// Why capture must restart: the helper stopped capturing or left, the
+    /// session moved to another helper, or another session took the console.
+    /// The last leaves the session's helper at once, so that neither the
+    /// picture nor input stays with a session that is off the console; the
+    /// restart then moves to the console's helper. Capture control asks every
+    /// 100 ms; on Linux the console is logind's as the session supervisor
+    /// reads it every second, on macOS the console user at the time.
     pub(crate) fn poll_ended(&self) -> Option<anyhow::Error> {
         if let Some(error) = self
             .events
@@ -772,16 +984,30 @@ impl Remote {
         {
             return Some(anyhow::anyhow!(error));
         }
-        let current = self
-            .current
+        let capturing = self
+            .capturing
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()?;
-        if current.closed.load(Ordering::SeqCst) {
+        if capturing.closed.load(Ordering::SeqCst) {
             return Some(anyhow::anyhow!("the session helper disconnected"));
         }
-        let console = self.registry.console_helper().ok();
-        if !console.is_some_and(|console| Arc::ptr_eq(&console, &current)) {
+        let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
+        if !current
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &capturing))
+        {
+            return Some(anyhow::anyhow!(
+                "the session moved to another session helper"
+            ));
+        }
+        let console = (self.registry.console)();
+        if !console.served_by(&capturing) {
+            self.leave(current.take(), &console);
+            self.capturing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
             return Some(anyhow::anyhow!("another session took the console"));
         }
         None
@@ -815,29 +1041,20 @@ impl Drop for Remote {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
-        self.detach(current);
+        if let Some(helper) = current {
+            self.detach(&helper);
+        }
         #[cfg(target_os = "linux")]
         if let Err(error) = super::platform::input_block::set_blocked(false) {
             tracing::warn!(error = ?error, "could not unblock the local keyboard and pointer");
         }
         #[cfg(target_os = "linux")]
-        if let Some(session) = self
-            .unlocked
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
-            match super::platform::sessions::Logind::connect()
-                .and_then(|logind| logind.lock_session(&session))
-            {
-                Ok(()) => {
-                    tracing::info!(session, "locked the GNOME session the technician unlocked")
-                }
-                Err(error) => {
-                    tracing::warn!(session, error = ?error, "could not lock the session again")
-                }
-            }
-        }
+        self.lock_again(
+            self.unlocked
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(),
+        );
     }
 }
 
@@ -962,6 +1179,15 @@ impl ScreenInput for HelperInput {
         self.0.done(Request::SetBlackout(enabled))
     }
     fn maintenance_state(&self) -> Option<meshrmm_protocol::SessionMessage> {
+        if let Some(reason) = self
+            .0
+            .notice
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            return Some(meshrmm_protocol::SessionMessage::MaintenanceError { reason });
+        }
         let state = *self
             .0
             .events
@@ -982,7 +1208,7 @@ impl ScreenInput for HelperInput {
     fn set_agent_input_blocked(&self, blocked: bool) -> anyhow::Result<()> {
         #[cfg(target_os = "linux")]
         {
-            self.0.helper()?.run(Request::ReleaseInput)?;
+            self.0.done(Request::ReleaseInput)?;
             super::platform::input_block::set_blocked(blocked)
         }
         #[cfg(target_os = "macos")]
@@ -1234,6 +1460,363 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// The session a fake helper serves.
+    #[derive(Clone, Copy)]
+    struct Seat {
+        uid: u32,
+        session: &'static str,
+    }
+
+    const A: Seat = Seat {
+        uid: 501,
+        session: "c1",
+    };
+    const B: Seat = Seat {
+        uid: 502,
+        session: "c2",
+    };
+    const C: Seat = Seat {
+        uid: 503,
+        session: "c3",
+    };
+
+    impl Seat {
+        /// The console while this seat's session holds it.
+        fn console(self) -> Console {
+            #[cfg(target_os = "linux")]
+            let console = Console::Session(self.session.to_owned());
+            #[cfg(target_os = "macos")]
+            let console = Console::User(self.uid);
+            console
+        }
+    }
+
+    /// A registry whose console is whatever `console` holds.
+    fn registry_on(console: &Arc<Mutex<Console>>) -> Arc<Registry> {
+        let console = Arc::clone(console);
+        Arc::new(Registry {
+            helpers: Mutex::default(),
+            console: Box::new(move || console.lock().unwrap().clone()),
+        })
+    }
+
+    /// A fake helper that answers every call, starting capture on one
+    /// display, and reports what it was asked.
+    struct FakeHelper {
+        connection: Arc<Connection>,
+        requests: mpsc::Receiver<Request>,
+    }
+
+    impl FakeHelper {
+        fn connect(registry: &Arc<Registry>, seat: Seat) -> Self {
+            let (coordinator, helper) = UnixStream::pair().unwrap();
+            send(
+                &helper,
+                &Hello {
+                    version: protocol::VERSION,
+                    login_window: false,
+                },
+            );
+            let connection = registry
+                .attach(coordinator, seat.uid, Some(seat.session.to_owned()))
+                .unwrap();
+            let (received, requests) = mpsc::channel();
+            std::thread::spawn(move || {
+                let mut calls = BufReader::new(helper.try_clone().unwrap());
+                while let Ok(Some(call)) = protocol::read::<Call>(&mut calls) {
+                    let reply = match call.request {
+                        Request::Start { .. } => started(),
+                        _ => Reply::Done,
+                    };
+                    // Reported before the reply, so whoever has the reply
+                    // finds the request.
+                    if received.send(call.request).is_err() {
+                        break;
+                    }
+                    send(
+                        &helper,
+                        &Event::Reply {
+                            id: call.id,
+                            result: Ok(reply),
+                        },
+                    );
+                }
+            });
+            Self {
+                connection,
+                requests,
+            }
+        }
+
+        /// The requests received since the last look.
+        fn received(&self) -> Vec<Request> {
+            self.requests.try_iter().collect()
+        }
+    }
+
+    fn started() -> Reply {
+        let display = meshrmm_protocol::Display {
+            session: meshrmm_protocol::DesktopSession::Console,
+            id: DisplayId(1),
+            name: "Display".into(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            primary: true,
+        };
+        Reply::Started {
+            displays: vec![display.clone()],
+            active_display: display,
+            format: meshrmm_protocol::VideoFormat {
+                width: 1920,
+                height: 1080,
+                frames_per_second: 30,
+                codec: meshrmm_protocol::Codec::H264,
+                pixel_format: meshrmm_protocol::PixelFormat::Nv12,
+                bitrate_bits_per_second: 4_000_000,
+            },
+        }
+    }
+
+    /// The requests' names.
+    fn names(requests: &[Request]) -> Vec<String> {
+        requests
+            .iter()
+            .map(|request| {
+                format!("{request:?}")
+                    .chars()
+                    .take_while(char::is_ascii_alphanumeric)
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn settings() -> StreamSettings {
+        StreamSettings {
+            frames_per_second: 30,
+            bitrate_bits_per_second: 4_000_000,
+            codec: meshrmm_protocol::Codec::H264,
+            capture_cursor: true,
+            grayscale: false,
+        }
+    }
+
+    fn click(pressed: bool) -> RemoteInput {
+        RemoteInput::PointerButton {
+            display_id: DisplayId(1),
+            button: meshrmm_protocol::PointerButton::Left,
+            pressed,
+        }
+    }
+
+    fn start(remote: &Arc<Remote>, display_id: Option<DisplayId>) -> anyhow::Result<Started> {
+        remote.start(display_id, settings(), |_| {})
+    }
+
+    fn is_notice(message: Option<meshrmm_protocol::SessionMessage>) -> bool {
+        matches!(
+            message,
+            Some(meshrmm_protocol::SessionMessage::MaintenanceError { .. })
+        )
+    }
+
+    #[test]
+    fn the_session_follows_the_console_to_another_sessions_helper() {
+        let console = Arc::new(Mutex::new(A.console()));
+        let registry = registry_on(&console);
+        let a = FakeHelper::connect(&registry, A);
+        let b = FakeHelper::connect(&registry, B);
+        let remote = Arc::new(Remote::with_registry(
+            Arc::clone(&registry),
+            SessionUi::default(),
+        ));
+        let input = HelperInput(Arc::clone(&remote));
+        start(&remote, Some(DisplayId(7))).unwrap();
+        let requests = a.received();
+        assert_eq!(names(&requests), ["BeginSession", "Start"]);
+        assert!(matches!(
+            requests[1],
+            Request::Start {
+                display_id: Some(DisplayId(7)),
+                ..
+            }
+        ));
+        assert!(remote.poll_ended().is_none());
+
+        *console.lock().unwrap() = B.console();
+        // Capture restarts on a new stream, and A's session is left at
+        // once: its capture stops and nothing it sends reaches the session.
+        let ended = remote.poll_ended().expect("the console moved");
+        assert!(format!("{ended}").contains("another session took the console"));
+        assert_eq!(names(&a.received()), ["EndSession"]);
+        assert!(a.connection.session.lock().unwrap().is_none());
+
+        // The restart starts B's main display: display 7 was A's.
+        start(&remote, Some(DisplayId(7))).unwrap();
+        let requests = b.received();
+        assert_eq!(names(&requests), ["BeginSession", "Start"]);
+        assert!(matches!(
+            requests[1],
+            Request::Start {
+                display_id: None,
+                ..
+            }
+        ));
+        input.apply(click(true)).unwrap();
+        input.apply_chat("hello".into()).unwrap();
+        assert_eq!(names(&b.received()), ["Input", "Chat"]);
+        assert!(a.received().is_empty());
+        assert!(remote.poll_ended().is_none());
+    }
+
+    #[test]
+    fn leaving_a_session_off_the_console_releases_what_the_session_held_there() {
+        let console = Arc::new(Mutex::new(A.console()));
+        let registry = registry_on(&console);
+        let a = FakeHelper::connect(&registry, A);
+        let b = FakeHelper::connect(&registry, B);
+        #[allow(unused_mut, reason = "only Linux locks sessions again")]
+        let mut remote = Remote::with_registry(Arc::clone(&registry), SessionUi::default());
+        #[cfg(target_os = "linux")]
+        let locked = {
+            let locked = Arc::new(Mutex::new(Vec::new()));
+            let record = Arc::clone(&locked);
+            remote.lock_session = Box::new(move |session| {
+                record.lock().unwrap().push(session.to_owned());
+                Ok(())
+            });
+            // As when GNOME refused to capture A's locked session.
+            *remote.unlocked.lock().unwrap() = Some(A.session.to_owned());
+            locked
+        };
+        let remote = Arc::new(remote);
+        let input = HelperInput(Arc::clone(&remote));
+        start(&remote, None).unwrap();
+        input.set_prevent_idle_lock(true).unwrap();
+        input.apply(click(true)).unwrap();
+        assert_eq!(
+            names(&a.received()),
+            ["BeginSession", "Start", "SetPreventIdleLock", "Input"]
+        );
+
+        *console.lock().unwrap() = B.console();
+        assert!(remote.poll_ended().is_some());
+        // Ending the session in A's helper releases the held button and the
+        // idle-lock inhibition there, as at the end of a remote session.
+        assert_eq!(names(&a.received()), ["EndSession"]);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(*locked.lock().unwrap(), [A.session]);
+            assert!(remote.unlocked.lock().unwrap().is_none());
+        }
+        // The technician's choice carries over to B's session.
+        start(&remote, None).unwrap();
+        assert_eq!(
+            names(&b.received()),
+            ["BeginSession", "SetPreventIdleLock", "Start"]
+        );
+        drop(input);
+        drop(remote);
+        #[cfg(target_os = "linux")]
+        assert_eq!(*locked.lock().unwrap(), [A.session]);
+    }
+
+    #[test]
+    fn the_session_waits_for_the_helper_of_a_console_session_that_has_none() {
+        let console = Arc::new(Mutex::new(A.console()));
+        let registry = registry_on(&console);
+        let a = FakeHelper::connect(&registry, A);
+        let remote = Arc::new(Remote::with_registry(
+            Arc::clone(&registry),
+            SessionUi::default(),
+        ));
+        let input = HelperInput(Arc::clone(&remote));
+        start(&remote, Some(DisplayId(7))).unwrap();
+        a.received();
+        assert!(!is_notice(input.maintenance_state()));
+
+        *console.lock().unwrap() = C.console();
+        assert!(remote.poll_ended().is_some());
+        assert_eq!(names(&a.received()), ["EndSession"]);
+        assert!(start(&remote, Some(DisplayId(7))).is_err());
+        // The technician is told once, and the session goes on: input has
+        // nowhere to go, but does not fail.
+        assert!(is_notice(input.maintenance_state()));
+        input.apply(click(true)).unwrap();
+        input.apply(click(false)).unwrap();
+        assert!(start(&remote, Some(DisplayId(7))).is_err());
+        assert!(!is_notice(input.maintenance_state()));
+        assert!(a.received().is_empty());
+
+        let c = FakeHelper::connect(&registry, C);
+        start(&remote, Some(DisplayId(7))).unwrap();
+        let requests = c.received();
+        assert_eq!(names(&requests), ["BeginSession", "Start"]);
+        assert!(matches!(
+            requests[1],
+            Request::Start {
+                display_id: None,
+                ..
+            }
+        ));
+        input.apply(click(true)).unwrap();
+        assert_eq!(names(&c.received()), ["Input"]);
+        assert!(remote.poll_ended().is_none());
+        assert!(a.received().is_empty());
+    }
+
+    #[test]
+    fn a_console_that_stays_put_changes_nothing() {
+        let console = Arc::new(Mutex::new(A.console()));
+        let registry = registry_on(&console);
+        let a = FakeHelper::connect(&registry, A);
+        let remote = Arc::new(Remote::with_registry(
+            Arc::clone(&registry),
+            SessionUi::default(),
+        ));
+        let input = HelperInput(Arc::clone(&remote));
+        start(&remote, Some(DisplayId(7))).unwrap();
+        a.received();
+        for _ in 0..3 {
+            assert!(remote.poll_ended().is_none());
+            input.apply(click(true)).unwrap();
+        }
+        assert_eq!(names(&a.received()), ["Input", "Input", "Input"]);
+        assert!(!is_notice(input.maintenance_state()));
+    }
+
+    #[test]
+    fn a_helper_connecting_in_a_session_off_the_console_is_not_used() {
+        let console = Arc::new(Mutex::new(A.console()));
+        let registry = registry_on(&console);
+        let a = FakeHelper::connect(&registry, A);
+        let remote = Arc::new(Remote::with_registry(
+            Arc::clone(&registry),
+            SessionUi::default(),
+        ));
+        let input = HelperInput(Arc::clone(&remote));
+        start(&remote, Some(DisplayId(7))).unwrap();
+        a.received();
+
+        let b = FakeHelper::connect(&registry, B);
+        assert!(remote.poll_ended().is_none());
+        input.apply(click(true)).unwrap();
+        // A restart for another reason stays in A's session, on its display.
+        start(&remote, Some(DisplayId(7))).unwrap();
+        let requests = a.received();
+        assert_eq!(names(&requests), ["Input", "Start"]);
+        assert!(matches!(
+            requests[1],
+            Request::Start {
+                display_id: Some(DisplayId(7)),
+                ..
+            }
+        ));
+        assert!(b.received().is_empty());
+        assert!(b.connection.session.lock().unwrap().is_none());
     }
 
     /// Runs a helper in this process against a coordinator socket and streams
