@@ -103,3 +103,26 @@ test("lines break where readings are missing, and areas close each piece", () =>
   assert.equal(nearestPoint(points, 64).at, 100);
   assert.equal(nearestPoint([], 1), null);
 });
+
+test("live lines join a minute's readings from before the page opened, and break where the device went offline", () => {
+  const seconds = (at) => at * 1_000;
+  const path = (times, gapMs = 15_000) =>
+    linePath(
+      times.map((at) => pointFromReading(reading(seconds(at)))),
+      (point) => point.cpu_percent,
+      (at) => at / 1_000,
+      () => 0,
+      gapMs,
+    ).replace(/[0-9.,]+/g, "");
+  // Unwatched, a reading a minute; the page opens, and the next comes within
+  // seconds, then one every five.
+  assert.equal(path([0, 60, 120, 180, 213, 218, 223]), "MLLLLLL");
+  // Watched, a disconnect of twenty seconds breaks the line; so does an
+  // outage between minute-apart readings longer than three of them.
+  assert.equal(path([0, 5, 10, 30, 35, 40]), "MLLMLL");
+  assert.equal(path([0, 60, 120, 400, 460]), "MLLML");
+  // Spacing after a break is still the spacing before it.
+  assert.equal(path([0, 5, 10, 30, 52, 57]), "MLLMML");
+  // History ranges break as before: their spacing is at least a minute.
+  assert.equal(path([0, 60, 120, 330, 390], 180_000), "MLLML");
+});

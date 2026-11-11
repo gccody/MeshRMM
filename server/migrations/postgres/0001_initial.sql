@@ -426,7 +426,8 @@ CREATE TABLE device_metrics (
   device_id TEXT NOT NULL,
   -- The minute's start, in Unix milliseconds.
   minute BIGINT NOT NULL,
-  samples BIGINT NOT NULL CHECK (samples > 0),
+  -- The milliseconds its readings cover, which weight its averages.
+  covered_ms BIGINT NOT NULL CHECK (covered_ms > 0),
   cpu_percent DOUBLE PRECISION NOT NULL,
   cpu_percent_max DOUBLE PRECISION NOT NULL,
   memory_used_bytes BIGINT NOT NULL,

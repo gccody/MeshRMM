@@ -15,6 +15,13 @@
 //! device, set on each change between unwatched and watched, so the listener
 //! never falls behind and costs nothing while nothing changes.
 //!
+//! Every connected Agent's connection listens for its device, so the
+//! registry holds an entry for each online device; the watched ones are also
+//! kept in a set of their own, so counting and listing them, as the metrics
+//! feed does every few seconds, costs what is watched, not the fleet.
+//! Listening, being told of a change and stopping each take the lock once,
+//! for one hash lookup.
+//!
 //! The lock is a plain mutex, held only while counting and never across an
 //! await. The metrics feed takes it inside the store's own lock while it
 //! scans for watched devices; nothing takes them the other way round.
@@ -28,7 +35,7 @@ use tokio::sync::watch;
 /// The fleet's watched devices. Clones share the registry.
 #[derive(Debug, Clone, Default)]
 pub struct Watched {
-    devices: Arc<Mutex<HashMap<Arc<str>, Entry>>>,
+    devices: Arc<Mutex<Devices>>,
 }
 
 #[derive(Debug)]
@@ -51,7 +58,13 @@ impl Entry {
     }
 }
 
-pub(super) type Devices = HashMap<Arc<str>, Entry>;
+/// Every device a socket watches or a task listens for, and the watched
+/// ones apart.
+#[derive(Debug, Default)]
+pub(super) struct Devices {
+    entries: HashMap<Arc<str>, Entry>,
+    watched: HashSet<Arc<str>>,
+}
 
 impl Watched {
     pub(super) fn lock(&self) -> MutexGuard<'_, Devices> {
@@ -66,15 +79,15 @@ impl Watched {
 
     /// How many event sockets watch the device.
     pub fn sockets(&self, device_id: &str) -> usize {
-        self.lock().get(device_id).map_or(0, |entry| entry.sockets)
+        self.lock()
+            .entries
+            .get(device_id)
+            .map_or(0, |entry| entry.sockets)
     }
 
     /// How many devices any socket watches.
     pub fn len(&self) -> usize {
-        self.lock()
-            .values()
-            .filter(|entry| entry.sockets > 0)
-            .count()
+        watched_count(&self.lock())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -84,7 +97,7 @@ impl Watched {
     /// How many devices the registry holds an entry for, watched or only
     /// listened to; for tests, to see that none is left behind.
     pub fn entries(&self) -> usize {
-        self.lock().len()
+        self.lock().entries.len()
     }
 
     /// Follows whether the device is watched, from now on.
@@ -111,6 +124,7 @@ impl Watched {
                 entry.sockets += 1;
                 if entry.sockets == 1 {
                     entry.signal.send_replace(true);
+                    devices.watched.insert(Arc::clone(&key));
                 }
                 key
             })
@@ -121,14 +135,16 @@ impl Watched {
     fn leave<'a>(&self, device_ids: impl IntoIterator<Item = &'a Arc<str>>) {
         let mut devices = self.lock();
         for device_id in device_ids {
-            let Some(entry) = devices.get_mut(&**device_id) else {
+            let Some(entry) = devices.entries.get_mut(&**device_id) else {
                 continue;
             };
             entry.sockets = entry.sockets.saturating_sub(1);
             if entry.sockets == 0 {
                 entry.signal.send_replace(false);
-                if entry.listeners == 0 {
-                    devices.remove(&**device_id);
+                let unused = entry.listeners == 0;
+                devices.watched.remove(&**device_id);
+                if unused {
+                    devices.entries.remove(&**device_id);
                 }
             }
         }
@@ -141,26 +157,29 @@ fn entry(
     devices: &mut Devices,
     device_id: impl AsRef<str> + Into<Arc<str>>,
 ) -> (Arc<str>, &mut Entry) {
-    let key = match devices.get_key_value(device_id.as_ref()) {
+    let key = match devices.entries.get_key_value(device_id.as_ref()) {
         Some((key, _)) => Arc::clone(key),
         None => device_id.into(),
     };
-    let entry = devices.entry(Arc::clone(&key)).or_insert_with(Entry::new);
+    let entry = devices
+        .entries
+        .entry(Arc::clone(&key))
+        .or_insert_with(Entry::new);
     (key, entry)
 }
 
 pub(super) fn is_watched(devices: &Devices, device_id: &str) -> bool {
-    devices
-        .get(device_id)
-        .is_some_and(|entry| entry.sockets > 0)
+    devices.watched.contains(device_id)
+}
+
+/// How many devices any socket watches.
+pub(super) fn watched_count(devices: &Devices) -> usize {
+    devices.watched.len()
 }
 
 /// The devices any socket watches.
 pub(super) fn watched_ids(devices: &Devices) -> impl Iterator<Item = &str> {
-    devices
-        .iter()
-        .filter(|(_, entry)| entry.sockets > 0)
-        .map(|(id, _)| &**id)
+    devices.watched.iter().map(|id| &**id)
 }
 
 /// Whether a device is watched, as it changes. Dropping it stops listening.
@@ -189,10 +208,10 @@ impl WatchedSignal {
 impl Drop for WatchedSignal {
     fn drop(&mut self) {
         let mut devices = self.registry.lock();
-        if let Some(entry) = devices.get_mut(&*self.device_id) {
+        if let Some(entry) = devices.entries.get_mut(&*self.device_id) {
             entry.listeners -= 1;
             if entry.listeners == 0 && entry.sockets == 0 {
-                devices.remove(&*self.device_id);
+                devices.entries.remove(&*self.device_id);
             }
         }
     }
@@ -344,6 +363,29 @@ mod tests {
         drop(signal);
         assert_eq!(registry.entries(), 1);
         drop(other);
+        assert_eq!(registry.entries(), 0);
+    }
+
+    #[test]
+    fn listened_to_devices_are_not_counted_or_listed_as_watched() {
+        let registry = Watched::default();
+        // Every connected Agent listens for its device.
+        let listeners: Vec<_> = (0..1_000)
+            .map(|n| registry.listen(&format!("d{n}")))
+            .collect();
+        let mut socket = WatchSet::new(registry.clone());
+        socket.replace(set(&["d7", "d9", "offline"]));
+        assert_eq!(registry.len(), 3);
+        assert_eq!(registry.entries(), 1_001);
+        let devices = registry.lock();
+        let mut watched: Vec<_> = watched_ids(&devices).collect();
+        watched.sort_unstable();
+        assert_eq!(watched, ["d7", "d9", "offline"]);
+        assert!(is_watched(&devices, "d7") && !is_watched(&devices, "d8"));
+        drop(devices);
+        drop(socket);
+        assert_eq!((registry.len(), registry.entries()), (0, 1_000));
+        drop(listeners);
         assert_eq!(registry.entries(), 0);
     }
 

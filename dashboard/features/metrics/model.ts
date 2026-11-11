@@ -216,8 +216,17 @@ export function niceCeiling(value: number, base = 10) {
   return 10 * magnitude;
 }
 
+// The longest an online device goes between readings: a minute, while no tab
+// watches it. Watched, it reports every few seconds.
+export const SLOWEST_READINGS_MS = 60_000;
+
 // The SVG path through the points' values, broken where readings are missing
-// for longer than `gapMs` (the device was offline).
+// (the device was offline): where two points are further apart than `gapMs`
+// and than three times the spacing of the points joined before them, which
+// counts up to SLOWEST_READINGS_MS. The live range has a reading a minute
+// from before its page opened, when nobody watched the device, and one every
+// few seconds since: the minute-apart ones draw as a line, while a disconnect
+// with the page open breaks it.
 export function linePath(
   points: MetricsPoint[],
   value: (point: MetricsPoint) => number,
@@ -227,8 +236,18 @@ export function linePath(
 ) {
   let path = "";
   let previous: number | null = null;
+  // The spacing of the last pair joined; the first pair is measured by its own.
+  let spacing: number | null = null;
   for (const point of points) {
-    const command = previous === null || point.at - previous > gapMs ? "M" : "L";
+    let command = "M";
+    if (previous !== null) {
+      const gap = point.at - previous;
+      const limit = Math.max(gapMs, 3 * Math.min(spacing ?? gap, SLOWEST_READINGS_MS));
+      if (gap <= limit) {
+        command = "L";
+        spacing = gap;
+      }
+    }
     path += `${command}${x(point.at).toFixed(1)},${y(value(point)).toFixed(1)}`;
     previous = point.at;
   }
