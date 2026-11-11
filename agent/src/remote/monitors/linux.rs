@@ -54,7 +54,7 @@ pub(super) fn restart_service(name: &str) -> anyhow::Result<()> {
     succeeded(finished, "systemctl restart").map(drop)
 }
 
-pub(super) fn is_agent_service(name: &str) -> bool {
+pub(in crate::remote) fn is_agent_service(name: &str) -> bool {
     let agent = crate::installer::SERVICE;
     name == agent || Some(name) == agent.strip_suffix(".service")
 }
@@ -114,7 +114,7 @@ pub(super) fn processes(name: &str) -> anyhow::Result<Vec<ProcessSample>> {
     Ok(found)
 }
 
-pub(super) fn is_protected_process(name: &str) -> bool {
+pub(in crate::remote) fn is_protected_process(name: &str) -> bool {
     ["systemd", "init", "meshrmm-agent", "kthreadd"].contains(&name)
 }
 

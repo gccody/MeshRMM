@@ -113,7 +113,7 @@ pub fn ancestors(processes: &[Process], pid: u32) -> HashSet<u32> {
 
 /// Whether `path` is the Agent executable or a copy of it, such as an update helper. Copies are
 /// compared by content, so another program cannot gain this protection by its name or folder.
-fn is_agent_image(path: &str) -> bool {
+pub fn is_agent_image(path: &str) -> bool {
     !path.is_empty()
         && std::env::current_exe()
             .and_then(|agent| same_contents(&agent, Path::new(path)))

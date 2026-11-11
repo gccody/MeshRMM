@@ -54,6 +54,10 @@ test("the file browser opens to files.browse and sits under Devices", () => {
   assert.equal(canView(account(["devices.view", "files.browse"]), "files"), true);
   assert.equal(canView(account(["devices.view", "files.manage"]), "files"), false);
   assert.equal(navViewFor("files"), "devices");
+  assert.equal(viewForPath("/tools"), "tools");
+  assert.equal(canView(account(["devices.view", "tools.services.view"]), "tools"), true);
+  assert.equal(canView(account(["devices.view", "tools.processes.manage"]), "tools"), false);
+  assert.equal(navViewFor("tools"), "devices");
 });
 
 test("the terminal page opens to either terminal permission and sits under Devices", () => {

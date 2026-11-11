@@ -9,6 +9,9 @@ mod telemetry;
 mod theme;
 mod window;
 
+/// Whether a program is the Agent or a copy of it; the remote tools don't end it either.
+pub(crate) use self::data::is_agent_image;
+
 use actions::Pending;
 use paint::*;
 use window::*;

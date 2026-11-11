@@ -262,6 +262,37 @@ yet.
 - Every platform keeps a hidden partial file beside an upload until it's
   checked, and the Agent's own record of them to delete abandoned ones.
 
+## Remote tools
+
+| | Windows | macOS | Linux |
+|---|---|---|---|
+| [Processes](remote-tools.md#processes) | Yes | Yes | Yes |
+| Read with | Toolhelp, process handles | libproc, `KERN_PROCARGS2` | `/proc` |
+| Session | Windows session | — | — |
+| Memory | Working set | Resident | Resident |
+| Ending | `TerminateProcess` | `SIGTERM`, then `SIGKILL` | `SIGTERM`, then `SIGKILL`, through a pidfd |
+| A reused process ID never ended in its place | Yes, checked on the handle that ends it | Checked just before; a narrow race remains | Yes, on Linux 5.3 and newer |
+| [Services](remote-tools.md#services) | Service Control Manager | launchd system domain | systemd |
+| Startup types | Automatic, Automatic (Delayed Start), Manual, Disabled | Enabled, Disabled | Enabled, Disabled (on demand), Masked; static units fixed |
+| Account | Logon account | The running job's user | `User=` |
+| Description | The service's | The job file's path | `Description=` |
+| As the system account | SYSTEM | root | root |
+
+- **Windows** session numbers are Windows's own: 0 for services, 1 and up
+  for signed-in users. macOS and Linux have no equivalent to list.
+- **macOS** has no process handle to check and signal in one step, so the
+  Agent checks the start time just before each signal; in the instant
+  between, a process that exits and whose ID is reused could be signalled.
+  The system reuses IDs slowly, so this is unlikely, not impossible. Only
+  the system domain is listed: each user's agents (`gui/<uid>`) come and go
+  with their sessions, and launchd describes jobs in no more words than
+  their labels and job files.
+- **Linux** services are systemd's alone: on a distribution without it,
+  the services tool answers with what running `systemctl` failed with. A
+  unit's startup is its unit file state; `static`, `indirect` and
+  `generated` units start only when something else asks, so they can't be
+  changed.
+
 ## Remote session video
 
 | | Windows | macOS | Linux |

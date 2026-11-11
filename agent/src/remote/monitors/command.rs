@@ -9,18 +9,18 @@ use std::time::{Duration, Instant};
 const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 
-pub(super) struct Finished {
+pub(in crate::remote) struct Finished {
     /// The exit code; `None` when a signal ended it.
-    pub(super) code: Option<i32>,
-    pub(super) stdout: String,
-    pub(super) stderr: String,
+    pub(in crate::remote) code: Option<i32>,
+    pub(in crate::remote) stdout: String,
+    pub(in crate::remote) stderr: String,
     /// It wrote more output than is kept.
-    pub(super) truncated: bool,
+    pub(in crate::remote) truncated: bool,
 }
 
 impl Finished {
     /// Its error output, or else its output, for a message.
-    pub(super) fn complaint(&self) -> String {
+    pub(in crate::remote) fn complaint(&self) -> String {
         let text = if self.stderr.trim().is_empty() {
             &self.stdout
         } else {
@@ -55,7 +55,7 @@ fn drain(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<(Vec<u8>, bool)
 }
 
 /// Runs `program` with `arguments`, stopping it after `timeout`.
-pub(super) fn run(
+pub(in crate::remote) fn run(
     program: &str,
     arguments: &[&str],
     timeout: Duration,

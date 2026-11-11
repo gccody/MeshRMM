@@ -80,6 +80,8 @@ mod thumbnail;
 #[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 mod toolbox;
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+mod tools;
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 mod transport;
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 mod unsent;
@@ -281,6 +283,27 @@ fn report_file_reply(
     }
 }
 
+/// Sends a tool request's answer without waiting for it to be written.
+/// One that can't be queued is lost; the server gives up on it.
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+fn report_tool_reply(
+    socket: &SignalingConnection,
+    request_id: String,
+    reply: meshrmm_protocol::ToolReply,
+) {
+    let status = AgentStatusMessage::ToolReply {
+        request_id,
+        reply: Box::new(reply),
+    };
+    let queued = match serde_json::to_string(&status) {
+        Ok(text) => socket.queue(Message::Text(text.into())),
+        Err(error) => Err(error.into()),
+    };
+    if let Err(error) = queued {
+        tracing::warn!(error = %error, "could not answer a tool request");
+    }
+}
+
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 async fn uninstall(socket: &SignalingConnection) -> anyhow::Result<ControlFlow<bool>> {
     crate::installer::schedule_uninstall().context("failed to schedule Agent self-uninstall")?;
@@ -387,6 +410,7 @@ pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
             applications: applications::Applications::new(std::sync::Arc::clone(&outbox)),
             wake: wake::Relay::new(),
             files: files::Files::new(),
+            tools: tools::Tools::new(),
             // Likewise, so monitors keep running while the Agent reconnects.
             monitors: monitors::Monitors::new(mode),
             writing_update: None,
@@ -424,6 +448,7 @@ struct Coordinator {
     applications: applications::Applications,
     wake: wake::Relay,
     files: files::Files,
+    tools: tools::Tools,
     monitors: monitors::Monitors,
     writing_update: Option<Writing>,
     writing_application: Option<Writing>,
@@ -624,6 +649,7 @@ impl Coordinator {
                 Some(receipt) = self.receipts.recv() => self.system_info.answered(receipt),
                 results = self.wake.next() => report_wake_results(socket, results),
                 (request_id, reply) = self.files.next() => report_file_reply(socket, request_id, reply),
+                (request_id, reply) = self.tools.next() => report_tool_reply(socket, request_id, reply),
                 messages = self.monitors.next() => report_monitors(socket, &self.monitors, messages),
                 () = self.update_schedule.due() => {
                     tracing::info!("starting the scheduled update scan");
@@ -778,6 +804,15 @@ impl Coordinator {
                         "the server asked for a file operation"
                     );
                     self.files.request(self.mode, request);
+                    return Ok(ControlFlow::Continue(()));
+                }
+                AgentCommand::ToolRequest { request } => {
+                    tracing::debug!(
+                        request_id = %request.request_id,
+                        operation = request.operation.name(),
+                        "the server asked for a tool request"
+                    );
+                    self.tools.request(request);
                     return Ok(ControlFlow::Continue(()));
                 }
                 AgentCommand::ScanApplications { run_id } => {
