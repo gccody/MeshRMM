@@ -29,6 +29,7 @@ import { SettingsPanel } from "../features/settings/settings-page";
 import { SoftwarePage } from "../features/system-info/software-page";
 import { TerminalPage } from "../features/terminal/terminal-page";
 import { FilesPage } from "../features/files/files-page";
+import { ToolsPage } from "../features/tools/tools-page";
 import { ToolboxPanel } from "../features/toolbox/toolbox-panel";
 import { UpdatesPage } from "../features/updates/updates-page";
 import { UsersPanel } from "../features/users/users-panel";
@@ -47,6 +48,7 @@ export function App() {
             <Route path="device" element={<DevicePage />} />
             <Route path="terminal" element={<TerminalPage />} />
             <Route path="files" element={<FilesPage />} />
+            <Route path="tools" element={<ToolsPage />} />
             <Route path="companies" element={<CompaniesPanel />} />
             <Route path="company" element={<CompanyPage />} />
             <Route path="custom-fields" element={<CustomFieldsPage />} />

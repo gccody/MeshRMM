@@ -160,7 +160,7 @@ pub(super) fn restart_service(name: &str) -> anyhow::Result<()> {
     wait_for(&service, ServiceState::Running)
 }
 
-pub(super) fn is_agent_service(name: &str) -> bool {
+pub(in crate::remote) fn is_agent_service(name: &str) -> bool {
     crate::service::is_agent_service(name)
         || manager()
             .ok()
@@ -251,7 +251,7 @@ pub(super) fn processes(name: &str) -> anyhow::Result<Vec<ProcessSample>> {
 }
 
 /// Processes Windows can't do without: ending one stops the computer.
-pub(super) fn is_protected_process(name: &str) -> bool {
+pub(in crate::remote) fn is_protected_process(name: &str) -> bool {
     [
         "system",
         "smss",

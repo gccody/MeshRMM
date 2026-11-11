@@ -38,6 +38,7 @@ pub mod targets;
 pub mod terminals;
 pub mod time;
 pub mod toolbox;
+pub mod tools;
 pub mod turn;
 pub mod updates;
 pub mod users;
@@ -117,6 +118,7 @@ pub async fn prepare(config: Config) -> anyhow::Result<AppState> {
         sessions: Sessions::new(Timeouts::new(idle)),
         terminals: terminals::Terminals::default(),
         files: files::Files::default(),
+        tools: tools::Tools::default(),
         turn: Turn::new(&instance_key),
         database,
         settings: Arc::default(),

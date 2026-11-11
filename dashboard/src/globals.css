@@ -698,6 +698,7 @@ td.row-actions > * + * { margin-left: 6px; }
 a.screen-action { text-decoration: none; }
 .device-status .device-links { margin-left: auto; display: inline-flex; flex-wrap: wrap; gap: 8px; }
 .device-status .device-terminal { min-height: 32px; text-decoration: none; }
+.device-status .device-terminal[aria-disabled=true] { opacity: .55; cursor: not-allowed; }
 .terminal-page { display: grid; gap: 14px; }
 .terminal-start { max-width: 560px; padding: 28px; display: grid; justify-items: start; gap: 10px; border: 1px solid var(--rule); border-radius: 14px; background: var(--panel); }
 .terminal-start > svg { color: var(--signal); }
@@ -1244,3 +1245,35 @@ button.outcome-chip:hover { color: var(--text); background: var(--raised); }
   .custom-field-row { grid-template-columns: 1fr; gap: 4px; }
 }
 .form-stack-field { display: grid; gap: 6px; }
+
+/* Remote tools: processes and services. */
+.tools-page .device-status { margin-bottom: 14px; }
+.tools-page .area-tabs { margin: 0 0 14px; }
+.tool-tab-unavailable { height: 34px; padding: 0 12px; display: inline-flex; align-items: center; gap: 7px; border-radius: 7px; color: var(--text-3); font-size: 13.5px; font-weight: 500; cursor: not-allowed; }
+.tool-tab-unavailable em { color: var(--text-3); font-size: 12px; font-style: normal; font-weight: 400; }
+.tools-status { display: inline-flex; align-items: center; gap: 7px; color: var(--text-3); font-size: 12.5px; }
+.tools-notice { margin: 10px 16px 0; }
+.tools-panel .selection-actions { display: inline-flex; flex-wrap: wrap; gap: 8px; }
+.process-table td.process-name { max-width: 520px; }
+.process-table .mono-detail, .service-table .service-description { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.service-table td:first-child { max-width: 480px; }
+.tree-toggle { width: 18px; height: 18px; margin-right: 4px; padding: 0; display: inline-flex; align-items: center; justify-content: center; vertical-align: -3px; border: 0; color: var(--text-3); background: none; cursor: pointer; }
+.tree-toggle:hover { color: var(--text); }
+.process-name.tree-depth-1 { padding-left: 34px; }
+.process-name.tree-depth-2 { padding-left: 52px; }
+.process-name.tree-depth-3 { padding-left: 70px; }
+.process-name.tree-depth-4 { padding-left: 88px; }
+.process-name.tree-depth-5 { padding-left: 106px; }
+.process-name.tree-depth-6 { padding-left: 124px; }
+.process-name.tree-depth-7 { padding-left: 142px; }
+.process-name.tree-depth-8 { padding-left: 160px; }
+.process-name.tree-depth-9 { padding-left: 178px; }
+.process-name.tree-depth-10 { padding-left: 196px; }
+.process-name.tree-depth-11 { padding-left: 214px; }
+.process-name.tree-depth-12 { padding-left: 232px; }
+.service-state { font-weight: 500; }
+.service-running { color: var(--live); }
+.service-failed { color: var(--danger); }
+.service-stopped, .service-other { color: var(--text-2); }
+.service-starting, .service-stopping, .service-paused { color: var(--warn); }
+.tools-end-list { max-height: 260px; overflow: auto; }

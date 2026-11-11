@@ -1,4 +1,4 @@
-import { Activity, AppWindow, ArrowLeft, Building2, CircleAlert, Cpu, FolderOpen, Gauge, Laptop, LoaderCircle, MonitorOff, Network, Package, Radar, ShieldCheck, Tag, Terminal } from "lucide-react";
+import { Activity, AppWindow, ArrowLeft, Building2, CircleAlert, Cog, Cpu, FolderOpen, Gauge, Laptop, LoaderCircle, MonitorOff, Network, Package, Radar, ShieldCheck, Tag, Terminal, Workflow } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import { NO_COMPANY, DEFAULT_DEVICE_FILTERS, serializeDeviceFilters } from "../agents/device-filters";
@@ -15,6 +15,7 @@ import { TagChips } from "../tags/tag-chip";
 import { TagDevicesDialog } from "../tags/tag-dialogs";
 import { terminalPagePath } from "../terminal/model";
 import { filesPagePath } from "../files/model";
+import { TOOLS, TOOL_LABELS, type Tool, canViewTool, toolsPagePath, unavailableReason } from "../tools/model";
 import { DeviceUpdates } from "../updates/device-updates";
 import { DeviceApplications } from "../applications/device-applications";
 import { DeviceWake } from "../wake/device-wake";
@@ -167,7 +168,7 @@ export function DevicePage() {
               {can("devices.edit") && <button ref={tagOpener} type="button" className="link-button" onClick={() => setTagging(true)} aria-haspopup="dialog">Edit tags</button>}
             </p>
           )}
-          {agent?.connected && (can("terminal.connect") || can("terminal.connect_system") || can("files.browse")) && (
+          {agent?.connected && (can("terminal.connect") || can("terminal.connect_system") || can("files.browse") || TOOLS.some((tool) => canViewTool(can, tool))) && (
             <span className="device-links">
               {(can("terminal.connect") || can("terminal.connect_system")) && (
                 <a className="secondary-button device-terminal" href={terminalPagePath(agent.id)} target="_blank" rel="noreferrer" aria-label={`Open a terminal on ${agent.name} in a new tab`}>
@@ -179,6 +180,19 @@ export function DevicePage() {
                   <FolderOpen size={15} aria-hidden="true" />Files
                 </a>
               )}
+              {TOOLS.filter((tool) => canViewTool(can, tool)).map((tool) => {
+                const Icon = TOOL_ICONS[tool];
+                const reason = unavailableReason(tool, agent.platform);
+                return reason ? (
+                  <span key={tool} className="secondary-button device-terminal" aria-disabled="true" title={reason}>
+                    <Icon size={15} aria-hidden="true" />{TOOL_LABELS[tool]}
+                  </span>
+                ) : (
+                  <a key={tool} className="secondary-button device-terminal" href={toolsPagePath(agent.id, tool)} target="_blank" rel="noreferrer" aria-label={`Open ${TOOL_LABELS[tool].toLowerCase()} on ${agent.name} in a new tab`}>
+                    <Icon size={15} aria-hidden="true" />{TOOL_LABELS[tool]}
+                  </a>
+                );
+              })}
             </span>
           )}
         </div>
@@ -237,6 +251,9 @@ export function DevicePage() {
     </>
   );
 }
+
+// The remote tools' icons, for their links beside the terminal and files.
+const TOOL_ICONS: Record<Tool, typeof Cog> = { processes: Workflow, services: Cog };
 
 function StatusLine({ connected, updatingTo, latest }: { connected: boolean; updatingTo?: string; latest: MetricsReading | null }) {
   const tone = connected ? "online" : updatingTo ? "updating" : "offline";

@@ -224,6 +224,11 @@ pub enum AgentCommand {
     RunMonitorAction {
         action: crate::MonitorAction,
     },
+    /// Lists or changes the device's processes or services; see
+    /// [`crate::ToolRequest`]. Answered by [`AgentStatusMessage::ToolReply`].
+    ToolRequest {
+        request: crate::ToolRequest,
+    },
 }
 
 /// Agent-to-coordinator lifecycle notifications and reports.
@@ -293,6 +298,11 @@ pub enum AgentStatusMessage {
     /// How a [`AgentCommand::RunMonitorAction`] went.
     MonitorActionDone {
         result: crate::MonitorActionResult,
+    },
+    /// The answer to a [`AgentCommand::ToolRequest`].
+    ToolReply {
+        request_id: String,
+        reply: Box<crate::ToolReply>,
     },
 }
 

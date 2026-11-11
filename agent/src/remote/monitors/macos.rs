@@ -52,7 +52,7 @@ pub(super) fn restart_service(label: &str) -> anyhow::Result<()> {
     succeeded(finished, "launchctl kickstart").map(drop)
 }
 
-pub(super) fn is_agent_service(label: &str) -> bool {
+pub(in crate::remote) fn is_agent_service(label: &str) -> bool {
     label.starts_with(crate::installer::DAEMON_LABEL)
 }
 
@@ -70,7 +70,7 @@ pub(super) fn processes(name: &str) -> anyhow::Result<Vec<ProcessSample>> {
         .collect())
 }
 
-pub(super) fn is_protected_process(name: &str) -> bool {
+pub(in crate::remote) fn is_protected_process(name: &str) -> bool {
     [
         "launchd",
         "kernel_task",

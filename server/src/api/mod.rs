@@ -38,6 +38,7 @@ mod system_info;
 mod tags;
 mod terminals;
 mod toolbox;
+mod tools;
 mod updates;
 mod users;
 mod wake;
@@ -89,6 +90,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .merge(report_routes())
         .merge(maintenance_window_routes())
         .merge(custom_field_routes())
+        .merge(remote_tool_routes())
         .layer(middleware::from_fn_with_state(state, csrf::check))
         // Responses carry account data; browsers and proxies must not keep them.
         .layer(SetResponseHeaderLayer::if_not_present(
@@ -391,6 +393,22 @@ fn device_routes() -> Router<AppState> {
         .route(
             "/agents/{id}/application-runs/{run_id}/result",
             post(agent::report_application_run),
+        )
+}
+
+/// The remote tools: a device's processes and services.
+fn remote_tool_routes() -> Router<AppState> {
+    Router::new()
+        .route("/agents/{id}/processes", get(tools::list_processes))
+        .route("/agents/{id}/processes/end", post(tools::end_processes))
+        .route("/agents/{id}/services", get(tools::list_services))
+        .route(
+            "/agents/{id}/services/control",
+            post(tools::control_service),
+        )
+        .route(
+            "/agents/{id}/services/startup",
+            post(tools::set_service_startup),
         )
 }
 

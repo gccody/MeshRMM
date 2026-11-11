@@ -42,7 +42,7 @@ use super::service_link::ActivityGuard;
 
 mod checks;
 #[cfg(unix)]
-mod command;
+pub(super) mod command;
 mod network;
 // Each operating system reads only its own tools' output.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -61,6 +61,12 @@ use self::linux as platform;
 use self::macos as platform;
 #[cfg(windows)]
 use self::windows as platform;
+
+#[cfg(unix)]
+pub(super) use self::platform::is_agent_service;
+/// What the remote tools share with monitors: the Agent's own service, and
+/// the processes the system can't do without.
+pub(super) use self::platform::is_protected_process;
 
 const MAX_RUNNING_CHECKS: usize = 8;
 const MAX_RUNNING_SCRIPTS: usize = 2;

@@ -153,6 +153,9 @@ pub async fn serve(
                         Ok(AgentStatusMessage::FileReply { request_id, reply }) => {
                             state.files.answered(&device_id, &request_id, *reply);
                         }
+                        Ok(AgentStatusMessage::ToolReply { request_id, reply }) => {
+                            state.tools.answered(&device_id, &request_id, *reply);
+                        }
                         Ok(AgentStatusMessage::MonitorResults { results }) => {
                             if state.agents.is_current(&device_id, connection.id) {
                                 monitors::reported(&state, &device_id, results).await;
@@ -181,6 +184,7 @@ pub async fn serve(
         state.metrics.disconnected(&device_id);
         // Requests sent on this connection won't be answered.
         state.files.device_disconnected(&device_id);
+        state.tools.device_disconnected(&device_id);
     }
     state.presence.disconnected(&device_id).await;
     updates::publish_device(&state, &device_id).await;
