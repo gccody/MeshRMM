@@ -238,15 +238,26 @@ impl Backend for Native {
     fn read(&mut self) -> anyhow::Result<Option<ClipboardContent>> {
         let text = optional(self.clipboard.get_text())?;
         let html = self.html()?;
-        let image = optional(self.clipboard.get_image())?
-            .map(|image| {
-                anyhow::Ok(ClipboardImage {
-                    width: image.width.try_into()?,
-                    height: image.height.try_into()?,
-                    rgba: image.bytes.into_owned(),
+        // Rich text is copied as its HTML and text. Programs such as Excel
+        // and Word also offer a picture of it that they draw only when asked:
+        // asking makes them render the whole selection, megabytes of pixels
+        // for a large one, and Excel then tells its user that the picture is
+        // too large. The image is read when it is the copy: alone, or beside
+        // HTML that only shows it.
+        let rich_text = html.as_deref().is_some_and(has_text_of_its_own);
+        let image = if rich_text {
+            None
+        } else {
+            optional(self.clipboard.get_image())?
+                .map(|image| {
+                    anyhow::Ok(ClipboardImage {
+                        width: image.width.try_into()?,
+                        height: image.height.try_into()?,
+                        rgba: image.bytes.into_owned(),
+                    })
                 })
-            })
-            .transpose()?;
+                .transpose()?
+        };
         Ok(content(text, html, image))
     }
 
