@@ -5,6 +5,7 @@ import { ModalDialog } from "../../lib/modal-dialog";
 import { useNow } from "../../lib/use-now";
 import type { Agent, MaintenanceAutomation } from "../agents/types";
 import { useCompanies, useDevices, useTags } from "../agents/use-devices";
+import { canEverywhere } from "../auth/types";
 import { DevicePicker } from "../device-picker/device-picker";
 import { TagTargetFields } from "../tags/tag-chip";
 import type { TagMatch } from "../tags/model";
@@ -54,13 +55,15 @@ export function StartMaintenanceDialog({ agents, returnFocus, onClose, onDone }:
   // After windows started or ended.
   onDone?: () => void;
 }) {
-  const { authorizedFetch, inventory } = useWorkspace();
+  const { account, authorizedFetch, inventory } = useWorkspace();
+  // Limited to some companies, maintenance goes on chosen devices, companies or tags.
+  const everyDevice = canEverywhere(account, "devices.maintenance") && canEverywhere(account, "devices.view");
   const companies = useCompanies(inventory.devices);
   const tags = useTags(inventory.devices);
   const fleet = useDevices(inventory.devices);
   const titleId = useId();
   const [draft, setDraft] = useState<StartDraft>(startDraft);
-  const [target, setTarget] = useState<TargetDraft>({ target: "all", deviceIds: [], companyIds: [], tagIds: [], tagMatch: "any" });
+  const [target, setTarget] = useState<TargetDraft>({ target: everyDevice ? "all" : "devices", deviceIds: [], companyIds: [], tagIds: [], tagMatch: "any" });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const now = useNow(15_000);
@@ -112,7 +115,7 @@ export function StartMaintenanceDialog({ agents, returnFocus, onClose, onDone }:
             <>
               <fieldset className="choice-list">
                 <legend>Devices</legend>
-                <label><input type="radio" name="maintenance-target" checked={target.target === "all"} onChange={() => setTarget({ ...target, target: "all" })} /><span><strong>Every device</strong>As they are now.</span></label>
+                {everyDevice && <label><input type="radio" name="maintenance-target" checked={target.target === "all"} onChange={() => setTarget({ ...target, target: "all" })} /><span><strong>Every device</strong>As they are now.</span></label>}
                 <label><input type="radio" name="maintenance-target" checked={target.target === "companies"} disabled={!companies.length} onChange={() => setTarget({ ...target, target: "companies" })} /><span><strong>Devices of chosen companies</strong>{companies.length ? "Choose them below." : "There are no companies yet."}</span></label>
                 <label><input type="radio" name="maintenance-target" checked={target.target === "tags"} disabled={!tags.length} onChange={() => setTarget({ ...target, target: "tags" })} /><span><strong>Devices with chosen tags</strong>{tags.length ? "The devices that have them now." : "There are no tags yet."}</span></label>
                 <label><input type="radio" name="maintenance-target" checked={target.target === "devices"} onChange={() => setTarget({ ...target, target: "devices" })} /><span><strong>Chosen devices</strong>{target.deviceIds.length ? `${target.deviceIds.length} chosen` : "Choose them below."}</span></label>

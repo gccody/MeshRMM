@@ -42,6 +42,11 @@ pub(super) async fn authorized_device(
 ) -> Result<(String, DevicePlatform), ApiError> {
     actor.require(permission)?;
     let device_id = parse_id(id, "device")?;
+    // A device in a company the permission doesn't reach is as missing as one
+    // that isn't enrolled.
+    actor
+        .require_device(&mut &state.database, permission, &device_id)
+        .await?;
     let platform = agents::active_platform(&mut &state.database, &device_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Device not found"))?;

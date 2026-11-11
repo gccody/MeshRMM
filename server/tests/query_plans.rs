@@ -6,6 +6,7 @@ mod common;
 
 use meshrmm_protocol_types::DevicePlatform;
 use meshrmm_server::{
+    access::CompanySet,
     applications::tables::{ApplicationRunItems, ApplicationRuns},
     db::tables::{AlertRemediations, Alerts, FileDeliveries, ScriptRuns, UpdateRuns},
     maintenance,
@@ -21,6 +22,11 @@ use sea_query_sqlx::{SqlxBinder, SqlxValues};
 use sqlx::{AssertSqlSafe, Connection, PgConnection, SqliteConnection};
 
 const NOW: i64 = 1_800_000_000_000;
+
+/// The companies a technician limited to some sees.
+fn some_companies() -> CompanySet {
+    CompanySet::Only(["company-a".to_owned(), "company-b".to_owned()].into())
+}
 
 enum Statement {
     Select(SelectStatement),
@@ -394,6 +400,11 @@ fn fleet_statements() -> Vec<(&'static str, Statement, &'static [&'static str])>
         tag_id: Some("tag".into()),
         platform: Some(DevicePlatform::Windows),
         status: Some(FleetStatus::Failed),
+        within: CompanySet::All,
+    };
+    let limited = FleetFilter {
+        within: some_companies(),
+        ..FleetFilter::default()
     };
     let status_key: &[&str] = &[
         "sqlite_autoindex_device_update_status_1",
@@ -425,6 +436,16 @@ fn fleet_statements() -> Vec<(&'static str, Statement, &'static [&'static str])>
             Statement::Select(store::fleet_page_query(&narrowed, NOW, 100, 0)),
             status_key,
         ),
+        (
+            "the Updates page's totals for some companies",
+            Statement::Select(store::fleet_counts_query(&limited, NOW)),
+            status_key,
+        ),
+        (
+            "a page of the Updates page's devices in some companies",
+            Statement::Select(store::fleet_page_query(&limited, NOW, 100, 0)),
+            status_key,
+        ),
     ]
 }
 
@@ -445,6 +466,7 @@ fn software_statements() -> Vec<(&'static str, Statement, &'static [&'static str
         scope: Scope {
             company: Some(CompanyFilter::None),
             tag: Some("tag".into()),
+            within: CompanySet::All,
         },
     };
     // Joining a device's snapshot and its device, by either's key.
@@ -486,6 +508,21 @@ fn software_statements() -> Vec<(&'static str, Statement, &'static [&'static str
         (
             "a page of the devices a search matches",
             Statement::Select(search::devices_page_query(&narrowed, 100, 0)),
+            snapshot_key,
+        ),
+        (
+            "a page of the devices in some companies",
+            Statement::Select(search::devices_page_query(
+                &DeviceFilter {
+                    scope: Scope {
+                        within: some_companies(),
+                        ..Scope::default()
+                    },
+                    ..DeviceFilter::default()
+                },
+                100,
+                0,
+            )),
             snapshot_key,
         ),
         (
@@ -941,11 +978,20 @@ fn page_statements() -> Vec<(String, Statement, &'static [&'static str])> {
         after: after.then(|| "00000000-0000-4000-8000-000000000400".to_owned()),
         offset,
         limit: 100,
+        within: CompanySet::All,
     };
     let mut statements = Vec::new();
     for (what, page, indexes) in [
         ("every device", page(None, false, 200), KEY),
         ("every device after one", page(None, true, 0), KEY),
+        (
+            "every device in some companies",
+            DevicePage {
+                within: some_companies(),
+                ..page(None, false, 0)
+            },
+            KEY,
+        ),
         (
             "the queued devices",
             page(Some(Outcome::Queued), false, 100),
@@ -1256,6 +1302,11 @@ fn outdated_statements() -> Vec<Checked> {
         query: Some("fire".into()),
         named: vec![firefox.clone()],
         held: vec![git.clone()],
+        within: CompanySet::All,
+    };
+    let limited = outdated::ListFilter {
+        within: some_companies(),
+        ..outdated::ListFilter::default()
     };
     let job_target = |target: Target| {
         Query::select()
@@ -1295,8 +1346,25 @@ fn outdated_statements() -> Vec<Checked> {
             summary_only,
         ),
         (
+            "the outdated list's counts for some companies",
+            Statement::Select(outdated::counts_query(&limited)),
+            &["idx_agents_company"],
+            &["SCAN device_packages", "Seq Scan on device_packages"],
+        ),
+        (
+            "a page of the packages outdated in some companies",
+            Statement::Select(outdated::page_query(&limited, 100, 0)),
+            &["idx_agents_company"],
+            &["SCAN device_packages", "Seq Scan on device_packages"],
+        ),
+        (
             "a page of an outdated package's devices",
-            Statement::Select(outdated::devices_query(&firefox, None, 101)),
+            Statement::Select(outdated::devices_query(
+                &firefox,
+                &CompanySet::All,
+                None,
+                101,
+            )),
             &["idx_device_packages_outdated_key"],
             &[
                 "TEMP B-TREE",
@@ -1308,6 +1376,7 @@ fn outdated_statements() -> Vec<Checked> {
             "a later page of an outdated package's devices",
             Statement::Select(outdated::devices_query(
                 &git,
+                &some_companies(),
                 Some("00000000-0000-4000-8000-000000000400"),
                 101,
             )),

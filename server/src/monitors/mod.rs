@@ -682,10 +682,12 @@ async fn owner_problem(executor: &mut impl Executor, rule: &Rule) -> db::Result<
             "The user whose access it runs with was disabled or removed; save the rule to run it with your access".to_owned(),
         ));
     };
-    let permissions = rbac::permissions_of(&rbac::user_roles(executor, &owner.id).await?);
+    // A rule reaches devices in every company, so the access it borrows must
+    // too: a permission held only in some companies doesn't count.
+    let access = rbac::access_of(&rbac::user_roles(executor, &owner.id).await?);
     let missing = [Permission::AlertsManage, Permission::ScriptsRun]
         .into_iter()
-        .filter(|permission| !permissions.contains(permission))
+        .filter(|permission| !access.everywhere(*permission))
         .collect::<Vec<_>>();
     Ok(lacks(&owner_label(&owner), &missing))
 }

@@ -380,12 +380,14 @@ impl Report {
 }
 
 /// The reports kept at `now`, newest first: at most `limit`, created before
-/// `before`, and only `schedule_id`'s when given.
+/// `before`, and only `schedule_id`'s when given, and only those
+/// `requested_by` asked for themselves when given.
 pub async fn list(
     executor: &mut impl Executor,
     limit: u64,
     before: Option<i64>,
     schedule_id: Option<&str>,
+    requested_by: Option<&str>,
     now: i64,
 ) -> db::Result<Vec<Report>> {
     let mut select = Query::select();
@@ -401,6 +403,11 @@ pub async fn list(
     }
     if let Some(schedule_id) = schedule_id {
         select.and_where(Expr::col(Reports::ScheduleId).eq(schedule_id));
+    }
+    if let Some(user_id) = requested_by {
+        select
+            .and_where(Expr::col(Reports::RequestedByUserId).eq(user_id))
+            .and_where(Expr::col(Reports::Trigger).eq(Trigger::Manual.as_str()));
     }
     executor.fetch_all(&select).await
 }
@@ -741,9 +748,9 @@ async fn owner_problem(
             schedule.owner
         )));
     };
-    let permissions = rbac::permissions_of(&rbac::user_roles(executor, &owner.id).await?);
-    if !permissions.contains(&Permission::ReportsView)
-        || !permissions.contains(&Permission::ReportsManage)
+    // Schedules cover any company, so the owner needs both everywhere.
+    let access = rbac::access_of(&rbac::user_roles(executor, &owner.id).await?);
+    if !access.everywhere(Permission::ReportsView) || !access.everywhere(Permission::ReportsManage)
     {
         return Ok(Some(format!(
             "{}, whose access the schedule runs with, no longer has the reports.view and reports.manage permissions; save the schedule to run it with your access.",

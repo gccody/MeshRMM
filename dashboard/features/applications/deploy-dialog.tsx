@@ -9,6 +9,7 @@ import { devicesOn, platformCounts } from "../device-picker/model";
 import { DEFAULT_WAIT_HOURS, MAX_WAIT_HOURS, type JobTargetKind, type OfflineChoice, coveredAgents, waitHoursProblem } from "../automation/model";
 import type { TagMatch } from "../tags/model";
 import { TagTargetFields } from "../tags/tag-chip";
+import { canEverywhere } from "../auth/types";
 import { useWorkspace } from "../workspace/workspace-context";
 import { useCompanies, useDevices, useTags } from "../agents/use-devices";
 import { startApplicationJob } from "./applications-api";
@@ -36,13 +37,15 @@ export function DeployDialog({ title, intro, request, platforms, deviceIds, outd
   returnFocus: RefObject<HTMLElement | null>;
   onClose: () => void;
 }) {
-  const { authorizedFetch, inventory, can } = useWorkspace();
+  const { account, authorizedFetch, inventory, can } = useWorkspace();
   const agents = useDevices(inventory.devices);
   const companies = useCompanies(inventory.devices);
   const tags = useTags(inventory.devices);
   const navigate = useNavigate();
   const titleId = useId();
   const wide = can("jobs.run_wide");
+  // Every device at once needs both permissions in every company.
+  const everyDevice = canEverywhere(account, "jobs.run_wide") && canEverywhere(account, "applications.deploy");
   const [target, setTarget] = useState<JobTargetKind>(outdated ? "outdated" : "devices");
   const [chosenDevices, setChosenDevices] = useState<readonly string[]>(deviceIds ?? []);
   const [chosenCompanies, setChosenCompanies] = useState<readonly string[]>([]);
@@ -120,7 +123,7 @@ export function DeployDialog({ title, intro, request, platforms, deviceIds, outd
             {wide && <>
               <label><input type="radio" name="deploy-target" checked={target === "companies"} onChange={() => setTarget("companies")} disabled={!companies.length} /><span><strong>Whole companies</strong>{companies.length ? "Every device in the companies chosen below, as they are when the job starts." : "There are no companies yet."}</span></label>
               <label><input type="radio" name="deploy-target" checked={target === "tags"} onChange={() => setTarget("tags")} disabled={!tags.length} /><span><strong>Tagged devices</strong>{tags.length ? "Every device with the tags chosen below, as they are when the job starts." : "There are no tags yet."}</span></label>
-              <label><input type="radio" name="deploy-target" checked={target === "all"} onChange={() => setTarget("all")} /><span><strong>Every device</strong>All {agents.length} devices.</span></label>
+              {everyDevice && <label><input type="radio" name="deploy-target" checked={target === "all"} onChange={() => setTarget("all")} /><span><strong>Every device</strong>All {agents.length} devices.</span></label>}
             </>}
           </fieldset>
           {target === "devices" && <DevicePicker agents={pickable} chosen={chosenDevices} onChange={setChosenDevices} language={null} />}

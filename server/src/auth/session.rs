@@ -9,6 +9,7 @@ use axum::{
 use sea_query::{Expr, ExprTrait, Query};
 
 use crate::{
+    access::Access,
     api_tokens,
     audit::{Actor, TokenRef},
     auth::oidc,
@@ -204,6 +205,8 @@ pub struct SignedIn {
     pub user: User,
     pub roles: Vec<Role>,
     pub permissions: Permissions,
+    /// The companies each permission reaches.
+    pub access: Access,
     pub two_factor_enabled: bool,
     pub second_factors: users::SecondFactors,
     /// The instance requires a second factor and this password session's
@@ -333,6 +336,7 @@ pub async fn load(
         session_created_at: session.created_at,
         session_expires_at: session.expires_at,
         permissions: account.permissions.clone(),
+        access: account.access.clone(),
         roles: account.roles.clone(),
         user: account.user.clone(),
         two_factor_enabled,
@@ -348,9 +352,12 @@ pub async fn load(
 pub struct Authorized {
     pub user: User,
     pub roles: Vec<Role>,
-    /// What the caller may do. For a token, only what its scope allows of
-    /// what the user's roles grant.
+    /// What the caller may do somewhere. For a token, only what its scope
+    /// allows of what the user's roles grant.
     pub permissions: Permissions,
+    /// The companies each of `permissions` reaches; see [`crate::access`].
+    /// A token reaches what its user does.
+    pub access: Access,
     pub ip: IpAddr,
     /// The token the request carries; `None` for the website.
     pub api_token: Option<TokenRef>,
@@ -366,6 +373,7 @@ impl Authorized {
             user: signed_in.user,
             roles: signed_in.roles,
             permissions: signed_in.permissions,
+            access: signed_in.access,
             ip: signed_in.ip,
             api_token: None,
         })
@@ -375,7 +383,7 @@ impl Authorized {
     pub fn for_token(
         user: User,
         roles: Vec<Role>,
-        permissions: Permissions,
+        access: Access,
         administrator: bool,
         ip: IpAddr,
         token: TokenRef,
@@ -383,7 +391,8 @@ impl Authorized {
         Self {
             user,
             roles,
-            permissions,
+            permissions: access.permissions(),
+            access,
             ip,
             api_token: Some(token),
             administrator,

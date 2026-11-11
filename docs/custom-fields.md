@@ -94,6 +94,18 @@ device or company, never the value). Setting a secret needs only
 never shows the old one. Scripts allowed to read a secret field get its
 value in plain text, like any other.
 
+**Companies.** Field definitions are shared by every company, so
+`custom_fields.manage` is instance-wide. Values follow the device: with a
+role limited to some companies (see [Users and
+roles](users-and-roles.md#company-scope)), a user reads, sets and reveals
+values only on their companies' devices and on those companies, the
+device wall's filter matches only their devices, and setting many devices
+at once is refused (`404`) if any is out of reach. Revealing needs
+`custom_fields.reveal` from a role that covers the device's company, not
+only some other company. A script gets the fields of the device it runs
+on, and writes back only there, and only users who may run scripts on a
+device start one.
+
 ### Many devices at once
 
 **Set field** in the device wall's selection bar sets one field on the

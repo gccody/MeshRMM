@@ -62,6 +62,18 @@ pub async fn create(
     let now = now_ms();
     let expires_at = now + HANDOFF_TTL_MS;
     let mut transaction = state.database.begin().await?;
+    actor
+        .require_device(&mut transaction, Permission::SessionsConnect, &device_id)
+        .await?;
+    if request.start_in_background {
+        actor
+            .require_device(
+                &mut transaction,
+                Permission::SessionsConnectBackground,
+                &device_id,
+            )
+            .await?;
+    }
     let platform = agents::active_platform(&mut transaction, &device_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Device not found"))?;

@@ -2,6 +2,11 @@
 //! generated reports and the schedules, runs reports and downloads them;
 //! `reports.manage` creates, edits, runs and deletes schedules, chooses
 //! their recipients, and deletes reports. See docs/reports.md.
+//!
+//! A user whose `reports.view` reaches only some companies makes reports of
+//! those companies' devices only, and sees only the reports they made, while
+//! those stay within their reach; schedules are for users who reach every
+//! company.
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -13,6 +18,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
+    access::CompanySet,
     agents::parse_id,
     audit,
     auth::Authorized,
@@ -29,7 +35,7 @@ use crate::{
         schedules::{self, ScheduleInput},
         scope::{Scope, ScopeInput},
     },
-    targets::{TagMatch, TargetKind},
+    targets::{TagMatch, Target, TargetKind},
     time::{DAY_MS, now_ms},
     users::new_id,
 };
@@ -45,6 +51,42 @@ fn report_not_found() -> ApiError {
 
 fn schedule_not_found() -> ApiError {
     ApiError::not_found("Schedule not found")
+}
+
+/// `scope` narrowed to the companies the actor's `reports.view` reaches. A
+/// user limited to some companies can't report on every device, and a
+/// company out of their reach is as missing as one that was deleted.
+fn within_reach(actor: &Authorized, scope: Scope) -> Result<Scope, ApiError> {
+    let reach = actor.companies(Permission::ReportsView);
+    let CompanySet::Only(reached) = &reach else {
+        return Ok(scope);
+    };
+    match scope.target() {
+        Target::All => Err(ApiError::forbidden(
+            "you can report on every device only with reports.view for every company; choose companies or tags instead",
+        )
+        .with_code("permission_denied")),
+        Target::Companies(ids) if ids.iter().any(|id| !reached.contains(id)) => {
+            Err(ApiError::not_found("a chosen company no longer exists"))
+        }
+        _ => Ok(scope.within(reach)),
+    }
+}
+
+/// Whether the actor may see `report`: every report with `reports.view` for
+/// every company; otherwise only those they made themselves, while what the
+/// report covered is still within their reach.
+fn sees(actor: &Authorized, report: &reports::Report) -> bool {
+    if actor.everywhere(Permission::ReportsView) {
+        return true;
+    }
+    report.trigger == Trigger::Manual.as_str()
+        && report.requested_by_user_id.as_deref() == Some(actor.user.id.as_str())
+        && Scope::from_json(&report.scope).is_some_and(|scope| {
+            actor
+                .companies(Permission::ReportsView)
+                .includes(scope.reach())
+        })
 }
 
 /// `GET /v1/report-templates`: what reports can be made, and whether email
@@ -97,13 +139,18 @@ pub async fn list(
         limit + 1,
         query.before,
         schedule_id.as_deref(),
+        (!actor.everywhere(Permission::ReportsView)).then_some(actor.user.id.as_str()),
         now_ms(),
     )
     .await?;
     let more = reports.len() as u64 > limit;
     let shown = &reports[..Ord::min(reports.len(), limit as usize)];
     Ok(Json(json!({
-        "reports": shown.iter().map(|report| report.view(&actor.user.id)).collect::<Vec<_>>(),
+        "reports": shown
+            .iter()
+            .filter(|report| sees(&actor, report))
+            .map(|report| report.view(&actor.user.id))
+            .collect::<Vec<_>>(),
         "next_before": if more { shown.last().map(|report| report.created_at) } else { None },
     })))
 }
@@ -169,6 +216,7 @@ pub async fn run(
         tag_ids: input.tag_ids,
         tag_match: input.tag_match,
     })?;
+    let scope = within_reach(&actor, scope)?;
     let mut transaction = state.database.begin().await?;
     scope.check_references(&mut transaction).await?;
     let (waiting,): (i64,) = transaction
@@ -216,11 +264,16 @@ pub async fn run(
     Ok((StatusCode::ACCEPTED, Json(report.view(&actor.user.id))))
 }
 
-async fn visible_report(state: &AppState, id: &str) -> Result<reports::Report, ApiError> {
+async fn visible_report(
+    state: &AppState,
+    actor: &Authorized,
+    id: &str,
+) -> Result<reports::Report, ApiError> {
     let id = parse_id(id, "report")?;
     reports::by_id(&mut &state.database, &id)
         .await?
         .filter(|report| report.expires_at > now_ms())
+        .filter(|report| sees(actor, report))
         .ok_or_else(report_not_found)
 }
 
@@ -247,7 +300,7 @@ pub async fn get(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     actor.require(Permission::ReportsView)?;
-    let report = visible_report(&state, &id).await?;
+    let report = visible_report(&state, &actor, &id).await?;
     let mut view = report.view(&actor.user.id);
     if report.status == "succeeded"
         && let Some(document) = reports::document(&state, &report.id).await?
@@ -292,7 +345,7 @@ pub async fn page(
     Query(query): Query<DownloadQuery>,
 ) -> Result<Response, ApiError> {
     actor.require(Permission::ReportsView)?;
-    let report = visible_report(&state, &id).await?;
+    let report = visible_report(&state, &actor, &id).await?;
     let document = stored_document(&state, &report).await?;
     let page = html::render(&document);
     let file = format!("{}.html", html::file_stem(&document));
@@ -325,7 +378,7 @@ pub async fn table_csv(
     Path((id, table)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
     actor.require(Permission::ReportsView)?;
-    let report = visible_report(&state, &id).await?;
+    let report = visible_report(&state, &actor, &id).await?;
     let document = stored_document(&state, &report).await?;
     let wanted = table.strip_suffix(".csv").unwrap_or(&table);
     let table = document
@@ -370,6 +423,11 @@ pub async fn list_schedules(
     actor: Authorized,
 ) -> Result<Json<Value>, ApiError> {
     actor.require(Permission::ReportsView)?;
+    // Schedules cover any company, so only users who reach every company
+    // see them.
+    if !actor.everywhere(Permission::ReportsView) {
+        return Ok(Json(json!({ "schedules": [] })));
+    }
     let schedules = schedules::load(&mut &state.database, None).await?;
     Ok(Json(json!({
         "schedules": schedules.iter().map(|schedule| schedule.view(&actor.user.id)).collect::<Vec<_>>(),
@@ -436,7 +494,8 @@ async fn save_schedule(
     existing: Option<&str>,
 ) -> Result<schedules::Schedule, ApiError> {
     actor.require(Permission::ReportsManage)?;
-    actor.require(Permission::ReportsView)?;
+    // A schedule runs with its saver's access on any company's devices.
+    actor.require_everywhere(Permission::ReportsView)?;
     let valid = input.validate()?;
     let id = existing.map_or_else(new_id, str::to_owned);
     let now = now_ms();
@@ -542,7 +601,7 @@ pub async fn run_schedule(
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     actor.require(Permission::ReportsManage)?;
-    actor.require(Permission::ReportsView)?;
+    actor.require_everywhere(Permission::ReportsView)?;
     let id = parse_id(&id, "schedule")?;
     let schedule = schedules::by_id(&mut &state.database, &id)
         .await?

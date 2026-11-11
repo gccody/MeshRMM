@@ -281,10 +281,10 @@ pub async fn authenticate(
             )
             .await?;
     }
-    let held = &account.permissions;
-    let permissions = match &token.permissions {
-        Some(scope) => held.intersection(scope).copied().collect(),
-        None => held.clone(),
+    // The token reaches the companies its user's roles do.
+    let access = match &token.permissions {
+        Some(scope) => account.access.limited_to(scope),
+        None => account.access.clone(),
     };
     // A scoped token isn't the Administrator role, which also stands for
     // permissions no list names.
@@ -293,7 +293,7 @@ pub async fn authenticate(
     Ok(Authorized::for_token(
         account.user.clone(),
         account.roles.clone(),
-        permissions,
+        access,
         administrator,
         ip,
         token.reference(),

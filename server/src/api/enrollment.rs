@@ -76,6 +76,18 @@ pub async fn create(
         Some(company_id) => Some(companies::ensure_exists(&mut transaction, company_id).await?),
         None => None,
     };
+    // Someone limited to some companies enrolls only into them: a device in
+    // no company is out of their reach.
+    match &company_id {
+        Some(company_id) => actor.require_company(Permission::DevicesEnroll, company_id)?,
+        None if !actor.everywhere(Permission::DevicesEnroll) => {
+            return Err(
+                ApiError::bad_request("choose one of your companies for the device")
+                    .with_code("company_required"),
+            );
+        }
+        None => {}
+    }
     transaction
         .execute(
             &Query::insert()

@@ -93,6 +93,9 @@ export type Account = {
   };
   roles: RoleRef[];
   permissions: Permission[];
+  // Those of `permissions` held only in some companies: they don't apply
+  // to other companies' devices or to devices in no company.
+  limited_permissions: Permission[];
   is_administrator: boolean;
   session: { id: string; auth_method: AuthMethod; created_at: number; expires_at: number };
   // Sign the browser out after this long without activity.
@@ -112,6 +115,11 @@ export type SignInResult =
 
 export const can = (account: Pick<Account, "permissions"> | null | undefined, permission: Permission) =>
   Boolean(account?.permissions.includes(permission));
+
+// Whether the account holds the permission in every company, as acting on
+// every device at once needs.
+export const canEverywhere = (account: Pick<Account, "permissions" | "limited_permissions"> | null | undefined, permission: Permission) =>
+  can(account, permission) && !account?.limited_permissions?.includes(permission);
 
 export const canAny = (account: Pick<Account, "permissions"> | null | undefined, permissions: readonly Permission[]) =>
   permissions.some((permission) => can(account, permission));

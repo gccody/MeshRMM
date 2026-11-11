@@ -530,12 +530,18 @@ pub struct Device {
     pub name: String,
 }
 
-/// The devices `target` covers that are enrolled and not deleted, by ID.
-pub async fn resolve(executor: &mut impl Executor, target: &Target) -> db::Result<Vec<Device>> {
+/// The devices `target` covers that are enrolled and not deleted and in a
+/// company of `within`, by ID.
+pub async fn resolve(
+    executor: &mut impl Executor,
+    target: &Target,
+    within: &crate::access::CompanySet,
+) -> db::Result<Vec<Device>> {
     let mut devices: Vec<Device> = Vec::new();
     let select = || {
         crate::agents::active()
             .column(Agents::Name)
+            .and_where_option(within.company_condition(Agents::CompanyId))
             .order_by(Agents::Id, Order::Asc)
             .to_owned()
     };

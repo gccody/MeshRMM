@@ -126,6 +126,17 @@ failed shows why.
 
 No built-in role except Administrator starts with them.
 
+`reports.manage` is instance-wide: schedules run on any company's devices
+and email anyone, so only roles over every company grant it, and saving or
+running a schedule also needs `reports.view` in every company. A user whose
+`reports.view` reaches only some companies (see [Users and
+roles](users-and-roles.md#company-scope)) makes reports of those
+companies' devices only: they choose companies or tags (tags resolve to
+the tagged devices in reach, as the report is made), never every device
+(`403 permission_denied`), and a company out of reach answers as a missing
+one. They see only the reports they made, while what those covered is still
+in their reach, and no schedules.
+
 The audit log records `report.generate` for every report, with its
 template, devices, period and time zone and what started it: a user (or
 their API token), a schedule (`Report schedule “Name”`) or *Run now*. It

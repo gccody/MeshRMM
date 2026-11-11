@@ -29,7 +29,11 @@ use crate::{
 pub async fn list(State(state): State<AppState>, actor: Authorized) -> Result<Response, ApiError> {
     actor.require(Permission::DevicesView)?;
     let snapshot = state.presence.snapshot().await?;
-    Ok(Json(&*snapshot).into_response())
+    let companies = actor.companies(Permission::DevicesView);
+    if companies.is_all() {
+        return Ok(Json(&*snapshot).into_response());
+    }
+    Ok(Json(snapshot.within(&companies)).into_response())
 }
 
 /// `DELETE /v1/agents/{id}`: removes the device and tells its Agent to
@@ -45,6 +49,9 @@ pub async fn delete(
     let id = parse_id(&id, "device")?;
     let now = now_ms();
     let mut transaction = state.database.begin().await?;
+    actor
+        .require_device(&mut transaction, Permission::DevicesDelete, &id)
+        .await?;
     let (name,): (String,) = transaction
         .fetch_optional(
             &Query::select()
@@ -126,6 +133,9 @@ pub async fn rotate_credential(
     actor.require(Permission::DevicesRotateCredentials)?;
     let id = parse_id(&id, "device")?;
     let mut transaction = state.database.begin().await?;
+    actor
+        .require_device(&mut transaction, Permission::DevicesRotateCredentials, &id)
+        .await?;
     let pending = agents::pending_credential(&mut transaction, &id)
         .await?
         .ok_or_else(|| ApiError::not_found("Device not found"))?;
@@ -214,6 +224,12 @@ pub async fn thumbnail(
 ) -> Result<Response, ApiError> {
     actor.require(Permission::DevicesView)?;
     let id = parse_id(&id, "device")?;
+    // A deleted device answers 204 below; one out of reach, 404.
+    if !actor.everywhere(Permission::DevicesView) {
+        actor
+            .require_device(&mut &state.database, Permission::DevicesView, &id)
+            .await?;
+    }
     // The website revalidates itself; nothing in between may keep a copy.
     let cache_control = (
         header::CACHE_CONTROL,

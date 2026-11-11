@@ -52,6 +52,9 @@ pub async fn open(
 ) -> Result<(StatusCode, Json<TerminalView>), ApiError> {
     actor.require(permission(request.run_as))?;
     let device_id = parse_id(&device_id, "device")?;
+    actor
+        .require_device(&mut &state.database, permission(request.run_as), &device_id)
+        .await?;
     let platform = agents::active_platform(&mut &state.database, &device_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Device not found"))?;
@@ -155,6 +158,13 @@ pub async fn connect(
         })?;
     // Dropping the claim forgets the terminal.
     actor.require(permission(requested.run_as))?;
+    actor
+        .require_device(
+            &mut &state.database,
+            permission(requested.run_as),
+            &requested.device_id,
+        )
+        .await?;
     Ok(upgrade
         .max_message_size(MAX_SOCKET_MESSAGE_BYTES)
         .on_upgrade(move |socket| relay::serve(state, claim, requested, agent, token, ip, socket)))

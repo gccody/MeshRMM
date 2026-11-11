@@ -3,6 +3,7 @@ import { type FormEvent, type RefObject, useId, useMemo, useState } from "react"
 import { AuthenticationRequired, errorText } from "../../lib/http";
 import { ModalDialog } from "../../lib/modal-dialog";
 import { useCompanies, useTags } from "../agents/use-devices";
+import { canEverywhere } from "../auth/types";
 import { currentZoneName, timeZones } from "../automation/model";
 import { useWorkspace } from "../workspace/workspace-context";
 import { PERIOD_LABELS, type PeriodKind, type Report, type RunDraft, type TemplateId, type Templates, runDraft, runDraftProblem, runInput } from "./model";
@@ -21,12 +22,17 @@ export function RunDialog({ templates, template, returnFocus, onClose, onQueued 
   onClose: () => void;
   onQueued: (report: Report) => void;
 }) {
-  const { authorizedFetch, inventory } = useWorkspace();
+  const { account, authorizedFetch, inventory } = useWorkspace();
+  // Limited to some companies, a report covers chosen companies or tags.
+  const everyDevice = canEverywhere(account, "reports.view");
   const companies = useCompanies(inventory.devices);
   const tags = useTags(inventory.devices);
   const titleId = useId();
   const zones = useMemo(() => timeZones(Intl.supportedValuesOf("timeZone")), []);
-  const [draft, setDraft] = useState<RunDraft>(() => runDraft(template, browserZone(), templates.default_stale_days));
+  const [draft, setDraft] = useState<RunDraft>(() => {
+    const initial = runDraft(template, browserZone(), templates.default_stale_days);
+    return everyDevice || initial.target !== "all" ? initial : { ...initial, target: "companies" };
+  });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const chosen = templates.templates.find((candidate) => candidate.id === draft.template);
@@ -59,7 +65,7 @@ export function RunDialog({ templates, template, returnFocus, onClose, onQueued 
             </select>
           </label>
           {chosen && <small className="field-help">{chosen.description}</small>}
-          <ScopeFields name="report-target" draft={draft} companies={companies} tags={tags} onChange={update} />
+          <ScopeFields name="report-target" draft={draft} companies={companies} tags={tags} onChange={update} everyDevice={everyDevice} />
           {chosen?.uses_period && (
             <label htmlFor="report-period">Period
               <select id="report-period" value={draft.period} onChange={(event) => update({ period: event.target.value as PeriodKind })}>

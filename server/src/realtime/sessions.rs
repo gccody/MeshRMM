@@ -33,11 +33,12 @@ use axum::extract::ws::{Message as WsMessage, WebSocket};
 
 use super::{LIVENESS, ToAgent, close_frame, send};
 use crate::{
+    access::Access,
     agents,
     audit::{self, Actor, Target},
     db::{self, Executor, tables::RemoteSessions},
     http::{ApiError, AppState},
-    rbac::{self, Permissions},
+    rbac,
     secrets::new_token,
     settings,
     time::now_ms,
@@ -836,14 +837,9 @@ pub async fn serve_peer(mut socket: WebSocket, handle: SessionHandle, role: Role
     handle.left(role, peer).await;
 }
 
-/// The user's permissions through their roles.
-pub async fn user_permissions(
-    executor: &mut impl Executor,
-    user_id: &str,
-) -> db::Result<Permissions> {
-    Ok(rbac::permissions_of(
-        &rbac::user_roles(executor, user_id).await?,
-    ))
+/// What the user's roles grant them, and where.
+pub async fn user_access(executor: &mut impl Executor, user_id: &str) -> db::Result<Access> {
+    Ok(rbac::access_of(&rbac::user_roles(executor, user_id).await?))
 }
 
 #[cfg(test)]

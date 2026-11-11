@@ -1,5 +1,6 @@
-//! Custom roles: named sets of permissions an administrator defines.
-use std::collections::HashMap;
+//! Custom roles: named sets of permissions an administrator defines, and
+//! the companies they reach.
+use std::collections::{BTreeSet, HashMap};
 
 use axum::{
     Json,
@@ -10,16 +11,18 @@ use sea_query::{Expr, ExprTrait, Func, Query};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{ensure_within, require_any};
+use super::{ensure_grants_within, require_any};
 use crate::{
+    access::{CompanySet, instance_permissions_on_limited_role},
+    agents::parse_id,
     audit::{self, Target},
     auth::Authorized,
     db::{
         self, Executor,
-        tables::{EffectiveUserRoles, RolePermissions, Roles},
+        tables::{Companies, EffectiveUserRoles, RoleCompanies, RolePermissions, Roles},
     },
     http::{ApiError, AppState, JsonBody},
-    rbac::{self, Permission, Permissions, Role},
+    rbac::{self, Permission, Permissions, Reach, Role},
     time::now_ms,
     users::new_id,
 };
@@ -31,6 +34,9 @@ const MAX_DESCRIPTION_LENGTH: usize = 500;
 pub struct PermissionView {
     name: Permission,
     description: &'static str,
+    /// `company` when a role limited to some companies can grant it on
+    /// their devices; `instance` when only roles for every company can.
+    reach: Reach,
 }
 
 /// `GET /v1/permissions`: every permission a role can grant.
@@ -41,6 +47,7 @@ pub async fn permissions(_actor: Authorized) -> Json<Vec<PermissionView>> {
             .map(|permission| PermissionView {
                 name: *permission,
                 description: permission.description(),
+                reach: permission.reach(),
             })
             .collect(),
     )
@@ -137,6 +144,75 @@ async fn ensure_name_free(
     Ok(())
 }
 
+/// The companies a request chose: every company, or the companies named,
+/// which must exist and of which there must be at least one.
+async fn chosen_companies(
+    executor: &mut impl Executor,
+    all_companies: bool,
+    company_ids: Vec<String>,
+) -> Result<CompanySet, ApiError> {
+    if all_companies {
+        if !company_ids.is_empty() {
+            return Err(ApiError::bad_request(
+                "a role for every company can't also name companies",
+            )
+            .with_code("invalid_role_companies"));
+        }
+        return Ok(CompanySet::All);
+    }
+    let ids = company_ids
+        .iter()
+        .map(|id| parse_id(id, "company"))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if ids.is_empty() {
+        return Err(
+            ApiError::bad_request("choose at least one company, or every company")
+                .with_code("invalid_role_companies"),
+        );
+    }
+    let mut found = 0;
+    let ids_list = ids.iter().cloned().collect::<Vec<_>>();
+    for chunk in ids_list.chunks(500) {
+        let rows: Vec<(String,)> = executor
+            .fetch_all(
+                &Query::select()
+                    .column(Companies::Id)
+                    .from(Companies::Table)
+                    .and_where(Expr::col(Companies::Id).is_in(chunk.iter().cloned()))
+                    .to_owned(),
+            )
+            .await?;
+        found += rows.len();
+    }
+    if found != ids.len() {
+        return Err(ApiError::not_found("a chosen company no longer exists"));
+    }
+    Ok(CompanySet::Only(ids))
+}
+
+/// Refuses permissions a role can't hold on `companies`, and permissions
+/// the actor doesn't hold on all of them.
+fn ensure_grantable(
+    actor: &Authorized,
+    permissions: &Permissions,
+    companies: &CompanySet,
+    what: &str,
+) -> Result<(), ApiError> {
+    let instance = instance_permissions_on_limited_role(permissions, companies);
+    if !instance.is_empty() {
+        let names = instance
+            .iter()
+            .map(|permission| permission.as_str())
+            .collect::<Vec<_>>();
+        return Err(ApiError::bad_request(format!(
+            "a role limited to some companies can't grant permissions that act on the whole instance: {}",
+            names.join(", ")
+        ))
+        .with_code("instance_permission_on_limited_role"));
+    }
+    ensure_grants_within(actor, permissions, companies, what)
+}
+
 async fn set_permissions(
     executor: &mut impl Executor,
     role_id: &str,
@@ -164,6 +240,70 @@ async fn set_permissions(
     Ok(())
 }
 
+async fn set_companies(
+    executor: &mut impl Executor,
+    role_id: &str,
+    companies: &CompanySet,
+) -> db::Result<()> {
+    executor
+        .execute(
+            &Query::update()
+                .table(Roles::Table)
+                .value(Roles::AllCompanies, companies.is_all())
+                .and_where(Expr::col(Roles::Id).eq(role_id))
+                .to_owned(),
+        )
+        .await?;
+    executor
+        .execute(
+            &Query::delete()
+                .from_table(RoleCompanies::Table)
+                .and_where(Expr::col(RoleCompanies::RoleId).eq(role_id))
+                .to_owned(),
+        )
+        .await?;
+    let CompanySet::Only(ids) = companies else {
+        return Ok(());
+    };
+    let ids = ids.iter().collect::<Vec<_>>();
+    for chunk in ids.chunks(400) {
+        let mut insert = Query::insert();
+        insert
+            .into_table(RoleCompanies::Table)
+            .columns([RoleCompanies::RoleId, RoleCompanies::CompanyId]);
+        for id in chunk {
+            insert.values_panic([role_id.into(), id.as_str().into()]);
+        }
+        executor.execute(&insert).await?;
+    }
+    Ok(())
+}
+
+/// The companies as the API and the audit log show them.
+fn companies_json(companies: &CompanySet) -> serde_json::Value {
+    match companies {
+        CompanySet::All => json!({ "all_companies": true, "company_ids": [] }),
+        CompanySet::Only(ids) => json!({ "all_companies": false, "company_ids": ids }),
+    }
+}
+
+fn apply_companies(role: &mut Role, companies: CompanySet) {
+    match companies {
+        CompanySet::All => {
+            role.all_companies = true;
+            role.company_ids = BTreeSet::new();
+        }
+        CompanySet::Only(ids) => {
+            role.all_companies = false;
+            role.company_ids = ids;
+        }
+    }
+}
+
+fn every_company() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NewRole {
@@ -171,6 +311,12 @@ pub struct NewRole {
     #[serde(default)]
     description: String,
     permissions: Permissions,
+    /// Whether the role reaches every company; otherwise only
+    /// `company_ids`.
+    #[serde(default = "every_company")]
+    all_companies: bool,
+    #[serde(default)]
+    company_ids: Vec<String>,
 }
 
 /// `POST /v1/roles`
@@ -182,8 +328,10 @@ pub async fn create(
     actor.require(Permission::RolesManage)?;
     let name = validate_name(&request.name)?;
     let description = validate_description(&request.description)?;
-    ensure_within(&actor, &request.permissions, "create this role")?;
     let mut transaction = state.database.begin().await?;
+    let companies =
+        chosen_companies(&mut transaction, request.all_companies, request.company_ids).await?;
+    ensure_grantable(&actor, &request.permissions, &companies, "create this role")?;
     ensure_name_free(&mut transaction, &name, None).await?;
     let id = new_id();
     let now = now_ms();
@@ -209,32 +357,43 @@ pub async fn create(
         )
         .await?;
     set_permissions(&mut transaction, &id, &request.permissions).await?;
+    set_companies(&mut transaction, &id, &companies).await?;
+    let mut details = json!({ "name": name, "permissions": request.permissions });
+    if let (Some(details), serde_json::Value::Object(scope)) =
+        (details.as_object_mut(), companies_json(&companies))
+    {
+        details.extend(scope);
+    }
     audit::record(
         &mut transaction,
         &actor.actor(),
         "role.create",
         Target::role(&id),
-        json!({ "name": name, "permissions": request.permissions }),
+        details,
     )
     .await?;
     transaction.commit().await?;
+    let mut role = Role {
+        id,
+        name,
+        description,
+        builtin: None,
+        permissions: request.permissions,
+        all_companies: true,
+        company_ids: BTreeSet::new(),
+    };
+    apply_companies(&mut role, companies);
     Ok((
         StatusCode::CREATED,
         Json(RoleView {
-            role: Role {
-                id,
-                name,
-                description,
-                builtin: None,
-                permissions: request.permissions,
-            },
+            role,
             member_count: 0,
         }),
     ))
 }
 
 /// Loads a role the actor may change: not the Administrator role, and none
-/// granting permissions the actor lacks.
+/// granting permissions the actor lacks on its companies.
 async fn editable(
     executor: &mut impl Executor,
     actor: &Authorized,
@@ -247,10 +406,15 @@ async fn editable(
         .ok_or_else(|| ApiError::not_found("no such role"))?;
     if role.is_administrator() {
         return Err(ApiError::forbidden(
-            "the Administrator role always has every permission and can't be changed",
+            "the Administrator role always has every permission in every company and can't be changed",
         ));
     }
-    ensure_within(actor, &role.permissions, "change this role")?;
+    ensure_grants_within(
+        actor,
+        &role.permissions,
+        &role.companies(),
+        "change this role",
+    )?;
     Ok(role)
 }
 
@@ -263,6 +427,12 @@ pub struct RoleUpdate {
     description: Option<String>,
     #[serde(default)]
     permissions: Option<Permissions>,
+    /// With `company_ids`, the companies the role reaches; both are
+    /// replaced together.
+    #[serde(default)]
+    all_companies: Option<bool>,
+    #[serde(default)]
+    company_ids: Option<Vec<String>>,
 }
 
 /// `PATCH /v1/roles/{id}`
@@ -284,6 +454,23 @@ pub async fn update(
         role.description = validate_description(description)?;
         changes.insert("description".into(), json!(role.description));
     }
+    let previous_companies = role.companies();
+    let companies = match (request.all_companies, request.company_ids) {
+        (None, None) => previous_companies.clone(),
+        (all_companies, company_ids) => {
+            let company_ids = company_ids.unwrap_or_default();
+            // Naming companies alone limits the role to them.
+            let all_companies = all_companies.unwrap_or(company_ids.is_empty());
+            chosen_companies(&mut transaction, all_companies, company_ids).await?
+        }
+    };
+    let permissions = request
+        .permissions
+        .clone()
+        .unwrap_or_else(|| role.permissions.clone());
+    if request.permissions.is_some() || companies != previous_companies {
+        ensure_grantable(&actor, &permissions, &companies, "grant these permissions")?;
+    }
     transaction
         .execute(
             &Query::update()
@@ -297,11 +484,21 @@ pub async fn update(
                 .to_owned(),
         )
         .await?;
-    if let Some(permissions) = request.permissions {
-        ensure_within(&actor, &permissions, "grant these permissions")?;
+    if request.permissions.is_some() {
         set_permissions(&mut transaction, &role.id, &permissions).await?;
         changes.insert("permissions".into(), json!(permissions));
         role.permissions = permissions;
+    }
+    if companies != previous_companies {
+        set_companies(&mut transaction, &role.id, &companies).await?;
+        if let serde_json::Value::Object(scope) = companies_json(&companies) {
+            changes.extend(scope);
+        }
+        changes.insert(
+            "previous_companies".into(),
+            companies_json(&previous_companies),
+        );
+        apply_companies(&mut role, companies);
     }
     audit::record(
         &mut transaction,

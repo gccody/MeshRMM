@@ -127,6 +127,7 @@ pub enum Roles {
     Name,
     Description,
     Builtin,
+    AllCompanies,
     CreatedAt,
     UpdatedAt,
 }
@@ -136,6 +137,13 @@ pub enum RolePermissions {
     Table,
     RoleId,
     Permission,
+}
+
+#[derive(Iden)]
+pub enum RoleCompanies {
+    Table,
+    RoleId,
+    CompanyId,
 }
 
 #[derive(Iden)]

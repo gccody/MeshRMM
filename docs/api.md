@@ -61,7 +61,10 @@ grant at the moment of the request. Take a permission away from a role and
 every token of its members loses it at once; disable or delete a user and
 their tokens stop working. A token limited to some permissions is never
 treated as the Administrator role, even if its user holds it, so signing
-out an administrator needs an unlimited token of an administrator.
+out an administrator needs an unlimited token of an administrator. A
+token reaches the companies its user's roles reach, each permission in
+the companies of the roles that grant it ([Users and
+roles](users-and-roles.md#company-scope)).
 
 Some routes refuse tokens whatever their permissions (`403
 api_token_not_allowed`), so that a leaked token can't create credentials

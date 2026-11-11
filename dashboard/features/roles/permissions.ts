@@ -33,3 +33,29 @@ export function groupPermissions(permissions: readonly PermissionInfo[]) {
   }
   return [...groups.entries()].map(([area, items]) => ({ label: GROUP_LABELS[area] ?? area, items }));
 }
+
+// Whether a role limited to some companies can grant the permission: one
+// that acts on what the whole server shares (users, roles, settings, the
+// shared toolbox, the application library, policies, alert rules, companies
+// and tags themselves, the audit log) needs a role for every company.
+export const grantableOnSomeCompanies = (permission: Pick<PermissionInfo, "reach">) => permission.reach !== "instance";
+
+// What a role saves of the permissions ticked: on a role limited to some
+// companies, only those such a role can grant.
+export function savedPermissions(granted: Iterable<PermissionInfo["name"]>, permissions: readonly PermissionInfo[], allCompanies: boolean) {
+  const ticked = new Set(granted);
+  return permissions
+    .filter((permission) => ticked.has(permission.name) && (allCompanies || grantableOnSomeCompanies(permission)))
+    .map((permission) => permission.name);
+}
+
+// The companies a role reaches, in words: "Every company", "Acme",
+// "Acme and Globex", or "3 companies".
+export function companyScopeLabel(role: { all_companies: boolean; company_ids: readonly string[] }, names: ReadonlyMap<string, string>) {
+  if (role.all_companies) return "Every company";
+  const named = role.company_ids.map((id) => names.get(id)).filter((name): name is string => Boolean(name));
+  if (!role.company_ids.length) return "No companies";
+  if (named.length === role.company_ids.length && named.length <= 2) return named.join(" and ");
+  const count = role.company_ids.length;
+  return `${count} ${count === 1 ? "company" : "companies"}`;
+}

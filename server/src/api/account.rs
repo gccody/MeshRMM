@@ -32,6 +32,10 @@ pub struct Account {
     two_factor: TwoFactorStatus,
     roles: Vec<RoleRef>,
     permissions: Permissions,
+    /// The permissions held only in some companies, by roles limited to
+    /// them: on other companies' devices, and devices in none, they don't
+    /// apply.
+    limited_permissions: Vec<crate::rbac::Permission>,
     is_administrator: bool,
     session: CurrentSession,
     /// Sign the browser out after this long without activity.
@@ -103,6 +107,7 @@ pub async fn get(
         },
         idle_timeout_minutes: signed_in.idle_timeout_minutes,
         connection_approval: settings.connection_approval,
+        limited_permissions: signed_in.access.limited(),
         permissions: signed_in.permissions,
         user: AccountUser {
             has_password: signed_in.user.password_hash.is_some(),

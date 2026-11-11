@@ -235,6 +235,7 @@ async fn paged(
             after: devices.last().map(|device| device.device_id.clone()),
             offset: 0,
             limit: PAGE,
+            within: meshrmm_server::access::CompanySet::All,
         };
         let rows = jobs::devices(&mut app.db(), job_id, &page, now)
             .await
@@ -244,6 +245,7 @@ async fn paged(
             after: None,
             offset: devices.len() as u64,
             limit: PAGE,
+            within: meshrmm_server::access::CompanySet::All,
         };
         let skipped = jobs::devices(&mut app.db(), job_id, &by_offset, now)
             .await

@@ -398,13 +398,6 @@ async fn only_changes_to_access_make_sockets_check_it_again() {
         assert_eq!(noted.status, 200, "{name}: {:?}", noted.body);
         let company = admin.post("/v1/companies", json!({ "name": "Acme" })).await;
         assert_eq!(company.status, 201, "{name}: {:?}", company.body);
-        let moved = admin
-            .put(
-                &format!("/v1/agents/{}/company", desk.device_id),
-                json!({ "company_id": company.body["id"] }),
-            )
-            .await;
-        assert_eq!(moved.status, 204, "{name}: {:?}", moved.body);
         let script = admin
             .post(
                 "/v1/toolbox/scripts",
@@ -431,6 +424,17 @@ async fn only_changes_to_access_make_sockets_check_it_again() {
             .await;
         assert_eq!(reset.status, 202, "{name}: {:?}", reset.body);
         assert_eq!(access_generation(&app), before, "{name}");
+
+        // Moving a device to another company changes who reaches it.
+        let moved = admin
+            .put(
+                &format!("/v1/agents/{}/company", desk.device_id),
+                json!({ "company_id": company.body["id"] }),
+            )
+            .await;
+        assert_eq!(moved.status, 204, "{name}: {:?}", moved.body);
+        assert!(access_generation(&app) > before, "{name}");
+        let before = access_generation(&app);
 
         // Signing in can drop roles from SSO groups.
         let signed_in = app

@@ -143,6 +143,10 @@ with subkeys deleted without them as `not_empty`.
 | `tools.registry.manage` | Create, change, rename and delete registry keys and values | Yes |
 
 A change permission doesn't include its view; a role usually holds both.
+Each is judged for the device's company: a role limited to some companies
+(see [Users and roles](users-and-roles.md#company-scope)) uses the tools
+only on its companies' devices, and any other device answers `404` as a
+missing one does.
 Each route checks its device in one place (`authorized_device` in
 `server/src/api/tools.rs`), which a device the user may not reach answers
 as not found. API tokens may use every route, within their permissions and

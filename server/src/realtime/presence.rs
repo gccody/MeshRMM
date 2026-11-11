@@ -49,6 +49,7 @@ use tokio::sync::{Mutex, broadcast, watch};
 
 use super::{AgentHub, Serializations, Shared};
 use crate::{
+    access::CompanySet,
     db::{
         self, Database,
         tables::{Agents, Companies, Tags},
@@ -149,6 +150,35 @@ impl PresenceEvent {
             | Self::CompanyDeleted { revision, .. }
             | Self::TagUpsert { revision, .. }
             | Self::TagDeleted { revision, .. } => *revision,
+        }
+    }
+
+    /// A snapshot of only the devices and companies `companies` reaches;
+    /// any other event as it is. Tags are the whole instance's.
+    pub fn within(&self, companies: &CompanySet) -> Self {
+        match self {
+            Self::Snapshot {
+                revision,
+                agents,
+                companies: all,
+                tags,
+                generated_at_unix_ms,
+            } => Self::Snapshot {
+                revision: *revision,
+                agents: agents
+                    .iter()
+                    .filter(|agent| companies.covers(agent.company_id.as_deref()))
+                    .cloned()
+                    .collect(),
+                companies: all
+                    .iter()
+                    .filter(|company| companies.covers(Some(&company.id)))
+                    .cloned()
+                    .collect(),
+                tags: tags.clone(),
+                generated_at_unix_ms: *generated_at_unix_ms,
+            },
+            other => other.clone(),
         }
     }
 }
@@ -478,17 +508,23 @@ impl Presence {
     }
 
     /// Those of `device_ids` that are devices, as subscribers were last told,
-    /// in the order given: an ID that is no device, or one deleted, is left
-    /// out.
-    pub async fn devices_among(&self, device_ids: Vec<String>) -> Vec<String> {
+    /// in the order given: an ID that is no device, one deleted, or one in a
+    /// company `companies` doesn't reach, is left out.
+    pub async fn devices_among(
+        &self,
+        device_ids: Vec<String>,
+        companies: &CompanySet,
+    ) -> Vec<String> {
         let state = self.inner.state.lock().await;
         device_ids
             .into_iter()
             .filter(|id| {
-                state
-                    .published
-                    .get(id)
-                    .is_some_and(|device| device.value.is_some())
+                state.published.get(id).is_some_and(|device| {
+                    device
+                        .value
+                        .as_ref()
+                        .is_some_and(|agent| companies.covers(agent.company_id.as_deref()))
+                })
             })
             .collect()
     }

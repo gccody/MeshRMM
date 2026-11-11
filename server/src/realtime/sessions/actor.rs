@@ -9,7 +9,6 @@ use super::{
     token_matches, unauthorized, unix_ms,
 };
 use crate::{
-    agents,
     db::tables::RemoteSessions,
     http::{ApiError, AppState},
     rbac::Permission,
@@ -370,9 +369,11 @@ impl SessionActor {
     /// removed, or its technician disabled or no longer allowed to connect.
     async fn still_allowed(&self) -> Result<Option<&'static str>, ApiError> {
         let mut database = &self.state.database;
-        if !agents::is_active(&mut database, &self.record.device_id).await? {
+        let Some(company_id) =
+            crate::access::device_company(&mut database, &self.record.device_id).await?
+        else {
             return Ok(Some("the device was removed"));
-        }
+        };
         // This runs after an access change, which made every cached account
         // stale, so the user is read afresh (once for all their sessions).
         let Some(account) = self
@@ -384,14 +385,14 @@ impl SessionActor {
         else {
             return Ok(Some("the technician's account was disabled"));
         };
-        let permissions = &account.permissions;
         let mut required = vec![Permission::SessionsConnect];
         if self.record.agent_request.start_in_background {
             required.push(Permission::SessionsConnectBackground);
         }
+        // Moving the device out of the technician's companies ends it too.
         if !required
             .iter()
-            .all(|permission| permissions.contains(permission))
+            .all(|permission| account.access.covers(*permission, company_id.as_deref()))
         {
             return Ok(Some("the technician may no longer connect"));
         }

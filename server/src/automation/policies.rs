@@ -1278,12 +1278,14 @@ async fn problem(executor: &mut impl Executor, policy: &Policy) -> db::Result<Op
             policy.owner
         )));
     };
-    let permissions = rbac::permissions_of(&rbac::user_roles(executor, &owner.id).await?);
+    // A policy can reach devices in every company, so the access it borrows
+    // must too: a permission held only in some companies doesn't count.
+    let access = rbac::access_of(&rbac::user_roles(executor, &owner.id).await?);
     let needed = policy.action.permissions();
-    if !permissions.contains(&Permission::AutomationManage)
+    if !access.everywhere(Permission::AutomationManage)
         || !needed
             .iter()
-            .all(|permission| permissions.contains(permission))
+            .all(|permission| access.everywhere(*permission))
     {
         let names = needed
             .iter()
@@ -1291,7 +1293,7 @@ async fn problem(executor: &mut impl Executor, policy: &Policy) -> db::Result<Op
             .collect::<Vec<_>>()
             .join(" and ");
         return Ok(Some(format!(
-            "{}, whose access it runs with, no longer has the automation.manage and {names} permissions; save the policy to run it with your access",
+            "{}, whose access it runs with, no longer has the automation.manage and {names} permissions in every company; save the policy to run it with your access",
             policy.owner
         )));
     }
@@ -1426,6 +1428,8 @@ async fn prepare(
         policy: Some((policy.id.clone(), policy.name.clone())),
         actor,
         scheduled,
+        // Its owner reaches every company; see `problem`.
+        within: crate::access::CompanySet::All,
     };
     match jobs::plan(&mut database, &state.agents, job).await {
         Ok(plan) => Ok(Prepared::Job(Box::new(plan))),
@@ -1999,7 +2003,13 @@ async fn maintenance_devices(
     if let Some(problem) = problem(&mut database, policy).await? {
         return Ok(Err(problem));
     }
-    let devices = maintenance_windows::resolve(&mut database, &policy.target).await?;
+    let devices = maintenance_windows::resolve(
+        &mut database,
+        &policy.target,
+        // Its owner reaches every company; see `problem`.
+        &crate::access::CompanySet::All,
+    )
+    .await?;
     Ok(if devices.is_empty() {
         Err(NO_DEVICES.to_owned())
     } else {
@@ -2079,7 +2089,12 @@ pub async fn run_maintenance_now(
     let Action::Maintenance { minutes, .. } = &policy.action else {
         return Err(ApiError::internal());
     };
-    let devices = maintenance_windows::resolve(&mut &state.database, &policy.target).await?;
+    let devices = maintenance_windows::resolve(
+        &mut &state.database,
+        &policy.target,
+        &crate::access::CompanySet::All,
+    )
+    .await?;
     if devices.is_empty() {
         return Err(ApiError::conflict(NO_DEVICES).with_code("policy_cannot_run"));
     }

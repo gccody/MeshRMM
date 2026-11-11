@@ -40,6 +40,7 @@ pub fn toolbox_user(actor: &Authorized) -> ToolboxUser {
     ToolboxUser {
         user_id: actor.user.id.clone(),
         permissions: actor.permissions.clone(),
+        access: actor.access.clone(),
         actor: actor.actor(),
     }
 }

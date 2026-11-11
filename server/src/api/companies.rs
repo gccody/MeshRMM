@@ -77,7 +77,8 @@ async fn find(executor: &mut impl Executor, id: &str) -> Result<Company, ApiErro
         .ok_or_else(|| ApiError::not_found("no such company"))
 }
 
-/// `GET /v1/companies`: every company, by name, with its device count.
+/// `GET /v1/companies`: every company the user may see devices in, by
+/// name, with its device count.
 pub async fn list(
     State(state): State<AppState>,
     actor: Authorized,
@@ -85,7 +86,16 @@ pub async fn list(
     actor.require(Permission::DevicesView)?;
     let mut database = &state.database;
     let counts = device_counts(&mut database).await?;
-    let mut companies: Vec<Company> = database.fetch_all(&company_select()).await?;
+    let mut companies: Vec<Company> = database
+        .fetch_all(
+            &company_select()
+                .and_where_option(actor.companies_condition(
+                    Permission::DevicesView,
+                    (Companies::Table, Companies::Id),
+                ))
+                .to_owned(),
+        )
+        .await?;
     companies.sort_by_cached_key(|company| (company.name.to_lowercase(), company.id.clone()));
     Ok(Json(
         companies
@@ -294,6 +304,9 @@ pub async fn delete(
         state.presence.refresh(device_id).await;
     }
     state.presence.refresh_company(&id).await;
+    // Roles limited to it no longer reach its devices, so open terminals and
+    // sessions check their user's access again.
+    state.presence.recheck_access();
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -364,6 +377,9 @@ pub async fn assign(
     .await?;
     transaction.commit().await?;
     state.presence.refresh(&id).await;
+    // Who may reach the device changed, so open terminals and sessions on it
+    // check their user's access again.
+    state.presence.recheck_access();
     Ok(StatusCode::NO_CONTENT)
 }
 

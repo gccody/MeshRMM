@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
-    agents::{self, parse_id},
+    agents::parse_id,
     alerts::store as alert_store,
     audit::{self, Target},
     auth::Authorized,
@@ -17,11 +17,17 @@ use crate::{
     rbac::Permission,
 };
 
-async fn active_device(state: &AppState, id: &str) -> Result<String, ApiError> {
+/// The active device a path names, if `permission` reaches it.
+async fn active_device(
+    state: &AppState,
+    actor: &Authorized,
+    permission: Permission,
+    id: &str,
+) -> Result<String, ApiError> {
     let id = parse_id(id, "device")?;
-    if !agents::is_active(&mut &state.database, &id).await? {
-        return Err(ApiError::not_found("Device not found"));
-    }
+    actor
+        .require_device(&mut &state.database, permission, &id)
+        .await?;
     Ok(id)
 }
 
@@ -34,7 +40,10 @@ pub async fn device_monitors(
 ) -> Result<Json<Vec<DeviceMonitor>>, ApiError> {
     actor.require(Permission::DevicesView)?;
     actor.require(Permission::AlertsView)?;
-    let id = active_device(&state, &id).await?;
+    let id = active_device(&state, &actor, Permission::AlertsView, &id).await?;
+    actor
+        .require_device(&mut &state.database, Permission::DevicesView, &id)
+        .await?;
     Ok(Json(monitors::for_device(&state, &id).await?))
 }
 
@@ -56,7 +65,10 @@ pub async fn check(
 ) -> Result<StatusCode, ApiError> {
     actor.require(Permission::DevicesView)?;
     actor.require(Permission::AlertsRespond)?;
-    let id = active_device(&state, &id).await?;
+    let id = active_device(&state, &actor, Permission::AlertsRespond, &id).await?;
+    actor
+        .require_device(&mut &state.database, Permission::DevicesView, &id)
+        .await?;
     let mut rule_ids = Vec::new();
     for rule_id in &request.rule_ids {
         let rule_id = parse_id(rule_id, "rule")?;
@@ -100,7 +112,12 @@ pub async fn rule_states(
     actor.require(Permission::AlertsView)?;
     let rule_id = parse_id(&parameters.rule, "rule")?;
     Ok(Json(RuleStates {
-        states: monitors::store::for_rule(&mut &state.database, &rule_id).await?,
+        states: monitors::store::for_rule(
+            &mut &state.database,
+            &rule_id,
+            &actor.companies(Permission::AlertsView),
+        )
+        .await?,
     }))
 }
 
@@ -113,7 +130,9 @@ pub async fn remediations(
     actor.require(Permission::AlertsView)?;
     let id = parse_id(&id, "alert")?;
     let mut database = &state.database;
-    if alert_store::get(&mut database, &id).await?.is_none() {
+    let alert = alert_store::get(&mut database, &id).await?;
+    if !alert.is_some_and(|alert| actor.covers(Permission::AlertsView, alert.company_id.as_deref()))
+    {
         return Err(ApiError::not_found("Alert not found"));
     }
     Ok(Json(remediation::attempts(&mut database, &id).await?))

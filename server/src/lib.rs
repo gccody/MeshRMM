@@ -1,5 +1,6 @@
 //! The self-hosted MeshRMM server: the website, the API, Agent and viewer
 //! connections, and downloads, for one company.
+pub mod access;
 pub mod admin;
 pub mod agent_rollout;
 pub mod agents;
