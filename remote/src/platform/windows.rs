@@ -140,6 +140,8 @@ struct Shared {
     first_presented: Arc<OnceLock<std::time::Instant>>,
     cursor_shape: Mutex<Option<CursorShape>>,
     agent_pointer_display: Mutex<Option<Option<meshrmm_protocol::DisplayId>>>,
+    /// The displays the device offers now, for the worker to show.
+    displays: Mutex<Option<Vec<Display>>>,
     ready: Condvar,
     stopping: AtomicBool,
     reconnect_status: Mutex<Option<ReconnectStatus>>,
@@ -169,6 +171,7 @@ impl Shared {
             first_presented: Default::default(),
             cursor_shape: Mutex::new(None),
             agent_pointer_display: Mutex::new(None),
+            displays: Mutex::new(None),
             ready: Condvar::new(),
             stopping: AtomicBool::new(false),
             reconnect_status: Mutex::new(None),
@@ -458,6 +461,12 @@ impl Presenter {
                 .fetch_add(queued.len() as u64, Ordering::Relaxed);
             queued.clear();
         }
+        // The reset carries the device's latest displays. A list still
+        // waiting for the worker is older, and the worker would show it
+        // after the reset's.
+        if let Ok(mut displays) = self.shared.displays.lock() {
+            displays.take();
+        }
         let (reply, response) = tokio::sync::oneshot::channel();
         // From here on, dropping it ends the reset.
         let wait = ResetWait {
@@ -481,6 +490,15 @@ impl Presenter {
     pub fn set_agent_pointer_display(&self, display_id: Option<meshrmm_protocol::DisplayId>) {
         if let Ok(mut pending) = self.shared.agent_pointer_display.lock() {
             *pending = Some(display_id);
+        }
+        self.shared.ready.notify_one();
+    }
+
+    /// Replaces the displays the window offers, leaving the stream and its
+    /// decoder alone.
+    pub fn set_displays(&self, displays: Vec<Display>) {
+        if let Ok(mut pending) = self.shared.displays.lock() {
+            *pending = Some(displays);
         }
         self.shared.ready.notify_one();
     }
@@ -711,7 +729,8 @@ unsafe fn apply_pending_reset(shared: &Shared, pipeline: &mut WorkerPipeline) ->
     true
 }
 
-/// Shows the latest agent pointer display and cursor shape the session sent.
+/// Shows the latest agent pointer display, display list and cursor shape
+/// the session sent.
 unsafe fn apply_pending_pointer_state(shared: &Shared, pipeline: &WorkerPipeline) {
     if let Some(display_id) = shared
         .agent_pointer_display
@@ -722,6 +741,14 @@ unsafe fn apply_pending_pointer_state(shared: &Shared, pipeline: &WorkerPipeline
         unsafe {
             window::set_agent_pointer_display(pipeline.window(), display_id);
         }
+    }
+    if let Some(displays) = shared
+        .displays
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.take())
+    {
+        unsafe { window::set_displays(pipeline.window(), displays) };
     }
     if let Some(shape) = shared
         .cursor_shape
@@ -929,6 +956,11 @@ impl Presenter {
         };
         (presenter, worker)
     }
+
+    /// The display list waiting for the worker to show it.
+    pub(crate) fn pending_displays(&self) -> Option<Vec<Display>> {
+        self.shared.displays.lock().unwrap().clone()
+    }
 }
 
 #[cfg(test)]
@@ -1099,6 +1131,21 @@ mod tests {
         let error = reset.await.unwrap_err();
         assert_eq!(error.to_string(), "no hardware decoder");
         assert!(!presenter.shared.resetting.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_reset_drops_an_older_display_list_and_keeps_a_newer_one() {
+        // The worker shows a waiting list after a reset's, so one the
+        // device sent before the reset's must not be left waiting.
+        let presenter = presenter(true);
+        presenter.set_displays(vec![display(1)]);
+        let _reset = presenter.reset_stream(FORMAT, display(2), vec![display(1), display(2)]);
+        assert_eq!(presenter.pending_displays(), None);
+        presenter.set_displays(vec![display(2), display(3)]);
+        assert_eq!(
+            presenter.pending_displays(),
+            Some(vec![display(2), display(3)])
+        );
     }
 
     /// A worker thread that stays in a modal loop until `release` is sent

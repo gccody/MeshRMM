@@ -658,12 +658,42 @@ impl CaptureControl {
                 }
                 self.mark_unavailable();
                 self.next_stream();
+            } else if let Some(catalog) = self.take_catalog()? {
+                send_control_message(&self.control_channel, catalog).await?;
             }
         }
         if !self.capture_running && std::time::Instant::now() >= self.capture_retry_after {
             self.retry_capture().await?;
         }
         Ok(())
+    }
+
+    /// The message that offers the viewer the displays, when they changed
+    /// while the stream did not. The stream, its display and its encoder
+    /// stay as they are, and the viewer keeps its decoder.
+    fn take_catalog(&mut self) -> anyhow::Result<Option<SessionMessage>> {
+        let Some(displays) = lock_streamer(&self.streamer)?.take_display_catalog() else {
+            return Ok(None);
+        };
+        if !displays
+            .iter()
+            .any(|display| display.id == self.active_display.id)
+        {
+            // Never offer a list without the display being shown; the
+            // streamer ends the stream when that display goes.
+            tracing::warn!(
+                display_id = self.active_display.id.0,
+                "the changed display list leaves out the display being shown"
+            );
+            return Ok(None);
+        }
+        tracing::info!(
+            displays = displays.len(),
+            stream_id = self.stream_id.0,
+            "the displays offered changed; publishing them without restarting the stream"
+        );
+        self.displays = displays.clone();
+        Ok(Some(SessionMessage::DisplayCatalog { displays }))
     }
 
     async fn retry_capture(&mut self) -> anyhow::Result<()> {

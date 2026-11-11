@@ -7,6 +7,8 @@ struct Recorder {
     calls: Arc<Mutex<Vec<&'static str>>>,
     codec: Codec,
     chroma: ChromaMode,
+    /// The displays to offer once, as a session list change does.
+    catalog: Option<Vec<Display>>,
 }
 
 impl Recorder {
@@ -64,6 +66,9 @@ impl ScreenStreamer for Recorder {
         self.record("end_stream");
         Ok(())
     }
+    fn take_display_catalog(&mut self) -> Option<Vec<Display>> {
+        self.catalog.take()
+    }
     fn poll_ended(&mut self) -> Option<anyhow::Result<()>> {
         None
     }
@@ -109,6 +114,7 @@ async fn encoder_restarts_end_the_stream_and_never_stop_capture() {
         calls: Arc::clone(&calls),
         codec: profile.codec,
         chroma: profile.chroma,
+        catalog: None,
     });
     let mut selection = ProfileSelection::new(profile);
     selection.negotiate(
@@ -169,4 +175,62 @@ async fn encoder_restarts_end_the_stream_and_never_stop_capture() {
         ["end_stream", "start"].repeat(4),
         "every restart ends the stream and starts the next; none stops capture"
     );
+}
+
+#[test]
+fn a_changed_display_list_is_offered_without_touching_the_stream() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let profile = VideoProfile {
+        codec: Codec::H265,
+        chroma: ChromaMode::Yuv420,
+    };
+    let rdp = Display {
+        session: meshrmm_protocol::DesktopSession::Rdp {
+            id: 6,
+            user: "bob".into(),
+        },
+        id: DisplayId(0x8000_0600),
+        ..display()
+    };
+    let streamer: Box<dyn ScreenStreamer> = Box::new(Recorder {
+        calls: Arc::clone(&calls),
+        codec: profile.codec,
+        chroma: profile.chroma,
+        catalog: Some(vec![display(), rdp.clone()]),
+    });
+    let mut capture = CaptureControl {
+        streamer: Arc::new(Mutex::new(streamer)),
+        slot: Arc::new(LatestFrameSlot::default()),
+        control_channel: Arc::new(RTCDataChannel::default()),
+        quality_ceiling: Arc::new(AtomicU32::new(8_000_000)),
+        stream_id: VideoStreamId(3),
+        displays: vec![display()],
+        active_display: display(),
+        format: format(profile.codec, profile.chroma),
+        configured_maximum_bitrate: 8_000_000,
+        active_profile: profile,
+        selection: ProfileSelection::new(profile),
+        capture_cursor: true,
+        recording: false,
+        viewer_controls_input: false,
+        capture_running: true,
+        capture_unavailable_since: None,
+        capture_retry_after: std::time::Instant::now(),
+    };
+
+    let message = capture.take_catalog().unwrap();
+    assert_eq!(
+        message,
+        Some(SessionMessage::DisplayCatalog {
+            displays: vec![display(), rdp.clone()]
+        })
+    );
+    // The viewer can now choose Bob's display, and the stream, its display
+    // and its encoder are as they were.
+    assert_eq!(capture.displays, vec![display(), rdp]);
+    assert_eq!(capture.stream_id, VideoStreamId(3));
+    assert_eq!(capture.active_display, display());
+    assert!(capture.capture_running);
+    assert!(calls.lock().unwrap().is_empty());
+    assert_eq!(capture.take_catalog().unwrap(), None);
 }

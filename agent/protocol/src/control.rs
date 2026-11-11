@@ -190,6 +190,13 @@ pub enum SessionMessage {
     Typing {
         active: bool,
     },
+    /// Sent by the Agent when the displays it offers change, such as an RDP
+    /// session starting or ending, while the stream and the display it shows
+    /// stay as the last `DisplayConfiguration` announced them. The viewer
+    /// replaces its list of displays and leaves its decoder alone.
+    DisplayCatalog {
+        displays: Vec<Display>,
+    },
 }
 
 /// Size of the virtual monitor a Windows Agent adds to a console that has no
@@ -942,6 +949,13 @@ mod desktop_session_tests {
                 format!("Display {}", index + 1)
             );
         }
+        let catalog = SessionMessage::DisplayCatalog {
+            displays: displays.clone(),
+        };
+        assert_eq!(
+            SessionMessage::decode(&catalog.encode().unwrap()).unwrap(),
+            catalog
+        );
         let message = SessionMessage::DisplayConfiguration {
             displays,
             active_display_id: DisplayId(102),

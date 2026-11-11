@@ -724,6 +724,12 @@ impl RemoteView {
         self.refresh_toolbar();
     }
 
+    /// Replaces the displays the toolbar offers; the display shown stays.
+    pub(super) fn set_displays(&self, displays: Vec<Display>) {
+        *self.ivars().displays.borrow_mut() = displays;
+        self.refresh_toolbar();
+    }
+
     pub(super) fn set_cursor_shape(&self, shape: CursorShape) {
         if *self.ivars().cursor_shape.borrow() == shape {
             return;

@@ -248,6 +248,14 @@ impl Presenter {
         });
     }
 
+    /// Replaces the displays the window offers, leaving the stream and its
+    /// decoder alone.
+    pub fn set_displays(&self, displays: Vec<Display>) {
+        exec_with_ui(self.shared.id, move |ui| {
+            ui.input_view.set_displays(displays.clone());
+        });
+    }
+
     /// Agent status can change on a static desktop that sends no frames.
     pub fn refresh_controls(&self) {
         exec_with_ui(self.shared.id, |ui| ui.input_view.refresh_debug(false));

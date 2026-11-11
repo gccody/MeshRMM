@@ -50,6 +50,49 @@ fn rdp_monitor_ids_are_stable_and_do_not_alias_console_or_other_users() {
     ));
 }
 
+/// The RDP sessions a test says exist, and how often the Agent asked.
+#[derive(Default)]
+pub(super) struct FakeSessions {
+    pub(super) sessions: Mutex<Vec<RdpSession>>,
+    /// Session lists the Agent asked for.
+    pub(super) lists: std::sync::atomic::AtomicUsize,
+    /// Client display sizes the Agent asked for, by session.
+    pub(super) sizes: Mutex<Vec<u32>>,
+}
+
+impl FakeSessions {
+    pub(super) fn with(sessions: Vec<RdpSession>) -> Arc<Self> {
+        Arc::new(Self {
+            sessions: Mutex::new(sessions),
+            ..Self::default()
+        })
+    }
+
+    pub(super) fn set(&self, sessions: Vec<RdpSession>) {
+        *self.sessions.lock().unwrap() = sessions;
+    }
+}
+
+impl RdpSessions for FakeSessions {
+    fn active(&self, _keep: Option<u32>) -> anyhow::Result<Vec<RdpSession>> {
+        self.lists.fetch_add(1, Ordering::AcqRel);
+        Ok(self.sessions.lock().unwrap().clone())
+    }
+
+    fn client_size(&self, id: u32) -> Option<(u32, u32)> {
+        self.sizes.lock().unwrap().push(id);
+        Some((1280, 720))
+    }
+}
+
+pub(super) fn rdp_session(id: u32, user: &str, connected: i64) -> RdpSession {
+    RdpSession {
+        id,
+        user: user.into(),
+        connected,
+    }
+}
+
 #[test]
 fn rdp_catalog_preserves_all_monitors_and_maps_the_active_monitor() {
     let session = meshrmm_protocol::DesktopSession::Rdp {
@@ -69,15 +112,11 @@ fn rdp_catalog_preserves_all_monitors_and_maps_the_active_monitor() {
     let mut streamer =
         DesktopCaptureStreamer::new(String::new(), String::new(), true, None, PathBuf::new());
     streamer.console_displays = vec![console.clone()];
+    streamer
+        .rdp
+        .set_source(FakeSessions::with(vec![rdp_session(3, "Alice", 1)]));
+    streamer.refresh_sessions();
     streamer.selected_session = Some(3);
-    streamer.session_displays = vec![(
-        Display {
-            session: session.clone(),
-            id: rdp_display_id(3, console.id),
-            ..console.clone()
-        },
-        console.id,
-    )];
     let monitors: Vec<_> = (1..=3)
         .map(|id| Display {
             id: DisplayId(id),

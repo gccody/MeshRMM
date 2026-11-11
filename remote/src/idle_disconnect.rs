@@ -114,6 +114,7 @@ pub fn is_activity(message: &SessionMessage) -> bool {
         | SessionMessage::Rejected { .. }
         | SessionMessage::StreamConfiguration { .. }
         | SessionMessage::DisplayConfiguration { .. }
+        | SessionMessage::DisplayCatalog { .. }
         | SessionMessage::CursorShape { .. }
         | SessionMessage::MaintenanceState { .. }
         | SessionMessage::MaintenanceError { .. }

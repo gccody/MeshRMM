@@ -76,6 +76,8 @@ struct Log {
     launches: Vec<Option<Kind>>,
     /// Every command each helper read, by launch.
     commands: Vec<(usize, Sent)>,
+    /// The desktop each helper was launched on, in launch order.
+    targets: Vec<DesktopTarget>,
     /// Launches whose process has ended.
     ended: Vec<usize>,
 }
@@ -96,10 +98,10 @@ type Ends = Arc<Mutex<Option<(File, File)>>>;
 impl Helpers {
     fn launcher(self: &Arc<Self>) -> HelperLauncher {
         let helpers = Arc::clone(self);
-        Arc::new(move |_target, _as_user| helpers.launch())
+        Arc::new(move |target, _as_user| helpers.launch(target))
     }
 
-    fn launch(self: &Arc<Self>) -> anyhow::Result<LaunchedHelper> {
+    fn launch(self: &Arc<Self>, target: DesktopTarget) -> anyhow::Result<LaunchedHelper> {
         let (child_input, parent_input) = create_pipe()?;
         let (parent_output, child_output) = create_pipe()?;
         let (parent_stderr, child_stderr) = create_pipe()?;
@@ -116,6 +118,7 @@ impl Helpers {
         let index = {
             let mut log = self.log.lock().unwrap();
             log.launches.push(None);
+            log.targets.push(target);
             log.launches.len() - 1
         };
         let ends: Ends = Arc::new(Mutex::new(Some((
@@ -354,6 +357,7 @@ fn opening(bitrate: u32) -> Vec<Received> {
 fn started(helpers: &Arc<Helpers>, bitrate: u32) -> (DesktopCaptureStreamer, Vec<Received>) {
     let mut streamer = DesktopCaptureStreamer::default();
     streamer.launcher = helpers.launcher();
+    streamer.rdp.set_source(FakeSessions::with(Vec::new()));
     let (first, received) = sink();
     let started = streamer
         .start(config(bitrate), Some(DISPLAY), first)
@@ -612,4 +616,264 @@ fn a_new_streams_frames_follow_its_started_event_on_the_pipe() {
         received.try_iter().collect::<Vec<_>>(),
         vec![(true, vec![1]), (false, vec![2])]
     );
+}
+
+// The RDP sessions of a terminal server, against fake helpers and a fake
+// session list. Every poll is due at once, so no test waits for one.
+
+/// A streamer started on the console with `sessions` signed in over RDP,
+/// and the sink of its stream.
+fn started_with_sessions(
+    helpers: &Arc<Helpers>,
+    sessions: &Arc<FakeSessions>,
+) -> (DesktopCaptureStreamer, EncodedFrameSink) {
+    let mut streamer = DesktopCaptureStreamer::default();
+    streamer.launcher = helpers.launcher();
+    streamer
+        .rdp
+        .set_source(Arc::clone(sessions) as Arc<dyn RdpSessions>);
+    streamer.rdp.poll_interval = Duration::ZERO;
+    let (first, received) = sink();
+    streamer
+        .start(config(8_000_000), Some(DISPLAY), Arc::clone(&first))
+        .unwrap();
+    assert_eq!(first_frames(&received), opening(8_000_000));
+    (streamer, first)
+}
+
+/// The sink the running capture helper's frames go to.
+fn current_sink(streamer: &DesktopCaptureStreamer) -> EncodedFrameSink {
+    let running = streamer.running.as_ref().expect("capture is running");
+    lock_frames(&running.sink)
+        .current
+        .clone()
+        .expect("the stream has a sink")
+}
+
+fn ids(displays: &[Display]) -> Vec<DisplayId> {
+    displays.iter().map(|display| display.id).collect()
+}
+
+fn placeholder(session: u32) -> DisplayId {
+    rdp_display_id(session, DisplayId(0))
+}
+
+#[test]
+fn a_session_starting_or_ending_elsewhere_publishes_the_catalog_and_leaves_the_stream_alone() {
+    let helpers = Arc::new(Helpers::default());
+    let sessions = FakeSessions::with(vec![rdp_session(5, "alice", 1)]);
+    let (mut streamer, first) = started_with_sessions(&helpers, &sessions);
+    let launched = helpers.launched();
+    let [capture] = helpers.of_kind(Kind::Capture)[..] else {
+        panic!("expected one capture helper, launched {launched:?}");
+    };
+    let sent = helpers.sent(capture);
+
+    // Bob signs in while the technician watches the console.
+    sessions.set(vec![rdp_session(5, "alice", 1), rdp_session(6, "bob", 2)]);
+    assert!(streamer.poll_ended().is_none());
+    let catalog = streamer.take_display_catalog().expect("a new catalog");
+    assert_eq!(
+        ids(&catalog),
+        vec![
+            DISPLAY,
+            meshrmm_protocol::BACKGROUND_DISPLAY_ID,
+            placeholder(5),
+            placeholder(6)
+        ]
+    );
+    assert_eq!(
+        catalog.last().unwrap().session,
+        meshrmm_protocol::DesktopSession::Rdp {
+            id: 6,
+            user: "bob".into()
+        }
+    );
+    // Published once; an unchanged list publishes nothing.
+    assert!(streamer.take_display_catalog().is_none());
+    assert!(streamer.poll_ended().is_none());
+    assert!(streamer.take_display_catalog().is_none());
+
+    // Alice signs out.
+    sessions.set(vec![rdp_session(6, "bob", 2)]);
+    assert!(streamer.poll_ended().is_none());
+    let catalog = streamer.take_display_catalog().expect("a new catalog");
+    assert_eq!(
+        ids(&catalog),
+        vec![
+            DISPLAY,
+            meshrmm_protocol::BACKGROUND_DISPLAY_ID,
+            placeholder(6)
+        ]
+    );
+
+    // No helper was launched, stopped or asked for anything, keyframes
+    // included, and the first stream's sink still takes its frames.
+    assert_eq!(helpers.launched(), launched);
+    assert_eq!(helpers.sent(capture), sent);
+    assert!(helpers.log.lock().unwrap().ended.is_empty());
+    assert!(Arc::ptr_eq(&current_sink(&streamer), &first));
+    // Bob's display was sized from his client, once, without a launch.
+    assert_eq!(*sessions.sizes.lock().unwrap(), vec![5, 6]);
+}
+
+#[test]
+fn an_unchanged_session_list_launches_nothing_on_start_or_on_an_in_place_restart() {
+    let helpers = Arc::new(Helpers::default());
+    let sessions = FakeSessions::with(
+        (2..32)
+            .map(|id| rdp_session(id, &format!("user{id}"), 1))
+            .collect(),
+    );
+    let (mut streamer, _) = started_with_sessions(&helpers, &sessions);
+    // The console's capture and service helpers, and none for the 30 sessions.
+    let console = vec![
+        Kind::Capture,
+        Kind::Files,
+        Kind::Chat,
+        Kind::Clipboard,
+        Kind::Input,
+    ];
+    assert_eq!(helpers.launched(), console);
+    assert_eq!(sessions.sizes.lock().unwrap().len(), 30);
+
+    let (format, frames) = restart(&mut streamer, 2_000_000);
+    assert_eq!(format.bitrate_bits_per_second, 2_000_000);
+    assert_eq!(frames, opening(2_000_000));
+    assert!(streamer.poll_ended().is_none());
+    assert!(streamer.take_display_catalog().is_none());
+    assert_eq!(helpers.launched(), console);
+    // Nothing about the sessions was asked again but their list.
+    assert_eq!(sessions.sizes.lock().unwrap().len(), 30);
+}
+
+#[test]
+fn the_viewed_session_ending_ends_its_capture_until_it_is_back() {
+    let helpers = Arc::new(Helpers::default());
+    let sessions = FakeSessions::with(vec![rdp_session(5, "alice", 1), rdp_session(6, "bob", 1)]);
+    let (mut streamer, _) = started_with_sessions(&helpers, &sessions);
+
+    // The technician switches to Alice's session. Its capture helper
+    // reports its monitor, which replaces the placeholder.
+    streamer.stop().unwrap();
+    let (next, received) = sink();
+    let started = streamer
+        .start(config(8_000_000), Some(placeholder(5)), next)
+        .unwrap();
+    first_frames(&received);
+    let alice = rdp_display_id(5, DISPLAY);
+    assert_eq!(started.active_display.id, alice);
+    assert!(ids(&started.displays).contains(&alice));
+    assert!(!ids(&started.displays).contains(&placeholder(5)));
+    let targets = helpers.log.lock().unwrap().targets.clone();
+    assert_eq!(
+        targets[targets.len() - 2..],
+        [DesktopTarget::Rdp(5, false), DesktopTarget::Rdp(5, false)]
+    );
+    let capture = *helpers.of_kind(Kind::Capture).last().unwrap();
+
+    // Bob's session ending leaves Alice's stream alone.
+    sessions.set(vec![rdp_session(5, "alice", 1)]);
+    assert!(streamer.poll_ended().is_none());
+    assert!(ids(&streamer.take_display_catalog().unwrap()).contains(&alice));
+    assert_ne!(helpers.sent(capture).last(), Some(&Sent::Stop));
+
+    // Alice disconnects: her capture stops, as it always did, and does not
+    // start again while she is away.
+    sessions.set(Vec::new());
+    assert!(matches!(streamer.poll_ended(), Some(Ok(()))));
+    assert_eq!(helpers.sent(capture).last(), Some(&Sent::Stop));
+    assert!(streamer.take_display_catalog().is_none());
+    let launched = helpers.launched().len();
+    let (next, _) = sink();
+    assert!(
+        streamer
+            .start(config(8_000_000), Some(alice), next)
+            .is_err()
+    );
+    assert_eq!(helpers.launched().len(), launched);
+
+    // She reconnects, and her monitor is captured again.
+    sessions.set(vec![rdp_session(5, "alice", 2)]);
+    let (next, received) = sink();
+    let started = streamer
+        .start(config(8_000_000), Some(alice), next)
+        .unwrap();
+    first_frames(&received);
+    assert_eq!(started.active_display.id, alice);
+    assert_eq!(
+        helpers.log.lock().unwrap().targets.last(),
+        Some(&DesktopTarget::Rdp(5, false))
+    );
+
+    // Her client reconnecting between two polls takes the desktop away too.
+    let capture = *helpers.of_kind(Kind::Capture).last().unwrap();
+    sessions.set(vec![rdp_session(5, "alice", 3)]);
+    assert!(matches!(streamer.poll_ended(), Some(Ok(()))));
+    assert_eq!(helpers.sent(capture).last(), Some(&Sent::Stop));
+}
+
+#[test]
+fn display_ids_of_sessions_stay_as_the_list_changes() {
+    let helpers = Arc::new(Helpers::default());
+    let sessions = FakeSessions::with(vec![rdp_session(5, "alice", 1), rdp_session(6, "bob", 1)]);
+    let (mut streamer, _) = started_with_sessions(&helpers, &sessions);
+    // The technician looks at Alice's session, then goes back to the console.
+    streamer.stop().unwrap();
+    let (next, _) = sink();
+    streamer
+        .start(config(8_000_000), Some(placeholder(5)), next)
+        .unwrap();
+    streamer.stop().unwrap();
+    let (next, _) = sink();
+    let started = streamer
+        .start(config(8_000_000), Some(DISPLAY), next)
+        .unwrap();
+    let alice = rdp_display_id(5, DISPLAY);
+    assert_eq!(
+        ids(&started.displays),
+        vec![
+            DISPLAY,
+            meshrmm_protocol::BACKGROUND_DISPLAY_ID,
+            alice,
+            placeholder(6)
+        ]
+    );
+
+    // Carol signs in, and Bob signs out.
+    sessions.set(vec![rdp_session(5, "alice", 1), rdp_session(7, "carol", 1)]);
+    assert!(streamer.poll_ended().is_none());
+    assert_eq!(
+        ids(&streamer.take_display_catalog().unwrap()),
+        vec![
+            DISPLAY,
+            meshrmm_protocol::BACKGROUND_DISPLAY_ID,
+            alice,
+            placeholder(7)
+        ]
+    );
+    // Alice's monitor is still the one her helper reported, so choosing it
+    // goes to that monitor in her session.
+    assert_eq!(streamer.rdp.route(alice), Some((5, Some(DISPLAY))));
+    assert_eq!(streamer.rdp.route(placeholder(7)), Some((7, None)));
+}
+
+#[test]
+fn a_crowded_terminal_server_offers_a_bounded_catalog_with_the_viewed_session() {
+    let sessions = FakeSessions::with(
+        (1..300)
+            .map(|id| rdp_session(id, "abcdefghijklmnopqrst", 1))
+            .collect(),
+    );
+    let mut catalog = RdpCatalog::new(Arc::clone(&sessions) as Arc<dyn RdpSessions>);
+    assert!(catalog.refresh(Some(250)).unwrap());
+    let displays: Vec<_> = catalog.displays().cloned().collect();
+    assert_eq!(displays.len(), MAX_RDP_SESSIONS);
+    assert!(catalog.session(250).is_some());
+    assert_eq!(sessions.sizes.lock().unwrap().len(), MAX_RDP_SESSIONS);
+    // It fits one control message with room to spare.
+    let message = meshrmm_protocol::SessionMessage::DisplayCatalog { displays }
+        .encode()
+        .unwrap();
+    assert!(message.len() < 16 * 1024, "{} bytes", message.len());
 }
