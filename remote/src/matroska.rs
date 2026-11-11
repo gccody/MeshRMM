@@ -299,7 +299,7 @@ pub(crate) mod tests {
                 encode_complete_timestamp_us: 1_000_001,
                 send_timestamp_us: 1_000_002,
                 keyframe: true,
-                data: data.to_vec(),
+                data: data.to_vec().into(),
             },
         )
     }

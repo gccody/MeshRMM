@@ -325,7 +325,7 @@ impl FrameQueue {
         }
     }
 
-    /// Queues a copy of `frame`, or leaves it out when the queue is over its
+    /// Queues `frame`, sharing its bytes, or leaves it out when the queue is over its
     /// bounds. Every frame from then on is left out too until a keyframe
     /// fits: a frame whose reference frames are missing cannot be decoded,
     /// and the writer resumes the part at that keyframe, with a gap in time.
@@ -731,6 +731,16 @@ mod tests {
         );
         assert_eq!(std::fs::read_dir(&held.directory).unwrap().count(), 1);
         std::fs::remove_dir_all(&held.directory).unwrap();
+    }
+
+    /// The presenter and the recording share a frame's bytes.
+    #[test]
+    fn a_queued_frame_shares_the_received_bytes() {
+        let queue = FrameQueue::new(QUEUE_LIMITS);
+        let (key, format) = frame(0, true);
+        assert_eq!(queue.push(&key, format, Instant::now()), Pushed::Queued);
+        let (queued, _) = queue.pop().unwrap();
+        assert_eq!(queued.data.as_ptr(), key.data.as_ptr());
     }
 
     #[test]

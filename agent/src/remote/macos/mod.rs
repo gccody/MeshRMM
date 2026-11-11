@@ -25,7 +25,7 @@ use meshrmm_protocol::{
 
 use super::platform;
 use super::platform::{ScreenInput, ScreenStreamer, StartedScreen};
-use super::video::LatestFrameSlot;
+use super::video::{LatestFrameSlot, with_codec_config};
 pub(crate) use crate::remote::helper::protocol::SessionUi;
 use crate::remote::helper::protocol::StreamSettings;
 
@@ -134,15 +134,13 @@ impl ScreenStreamer for PlatformScreenStreamer {
                 encode_complete_timestamp_us: encoded_us,
                 send_timestamp_us: 0,
                 keyframe,
-                data,
+                data: data.into(),
             });
         };
         let started = match &mut self.backend {
             Backend::Direct { screen, .. } => screen.start(display_id, settings, move |unit| {
-                let mut data = unit.codec_config.unwrap_or_default();
-                data.extend_from_slice(&unit.data);
                 publish(
-                    data,
+                    with_codec_config(unit.codec_config, unit.data),
                     unit.keyframe,
                     unit.capture_timestamp_us,
                     unit.encode_complete_timestamp_us,

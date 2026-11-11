@@ -204,7 +204,7 @@ pub(super) fn install_video_handler(
         let output = output.clone();
         Box::pin(async move {
             let received_at_us = monotonic_timestamp_us();
-            let packet = match VideoPacket::decode(&message.data) {
+            let packet = match VideoPacket::decode(message.data) {
                 Ok(packet) => packet,
                 Err(error) => {
                     tracing::warn!(error = %error, "discarding invalid video packet");
@@ -316,7 +316,7 @@ mod tests {
             encode_complete_timestamp_us: 2,
             send_timestamp_us: 3,
             keyframe,
-            data: vec![1],
+            data: vec![1].into(),
         }
     }
 
@@ -356,7 +356,7 @@ mod tests {
         let mut state = VideoReceiveState::new();
         state.accept_completed(encoded_frame(1, true));
         let mut frame = encoded_frame(2, false);
-        frame.data = vec![1; 6];
+        frame.data = vec![1; 6].into();
         let packet = meshrmm_protocol::fragment_frame(&frame, 3)
             .unwrap()
             .remove(0);

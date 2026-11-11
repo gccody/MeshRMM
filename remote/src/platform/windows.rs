@@ -1024,7 +1024,7 @@ mod tests {
             encode_complete_timestamp_us: 0,
             send_timestamp_us: 0,
             keyframe,
-            data: vec![0, 0, 0, 1],
+            data: vec![0, 0, 0, 1].into(),
         }
     }
 

@@ -3094,6 +3094,7 @@ dependencies = [
 name = "meshrmm-protocol"
 version = "0.2.0"
 dependencies = [
+ "bytes",
  "meshrmm-protocol-types",
  "postcard",
  "serde",

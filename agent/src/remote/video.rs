@@ -35,6 +35,19 @@ impl Queue {
     }
 }
 
+/// An access unit's bytes with its codec configuration, if any, in front:
+/// the access unit itself when there is none, which is every frame but a
+/// keyframe.
+pub(crate) fn with_codec_config(codec_config: Option<Vec<u8>>, data: Vec<u8>) -> Vec<u8> {
+    match codec_config {
+        Some(mut joined) => {
+            joined.extend_from_slice(&data);
+            joined
+        }
+        None => data,
+    }
+}
+
 pub struct LatestFrameSlot {
     queue: Mutex<Queue>,
     keyframe: Mutex<Option<Arc<EncodedFrame>>>,
@@ -188,7 +201,7 @@ mod tests {
             encode_complete_timestamp_us: 2,
             send_timestamp_us: 0,
             keyframe: false,
-            data: vec![frame_id as u8],
+            data: vec![frame_id as u8].into(),
         }
     }
 
@@ -197,6 +210,18 @@ mod tests {
             keyframe: true,
             ..frame(frame_id)
         }
+    }
+
+    #[test]
+    fn an_access_unit_without_codec_configuration_is_not_copied() {
+        let data = vec![0, 0, 0, 1, 0x41];
+        let pointer = data.as_ptr();
+        let joined = with_codec_config(None, data);
+        assert_eq!(joined.as_ptr(), pointer);
+        assert_eq!(
+            with_codec_config(Some(vec![0, 0, 0, 1, 0x67]), vec![0, 0, 0, 1, 0x65]),
+            [0, 0, 0, 1, 0x67, 0, 0, 0, 1, 0x65]
+        );
     }
 
     #[tokio::test]
@@ -254,7 +279,7 @@ mod tests {
 
     fn sized(frame_id: u64, bytes: usize) -> EncodedFrame {
         EncodedFrame {
-            data: vec![0; bytes],
+            data: vec![0; bytes].into(),
             ..frame(frame_id)
         }
     }
