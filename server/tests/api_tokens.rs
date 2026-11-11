@@ -147,20 +147,21 @@ async fn tokens_act_for_their_user_within_their_scope() {
             json!({ "name": "Manage users", "expires_in_days": 7, "permissions": ["users.manage"] }),
         )
         .await;
-        let renamed = call(
+        let signed_out = call(
             &app,
             &managing,
-            Method::PATCH,
-            &format!("/v1/users/{admin_id}"),
-            Some(json!({ "display_name": "Eve" })),
+            Method::POST,
+            &format!("/v1/users/{admin_id}/sign-out"),
+            Some(json!({})),
         )
         .await;
-        assert_eq!(renamed.code(), "permission_denied", "{name}");
+        assert_eq!(signed_out.code(), "permission_denied", "{name}");
         assert_eq!(
             get(&app, &scoped, "/v1/api-tokens/current").await.body["permissions"],
             json!(["devices.view"])
         );
 
+        let admin_user = format!("/v1/users/{admin_id}");
         // Account security, credentials and the website's sockets are off
         // limits to every token.
         for (method, path, body) in [
@@ -201,6 +202,12 @@ async fn tokens_act_for_their_user_within_their_scope() {
                 "/v1/users/someone/unlink-sso",
                 Some(json!({})),
             ),
+            (
+                Method::PATCH,
+                admin_user.as_str(),
+                Some(json!({ "display_name": "Eve" })),
+            ),
+            (Method::POST, "/v1/roles", Some(json!({}))),
             (Method::GET, "/v1/events", None),
             (Method::POST, "/v1/remote/handoffs", Some(json!({}))),
         ] {
@@ -890,6 +897,136 @@ async fn tokens_cant_invite_reroute_email_or_unlink_sso() {
         assert_eq!(
             admin.get("/v1/settings/smtp").await.body["configured"],
             false,
+            "{name}"
+        );
+        app.finish().await;
+    }
+}
+
+/// Nor can an administrator's unlimited token change users or roles, which
+/// would outlast revoking it: enable a disabled account, give someone the
+/// Administrator role, delete a user for SSO to create again, or make or
+/// change what a role grants. It still reads users and roles and signs
+/// users out; the website still does all of it.
+#[tokio::test]
+async fn tokens_cant_change_users_or_roles() {
+    for app in common::apps().await {
+        let name = app.name;
+        let mut admin = common::set_up(&app).await;
+        let role = common::add_role(&mut admin, "Auditor", &["devices.view"]).await;
+        let (_, tech_id) = common::add_user(&app, &mut admin, "tech@example.com", &[&role]).await;
+        let disabled = admin
+            .patch(&format!("/v1/users/{tech_id}"), json!({ "disabled": true }))
+            .await;
+        assert_eq!(
+            disabled.status,
+            StatusCode::OK,
+            "{name}: {:?}",
+            disabled.body
+        );
+        let tech = admin.get(&format!("/v1/users/{tech_id}")).await.body;
+        let roles = admin.get("/v1/roles").await.body;
+
+        let (token_id, secret) = make(
+            &mut admin,
+            json!({ "name": "Admin script", "expires_in_days": 7 }),
+        )
+        .await;
+        let user = format!("/v1/users/{tech_id}");
+        let custom = format!("/v1/roles/{role}");
+        for (method, path, body) in [
+            (
+                Method::PATCH,
+                user.as_str(),
+                Some(json!({ "disabled": false })),
+            ),
+            (
+                Method::PATCH,
+                user.as_str(),
+                Some(json!({ "role_ids": ["administrator"] })),
+            ),
+            (
+                Method::PATCH,
+                user.as_str(),
+                Some(json!({ "display_name": "Eve" })),
+            ),
+            (Method::DELETE, user.as_str(), None),
+            (
+                Method::POST,
+                "/v1/roles",
+                Some(json!({ "name": "Backdoor", "permissions": ["users.manage"] })),
+            ),
+            (
+                Method::PATCH,
+                custom.as_str(),
+                Some(json!({ "permissions": ["devices.view", "users.manage"] })),
+            ),
+            (Method::DELETE, custom.as_str(), None),
+        ] {
+            let response = call(&app, &secret, method, path, body).await;
+            assert_eq!(response.status, StatusCode::FORBIDDEN, "{name}: {path}");
+            assert_eq!(response.code(), "api_token_not_allowed", "{name}: {path}");
+        }
+
+        // Nothing changed, and the token did nothing the audit log saw.
+        assert_eq!(admin.get(&user).await.body, tech, "{name}");
+        assert_eq!(tech["disabled"], true, "{name}");
+        assert_eq!(admin.get("/v1/roles").await.body, roles, "{name}");
+        let audit = admin
+            .get(&format!("/v1/audit?api_token_id={token_id}"))
+            .await;
+        assert_eq!(audit.body["events"], json!([]), "{name}");
+
+        // Reading users and roles, and signing a user out, still work.
+        for path in ["/v1/users", user.as_str(), "/v1/roles", "/v1/permissions"] {
+            let read = get(&app, &secret, path).await;
+            assert_eq!(read.status, StatusCode::OK, "{name}: {path}");
+        }
+        assert_eq!(get(&app, &secret, &user).await.body, tech, "{name}");
+        let signed_out = call(
+            &app,
+            &secret,
+            Method::POST,
+            &format!("/v1/users/{tech_id}/sign-out"),
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(signed_out.status, StatusCode::NO_CONTENT, "{name}");
+
+        // The website still does all of it.
+        let enabled = admin
+            .patch(
+                &user,
+                json!({ "disabled": false, "role_ids": ["technician"], "display_name": "Tech" }),
+            )
+            .await;
+        assert_eq!(enabled.status, StatusCode::OK, "{name}: {:?}", enabled.body);
+        assert_eq!(enabled.body["disabled"], false, "{name}");
+        assert_eq!(enabled.body["roles"][0]["id"], "technician", "{name}");
+        let created = admin
+            .post(
+                "/v1/roles",
+                json!({ "name": "Helpdesk", "permissions": ["devices.view"] }),
+            )
+            .await;
+        assert_eq!(
+            created.status,
+            StatusCode::CREATED,
+            "{name}: {:?}",
+            created.body
+        );
+        let changed = admin
+            .patch(
+                &custom,
+                json!({ "permissions": ["devices.view", "audit.view"] }),
+            )
+            .await;
+        assert_eq!(changed.status, StatusCode::OK, "{name}: {:?}", changed.body);
+        assert_eq!(admin.delete(&custom).await.status, StatusCode::NO_CONTENT);
+        assert_eq!(admin.delete(&user).await.status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            admin.get(&user).await.status,
+            StatusCode::NOT_FOUND,
             "{name}"
         );
         app.finish().await;
