@@ -19,8 +19,9 @@ type Loaded = DeviceMetrics & {
   loadedAt: number;
 };
 
-// A device's resource usage over `range`. The live range loads once and then
-// grows with the readings the event socket delivers as `latest`.
+// A device's resource usage over `range`. The live range loads once, and
+// again whenever the tab is shown, and grows with the readings the event
+// socket delivers as `latest`.
 export function useDeviceMetrics({ authorizedFetch, deviceId, range, latest }: {
   authorizedFetch: AuthorizedFetch;
   deviceId: string;
@@ -49,9 +50,16 @@ export function useDeviceMetrics({ authorizedFetch, deviceId, range, latest }: {
     };
     void load();
     const timer = range === "live" ? undefined : window.setInterval(() => void load(), HISTORY_REFRESH_MS);
+    // A hidden tab is sent no readings, so the live range is read again
+    // when it is shown, for the points it missed.
+    const shown = () => {
+      if (range === "live" && document.visibilityState === "visible") void load();
+    };
+    document.addEventListener("visibilitychange", shown);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", shown);
     };
   }, [authorizedFetch, deviceId, range]);
 

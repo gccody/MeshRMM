@@ -3,7 +3,6 @@
 mod common;
 
 use std::{
-    collections::HashSet,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -12,7 +11,10 @@ use common::{
     Agent, App, Received, SOCKET_WAIT, Server, Ws, apps, apps_with, quiet, receive,
     receive_any_json, receive_close, receive_json, send_json, send_text, set_up, user_with,
 };
-use meshrmm_server::realtime::presence::{PresenceAgent, PresenceEvent};
+use meshrmm_server::realtime::{
+    metrics::WatchedSignal,
+    presence::{PresenceAgent, PresenceEvent},
+};
 use serde_json::{Value, json};
 use tokio::sync::broadcast::Receiver;
 
@@ -207,7 +209,7 @@ async fn deleted_devices_leave_presence_and_their_agents_uninstall() {
         send_json(&mut control, json!({ "type": "uninstall_scheduled" })).await;
         assert_eq!(receive_close(&mut control).await, 4001);
         quiet(&mut events, Duration::from_millis(300)).await;
-        send_text(&mut events, "refresh").await;
+        send_json(&mut events, json!({ "type": "refresh" })).await;
         let snapshot = receive_json(&mut events).await;
         assert_eq!(snapshot["type"], "snapshot");
         assert_eq!(snapshot["agents"], json!([]));
@@ -621,11 +623,13 @@ async fn agents_report_resource_usage_to_the_website_and_history() {
 
         let mut events = admin.events(&server).await.unwrap();
         receive_json(&mut events).await;
+        watch(&mut events, &[&agent.device_id]).await;
         let mut control = agent.connect(&server).await.unwrap();
         receive_json(&mut events).await;
         send_json(&mut control, metrics_report(20.0, 4_000)).await;
 
-        // The event socket sends new readings every few seconds.
+        // The event socket sends a watched device's new readings every few
+        // seconds.
         let event = receive_json(&mut events).await;
         assert_eq!(event["type"], "metrics", "{}", app.name);
         let reading = &event["readings"][0];
@@ -1162,13 +1166,14 @@ async fn sockets_send_what_they_share_serialised_once() {
         let mut admin = set_up(&app).await;
         let desk = app.enroll(&mut admin, "Desk").await;
         for count in [1_u64, 2, 10] {
-            let opened = app.state.metrics.feed_work();
             let mut sockets = Vec::new();
             for _ in 0..count {
                 let mut events = admin.events(&server).await.unwrap();
                 next_text(&mut events, "snapshot").await;
                 // The counts each socket reads for itself as it opens.
                 next_text(&mut events, "alert_counts").await;
+                watch(&mut events, &[&desk.device_id]).await;
+                assert_eq!(until_pong(&mut events).await, [] as [Value; 0]);
                 sockets.push(events);
             }
             let before = app.state.presence.serializations();
@@ -1186,10 +1191,6 @@ async fn sockets_send_what_they_share_serialised_once() {
                 1,
                 "{name}: one presence change for {count} sockets"
             );
-            // Each socket took its full set after its snapshot; with no
-            // reading since, they shared one, empty.
-            let work = app.state.metrics.feed_work();
-            assert_eq!(work.full_sets - opened.full_sets, 1, "{name}: {work:?}");
 
             let before = app.state.alerts.serializations();
             meshrmm_server::alerts::announce_counts(&app.state).await;
@@ -1216,8 +1217,8 @@ async fn sockets_send_what_they_share_serialised_once() {
             assert!(readings.contains(&desk.device_id), "{readings}");
             let work = app.state.metrics.feed_work();
             assert_eq!(work.ticks - before.ticks, 1, "{name}: {work:?}");
-            assert_eq!(work.hand_overs, before.hand_overs, "{name}: {work:?}");
-            assert_eq!(work.full_sets, before.full_sets, "{name}: {work:?}");
+            // Its JSON made once for every socket that watches the device.
+            assert_eq!(work.serialized - before.serialized, 1, "{name}: {work:?}");
             // A scan a tick, however many sockets: the reading is sent at
             // the first tick after it.
             assert!(work.scans - before.scans <= 2, "{name}: {work:?}");
@@ -1246,115 +1247,296 @@ fn readings_in(message: &Value) -> Vec<(String, i64)> {
         .collect()
 }
 
-/// Records a reading for each device, and returns them as (device, time).
-fn report_all(app: &App, devices: &[String]) -> HashSet<(String, i64)> {
-    for device in devices {
-        app.state.metrics.record(device, usage(5.0, 1));
-    }
+/// The devices a metrics message has readings of, sorted.
+fn devices_in(message: &Value) -> Vec<String> {
+    let mut devices = readings_in(message)
+        .into_iter()
+        .map(|(device, _)| device)
+        .collect::<Vec<_>>();
+    devices.sort();
     devices
+}
+
+/// Has the event socket watch exactly `devices`.
+async fn watch(events: &mut Ws, devices: &[&str]) {
+    send_json(events, json!({ "type": "watch", "devices": devices })).await;
+}
+
+/// Pings the socket and returns what it sent before the answer, which is
+/// everything it sent for the messages it was sent before: the server reads
+/// a socket's messages in order.
+async fn until_pong(events: &mut Ws) -> Vec<Value> {
+    send_json(events, json!({ "type": "ping" })).await;
+    let mut sent = Vec::new();
+    loop {
+        let message = receive_json(events).await;
+        if message["type"] == "pong" {
+            return sent;
+        }
+        sent.push(message);
+    }
+}
+
+/// The devices of the metrics messages, sorted, one list each.
+fn readings_sent(messages: &[Value]) -> Vec<Vec<String>> {
+    messages
         .iter()
-        .map(|device| {
-            let latest = app.state.metrics.latest(device).unwrap();
-            (latest.device_id, latest.at)
-        })
+        .filter(|message| message["type"] == "metrics")
+        .map(devices_in)
         .collect()
 }
 
-/// Records a newer reading for each device than those in `earlier`, and
-/// returns them. Readings closer together than two seconds of the server's
-/// clock are dropped, so a device is asked again until one is kept.
-async fn report_again(
-    app: &App,
-    devices: &[String],
-    earlier: &HashSet<(String, i64)>,
-) -> HashSet<(String, i64)> {
-    let deadline = tokio::time::Instant::now() + SOCKET_WAIT;
-    let mut later = HashSet::new();
-    for device in devices {
-        loop {
-            app.state.metrics.record(device, usage(5.0, 1));
-            let latest = app.state.metrics.latest(device).unwrap();
-            if !earlier.contains(&(latest.device_id.clone(), latest.at)) {
-                later.insert((latest.device_id, latest.at));
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "{device} kept its reading"
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
-    later
+/// The next metrics message's devices, sorted.
+async fn next_readings(events: &mut Ws) -> Vec<String> {
+    let text = next_text(events, "metrics").await;
+    devices_in(&serde_json::from_str(&text).unwrap())
 }
 
-/// Reads metrics messages until `expected` all arrived, and returns every
-/// reading they had.
-async fn receive_readings(
-    events: &mut Ws,
-    expected: &HashSet<(String, i64)>,
-) -> Vec<(String, i64)> {
-    let mut received = Vec::new();
-    while !expected.iter().all(|reading| received.contains(reading)) {
-        let message = receive_json(events).await;
-        if message["type"] == "metrics" {
-            received.extend(readings_in(&message));
-        }
+async fn enroll_all(app: &App, admin: &mut common::Browser, names: &[&str]) -> Vec<String> {
+    let mut devices = Vec::new();
+    for name in names {
+        devices.push(app.enroll(admin, name).await.device_id);
     }
-    received
+    devices
+}
+
+fn sorted(devices: &[&str]) -> Vec<String> {
+    let mut devices = devices
+        .iter()
+        .map(|device| (*device).to_owned())
+        .collect::<Vec<_>>();
+    devices.sort();
+    devices
+}
+
+/// Whether the device is watched once that next changes.
+async fn wait(signal: &mut WatchedSignal) -> bool {
+    tokio::time::timeout(SOCKET_WAIT, signal.changed())
+        .await
+        .expect("the device's watch changed")
 }
 
 #[tokio::test]
-async fn a_socket_opening_while_devices_report_gets_each_reading_once() {
+async fn a_socket_sends_readings_of_the_devices_it_watches_only() {
     for app in apps().await {
         let name = app.name;
         let server = app.serve().await;
-        let admin = set_up(&app).await;
-        let devices = (0..40)
-            .map(|n| format!("device-{n:02}"))
-            .collect::<Vec<_>>();
-        // Another socket keeps the feed going throughout.
-        let mut other = admin.events(&server).await.unwrap();
-        receive_json(&mut other).await;
-        let mut expected = report_all(&app, &devices[..20]);
+        let mut admin = set_up(&app).await;
+        let devices = enroll_all(&app, &mut admin, &["A", "B", "C", "D"]).await;
+        let [a, b, c, d] = [0, 1, 2, 3].map(|n| devices[n].as_str());
+        app.state.metrics.record(b, usage(1.0, 1));
+        app.state.metrics.record(c, usage(1.0, 1));
         let mut events = admin.events(&server).await.unwrap();
-        // While it opens and sends the full set, more devices report.
-        expected.extend(report_all(&app, &devices[20..]));
-        let mut received = receive_readings(&mut events, &expected).await;
+        assert_eq!(receive_json(&mut events).await["type"], "snapshot");
+        // A socket watches nothing until its tab says what it shows.
+        assert_eq!(until_pong(&mut events).await, [] as [Value; 0], "{name}");
+        assert!(app.state.metrics.watched().is_empty(), "{name}");
 
-        // Then each device's next reading, once.
-        let later = report_again(&app, &devices, &expected).await;
-        received.extend(receive_readings(&mut events, &later).await);
-        let mut seen = HashSet::new();
-        for reading in &received {
-            assert!(
-                expected.contains(reading) || later.contains(reading),
-                "{name}: {reading:?} was never recorded"
-            );
-            assert!(seen.insert(reading), "{name}: {reading:?} was sent twice");
-        }
-        drop(other);
+        // Watching sends at once the latest reading of each device it
+        // adds that has one.
+        watch(&mut events, &[a, b]).await;
+        assert_eq!(
+            readings_sent(&until_pong(&mut events).await),
+            [sorted(&[b])],
+            "{name}"
+        );
+        // A new set: only what it adds is sent; b was sent already.
+        watch(&mut events, &[b, c, d]).await;
+        assert_eq!(
+            readings_sent(&until_pong(&mut events).await),
+            [sorted(&[c])],
+            "{name}"
+        );
+        let watched = app.state.metrics.watched();
+        assert!(!watched.is_watched(a), "{name}");
+        assert!([b, c, d].iter().all(|device| watched.sockets(device) == 1));
+
+        // Each tick has only the watched devices' new readings: a, which
+        // it no longer watches, is not sent.
+        app.state.metrics.record(a, usage(2.0, 1));
+        app.state.metrics.record(d, usage(2.0, 1));
+        assert_eq!(next_readings(&mut events).await, sorted(&[d]), "{name}");
         app.finish().await;
     }
 }
 
 #[tokio::test]
-async fn a_socket_that_falls_behind_starts_over_with_a_snapshot_and_every_reading() {
+async fn a_socket_watches_only_devices_it_may_see() {
+    for app in apps().await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let devices = enroll_all(&app, &mut admin, &["Desk", "Laptop", "Gone"]).await;
+        let [desk, laptop, gone] = [0, 1, 2].map(|n| devices[n].as_str());
+        let deleted = admin.delete(&format!("/v1/agents/{gone}")).await;
+        assert_eq!(deleted.status, 204, "{name}: {:?}", deleted.body);
+        // Readings of a device the user may see, of a deleted one, and of
+        // an ID that is no device.
+        for device in [desk, gone, "not-a-device"] {
+            app.state.metrics.record(device, usage(1.0, 1));
+        }
+        let mut events = admin.events(&server).await.unwrap();
+        assert_eq!(receive_json(&mut events).await["type"], "snapshot");
+        watch(&mut events, &[desk, gone, "not-a-device", laptop]).await;
+        assert_eq!(
+            readings_sent(&until_pong(&mut events).await),
+            [sorted(&[desk])],
+            "{name}"
+        );
+        let watched = app.state.metrics.watched();
+        assert!(!watched.is_watched(gone), "{name}");
+        assert!(!watched.is_watched("not-a-device"), "{name}");
+        assert_eq!(watched.len(), 2, "{name}");
+        // Nor do they reach a tick.
+        for device in [gone, "not-a-device", laptop] {
+            app.state.metrics.record(device, usage(2.0, 1));
+        }
+        assert_eq!(
+            next_readings(&mut events).await,
+            sorted(&[laptop]),
+            "{name}"
+        );
+
+        // A watched device that is deleted is dropped from the set before
+        // the socket announces the deletion.
+        let deleted = admin.delete(&format!("/v1/agents/{desk}")).await;
+        assert_eq!(deleted.status, 204, "{name}: {:?}", deleted.body);
+        let event = receive_json(&mut events).await;
+        assert_eq!(event["type"], "agent_deleted", "{name}: {event}");
+        assert!(!watched.is_watched(desk), "{name}");
+        assert_eq!(watched.entries(), 1, "{name}: only the laptop's is left");
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn watch_messages_are_bounded_and_unreadable_ones_close_the_socket() {
+    use meshrmm_server::realtime::metrics::MAX_WATCHED;
+
+    for app in apps().await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let desk = app.enroll(&mut admin, "Desk").await.device_id;
+        let mut events = admin.events(&server).await.unwrap();
+        assert_eq!(receive_json(&mut events).await["type"], "snapshot");
+        let watched = app.state.metrics.watched();
+
+        // An ID named again counts once.
+        let repeated = vec![desk.as_str(); 600];
+        watch(&mut events, &repeated).await;
+        until_pong(&mut events).await;
+        assert_eq!(watched.sockets(&desk), 1, "{name}");
+        // The first MAX_WATCHED distinct IDs are taken and the rest are
+        // ignored, here a device after as many that are none.
+        let others = (0..MAX_WATCHED)
+            .map(|n| format!("x{n}"))
+            .collect::<Vec<_>>();
+        let mut past_the_bound = others.iter().map(String::as_str).collect::<Vec<_>>();
+        past_the_bound.push(&desk);
+        watch(&mut events, &past_the_bound).await;
+        until_pong(&mut events).await;
+        assert!(watched.is_empty(), "{name}");
+
+        // A message the socket can't read closes it, as the old plain
+        // `refresh` does.
+        for unreadable in [
+            "refresh",
+            r#"{"type":"watch","devices":"all"}"#,
+            r#"{"type":"watch"}"#,
+            r#"{"type":"subscribe"}"#,
+            "[]",
+        ] {
+            let mut events = admin.events(&server).await.unwrap();
+            assert_eq!(receive_json(&mut events).await["type"], "snapshot");
+            send_text(&mut events, unreadable).await;
+            assert_eq!(
+                receive_close(&mut events).await,
+                1003,
+                "{name}: {unreadable}"
+            );
+        }
+        // So does one too large for any watch.
+        let mut events = admin.events(&server).await.unwrap();
+        assert_eq!(receive_json(&mut events).await["type"], "snapshot");
+        let huge = (0..1_000).map(|n| format!("{n:036}")).collect::<Vec<_>>();
+        let huge = huge.iter().map(String::as_str).collect::<Vec<_>>();
+        watch(&mut events, &huge).await;
+        assert!(
+            matches!(
+                receive(&mut events).await,
+                Received::Close(1009) | Received::Gone
+            ),
+            "{name}"
+        );
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn the_registry_counts_the_sockets_watching_a_device_until_they_close() {
+    for app in apps().await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let devices = enroll_all(&app, &mut admin, &["Desk", "Laptop"]).await;
+        let [desk, laptop] = [0, 1].map(|n| devices[n].as_str());
+        let watched = app.state.metrics.watched();
+        let mut desk_signal = watched.listen(desk);
+        let mut laptop_signal = watched.listen(laptop);
+        let mut first = admin.events(&server).await.unwrap();
+        receive_json(&mut first).await;
+        watch(&mut first, &[desk, laptop]).await;
+        until_pong(&mut first).await;
+        assert!(wait(&mut desk_signal).await, "{name}");
+        assert!(wait(&mut laptop_signal).await, "{name}");
+        let mut second = admin.events(&server).await.unwrap();
+        receive_json(&mut second).await;
+        watch(&mut second, &[desk]).await;
+        until_pong(&mut second).await;
+        assert_eq!(watched.sockets(desk), 2, "{name}");
+        assert_eq!(watched.sockets(laptop), 1, "{name}");
+
+        // A connection dropped without a close leaves the registry as one
+        // closed would: all its devices at once.
+        drop(first);
+        assert!(!wait(&mut laptop_signal).await, "{name}");
+        assert_eq!(watched.sockets(desk), 1, "{name}");
+        assert!(desk_signal.is_watched(), "{name}");
+        // And when the last socket watching a device leaves, it is
+        // unwatched.
+        second.close(None).await.unwrap();
+        assert!(!wait(&mut desk_signal).await, "{name}");
+        assert!(watched.is_empty(), "{name}");
+        // Listeners keep their entries while they listen, and no longer.
+        assert_eq!(watched.entries(), 2, "{name}");
+        drop((desk_signal, laptop_signal));
+        assert_eq!(watched.entries(), 0, "{name}");
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn a_socket_that_falls_behind_starts_over_with_a_snapshot_and_its_readings() {
     use sea_query::Query;
 
     for app in apps().await {
         let name = app.name;
         let server = app.serve().await;
-        let admin = set_up(&app).await;
-        let devices = (0..50)
-            .map(|n| format!("device-{n:02}"))
-            .collect::<Vec<_>>();
-        report_all(&app, &devices);
+        let mut admin = set_up(&app).await;
+        let devices = enroll_all(&app, &mut admin, &["A", "B", "C"]).await;
+        for device in &devices {
+            app.state.metrics.record(device, usage(5.0, 1));
+        }
         let mut events = admin.events(&server).await.unwrap();
         assert_eq!(receive_json(&mut events).await["type"], "snapshot");
-        let first = receive_json(&mut events).await;
-        assert_eq!(readings_in(&first).len(), 50, "{name}");
-        let built = app.state.metrics.feed_work().full_sets;
+        watch(&mut events, &[devices[0].as_str(), devices[1].as_str()]).await;
+        let first = until_pong(&mut events).await;
+        assert_eq!(
+            readings_sent(&first),
+            [sorted(&[devices[0].as_str(), devices[1].as_str()])],
+            "{name}"
+        );
 
         // While the socket isn't read, more presence changes than it may
         // fall behind by, published together.
@@ -1374,15 +1556,14 @@ async fn a_socket_that_falls_behind_starts_over_with_a_snapshot_and_every_readin
         let burst = app.state.presence.snapshot().await.unwrap().revision();
 
         // It starts over: a snapshot from after the changes, none of them on
-        // their own, and every reading again.
+        // their own, and the watched devices' readings again.
         let snapshot = receive_json(&mut events).await;
         assert_eq!(snapshot["type"], "snapshot", "{name}: {snapshot}");
         assert!(snapshot["revision"].as_u64().unwrap() >= burst, "{name}");
         assert_eq!(snapshot["companies"].as_array().unwrap().len(), 300);
         let again = receive_json(&mut events).await;
-        assert_eq!(readings_in(&again), readings_in(&first), "{name}");
-        // No reading came since, so the full set it had was still current.
-        assert_eq!(app.state.metrics.feed_work().full_sets, built, "{name}");
+        assert_eq!(readings_in(&again).len(), 2, "{name}");
+        assert_eq!(devices_in(&again), devices_in(&first[0]), "{name}");
         app.finish().await;
     }
 }

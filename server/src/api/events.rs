@@ -2,10 +2,27 @@
 //! usage and alerts.
 //!
 //! It sends a snapshot of the devices, then each change with the next
-//! revision. The website sends `refresh` for a new snapshot when it missed a
-//! change. Every few seconds it also sends the latest resource usage of the
-//! devices that reported since it last did, which carries no revision: after
-//! each snapshot it sends every online device's. A user who may see alerts
+//! revision. Live resource usage, which carries no revision, it sends only
+//! for the devices the tab says it shows. The tab sends JSON messages
+//! ([`Request`]):
+//!
+//! - `{"type":"watch","devices":[...]}` replaces the devices the socket
+//!   watches; an empty list watches none, and a socket opens watching none.
+//!   It takes the first [`MAX_WATCHED`] distinct IDs and ignores the rest,
+//!   and ignores IDs of no device the user may see: a user who may see
+//!   devices (the permission the socket needs) sees every device, so an ID
+//!   is ignored when it is no device or a deleted one. The socket sends the
+//!   latest reading of each device it starts watching at once, then every
+//!   few seconds the watched devices' readings taken since, and after each
+//!   snapshot every watched device's latest. A deleted device is dropped
+//!   from the set.
+//! - `{"type":"refresh"}` asks for a new snapshot, when the tab missed a
+//!   change.
+//! - `{"type":"ping"}` is answered with `{"type":"pong"}`, so a tab can tell
+//!   a quiet socket from a dead one.
+//!
+//! Any other message closes the socket with 1003, and one over
+//! [`MAX_MESSAGE_BYTES`] closes it too. A user who may see alerts
 //! also gets the unresolved alert counts after each snapshot, and each alert
 //! that is raised or changes ([`AlertEvent`]). A user who may see jobs gets
 //! `job_update` with each job they may see whose counts changed, and
@@ -21,10 +38,13 @@
 //! What every socket sends alike is serialised once for all of them: each
 //! presence change and snapshot, alert event and update event is
 //! [`Shared`](crate::realtime::Shared), and resource usage comes from one
-//! feed that scans and serialises each tick once
-//! ([`Metrics::subscribe`](crate::realtime::Metrics::subscribe)). Only job
-//! events, shaped for each viewer, and the alert counts are made per socket.
+//! feed that scans once a tick and serialises each reading once however
+//! many sockets watch its device
+//! ([`Metrics::subscribe`](crate::realtime::Metrics::subscribe)). Job
+//! events, shaped for each viewer, the alert counts, and each socket's
+//! message of the readings it watches are made per socket.
 use std::{
+    collections::HashSet,
     net::IpAddr,
     time::{Duration, Instant},
 };
@@ -37,6 +57,7 @@ use axum::{
     http::{HeaderMap, header},
     response::Response,
 };
+use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::broadcast::error::RecvError;
 
@@ -46,7 +67,12 @@ use crate::{
     automation::jobs::Viewer,
     http::{ApiError, AppState, client_ip::ClientIp},
     rbac::Permission,
-    realtime::{close_frame, metrics::Subscription, send},
+    realtime::{
+        close_frame,
+        metrics::{MAX_WATCHED, Subscription},
+        presence::PresenceEvent,
+        send,
+    },
 };
 
 /// Browsers don't ping; this keeps proxies from closing a quiet socket and
@@ -54,10 +80,36 @@ use crate::{
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// A browser that hasn't answered two pings is gone.
 const SILENCE_LIMIT: Duration = Duration::from_secs(75);
+/// The largest message the socket takes: a watch of [`MAX_WATCHED`] device
+/// IDs, 36 characters each and 3 more to quote and separate them, is about
+/// 20 KiB.
+const MAX_MESSAGE_BYTES: usize = 32 * 1024;
 /// The read buffer each open tab's socket holds (tungstenite's default is
-/// 128 KiB). The website sends only `refresh` and pongs, and the socket
-/// takes no message over 1 KiB.
+/// 128 KiB). The website's messages are small but for a watch, which a
+/// larger message buffer takes as it arrives.
 const READ_BUFFER_BYTES: usize = 1024;
+
+/// What a tab sends.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Request {
+    /// Watch exactly these devices.
+    Watch { devices: Vec<String> },
+    /// Send a new snapshot.
+    Refresh,
+    /// Answer, to show the socket is alive.
+    Ping,
+}
+
+/// The first [`MAX_WATCHED`] distinct IDs, in order.
+fn bounded(device_ids: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    device_ids
+        .into_iter()
+        .filter(|id| seen.insert(id.clone()))
+        .take(MAX_WATCHED)
+        .collect()
+}
 
 pub async fn subscribe(
     State(state): State<AppState>,
@@ -85,7 +137,8 @@ pub async fn subscribe(
     let allowed = Allowed::of(&actor);
     let token = session::token(&headers).expect("an authorized request has a session cookie");
     Ok(upgrade
-        .max_message_size(1024)
+        .max_message_size(MAX_MESSAGE_BYTES)
+        .max_frame_size(MAX_MESSAGE_BYTES)
         .read_buffer_size(READ_BUFFER_BYTES)
         .on_upgrade(move |socket| serve(state, token, ip, allowed, socket)))
 }
@@ -122,6 +175,9 @@ async fn serve(
             event = events.recv() => match event {
                 Ok(event) if event.revision() > revision => {
                     revision = event.revision();
+                    if let PresenceEvent::AgentDeleted { agent_id, .. } = &*event {
+                        usage.unwatch(agent_id);
+                    }
                     if !send(&mut socket, event.message()).await {
                         return;
                     }
@@ -136,13 +192,32 @@ async fn serve(
             frame = socket.recv() => {
                 last_heard = Instant::now();
                 match frame {
-                Some(Ok(Message::Text(text))) if text.as_str() == "refresh" => {
-                    match send_snapshot(&state, &mut socket, alerts, &mut usage).await {
-                        Some(sent) => revision = sent,
-                        None => return,
+                Some(Ok(Message::Text(text))) => match serde_json::from_str(text.as_str()) {
+                    Ok(Request::Watch { devices }) => {
+                        let devices = state.presence.devices_among(bounded(devices)).await;
+                        if let Some(readings) = usage.watch(devices)
+                            && !send(&mut socket, Message::Text(readings)).await
+                        {
+                            return;
+                        }
                     }
-                }
-                Some(Ok(Message::Text(_) | Message::Binary(_))) => {
+                    Ok(Request::Refresh) => {
+                        match send_snapshot(&state, &mut socket, alerts, &mut usage).await {
+                            Some(sent) => revision = sent,
+                            None => return,
+                        }
+                    }
+                    Ok(Request::Ping) => {
+                        if !send(&mut socket, Message::Text(r#"{"type":"pong"}"#.into())).await {
+                            return;
+                        }
+                    }
+                    Err(_) => {
+                        send(&mut socket, close_frame(1003, "unsupported message")).await;
+                        return;
+                    }
+                },
+                Some(Ok(Message::Binary(_))) => {
                     send(&mut socket, close_frame(1003, "unsupported message")).await;
                     return;
                 }
@@ -282,9 +357,11 @@ async fn send_json(socket: &mut WebSocket, event: &impl serde::Serialize) -> boo
     send(socket, Message::Text(json.into())).await
 }
 
-/// Sends a snapshot, the alert counts if `alerts`, and every online
+/// Sends a snapshot, the alert counts if `alerts`, and every watched
 /// device's latest reading, and returns the snapshot's revision, or `None`
-/// if the socket or the database failed.
+/// if the socket or the database failed. A watched device that is no longer
+/// in the fleet, as one deleted while the socket fell behind, stops being
+/// watched.
 async fn send_snapshot(
     state: &AppState,
     socket: &mut WebSocket,
@@ -303,6 +380,9 @@ async fn send_snapshot(
     if alerts {
         send_alert_counts(state, socket).await.then_some(())?;
     }
+    let watching = usage.watching().map(str::to_owned).collect();
+    let devices = state.presence.devices_among(watching).await;
+    usage.retain(devices);
     if let Some(readings) = usage.restart() {
         send(socket, Message::Text(readings)).await.then_some(())?;
     }

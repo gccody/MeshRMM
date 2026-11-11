@@ -6,6 +6,7 @@ import type { MetricsReading } from "../metrics/model";
 import type { UpdateEvent } from "../updates/model";
 import { DeviceStore } from "./device-store";
 import { type InventoryTarget, inventoryStatus, refreshInventory } from "./inventory-stream";
+import { metricsWatch } from "./metrics-watch";
 import { parseAgentList } from "./model";
 import { ThumbnailStore } from "./thumbnails";
 import { useDevicesLoaded } from "./use-devices";
@@ -103,7 +104,17 @@ export function useAgentInventory({ enabled, authorizedFetch, onRefused, onAlert
     },
   }), [devices, fail]);
   const applyMetrics = useCallback((readings: MetricsReading[]) => devices.applyReadings(readings), [devices]);
-  const { connection, since, now, reconnect } = useInventoryConnection({ enabled, revisionRef: revision, inventory: target, onMetrics: applyMetrics, onAlerts, onJobs, onUpdates, onRefused });
+  // The socket sends the readings of the devices the page shows, and none
+  // while the tab is hidden.
+  const [watch] = useState(() => metricsWatch({ shown: () => devices.readers(), onWatching: (watched) => devices.watching(watched) }));
+  useEffect(() => devices.subscribeReaders(() => watch.changed()), [devices, watch]);
+  useEffect(() => {
+    const update = () => watch.setVisible(document.visibilityState !== "hidden");
+    update();
+    document.addEventListener("visibilitychange", update);
+    return () => document.removeEventListener("visibilitychange", update);
+  }, [watch]);
+  const { connection, since, now, reconnect } = useInventoryConnection({ enabled, revisionRef: revision, inventory: target, onMetrics: applyMetrics, watch, onAlerts, onJobs, onUpdates, onRefused });
 
   const refresh = useCallback(
     () => refreshInventory(connection, { wake: reconnect, load: loadAgents }),

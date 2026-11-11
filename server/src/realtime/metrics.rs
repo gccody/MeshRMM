@@ -14,10 +14,13 @@
 //! device per minute: 167 a second for 10,000 Agents.
 //!
 //! The website's event sockets get new readings from one feed
-//! (`metrics/feed.rs`): every [`FEED_INTERVAL`] it scans once for the
-//! readings since its last scan and serialises them once, however many
-//! sockets listen.
+//! (`metrics/feed.rs`), and only those of the devices each socket watches:
+//! every [`FEED_INTERVAL`] it scans once for the watched devices' readings
+//! since its last scan, and each reading's JSON is made once however many
+//! sockets send it. Which devices any socket watches is the [`Watched`]
+//! registry (`metrics/watched.rs`).
 mod feed;
+mod watched;
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque, btree_map::Entry},
@@ -29,7 +32,10 @@ use meshrmm_protocol_types::{METRICS_INTERVAL_SECONDS, SystemMetrics};
 use sea_query::{Expr, ExprTrait, InsertStatement, OnConflict, Order, Query};
 use serde::{Deserialize, Serialize};
 
-pub use self::feed::{FEED_INTERVAL, FeedWork, Subscription};
+pub use self::{
+    feed::{FEED_INTERVAL, FeedWork, MAX_WATCHED, Subscription},
+    watched::{Watched, WatchedSignal},
+};
 use crate::{
     db::{self, Database, tables::DeviceMetrics},
     time::{DAY_MS, HOUR_MS, MINUTE_MS, SECOND_MS, now_ms},
@@ -451,6 +457,8 @@ pub struct Metrics {
     writer: Arc<tokio::sync::Mutex<Writer>>,
     /// What the website's event sockets send.
     feed: Arc<feed::Feed>,
+    /// The devices the event sockets watch.
+    watched: Watched,
 }
 
 impl Metrics {
@@ -465,6 +473,7 @@ impl Metrics {
             pending: Arc::new(Mutex::new(Pending::new(limit))),
             writer: Arc::default(),
             feed: Arc::default(),
+            watched: Watched::default(),
         }
     }
 
@@ -570,6 +579,41 @@ impl Metrics {
             .cloned()
             .collect();
         (readings, state.sequence)
+    }
+
+    /// The latest reading of every watched device that reported after
+    /// `sequence`, and the sequence to ask from next. It looks through the
+    /// watched devices or the online ones, whichever are fewer.
+    fn watched_since(&self, sequence: u64) -> (Vec<Reading>, u64) {
+        let state = self.state();
+        let watched = self.watched.lock();
+        let newer = |reading: &&Reading| reading.sequence > sequence;
+        let readings = if watched.len() < state.devices.len() {
+            watched::watched_ids(&watched)
+                .filter_map(|id| state.devices.get(id)?.latest.as_ref())
+                .filter(newer)
+                .cloned()
+                .collect()
+        } else {
+            state
+                .devices
+                .iter()
+                .filter(|(id, _)| watched::is_watched(&watched, id))
+                .filter_map(|(_, device)| device.latest.as_ref())
+                .filter(newer)
+                .cloned()
+                .collect()
+        };
+        (readings, state.sequence)
+    }
+
+    /// The latest reading of each of the devices that has one.
+    fn latest_readings<'a>(&self, device_ids: impl IntoIterator<Item = &'a str>) -> Vec<Reading> {
+        let state = self.state();
+        device_ids
+            .into_iter()
+            .filter_map(|id| state.devices.get(id)?.latest.clone())
+            .collect()
     }
 
     /// The sequence to ask [`Metrics::since`] from to get only readings
@@ -1119,6 +1163,41 @@ mod tests {
         assert_eq!(unchanged, sequence);
         metrics.record_at("b", sample(3.0, 3), 10 * SECOND_MS);
         let (readings, _) = metrics.since(sequence);
+        assert_eq!(readings.len(), 1);
+        assert_eq!(readings[0].device_id, "b");
+    }
+
+    #[tokio::test]
+    async fn the_scan_returns_each_new_reading_of_a_watched_device_once() {
+        let metrics = store().await;
+        let mut socket = watched::WatchSet::new(metrics.watched.clone());
+        socket.replace(["a", "b"].map(String::from).into());
+        metrics.record_at("a", sample(1.0, 1), 0);
+        metrics.record_at("b", sample(2.0, 2), 0);
+        metrics.record_at("unwatched", sample(2.0, 2), 0);
+        let (readings, sequence) = metrics.watched_since(0);
+        assert_eq!(readings.len(), 2);
+        assert!(
+            readings
+                .iter()
+                .all(|reading| reading.device_id != "unwatched")
+        );
+        let (readings, unchanged) = metrics.watched_since(sequence);
+        assert!(readings.is_empty());
+        assert_eq!(unchanged, sequence);
+        // Fewer watched devices than online ones, and more, find the same.
+        for extra in 0..10 {
+            metrics.record_at(&format!("x{extra}"), sample(1.0, 1), 0);
+        }
+        let many = (0..20)
+            .map(|n| format!("w{n}"))
+            .chain(["a".into(), "b".into()]);
+        let mut wide = watched::WatchSet::new(metrics.watched.clone());
+        assert_eq!(metrics.watched_since(0).0.len(), 2);
+        wide.replace(many.collect());
+        assert_eq!(metrics.watched_since(0).0.len(), 2);
+        metrics.record_at("b", sample(3.0, 3), 10 * SECOND_MS);
+        let (readings, _) = metrics.watched_since(sequence);
         assert_eq!(readings.len(), 1);
         assert_eq!(readings[0].device_id, "b");
         let json = serde_json::to_value(&readings[0]).unwrap();

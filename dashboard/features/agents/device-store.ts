@@ -1,6 +1,7 @@
-// The devices, companies and tags the website holds, and each online
-// device's latest resource reading. It lives outside React so that a change
-// costs what it changed: a device's change moves only that device in the
+// The devices, companies and tags the website holds, and the latest
+// resource reading of each online device the page shows. It lives outside
+// React so that a change costs what it changed: a device's change moves
+// only that device in the
 // list, a reading updates only its device, and subscribers hear only of what
 // they follow, at most once a frame however many changes arrive. No React or
 // DOM here, so node:test loads it directly.
@@ -103,8 +104,13 @@ export class DeviceStore {
   #loaded = false;
   #updatedAt: number | null = null;
   #lastUpdated: Date | null = null;
-  // Only online devices' readings; one going offline or away takes its own.
+  // Only online devices' readings, and only of the devices the event socket
+  // watches; one going offline or away, or no longer watched, takes its own.
   #readings = new Map<string, MetricsReading>();
+  // What the event socket was last told to watch: its readings are live.
+  #watched: ReadonlySet<string> = new Set();
+  // Hear when the devices whose reading is shown change.
+  #readersListeners = new Set<Listener>();
 
   #listeners = new Map<Topic, Set<Listener>>();
   #deviceListeners = new Map<string, Set<Listener>>();
@@ -170,13 +176,15 @@ export class DeviceStore {
     }
   }
 
-  // The latest readings of the devices that reported. A device that is
-  // offline, or not yet known, has none: the server sends every online
-  // device's reading again after each snapshot.
+  // The latest readings of the watched devices that reported. A device that
+  // is offline, not yet known, or not watched has none: the server sends
+  // every watched device's reading again after each snapshot, and at once
+  // when it starts watching one. A reading of a device no longer watched,
+  // sent before the socket heard so, is dropped.
   applyReadings(readings: readonly MetricsReading[]) {
     for (const reading of readings) {
       const id = reading.device_id;
-      if (!this.#agents.get(id)?.connected) continue;
+      if (!this.#watched.has(id) || !this.#agents.get(id)?.connected) continue;
       this.#readings.set(id, reading);
       if (this.#readingListeners.has(id)) this.#changedReadings.add(id);
     }
@@ -266,7 +274,43 @@ export class DeviceStore {
   }
 
   subscribeReading(id: string, listener: Listener) {
-    return listen(this.#readingListeners, id, listener);
+    const first = !this.#readingListeners.has(id);
+    const unsubscribe = listen(this.#readingListeners, id, listener);
+    if (first) this.#readersChanged();
+    return () => {
+      unsubscribe();
+      if (!this.#readingListeners.has(id)) this.#readersChanged();
+    };
+  }
+
+  // The devices whose reading something on the page shows: what the event
+  // socket is asked to watch.
+  readers(): Iterable<string> {
+    return this.#readingListeners.keys();
+  }
+
+  // Hears at once, not once a frame, when a device gains its first reading
+  // subscriber or loses its last.
+  subscribeReaders(listener: Listener) {
+    this.#readersListeners.add(listener);
+    return () => {
+      this.#readersListeners.delete(listener);
+    };
+  }
+
+  // The devices the event socket was just told to watch. Any other
+  // device's reading is no longer live, so it is dropped rather than shown
+  // as current later.
+  watching(devices: ReadonlySet<string>) {
+    this.#watched = devices;
+    for (const id of this.#readings.keys()) {
+      if (!devices.has(id)) this.#dropReading(id);
+    }
+    this.#request();
+  }
+
+  #readersChanged() {
+    for (const listener of [...this.#readersListeners]) listener();
   }
 
   #upsert(agent: Agent) {

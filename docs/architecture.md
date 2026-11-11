@@ -209,17 +209,28 @@ task.
   change and snapshot, alert event and update event is broadcast as a
   `Shared` event (`server/src/realtime/shared.rs`), whose JSON the first
   socket to send it makes and the others send as the same bytes. Only job
-  events, shaped for each viewer, are serialised per socket.
+  events, shaped for each viewer, and each socket's message of the readings
+  it watches are made per socket.
 - **Metrics**: the latest resource readings of each Agent, held in memory.
   Its writer task stores the finished minutes of every device together
-  every 5 seconds, in one transaction. While any event socket is open, one
-  feed task (`server/src/realtime/metrics/feed.rs`) scans every 5 seconds
-  for the readings since its last scan, serialises them once and broadcasts
-  them to every socket. A socket that opens, refreshes or falls behind first
-  sends every online device's latest reading, shared with the sockets that
-  ask before the next tick, and then the ticks: of the first, only the
-  readings numbered after its full set, so none is missed or sent twice.
-  See [devices](devices.md#resource-monitoring).
+  every 5 seconds, in one transaction. Each event socket watches the
+  devices its tab shows, and the `Watched` registry
+  (`server/src/realtime/metrics/watched.rs`) counts the sockets watching
+  each device, dropping a device when its last socket stops watching it or
+  closes, however it closes. A task can follow one device being watched
+  with `Watched::listen`, a `tokio::sync::watch` channel set on each change
+  between watched and not; nothing listens yet. While any event socket is
+  open, one feed task (`server/src/realtime/metrics/feed.rs`) scans every 5
+  seconds for the watched devices' readings since its last scan, looking
+  through the watched devices or the online ones, whichever are fewer, and
+  broadcasts them. Each socket picks out its own devices' readings from the
+  smaller of the tick and its set, so a tick costs a socket what it
+  watches, not the fleet; each reading's JSON is made once, by the first
+  socket that sends it, and copied into every socket's message. A socket
+  that starts watching a device sends its latest reading at once, and one
+  that refreshes or falls behind sends every watched device's again; each
+  socket keeps the number of the last reading it sent per device, so none
+  is sent twice. See [devices](devices.md#resource-monitoring).
 - **Alerts**: the engine's task reads presence and the metrics, keeping each
   device's readings only as far back as the enabled CPU and memory rules
   look, raises and resolves alerts, and broadcasts them; event sockets of users who may see

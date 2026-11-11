@@ -456,6 +456,22 @@ impl Presence {
         )
     }
 
+    /// Those of `device_ids` that are devices, as subscribers were last told,
+    /// in the order given: an ID that is no device, or one deleted, is left
+    /// out.
+    pub async fn devices_among(&self, device_ids: Vec<String>) -> Vec<String> {
+        let state = self.inner.state.lock().await;
+        device_ids
+            .into_iter()
+            .filter(|id| {
+                state
+                    .published
+                    .get(id)
+                    .is_some_and(|device| device.value.is_some())
+            })
+            .collect()
+    }
+
     /// Publishes the device's current state, if it changed.
     pub async fn refresh(&self, device_id: &str) {
         let read = self.read_device(device_id).await;

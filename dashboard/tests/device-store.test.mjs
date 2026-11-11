@@ -129,6 +129,7 @@ test("a snapshot replaces everything", () => {
   const clock = frames();
   const devices = new DeviceStore({ schedule: clock.schedule });
   devices.replace({ agents: [device("a", "A", true), device("b", "B", true)], companies: [{ id: "c", name: "Acme" }], tags: [{ id: "t", name: "Servers", color: "blue" }] });
+  devices.watching(new Set(["a", "b"]));
   devices.applyReadings([reading("a", 10), reading("b", 20)]);
   devices.replace({ agents: [device("b", "B", false), device("c", "C", true)], companies: [], tags: [] });
   assert.deepEqual(devices.agents().map((agent) => agent.id), ["c", "b"]);
@@ -212,6 +213,7 @@ test("a reading notifies only its device's subscribers", () => {
   devices.subscribeDevice("a", () => heard.push("device a"));
   const before = devices.agents();
 
+  devices.watching(new Set(["a", "b", "c", "unknown"]));
   devices.applyReadings([reading("a", 10), reading("c", 30), reading("unknown", 50)]);
   clock.run();
   assert.deepEqual(heard.sort(), ["a", "c"]);
@@ -226,10 +228,56 @@ test("a reading notifies only its device's subscribers", () => {
   assert.equal(clock.pending, 0);
 });
 
+test("the devices whose reading is shown are heard of as their first subscriber comes and their last goes", () => {
+  const devices = new DeviceStore({ schedule: () => {} });
+  let heard = 0;
+  devices.subscribeReaders(() => heard++);
+  const first = devices.subscribeReading("a", () => {});
+  const second = devices.subscribeReading("a", () => {});
+  const other = devices.subscribeReading("b", () => {});
+  assert.equal(heard, 2, "a second subscriber to a changes nothing shown");
+  assert.deepEqual([...devices.readers()].sort(), ["a", "b"]);
+  first();
+  assert.equal(heard, 2);
+  second();
+  assert.equal(heard, 3);
+  other();
+  assert.deepEqual([...devices.readers()], []);
+  assert.equal(heard, 4);
+});
+
+test("a reading is kept only while the socket watches its device", () => {
+  const clock = frames();
+  const devices = new DeviceStore({ schedule: clock.schedule });
+  devices.replace({ agents: [device("a", "A", true), device("b", "B", true)], ...empty });
+  devices.applyReadings([reading("a", 10)]);
+  assert.equal(devices.reading("a"), undefined, "nothing is watched yet");
+  devices.watching(new Set(["a", "b"]));
+  devices.applyReadings([reading("a", 10), reading("b", 20)]);
+  clock.run();
+  const heard = [];
+  devices.subscribeReading("a", () => heard.push("a"));
+  devices.subscribeReading("b", () => heard.push("b"));
+  // No longer watched, a's reading would only grow old: it goes, and its
+  // tile hears so.
+  devices.watching(new Set(["b"]));
+  clock.run();
+  assert.deepEqual(heard, ["a"]);
+  assert.equal(devices.reading("a"), undefined);
+  assert.equal(devices.reading("b").cpu_percent, 20);
+  // One the server sent before it heard is not taken either.
+  devices.applyReadings([reading("a", 30)]);
+  assert.equal(devices.reading("a"), undefined);
+  // Watching none, as a hidden tab, keeps none.
+  devices.watching(new Set());
+  assert.equal(devices.reading("b"), undefined);
+});
+
 test("a device going offline or deleted takes its reading", () => {
   const clock = frames();
   const devices = new DeviceStore({ schedule: clock.schedule });
   devices.replace({ agents: [device("a", "A", true), device("b", "B", true)], ...empty });
+  devices.watching(new Set(["a", "b"]));
   devices.applyReadings([reading("a", 10), reading("b", 20)]);
   clock.run();
   let heard = 0;
@@ -285,6 +333,7 @@ test("clearing empties the store and tells every subscriber", () => {
   const clock = frames();
   const devices = new DeviceStore({ schedule: clock.schedule });
   devices.replace({ agents: [device("a", "A", true)], ...empty });
+  devices.watching(new Set(["a"]));
   devices.applyReadings([reading("a", 10)]);
   clock.run();
   const heard = [];
