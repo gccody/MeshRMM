@@ -10,25 +10,41 @@ use meshrmm_protocol::{
     SessionMessage,
 };
 use meshrmm_session_transport::test_link::TestLink;
-use meshrmm_session_transport::{CHAT_CHANNEL, CLIPBOARD_CHANNEL, FILE_CHANNEL};
+use meshrmm_session_transport::{CHAT_CHANNEL, CLIPBOARD_CHANNEL, FILE_CHANNEL, ServiceChannel};
 use tokio::sync::{Notify, mpsc};
 
 use super::super::platform::ScreenInput;
 use super::service_workers::{spawn_chat_worker, spawn_clipboard_worker, spawn_file_worker};
 
-/// How long the link carries nothing: past the old five-second limit, and short of the 25
-/// seconds after which ICE gives the connection up.
+/// How long the link carries nothing once a worker waits for room: past the old five-second
+/// limit. It passes on tokio's paused clock, as that limit did; ICE judges a silent
+/// connection by the system clock, which hardly moves meanwhile.
 const STALL: Duration = Duration::from_secs(10);
 
-/// Bounds a wait so a broken worker fails its test instead of hanging it. The clock is paused,
-/// so this costs nothing while things work. It is long because the clock runs on while a
-/// worker's own thread is busy.
-const PATIENCE: Duration = Duration::from_secs(24 * 60 * 60);
+/// The real time a wait may take before a broken worker fails its test instead of hanging it.
+/// It is not measured on the paused clock: that runs on whenever this thread is idle, as it is
+/// while a worker's own thread is busy, however briefly, so it is no measure of a worker that
+/// has not got there.
+const PATIENCE: Duration = Duration::from_secs(60);
 
 async fn within<T>(future: impl std::future::Future<Output = T>) -> T {
-    tokio::time::timeout(PATIENCE, future)
-        .await
-        .expect("the worker never got there")
+    let started = std::time::Instant::now();
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            output = &mut future => return output,
+            () = tokio::time::sleep(Duration::from_secs(1)) => {
+                assert!(started.elapsed() < PATIENCE, "the worker never got there");
+            }
+        }
+    }
+}
+
+/// Lets the stall's time pass once the worker on `channel` waits for room, which it does from
+/// then on: the link is cut, so nothing it queued is acknowledged.
+async fn stall(channel: &ServiceChannel) {
+    within(channel.writer_waiting()).await;
+    tokio::time::sleep(STALL).await;
 }
 
 /// What the device has to send, released to the workers as each test says.
@@ -140,6 +156,7 @@ impl ScreenInput for Device {
         Ok(content)
     }
     fn start_chat(&self) -> anyhow::Result<()> {
+        self.events.send("chat started")?;
         Ok(())
     }
     fn stop_chat(&self) {}
@@ -174,7 +191,7 @@ async fn file_transfers_carry_on_after_their_channel_has_no_room_for_ten_seconds
     link.cut();
     device.send_files((0..CHUNKS).map(|index| chunk(1, index)));
     let (_files, mut task) = spawn_file_worker(device.clone(), channels[0].clone(), None).unwrap();
-    tokio::time::sleep(STALL).await;
+    stall(&channels[0]).await;
     link.restore();
     assert_files_arrive(&mut link, (0..CHUNKS).map(|index| chunk(1, index))).await;
     // A transfer the file helper gave up on is reported, and the next one goes too.
@@ -196,7 +213,7 @@ async fn file_transfers_carry_on_after_their_channel_has_no_room_for_ten_seconds
 /// returns once the stall has outlasted five seconds and the worker still serves its peer.
 async fn file_worker_waiting_for_room(
     link: &TestLink,
-    channels: &[meshrmm_session_transport::ServiceChannel],
+    channels: &[ServiceChannel],
 ) -> (
     mpsc::Sender<FileMessage>,
     crate::remote::native_task::NativeTask,
@@ -205,7 +222,7 @@ async fn file_worker_waiting_for_room(
     link.cut();
     device.send_files((0..CHUNKS).map(|index| chunk(1, index)));
     let (files, task) = spawn_file_worker(device, channels[0].clone(), None).unwrap();
-    tokio::time::sleep(STALL).await;
+    stall(&channels[0]).await;
     files.try_send(FileMessage::Ack { id: 1 }).unwrap();
     assert_eq!(within(events.recv()).await, Some("file applied"));
     (files, task)
@@ -243,7 +260,7 @@ async fn the_latest_copy_is_sent_once_the_clipboard_channel_has_room_again() {
     let earlier_chunks = earlier.messages().unwrap().len();
     device.copy(earlier);
     assert_eq!(within(events.recv()).await, Some("clipboard polled"));
-    tokio::time::sleep(STALL).await;
+    stall(&channels[0]).await;
     let latest = ClipboardContent::from("latest");
     device.copy(latest.clone());
     assert_eq!(within(events.recv()).await, Some("clipboard polled"));
@@ -270,10 +287,13 @@ async fn the_latest_copy_is_sent_once_the_clipboard_channel_has_room_again() {
 #[tokio::test(start_paused = true)]
 async fn chat_carries_on_after_its_channel_has_no_room_for_ten_seconds() {
     let (mut link, channels) = TestLink::connect(&[CHAT_CHANNEL]).await;
-    let (device, _events) = Device::new();
+    let (device, mut events) = Device::new();
     let (chat, mut task) = spawn_chat_worker(device.clone(), channels[0].clone(), None).unwrap();
     link.cut();
     chat.try_send(SessionMessage::ChatAvailable).unwrap();
+    // The chat helper has text only once the worker has started it, which comes before the
+    // worker's ChatAvailable; text it already held could go before that.
+    assert_eq!(within(events.recv()).await, Some("chat started"));
     // More than webrtc-sctp's pending queue takes, in texts as long as a chat message may be.
     let texts: Vec<_> = (0..64)
         .map(|index| {
@@ -284,7 +304,7 @@ async fn chat_carries_on_after_its_channel_has_no_room_for_ten_seconds() {
         })
         .collect();
     device.say(texts.clone());
-    tokio::time::sleep(STALL).await;
+    stall(&channels[0]).await;
     link.restore();
     assert_eq!(
         within(link.next()).await,
