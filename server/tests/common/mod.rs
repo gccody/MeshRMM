@@ -539,6 +539,22 @@ impl Agent {
         self.send(request).await.json(self.name)
     }
 
+    /// Posts `body` to `/v1/agents/{device}/system-info` from 127.0.0.1, the
+    /// address its control connection comes from.
+    pub async fn post_snapshot(&self, body: axum::body::Body) -> RawResponse {
+        let peer: std::net::SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let request = self
+            .request(
+                axum::http::Method::POST,
+                &format!("/v1/agents/{}/system-info", self.device_id),
+            )
+            .extension(axum::extract::ConnectInfo(peer))
+            .header("content-type", "application/json")
+            .body(body)
+            .unwrap();
+        self.send(request).await
+    }
+
     /// The same Agent with another credential.
     pub fn with_token(&self, token: &str) -> Self {
         Self {

@@ -186,7 +186,8 @@ task.
 - **Coordinator**, one per connected Agent (`/v1/agents/{id}/connect`):
   authentication, superseding an older connection of the same Agent,
   revocation, commands (session requests, scripts, file deliveries,
-  uninstall, system information, the update scan schedule, update scans and
+  uninstall, requests for system information, the update scan schedule,
+  update scans and
   installs, terminals,
   wake packets, file requests and transfers, monitors and self-healing
   actions),
@@ -451,6 +452,15 @@ these rules:
   slow uplink; while the server takes such a write in, the connection counts
   as alive though its pongs wait behind it. Control-channel writes have a
   five-second deadline.
+- Nothing large travels on the control connection, whose messages arrive one
+  at a time and are heard only once whole: the server takes an Agent it has
+  heard no frame from for a minute as gone. System information snapshots
+  (up to 6 MiB) and the final results of scripts, file deliveries, update
+  installs and application runs are posted over HTTPS
+  (`server/src/api/agent.rs`), with no limit in total but dropped once the
+  body has sent nothing for a minute. The control connection takes messages
+  of at most 4 MiB (`MAX_CONTROL_MESSAGE_BYTES`), which its largest, the
+  update and application scans, fit in.
 - An update or application report the control connection fails to send goes
   first on the next connection, but only until three connections in a row
   have failed to send it. It is then dropped, and the server counts the runs

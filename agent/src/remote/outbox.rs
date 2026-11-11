@@ -153,13 +153,13 @@ pub(crate) trait Deliver {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum Verdict {
+pub(crate) enum Verdict {
     Taken,
     Refused,
     Retry,
 }
 
-fn verdict(sent: &Sent) -> Verdict {
+pub(crate) fn verdict(sent: &Sent) -> Verdict {
     match sent {
         Sent::Status(200..=299) => Verdict::Taken,
         // A post that left with the credential the server has just replaced
@@ -172,7 +172,7 @@ fn verdict(sent: &Sent) -> Verdict {
 
 /// How long to wait after `failures` retryable failures in a row, before
 /// jitter.
-fn backoff(failures: u32) -> Duration {
+pub(crate) fn backoff(failures: u32) -> Duration {
     let doublings = failures.saturating_sub(1).min(16);
     FIRST_RETRY.saturating_mul(1 << doublings).min(LAST_RETRY)
 }

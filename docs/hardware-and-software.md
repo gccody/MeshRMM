@@ -48,17 +48,31 @@ collects at once when the server sends `collect_system_info`, and after an
 application install or uninstall run finishes; the next one it collects on
 its own is counted from then. Collecting runs on a blocking thread, one
 snapshot at a time, so the control connection never waits for it; a request
-that arrives while one is being collected is answered by that one. The
-snapshot goes to the server as the `system_info` status message on the
-control connection (`agent/src/remote/system_info.rs`).
+that arrives while one is being collected is answered by that one.
+
+The Agent posts the snapshot to `POST /v1/agents/{id}/system-info` with its
+own credential, from a thread of its own
+(`agent/src/remote/system_info/upload.rs`), not on the control connection.
+A snapshot can be megabytes, which takes minutes on a slow uplink; on the
+control connection it would hold up every other message, and the server,
+which hears a frame only once it has arrived whole, would take the Agent
+for gone after a minute (`agents::Timeouts::silence`), cut the connection,
+and get the same snapshot first on the next one, so the device would never
+stay online. The post has no limit in total: it gives up only when the
+socket has taken nothing for a minute, and the server drops a body that has
+sent nothing for a minute. Only the newest snapshot not yet delivered is
+kept, in memory: a newer one replaces it, and one a restart loses is
+collected again. A failed post is retried like the Agent's results, after 5
+seconds, doubling to 10 minutes, and at once when the control connection
+comes back or a newer snapshot arrives; a refusal other than 401, 408 or
+429 drops it.
 
 The applications are nearly all of a snapshot's bytes and seldom change, so
 the Agent leaves out a list the server already holds:
 
-- The server says which list it holds, as `stored_applications` with its
+- The server says which list it holds: as `stored_applications` with its
   `applications_hash` (none for no list), first thing on every connection,
-  after it stores a snapshot's list, and after a snapshot named a list it
-  doesn't hold.
+  and in its answer to each snapshot, `{applications_hash, collect_again}`.
 - A snapshot whose applications hash to that is sent without them and with
   `applications_unchanged` set to the hash. Until the server has said, as at
   the start of a connection, every snapshot carries its list.
@@ -130,13 +144,16 @@ A snapshot that names its list (`applications_unchanged`) does no
 application work: when the hash is the one stored, the list and its history
 stay as they are, and the rest of the snapshot is stored as usual. When it
 isn't, after the device's rows were removed or a race, the rest is stored,
-the stored list (or none) is kept, and the server tells the Agent which list
-it holds and asks for a new snapshot, which then carries the list. A
-disagreement can cost a list sent whole, never a wrong list kept.
+the stored list (or none) is kept, and the answer says which list the
+server holds, with `collect_again`, which makes the Agent collect a new
+snapshot that then carries the list. A disagreement can cost a list sent
+whole, never a wrong list kept.
 
-The public address is the one the control connection comes from (behind
-trusted proxies, from `X-Forwarded-For`), recorded whenever the Agent
-connects. When an Agent connects and the server's snapshot is missing or
+The public address is the one the control connection or the snapshot comes
+from (behind trusted proxies, from `X-Forwarded-For`), recorded whenever the
+Agent connects or posts one. A snapshot is taken whether or not the Agent's
+control connection is up; the credential is what counts. When an Agent
+connects and the server's snapshot is missing or
 more than 7 hours old, the server asks for a new one. Deleting a device
 deletes everything it sent.
 
@@ -165,6 +182,7 @@ deletes everything it sent.
 |---|---|
 | `GET /v1/agents/{id}/system-info` | The latest snapshot without its applications, with `application_count`, `public_ip`, `collected_at` and `received_at`. 404 `not_collected` before the first one. |
 | `POST /v1/agents/{id}/system-info/refresh` | Asks the online Agent for a new snapshot: 202, or 409 `device_offline`. |
+| `POST /v1/agents/{id}/system-info` | The Agent's own route, with its credential: `{system, applications_unchanged}`, at most 6 MiB and 64 KiB. Answers `{applications_hash, collect_again}`. 401 for a wrong credential, 409 for a device being removed, 413 for a larger body (refused as soon as it says or sends more), 408 for one that sends nothing for a minute. |
 | `GET /v1/agents/{id}/applications` | The applications, by name. |
 | `GET /v1/agents/{id}/application-changes?limit=` | Changes, newest first (200 by default, at most 1,000). |
 | `GET /v1/system-info?q=&os=&model=&serial=&ip=&application=&company=&tag=&limit=&offset=` | `{devices, matching}`: a page of the snapshots of the devices matching every filter given, by name then ID, each as `GET /v1/agents/{id}/system-info` returns it with the device's name, platform and company, and how many devices match. Each filter matches anywhere in its field, ignoring case: `q` any of the name, operating system, model, serial number, IP addresses and host name; `model` the model or manufacturer; `ip` an adapter's or the public address; `application` an installed application's name. `company` is a company's ID or `none`; `tag` a tag's ID. 100 devices a page by default, at most 200; `limit=0` counts only. |
@@ -178,13 +196,15 @@ counting and paging are the database's, so a page reads only its own
 devices' snapshots; the `application` filter reads the rows of the
 application names that match.
 
-Every route needs `devices.view`, refreshing included: it only makes the
-Agent collect again, so it isn't audited.
+Every route but the Agent's needs `devices.view`, refreshing included: it
+only makes the Agent collect again, so it isn't audited.
 
 ## Tests
 
-`cargo test -p meshrmm-server --test system_info` exercises snapshots over a
-real control connection, refreshes, change tracking, searches and
+`cargo test -p meshrmm-server --test system_info` exercises snapshots posted
+over HTTPS beside a real control connection (one that trickles in for longer
+than the control connection's silence limit, one that stalls, oversized and
+unauthenticated ones), refreshes, change tracking, searches and
 permissions; `cargo test -p meshrmm-agent system_info` collects the real
 computer's snapshot and checks the parsers. It also pages through more
 devices than a page, checks that a page costs the same statements for any

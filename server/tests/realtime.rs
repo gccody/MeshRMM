@@ -892,10 +892,9 @@ async fn disconnect_settled(
     presence_of(presence, device_id, |agent| !agent.connected).await;
 }
 
-/// A small snapshot as an Agent sends it.
+/// A small snapshot as an Agent posts it.
 fn system_info() -> Value {
     json!({
-        "type": "system_info",
         "system": {
             "collected_at_unix_ms": 1_700_000_000_000_i64,
             "os": { "id": "windows", "name": "Windows 11 Pro", "version": "24H2", "architecture": "x86_64" },
@@ -926,7 +925,8 @@ async fn make_idle(
     agent: &Agent,
 ) {
     let mut control = agent.connect(server).await.unwrap();
-    send_json(&mut control, system_info()).await;
+    let posted = agent.post_snapshot(system_info().to_string().into()).await;
+    assert_eq!(posted.status, 200);
     send_json(&mut control, update_scan()).await;
     settle(app, &mut control, &agent.device_id).await;
     disconnect_settled(presence, control, &agent.device_id).await;

@@ -18,6 +18,30 @@ use crate::{
 
 pub const MAX_NAME_CHARS: usize = 120;
 
+/// How long an Agent may go quiet, which tests shorten.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timeouts {
+    /// The control connection is dead once the server has heard no frame
+    /// on it for this long ([`crate::realtime::LIVENESS`]).
+    pub silence: std::time::Duration,
+    /// An upload, such as a system information snapshot, is dropped once
+    /// its body has sent no bytes for this long. It has no limit in total:
+    /// a snapshot of megabytes takes minutes on a slow uplink.
+    pub upload_stall: std::time::Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            silence: crate::realtime::LIVENESS,
+            // Like the Agent's own stall limit on its writes, for the same
+            // reasons: a slow link's send buffer drains in bursts, and TCP
+            // waits longer each time it retransmits a lost packet.
+            upload_stall: std::time::Duration::from_secs(60),
+        }
+    }
+}
+
 /// A device ID, run ID or other server-generated ID from a request path:
 /// a UUID in its usual lowercase hyphenated form, which is also safe to use
 /// as a file name.
