@@ -48,6 +48,7 @@ enum Sent {
     Input(RemoteInput),
     ReleaseInput,
     Stop,
+    Pause,
     Other,
 }
 
@@ -64,6 +65,7 @@ impl Sent {
             ParentCommand::Input(input) => Self::Input(input.clone()),
             ParentCommand::ReleaseInput => Self::ReleaseInput,
             ParentCommand::Stop => Self::Stop,
+            ParentCommand::PauseCapture => Self::Pause,
             _ => Self::Other,
         }
     }
@@ -209,6 +211,10 @@ impl Helpers {
                     emit(ends, &ChildEvent::Error("the input desktop changed".into()));
                     let _ = unsafe { TerminateProcess(process.0, 1) };
                     return;
+                }
+                // A frame the paused encoder made before it stopped.
+                (Kind::Capture, ParentCommand::PauseCapture) => {
+                    emit(ends, &frame(false, vec![LEFTOVER]));
                 }
                 (Kind::Capture, _) => {}
                 (
@@ -375,6 +381,50 @@ fn restart(streamer: &mut DesktopCaptureStreamer, bitrate: u32) -> (ActiveFormat
         .start(config(bitrate), Some(DISPLAY), next)
         .unwrap();
     (started.format, first_frames(&received))
+}
+
+#[test]
+fn a_pause_idles_the_helper_and_resuming_restarts_capture_in_it() {
+    let helpers = Arc::new(Helpers::default());
+    let mut streamer = DesktopCaptureStreamer::default();
+    streamer.launcher = helpers.launcher();
+    streamer.rdp.set_source(FakeSessions::with(Vec::new()));
+    let (first, first_received) = sink();
+    streamer
+        .start(config(8_000_000), Some(DISPLAY), first)
+        .unwrap();
+    assert_eq!(first_frames(&first_received), opening(8_000_000));
+    let launched = helpers.launched();
+    let [capture] = helpers.of_kind(Kind::Capture)[..] else {
+        panic!("expected one capture helper, launched {launched:?}");
+    };
+
+    streamer.pause().unwrap();
+    helpers.wait(|log| log.commands.contains(&(capture, Sent::Pause)).then_some(()));
+    // A paused helper is not a stopped or stalled one.
+    assert!(streamer.poll_ended().is_none());
+
+    let (next, received) = sink();
+    let format = streamer
+        .start(config(8_000_000), Some(DISPLAY), next)
+        .unwrap()
+        .format;
+    assert_eq!(format.bitrate_bits_per_second, 8_000_000);
+    // The resumed stream starts with its keyframe; the frame the paused
+    // encoder left on the pipe reached neither stream.
+    assert_eq!(first_frames(&received), opening(8_000_000));
+    assert!(first_received.try_recv().is_err());
+    // The same helper paused and resumed: nothing was launched or ended.
+    assert_eq!(helpers.launched(), launched);
+    assert_eq!(
+        helpers.sent(capture),
+        vec![
+            Sent::Start { bitrate: 8_000_000 },
+            Sent::Pause,
+            Sent::Start { bitrate: 8_000_000 },
+        ]
+    );
+    assert!(helpers.log.lock().unwrap().ended.is_empty());
 }
 
 #[test]

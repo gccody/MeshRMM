@@ -192,6 +192,7 @@ impl ControlRouting {
                 self.session_close.set_clear_clipboard(enabled);
                 None
             }
+            SessionMessage::SetVideoPaused { paused } => Some(ControlCommand::VideoPaused(paused)),
             SessionMessage::Stop { .. } => Some(ControlCommand::Stop),
             message => self.enqueue(message),
         }

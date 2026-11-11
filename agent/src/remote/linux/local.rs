@@ -360,6 +360,13 @@ impl LocalScreen {
         self.running = None;
     }
 
+    /// Stops capture and the encoder while the viewer shows no video. A
+    /// Linux session shows nothing else for capture to keep, so this is a
+    /// stop; the display server connection stays for the next start.
+    pub(crate) fn pause(&mut self) {
+        self.stop();
+    }
+
     pub(crate) fn poll_ended(&mut self) -> Option<anyhow::Error> {
         let running = self.running.as_mut()?;
         self.input.set_cursor(running.stream.cursor_shape());

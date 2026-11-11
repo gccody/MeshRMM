@@ -102,6 +102,9 @@ pub fn is_activity(message: &SessionMessage) -> bool {
         | SessionMessage::Stats(_)
         | SessionMessage::Start { .. }
         | SessionMessage::Stop { .. }
+        // Minimising a window is not using the session, so a session left
+        // minimised still reaches its idle limit.
+        | SessionMessage::SetVideoPaused { .. }
         | SessionMessage::ViewerCapabilities { .. }
         | SessionMessage::VideoProfileRejected { .. }
         | SessionMessage::ServiceChannelReady
@@ -266,6 +269,7 @@ mod tests {
             SessionMessage::Stop {
                 reason: "closed".into(),
             },
+            SessionMessage::SetVideoPaused { paused: true },
             SessionMessage::ViewerCapabilities {
                 profiles: vec![profile],
                 quality: QualityPreset::Balanced,

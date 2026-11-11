@@ -37,6 +37,11 @@ pub(super) struct ViewerControlQueue {
     input: Arc<Mutex<ViewerInputState>>,
     pointer_changed: Arc<Notify>,
     keyframes: Arc<Mutex<KeyframeRequests>>,
+    /// Whether this connection's video is up and how many streams it had,
+    /// for telling the device whether to pause it.
+    pub(super) video: Arc<tokio::sync::watch::Sender<crate::video_pause::ConnectionVideo>>,
+    /// The device was last told to pause the video.
+    pub(super) video_paused: Arc<AtomicBool>,
     pub(super) resume_state: ViewerResumeState,
 }
 
@@ -119,8 +124,37 @@ impl ViewerControlQueue {
             })),
             pointer_changed: Arc::new(Notify::new()),
             keyframes,
+            video: Arc::new(tokio::sync::watch::Sender::new(Default::default())),
+            video_paused: Arc::new(AtomicBool::new(false)),
             resume_state,
         }
+    }
+
+    /// Tells the device whether to pause the video for as long as this
+    /// connection lasts; see [`crate::video_pause::tell_device`].
+    pub(super) fn tell_device_of_pauses(&self) -> tokio::task::JoinHandle<()> {
+        let queue = self.clone();
+        tokio::spawn(crate::video_pause::tell_device(
+            self.resume_state.video_pause.watch(),
+            self.video.subscribe(),
+            Arc::clone(&self.video_paused),
+            move |paused| {
+                if paused && let Ok(mut requests) = queue.keyframes.lock() {
+                    // A keyframe asked for before the pause is not coming.
+                    *requests = KeyframeRequests::default();
+                }
+                queue.send(SessionMessage::SetVideoPaused { paused });
+            },
+        ))
+    }
+
+    /// Notes whether the window shows this connection's stream yet.
+    pub(super) fn set_video_presented(&self, presented: bool) {
+        self.video.send_if_modified(|video| {
+            let changed = video.presented != presented;
+            video.presented = presented;
+            changed
+        });
     }
 
     pub(super) fn send(&self, message: SessionMessage) {
@@ -193,6 +227,11 @@ impl ViewerControlQueue {
     /// Sends a keyframe request that had to wait, or one that went
     /// unanswered, once it is due.
     pub(super) fn poll_keyframe_request(&self, now_us: u64) {
+        // A paused device sends no keyframe; the stream that resumes it
+        // starts with one, and its new stream ID starts the requests over.
+        if self.video_paused.load(Ordering::Acquire) {
+            return;
+        }
         let due = self
             .keyframes
             .lock()
@@ -244,6 +283,7 @@ impl ViewerControlQueue {
             toolbox: resume_state.toolbox.clone(),
             quality: Arc::clone(&resume_state.quality),
             chroma: Arc::clone(&resume_state.chroma),
+            video_pause: resume_state.video_pause.clone(),
             #[cfg(windows)]
             profiles: Arc::clone(profiles),
         })
@@ -496,6 +536,10 @@ impl ControlHandler {
             catalog.take();
         }
         let configuration_sequence = self.configurations_seen.fetch_add(1, Ordering::AcqRel) + 1;
+        // Each new stream is told whether to pause again.
+        self.viewer_control
+            .video
+            .send_modify(|video| video.streams += 1);
         let previous = self.presenter.lock().ok().and_then(|guard| {
             guard
                 .as_ref()

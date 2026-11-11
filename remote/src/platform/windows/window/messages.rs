@@ -49,10 +49,15 @@ pub(super) unsafe extern "system" fn window_proc(
                 // The worker resizes the swap chain after the message pump
                 // returns, which is after a border drag ends.
                 if wparam.0 == SIZE_MINIMIZED as usize {
-                    // A minimised window has no keyboard to vouch for.
+                    // A minimised window has no keyboard to vouch for, and
+                    // shows no video.
                     context.release_input();
+                    context.shows_video.set_shown(false);
                 } else {
                     context.resize_pending.set(true);
+                    if matches!(wparam.0 as u32, SIZE_RESTORED | SIZE_MAXIMIZED) {
+                        context.shows_video.set_shown(true);
+                    }
                 }
                 context.layout_toolbar(window);
             }

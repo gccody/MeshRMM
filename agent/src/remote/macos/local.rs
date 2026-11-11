@@ -160,6 +160,13 @@ impl LocalScreen {
         self.borders.clear();
     }
 
+    /// Stops the ScreenCaptureKit stream and its encoder while the viewer
+    /// shows no video. The borders stay, so the user still sees which
+    /// display is shared; the next start begins a new stream.
+    pub(crate) fn pause(&mut self) {
+        self.capture = None;
+    }
+
     pub(crate) fn poll_ended(&mut self) -> Option<anyhow::Error> {
         let error = self.capture.as_ref()?.poll_ended()?;
         self.capture = None;

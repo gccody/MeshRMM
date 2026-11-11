@@ -99,6 +99,7 @@ pub struct ControlSink {
     toolbox: crate::toolbox::Toolbox,
     quality: Arc<Mutex<meshrmm_protocol::QualityPreset>>,
     chroma: Arc<Mutex<meshrmm_protocol::ChromaMode>>,
+    video_pause: crate::video_pause::VideoPause,
     #[cfg(windows)]
     profiles: Arc<Vec<meshrmm_protocol::VideoProfile>>,
 }
@@ -128,6 +129,8 @@ pub struct ControlSinkParts {
     pub toolbox: crate::toolbox::Toolbox,
     pub quality: Arc<Mutex<meshrmm_protocol::QualityPreset>>,
     pub chroma: Arc<Mutex<meshrmm_protocol::ChromaMode>>,
+    /// What shows the session's video, which each window reports itself to.
+    pub video_pause: crate::video_pause::VideoPause,
     #[cfg(windows)]
     pub profiles: Arc<Vec<meshrmm_protocol::VideoProfile>>,
 }
@@ -155,6 +158,7 @@ impl ControlSink {
             toolbox,
             quality,
             chroma,
+            video_pause,
             #[cfg(windows)]
             profiles,
         } = parts;
@@ -179,9 +183,16 @@ impl ControlSink {
             toolbox,
             quality,
             chroma,
+            video_pause,
             #[cfg(windows)]
             profiles,
         }
+    }
+
+    /// A window that can show the session's video, counted until dropped;
+    /// see [`crate::video_pause`].
+    pub fn video_window(&self, shown: bool) -> crate::video_pause::VideoWindow {
+        self.video_pause.window(shown)
     }
 
     pub fn credential_state(&self) -> meshrmm_protocol::CredentialState {

@@ -147,8 +147,21 @@ enum ControlCommand {
         reason: String,
     },
     SelectDisplay(DisplayId),
+    /// The viewer shows no video (true), or shows it again.
+    VideoPaused(bool),
     ChannelClosed,
     Stop,
+}
+
+/// Whether the viewer shows the video, for this connection. Capture control
+/// sets it when it pauses and resumes capture; the video sender reads it, so
+/// that neither its keyframe deadline nor its rate feedback counts the time
+/// paused.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct VideoPause {
+    paused: bool,
+    /// How many pauses there were.
+    pauses: u64,
 }
 
 struct CaptureStartup {
@@ -156,6 +169,7 @@ struct CaptureStartup {
     encoder_status: Arc<EncoderStatus>,
     initial_display: Option<DisplayId>,
     session_close: Arc<SessionClose>,
+    video_pause: Arc<tokio::sync::watch::Sender<VideoPause>>,
 }
 
 const DISCONNECTED_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(10);
@@ -263,6 +277,7 @@ async fn run_connected_sender(
         Arc::clone(&capture.quality_ceiling),
         capture.encoder_status,
         Arc::clone(&channels.audio.bits),
+        capture.video_pause.subscribe(),
         video_failure_tx,
     );
     cleanup.tasks.push(video_sender.abort_handle());
@@ -409,6 +424,7 @@ struct StartedCapture {
     slot: Arc<LatestFrameSlot>,
     quality_ceiling: Arc<AtomicU32>,
     encoder_status: Arc<EncoderStatus>,
+    video_pause: Arc<tokio::sync::watch::Sender<VideoPause>>,
     commands: mpsc::Sender<ControlCommand>,
     started: StartedScreen,
 }
@@ -424,6 +440,8 @@ async fn start_capture(
     let slot = Arc::new(LatestFrameSlot::default());
     let quality_ceiling = Arc::new(AtomicU32::new(1));
     let encoder_status = Arc::new(EncoderStatus::default());
+    // Each connection starts unpaused; a viewer that shows no video says so.
+    let video_pause = Arc::new(tokio::sync::watch::Sender::new(VideoPause::default()));
     let (capture_tx, capture_rx) = mpsc::channel(64);
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let capture_streamer = Arc::clone(streamer);
@@ -435,6 +453,7 @@ async fn start_capture(
         initial_display: start_in_background
             .then_some(DisplayId(meshrmm_protocol::BACKGROUND_DISPLAY_ID.0)),
         session_close,
+        video_pause: Arc::clone(&video_pause),
     };
     let capture_task = NativeTask::spawn("meshrmm-capture-control", move |stop| async move {
         let result = run_capture_control(
@@ -477,6 +496,7 @@ async fn start_capture(
         slot,
         quality_ceiling,
         encoder_status,
+        video_pause,
         commands: capture_tx,
         started,
     })

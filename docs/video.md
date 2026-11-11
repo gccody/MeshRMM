@@ -120,6 +120,55 @@ Below the ceiling the Agent adapts (`agent/src/remote/bitrate.rs`):
   one. A restart costs a keyframe, so steps need sustained congestion and are
   spaced apart.
 
+## Pausing while minimised
+
+The viewer sends `SetVideoPaused` when no window of the session has shown the
+video for two seconds, and sends it again with `paused: false` as soon as one
+does (see [minimised viewer](remote-sessions.md#minimised-viewer)). It holds
+the pause while recording. It also holds it until the connection has
+presented a frame, so a reconnect while minimised streams until the first
+picture and then pauses again. Each connection starts unpaused.
+
+The Agent handles the message once, in capture control
+(`agent/src/remote/transport/capture_control.rs`). Pausing stops the stream:
+the frame slot moves to a new stream id, so no stale frame is sent, and the
+platform stops capturing and encoding without ending its helpers:
+
+- **Windows service:** the desktop's LocalSystem capture helper stays
+  running and stops its capture and encoder. A helper launch costs a process,
+  a desktop attach and a D3D11 device, so a minimise and restore should not
+  pay it. The helper keeps its border and is still checked for desktop
+  switches and exit; its background-stall check is off while paused.
+- **Console-mode Agent:** the Windows.Graphics.Capture streamer stops; the
+  indicator and border stay.
+- **macOS:** the session helper stays running and stops its ScreenCaptureKit
+  stream and encoder, keeping its borders. A helper must be launched into the
+  user's GUI session, so it is kept. If another session takes the console while
+  paused, the session moves to that session's helper without starting capture.
+- **Linux:** capture and encoding stop and the display server connection
+  stays.
+
+While paused, keyframe requests, quality, chroma, cursor-capture and display
+changes are recorded without restarting capture, and the next start uses
+them. The desktop poll still watches for desktop switches, a helper that
+exits, and display list changes, which it sends as usual.
+
+Resuming starts capture again as a new stream, so the first frame is a
+keyframe, and sends the current display configuration first. The pointer
+shape and position come from input, not capture, so they keep updating while
+paused. The timers that would read a pause as a fault ignore it:
+
+- The video sender's 10 second wait for a stream's first keyframe counts only
+  time not paused.
+- No keyframe is requested and no stall is recovered while paused, and the
+  viewer sends no keyframe requests while it has asked for a pause.
+- Adaptive bitrate and the H.265 restart ladder start measuring healthy and
+  congested time again after a pause, so the idle stretch does not count as
+  headroom for a step up.
+- The viewer's 30 second "no video" check is unchanged. It only runs while
+  the connection has no presented frame, and then the viewer asks for the
+  video to resume.
+
 ## Software fallback
 
 Software H.264 4:2:0 is the last resort at both ends.

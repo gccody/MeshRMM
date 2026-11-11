@@ -9,7 +9,9 @@ use tokio::sync::mpsc;
 use webrtc::data_channel::RTCDataChannel;
 
 use super::control_channel::send_control_message;
-use super::{CaptureStartup, ControlCommand, capture_cursor_for_session, lock_streamer};
+use super::{
+    CaptureStartup, ControlCommand, VideoPause, capture_cursor_for_session, lock_streamer,
+};
 use crate::remote::platform::{ScreenStreamer, StartedScreen};
 use crate::remote::sender_failure::{initial_start_error, profile_start_error};
 use crate::remote::video::LatestFrameSlot;
@@ -155,6 +157,7 @@ pub(super) async fn run_capture_control(
         encoder_status,
         initial_display,
         session_close,
+        video_pause,
     } = startup;
     // Congestion steps belong to one connection; a resumed sender starts at
     // the quality bitrate and adapts again.
@@ -189,6 +192,8 @@ pub(super) async fn run_capture_control(
         capture_running: true,
         capture_unavailable_since: None,
         capture_retry_after: std::time::Instant::now(),
+        paused: false,
+        video_pause,
     };
     let _ = started_tx.send(Ok(started));
     let mut desktop_interval = tokio::time::interval(DESKTOP_LIFECYCLE_INTERVAL);
@@ -234,11 +239,19 @@ struct CaptureControl {
     capture_running: bool,
     capture_unavailable_since: Option<std::time::Instant>,
     capture_retry_after: std::time::Instant,
+    /// The viewer shows no video, so capture is stopped until it does; see
+    /// [`ScreenStreamer::pause`].
+    paused: bool,
+    video_pause: Arc<tokio::sync::watch::Sender<VideoPause>>,
 }
 
 impl CaptureControl {
     async fn apply(&mut self, command: ControlCommand) -> anyhow::Result<()> {
         match command {
+            ControlCommand::VideoPaused(paused) => self.set_paused(paused).await?,
+            // A paused stream has no encoder; the stream that resumes it
+            // starts with its keyframe.
+            ControlCommand::Keyframe if self.paused => {}
             ControlCommand::Keyframe => {
                 if let Err(error) = lock_streamer(&self.streamer)?.request_keyframe() {
                     tracing::warn!(error = %error, "could not request a keyframe while the desktop is changing");
@@ -338,6 +351,44 @@ impl CaptureControl {
         self.capture_retry_after = std::time::Instant::now();
     }
 
+    /// Stops capture while the viewer shows no video, and starts a new stream
+    /// as soon as it shows it again. Nothing restarts capture while paused:
+    /// what the viewer changes meanwhile applies to the stream that resumes.
+    async fn set_paused(&mut self, paused: bool) -> anyhow::Result<()> {
+        if paused == self.paused {
+            return Ok(());
+        }
+        self.paused = paused;
+        self.video_pause.send_modify(|state| {
+            state.paused = paused;
+            state.pauses += u64::from(paused);
+        });
+        if !paused {
+            tracing::info!(
+                stream_id = self.stream_id.0,
+                "the viewer shows the video again; resuming capture"
+            );
+            // Now rather than at the next desktop check. A start that fails
+            // is retried as any other is.
+            self.mark_unavailable();
+            return self.retry_capture().await;
+        }
+        // Capture that is not running may still have a helper to idle.
+        if let Err(error) = lock_streamer(&self.streamer)?.pause() {
+            // The start that resumes replaces whatever did not pause.
+            tracing::warn!(error = ?error, "capture did not pause cleanly");
+        }
+        // Nothing of the paused stream goes out, and the next is another.
+        self.next_stream();
+        self.capture_running = false;
+        self.capture_unavailable_since = None;
+        tracing::info!(
+            stream_id = self.stream_id.0,
+            "the viewer shows no video; paused capture"
+        );
+        Ok(())
+    }
+
     fn adopt(&mut self, started: StartedScreen) {
         self.displays = started.displays;
         self.active_display = started.active_display;
@@ -379,6 +430,10 @@ impl CaptureControl {
         let value = value.min(ceiling);
         let mut streamer = lock_streamer(&self.streamer)?;
         streamer.set_congestion_bitrate((value < ceiling).then_some(value));
+        if self.paused {
+            // No encoder runs; the stream that resumes starts at this rate.
+            return Ok(());
+        }
         if let Err(error) = streamer.set_adaptive_bitrate(value) {
             tracing::warn!(error = %error, "could not set bitrate while the desktop is changing");
         }
@@ -434,6 +489,10 @@ impl CaptureControl {
         let mut capture_changed = lock_streamer(&self.streamer)?.set_quality(quality);
         if let Some(resolution) = headless_resolution {
             capture_changed |= lock_streamer(&self.streamer)?.set_headless_resolution(resolution);
+        }
+        if self.paused {
+            // The stream that resumes starts with these settings.
+            return Ok(());
         }
         let candidates = self.candidates();
         if self.capture_running
@@ -501,6 +560,8 @@ impl CaptureControl {
             self.recording,
         ));
         match update {
+            // The stream that resumes captures with the new setting.
+            Ok(_) if self.paused => {}
             Ok(false) => {}
             Err(error) => tracing::warn!(
                 %error,
@@ -530,6 +591,10 @@ impl CaptureControl {
                 requested_chroma = ?self.selection.chroma(),
                 "chroma selection retained active profile"
             );
+            return Ok(());
+        }
+        if self.paused {
+            // The stream that resumes starts with the best profile.
             return Ok(());
         }
         self.end_stream()?;
@@ -562,6 +627,9 @@ impl CaptureControl {
             reason,
             "viewer rejected video profile; trying fallback"
         );
+        if self.paused {
+            return Ok(());
+        }
         let candidates = self.candidates();
         self.end_stream()?;
         let started = self.start(self.active_display.id, &candidates)?;
@@ -584,6 +652,11 @@ impl CaptureControl {
             );
             return Ok(());
         };
+        if self.paused {
+            // The stream that resumes shows it.
+            self.active_display = selected;
+            return Ok(());
+        }
         let switch_started = std::time::Instant::now();
         self.capture_running = false;
         self.capture_unavailable_since = Some(std::time::Instant::now());
@@ -648,6 +721,9 @@ impl CaptureControl {
     }
 
     async fn poll_desktop(&mut self) -> anyhow::Result<()> {
+        if self.paused {
+            return self.poll_paused().await;
+        }
         if self.capture_running {
             let capture_ended = lock_streamer(&self.streamer)?.poll_ended();
             if let Some(capture_result) = capture_ended {
@@ -664,6 +740,23 @@ impl CaptureControl {
         }
         if !self.capture_running && std::time::Instant::now() >= self.capture_retry_after {
             self.retry_capture().await?;
+        }
+        Ok(())
+    }
+
+    /// The desktop check while paused. The session still follows the
+    /// desktop: a helper that ends, a viewed session that ends or a console
+    /// another session takes is let go now, and the display list stays
+    /// current. Nothing starts capture until the viewer shows the video.
+    async fn poll_paused(&mut self) -> anyhow::Result<()> {
+        let ended = lock_streamer(&self.streamer)?.poll_ended();
+        if let Some(result) = ended {
+            tracing::info!(
+                error = ?result.err(),
+                "the paused capture's desktop or helper changed; resuming starts it afresh"
+            );
+        } else if let Some(catalog) = self.take_catalog()? {
+            send_control_message(&self.control_channel, catalog).await?;
         }
         Ok(())
     }
@@ -712,7 +805,7 @@ impl CaptureControl {
                     stream_id = self.stream_id.0,
                     display_id = self.active_display.id.0,
                     recovery_ms,
-                    "remote session moved to the visible desktop"
+                    "capture started again on the visible desktop"
                 );
             }
             Err(error) => {

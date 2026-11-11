@@ -90,6 +90,24 @@ The viewer title shows the active display. While the computer's own user has
 control of the mouse, the display menu marks the monitor their pointer is on
 with `➤`.
 
+## Minimised viewer
+
+When no window of a session shows the video for two seconds, the viewer asks
+the Agent to pause it, and the device stops capturing, encoding and sending
+video. A window shows nothing while it is minimised on Windows, or while it is
+miniaturised or the viewer is hidden (⌘H) on macOS. A window that other
+windows cover still counts as showing the video. Restoring the window resumes
+the video at once, starting with a keyframe and the current display list and
+pointer, and until then the window keeps the last picture.
+
+Everything else keeps running while the video is paused: the session, audio,
+input, the clipboard, files, chat, the user's indicator and border, blackout,
+input blocking and the idle timeout. A paused session is not a stalled one,
+so it does not reconnect or report an error. Recording keeps the video
+running, and starting a recording while minimised resumes it. After a
+reconnect the viewer tells the Agent again once the new connection has shown
+a picture.
+
 ## Input
 
 The viewer sends mouse, wheel and physical keyboard input while its window is
@@ -228,6 +246,8 @@ computer. A red **REC** item stays in the toolbar; click it to stop.
   nothing is converted at the end. A disk error or a full queue stops the
   recording with a message and leaves the session running.
 - Disconnecting saves what was captured and stops recording.
+- A recording keeps the video running while the viewer is minimised (see
+  [minimised viewer](#minimised-viewer)).
 
 ## Annotations
 

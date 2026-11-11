@@ -172,6 +172,16 @@ impl ScreenStreamer for PlatformScreenStreamer {
         }
     }
 
+    fn pause(&mut self) -> anyhow::Result<()> {
+        match &mut self.backend {
+            Backend::Direct { screen, .. } => {
+                screen.pause();
+                Ok(())
+            }
+            Backend::Helper(remote) => remote.pause(),
+        }
+    }
+
     fn poll_ended(&mut self) -> Option<anyhow::Result<()>> {
         match &mut self.backend {
             Backend::Direct { screen, .. } => screen.poll_ended(),

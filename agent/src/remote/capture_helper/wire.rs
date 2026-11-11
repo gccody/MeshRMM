@@ -75,6 +75,7 @@ pub(super) fn write_command(mut writer: impl Write, command: &ParentCommand) -> 
         ParentCommand::SetPreventIdleLock(enabled) => writer.write_all(&[21, u8::from(*enabled)]),
         ParentCommand::SetCursorCapture(enabled) => writer.write_all(&[18, u8::from(*enabled)]),
         ParentCommand::SetDisplayBorder(enabled) => writer.write_all(&[20, u8::from(*enabled)]),
+        ParentCommand::PauseCapture => writer.write_all(&[COMMAND_PAUSE_CAPTURE]),
         ParentCommand::RequestKeyframe => writer.write_all(&[COMMAND_REQUEST_KEYFRAME]),
         ParentCommand::SetBitrate(bits_per_second) => {
             writer.write_all(&[COMMAND_SET_BITRATE])?;
@@ -153,6 +154,7 @@ pub(super) fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
         21 => Ok(ParentCommand::SetPreventIdleLock(read_bool(&mut reader)?)),
         18 => Ok(ParentCommand::SetCursorCapture(read_bool(&mut reader)?)),
         20 => Ok(ParentCommand::SetDisplayBorder(read_bool(&mut reader)?)),
+        COMMAND_PAUSE_CAPTURE => Ok(ParentCommand::PauseCapture),
         COMMAND_REQUEST_KEYFRAME => Ok(ParentCommand::RequestKeyframe),
         COMMAND_SET_BITRATE => Ok(ParentCommand::SetBitrate(read_u32(&mut reader)?)),
         COMMAND_START_INPUT => Ok(ParentCommand::StartInput {
