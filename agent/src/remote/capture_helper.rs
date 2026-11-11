@@ -349,10 +349,12 @@ fn lock_frames(frames: &HelperFrames) -> std::sync::MutexGuard<'_, FrameRoute> {
 pub struct DesktopCaptureStreamer {
     background_active: Arc<AtomicBool>,
     console_displays: Vec<Display>,
-    session_displays: Vec<(Display, DisplayId)>,
+    /// The RDP sessions offered to the viewer, and their displays.
+    rdp: RdpCatalog,
+    /// The displays offered changed since the last configuration said
+    /// which; see [`Self::take_display_catalog`].
+    catalog_changed: bool,
     selected_session: Option<u32>,
-    known_sessions: Vec<(u32, String)>,
-    sessions_checked: Instant,
     display_routes: Arc<Mutex<Vec<(DisplayId, DisplayId)>>>,
     blackout_message: String,
     viewer_name: String,
@@ -401,10 +403,9 @@ impl DesktopCaptureStreamer {
         Self {
             background_active: Arc::new(AtomicBool::new(false)),
             console_displays: Vec::new(),
-            session_displays: Vec::new(),
+            rdp: RdpCatalog::new(Arc::new(WtsSessions)),
+            catalog_changed: false,
             selected_session: None,
-            known_sessions: Vec::new(),
-            sessions_checked: Instant::now(),
             display_routes: Arc::new(Mutex::new(Vec::new())),
             viewer_name,
             blackout_message,
@@ -536,17 +537,8 @@ impl DesktopCaptureStreamer {
     }
 
     pub fn poll_ended(&mut self) -> Option<anyhow::Result<()>> {
-        if self.sessions_checked.elapsed() >= Duration::from_secs(5) {
-            self.sessions_checked = Instant::now();
-            if let Ok(sessions) = active_rdp_sessions()
-                && sessions != self.known_sessions
-            {
-                self.known_sessions = sessions;
-                // Restart capture to publish the changed session catalog using the
-                // existing ordered DisplayConfiguration/stream boundary.
-                let result = self.stop();
-                return Some(result);
-            }
+        if let Some(result) = self.poll_sessions() {
+            return Some(result);
         }
         let running = self.running.as_ref()?;
         if running.target == DesktopTarget::Background

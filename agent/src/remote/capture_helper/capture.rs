@@ -51,19 +51,18 @@ impl DesktopCaptureStreamer {
         display_id: Option<DisplayId>,
         sink: EncodedFrameSink,
     ) -> anyhow::Result<StartedDesktop> {
+        // One WTS query per session; nothing is launched to list monitors.
         self.refresh_sessions();
-        let selected =
-            display_id.and_then(|id| self.session_displays.iter().find(|(d, _)| d.id == id));
+        let route = display_id.and_then(|id| self.rdp.route(id));
         anyhow::ensure!(
-            display_id
-                .is_none_or(|id| id.0 < 0x8000_0000 || id.0 >= u32::MAX - 2 || selected.is_some()),
-            "selected RDP display is no longer available"
+            route.is_none_or(|(session, _)| self.rdp.session(session).is_some()),
+            "selected RDP session is no longer available"
         );
-        let session = selected.and_then(|(d, _)| match d.session {
-            meshrmm_protocol::DesktopSession::Rdp { id, .. } => Some(id),
-            _ => None,
-        });
-        let display_id = selected.map(|(_, local)| *local).or(display_id);
+        let session = route.map(|(session, _)| session);
+        let display_id = match route {
+            Some((_, local)) => local,
+            None => display_id,
+        };
         if session != self.selected_session {
             self.shutdown()?;
             self.selected_session = session;
@@ -149,13 +148,10 @@ impl DesktopCaptureStreamer {
         if display_id.is_none()
             && !background
             && self.selected_session.is_none()
-            && let Some((display, _)) = self
-                .session_displays
-                .iter()
-                .find(|(d, _)| d.primary)
-                .or(self.session_displays.first())
+            && let Some(display) = self.rdp.first_display()
         {
-            return self.start_capture(config, Some(display.id), sink);
+            let display_id = display.id;
+            return self.start_capture(config, Some(display_id), sink);
         }
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no interactive desktop is available")))
     }

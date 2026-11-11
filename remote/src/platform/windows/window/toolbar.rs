@@ -989,3 +989,12 @@ pub(in crate::platform::windows) unsafe fn set_agent_pointer_display(
         context.refresh_toolbar();
     }
 }
+
+/// Replaces the displays the toolbar offers, as when an RDP session starts
+/// or ends on the device. The stream and the display shown stay as they are.
+pub(in crate::platform::windows) unsafe fn set_displays(window: HWND, displays: Vec<Display>) {
+    if let Some(context) = unsafe { window_context(window) } {
+        context.displays.replace(displays);
+        context.refresh_toolbar();
+    }
+}

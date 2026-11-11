@@ -38,7 +38,7 @@ mod toolbar;
 
 pub(super) use creation::create_window;
 use creation::remember_placement;
-pub(super) use toolbar::set_agent_pointer_display;
+pub(super) use toolbar::{set_agent_pointer_display, set_displays};
 
 /// SS_CENTER, which lives in an otherwise unused Windows feature.
 pub(super) const STATIC_CENTER: u32 = 0x0001;

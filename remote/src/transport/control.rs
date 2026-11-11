@@ -302,6 +302,7 @@ pub(super) fn install_control_handler(
         debug,
         cursor_shape: Arc::new(Mutex::new(CursorShape::Default)),
         pointer_display: Arc::new(Mutex::new(None)),
+        catalog: Arc::new(Mutex::new(None)),
         capabilities_sent: Arc::new(AtomicBool::new(false)),
         supported_profiles: Arc::new(OnceLock::new()),
         configurations_seen: Arc::new(AtomicU64::new(0)),
@@ -348,6 +349,9 @@ struct ControlHandler {
     debug: DebugInfo,
     cursor_shape: Arc<Mutex<CursorShape>>,
     pointer_display: Arc<Mutex<Option<DisplayId>>>,
+    /// The displays the device offered since its last configuration, for
+    /// a presenter that configuration starts.
+    catalog: Arc<Mutex<Option<Vec<Display>>>>,
     capabilities_sent: Arc<AtomicBool>,
     supported_profiles: Arc<OnceLock<Arc<Vec<VideoProfile>>>>,
     configurations_seen: Arc<AtomicU64>,
@@ -423,6 +427,20 @@ impl ControlHandler {
                 self.refresh_controls();
             }
             Ok(SessionMessage::Stop { reason }) => tracing::info!(reason, "Agent stopped stream"),
+            Ok(SessionMessage::DisplayCatalog { displays }) => {
+                tracing::info!(
+                    displays = displays.len(),
+                    "the device offers other displays; the stream goes on"
+                );
+                if let Ok(mut current) = self.catalog.lock() {
+                    *current = Some(displays.clone());
+                }
+                if let Ok(guard) = self.presenter.lock()
+                    && let Some(active) = guard.as_ref()
+                {
+                    active.presenter.set_displays(displays);
+                }
+            }
             Ok(SessionMessage::AgentPointerDisplay { display_id }) => {
                 if let Ok(mut current) = self.pointer_display.lock() {
                     *current = display_id;
@@ -472,6 +490,11 @@ impl ControlHandler {
         stream_id: VideoStreamId,
         format: VideoFormat,
     ) {
+        // The configuration's displays are the device's latest; a catalog
+        // that follows it replaces them again.
+        if let Ok(mut catalog) = self.catalog.lock() {
+            catalog.take();
+        }
         let configuration_sequence = self.configurations_seen.fetch_add(1, Ordering::AcqRel) + 1;
         let previous = self.presenter.lock().ok().and_then(|guard| {
             guard
@@ -736,6 +759,11 @@ impl ControlHandler {
                 }
                 if let Ok(shape) = self.cursor_shape.lock() {
                     new_presenter.set_cursor_shape(*shape);
+                }
+                // Offered while the presenter started.
+                if let Some(displays) = self.catalog.lock().ok().and_then(|catalog| catalog.clone())
+                {
+                    new_presenter.set_displays(displays);
                 }
                 let mut old = self.presenter.lock().ok().and_then(|mut guard| {
                     guard.replace(ActivePresenter {
@@ -1006,6 +1034,7 @@ mod tests {
             debug: DebugInfo::new("test"),
             cursor_shape: Arc::new(Mutex::new(CursorShape::Default)),
             pointer_display: Arc::new(Mutex::new(None)),
+            catalog: Arc::new(Mutex::new(None)),
             capabilities_sent: Arc::new(AtomicBool::new(true)),
             supported_profiles: Arc::new(OnceLock::from(Arc::new(Vec::new()))),
             configurations_seen: Arc::new(AtomicU64::new(1)),
@@ -1062,6 +1091,33 @@ mod tests {
                 stream_id: VideoStreamId(2)
             }
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_display_catalog_changes_the_list_and_leaves_the_stream_alone() {
+        let (held, _worker) = Presenter::held_for_test();
+        let (handler, active, mut sent) = streaming_handler(held);
+        // An RDP session started elsewhere on the device.
+        let displays = vec![display(1), display(2)];
+        let catalog = SessionMessage::DisplayCatalog {
+            displays: displays.clone(),
+        }
+        .encode()
+        .unwrap();
+        handler.handle(&catalog).await;
+        {
+            let guard = active.try_lock().unwrap();
+            let active = guard.as_ref().unwrap();
+            assert_eq!(active.presenter.pending_displays(), Some(displays.clone()));
+            // The decoder was not reset: it still takes the stream's frames.
+            assert_eq!(active.stream_id, VideoStreamId(1));
+            assert!(active.presenter.publish(keyframe(VideoStreamId(1)), 0));
+        }
+        // No keyframe or display was asked for.
+        assert!(sent.try_recv().is_err());
+        // Kept for a presenter a configuration in progress starts.
+        assert_eq!(*handler.catalog.lock().unwrap(), Some(displays));
     }
 
     #[cfg(windows)]

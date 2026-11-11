@@ -50,6 +50,12 @@ pub trait ScreenStreamer: Send {
         self.stop()
     }
     fn poll_ended(&mut self) -> Option<anyhow::Result<()>>;
+    /// The displays to offer the viewer, when they changed while the stream
+    /// and the display it shows did not, such as an RDP session starting or
+    /// ending elsewhere on the computer.
+    fn take_display_catalog(&mut self) -> Option<Vec<Display>> {
+        None
+    }
     fn request_keyframe(&self) -> anyhow::Result<()>;
     /// Configure the quality ceiling for later starts; preset changes restart
     /// capture. A congestion bitrate stays in force (see `StartBitrate`).
@@ -390,6 +396,13 @@ impl ScreenStreamer for PlatformScreenStreamer {
             CaptureBackend::Desktop(streamer) => streamer.poll_ended(),
         }
         .map(|result| result.context("Windows GPU capture/encode worker stopped"))
+    }
+
+    fn take_display_catalog(&mut self) -> Option<Vec<Display>> {
+        match &mut self.inner {
+            CaptureBackend::Desktop(streamer) => streamer.take_display_catalog(),
+            CaptureBackend::Direct(_) => None,
+        }
     }
 
     fn request_keyframe(&self) -> anyhow::Result<()> {

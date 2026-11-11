@@ -140,6 +140,8 @@ struct Shared {
     first_presented: Arc<OnceLock<std::time::Instant>>,
     cursor_shape: Mutex<Option<CursorShape>>,
     agent_pointer_display: Mutex<Option<Option<meshrmm_protocol::DisplayId>>>,
+    /// The displays the device offers now, for the worker to show.
+    displays: Mutex<Option<Vec<Display>>>,
     ready: Condvar,
     stopping: AtomicBool,
     reconnect_status: Mutex<Option<ReconnectStatus>>,
@@ -169,6 +171,7 @@ impl Shared {
             first_presented: Default::default(),
             cursor_shape: Mutex::new(None),
             agent_pointer_display: Mutex::new(None),
+            displays: Mutex::new(None),
             ready: Condvar::new(),
             stopping: AtomicBool::new(false),
             reconnect_status: Mutex::new(None),
@@ -485,6 +488,15 @@ impl Presenter {
         self.shared.ready.notify_one();
     }
 
+    /// Replaces the displays the window offers, leaving the stream and its
+    /// decoder alone.
+    pub fn set_displays(&self, displays: Vec<Display>) {
+        if let Ok(mut pending) = self.shared.displays.lock() {
+            *pending = Some(displays);
+        }
+        self.shared.ready.notify_one();
+    }
+
     /// The window pump already refreshes controls without waiting for frames.
     pub fn refresh_controls(&self) {}
 
@@ -711,7 +723,8 @@ unsafe fn apply_pending_reset(shared: &Shared, pipeline: &mut WorkerPipeline) ->
     true
 }
 
-/// Shows the latest agent pointer display and cursor shape the session sent.
+/// Shows the latest agent pointer display, display list and cursor shape
+/// the session sent.
 unsafe fn apply_pending_pointer_state(shared: &Shared, pipeline: &WorkerPipeline) {
     if let Some(display_id) = shared
         .agent_pointer_display
@@ -722,6 +735,14 @@ unsafe fn apply_pending_pointer_state(shared: &Shared, pipeline: &WorkerPipeline
         unsafe {
             window::set_agent_pointer_display(pipeline.window(), display_id);
         }
+    }
+    if let Some(displays) = shared
+        .displays
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.take())
+    {
+        unsafe { window::set_displays(pipeline.window(), displays) };
     }
     if let Some(shape) = shared
         .cursor_shape
@@ -928,6 +949,11 @@ impl Presenter {
             thread,
         };
         (presenter, worker)
+    }
+
+    /// The display list waiting for the worker to show it.
+    pub(crate) fn pending_displays(&self) -> Option<Vec<Display>> {
+        self.shared.displays.lock().unwrap().clone()
     }
 }
 
