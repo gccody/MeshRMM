@@ -15,7 +15,7 @@ mod capture;
 mod cursor;
 pub(crate) mod display;
 mod encoder;
-mod input;
+pub(crate) mod input;
 pub(crate) mod input_block;
 mod keep_awake;
 mod keymap;

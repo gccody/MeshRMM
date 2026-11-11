@@ -2,8 +2,9 @@
 //! computer's sessions, and starts a session helper in each X11 or Wayland
 //! session, the login screen's included, as the session's user and with the
 //! session's environment, which it reads from the session's own processes.
-//! A helper inherits one end of a socket pair, its link to the coordinator,
-//! and the uinput descriptors it injects input through.
+//! A helper inherits one end of a socket pair, its link to the coordinator.
+//! The coordinator keeps the uinput descriptors and injects input itself, so
+//! a helper, which runs as the session's user, never holds them.
 //!
 //! The session on seat0 that logind calls active is the console: remote
 //! sessions and thumbnails use its helper.
@@ -330,94 +331,23 @@ impl Supervisor {
         let account = Account::of(session.uid)?;
         let (coordinator, helper) =
             UnixStream::pair().context("could not create the helper's socket")?;
-        let keyboard = crate::remote::linux::input::open_uinput()
-            .inspect_err(|error| tracing::warn!(error = ?error, "remote input will be unavailable"))
-            .ok();
-        let pointer = keyboard
-            .as_ref()
-            .and_then(|_| crate::remote::linux::input::open_uinput().ok());
-        let inherited: Vec<OwnedFd> = [
-            Some(OwnedFd::from(helper)),
-            keyboard.map(OwnedFd::from),
-            pointer.map(OwnedFd::from),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        let mut command = Command::new(&self.executable);
-        command
-            .arg("--session-helper")
-            .env_clear()
-            .envs(&environment)
-            .env("HOME", &account.home)
-            .env("USER", &session.user)
-            .env("LOGNAME", &session.user)
-            .env("SHELL", &account.shell)
-            .env(
-                "PATH",
-                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            )
-            .env("XDG_RUNTIME_DIR", runtime_directory(session.uid))
-            .env("XDG_SESSION_ID", &session.id)
-            .env("XDG_SESSION_TYPE", &session.kind)
-            .env(SOCKET_VARIABLE, "3")
-            .current_dir(&account.home)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        if inherited.len() == 3 {
-            command.env(crate::remote::linux::input::DESCRIPTORS_VARIABLE, "4,5");
-        }
-        if session.greeter {
-            command.env(LOGIN_WINDOW_VARIABLE, "1");
-        }
-        if !environment.contains_key("DBUS_SESSION_BUS_ADDRESS") {
-            command.env(
-                "DBUS_SESSION_BUS_ADDRESS",
-                format!("unix:path={}/bus", runtime_directory(session.uid).display()),
-            );
-        }
-        let mut raw = [-1; 3];
-        for (slot, fd) in raw.iter_mut().zip(&inherited) {
-            *slot = fd.as_raw_fd();
-        }
-        let (uid, gid, groups) = (account.uid, account.gid, account.groups.clone());
-        // SAFETY: the closure neither allocates nor takes locks; it makes
-        // only async-signal-safe system calls.
-        unsafe {
-            command.pre_exec(move || {
-                // Move the descriptors out of the way, then to 3, 4 and 5,
-                // where dup2 also makes them survive exec.
-                let mut moved = [-1; 3];
-                for (high, &fd) in moved.iter_mut().zip(&raw) {
-                    if fd < 0 {
-                        continue;
-                    }
-                    *high = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 100);
-                    if *high < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
-                for (index, &fd) in moved.iter().enumerate() {
-                    if fd >= 0 && libc::dup2(fd, 3 + index as i32) < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
-                if libc::setgroups(groups.len(), groups.as_ptr()) != 0
-                    || libc::setgid(gid) != 0
-                    || libc::setuid(uid) != 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                // The helper ends with the coordinator.
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
-                Ok(())
-            });
-        }
+        // The helper inherits only its end of the socket. The `/dev/uinput`
+        // descriptors stay with the root coordinator, which injects input
+        // itself; a helper runs as the session's user, so handing it those
+        // root-opened descriptors would let that user's other processes reach
+        // them and type and click across every session on the computer.
+        let socket = OwnedFd::from(helper);
+        let mut command = helper_command(
+            &self.executable,
+            session,
+            &account,
+            &environment,
+            socket.as_raw_fd(),
+        );
         let child = command
             .spawn()
             .context("could not start the session helper")?;
-        drop(inherited);
+        drop(socket);
         tracing::info!(
             session = %session.id,
             user = %session.user,
@@ -449,6 +379,72 @@ impl Supervisor {
             connection,
         }))
     }
+}
+
+/// Builds a helper's command: its argument, environment, working directory
+/// and the pre-exec that moves the socket to descriptor 3 and drops to the
+/// session's user. The helper inherits only `socket_fd`; the uinput
+/// descriptors are never passed, so the session's user cannot reach them.
+fn helper_command(
+    executable: &std::path::Path,
+    session: &Session,
+    account: &Account,
+    environment: &HashMap<String, String>,
+    socket_fd: std::os::fd::RawFd,
+) -> Command {
+    let mut command = Command::new(executable);
+    command
+        .arg("--session-helper")
+        .env_clear()
+        .envs(environment)
+        .env("HOME", &account.home)
+        .env("USER", &session.user)
+        .env("LOGNAME", &session.user)
+        .env("SHELL", &account.shell)
+        .env(
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        )
+        .env("XDG_RUNTIME_DIR", runtime_directory(session.uid))
+        .env("XDG_SESSION_ID", &session.id)
+        .env("XDG_SESSION_TYPE", &session.kind)
+        .env(SOCKET_VARIABLE, "3")
+        .current_dir(&account.home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if session.greeter {
+        command.env(LOGIN_WINDOW_VARIABLE, "1");
+    }
+    if !environment.contains_key("DBUS_SESSION_BUS_ADDRESS") {
+        command.env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}/bus", runtime_directory(session.uid).display()),
+        );
+    }
+    let (uid, gid, groups) = (account.uid, account.gid, account.groups.clone());
+    // SAFETY: the closure neither allocates nor takes locks; it makes
+    // only async-signal-safe system calls.
+    unsafe {
+        command.pre_exec(move || {
+            // Move the socket out of the way, then to descriptor 3, where
+            // dup2 also makes it survive exec.
+            let high = libc::fcntl(socket_fd, libc::F_DUPFD_CLOEXEC, 100);
+            if high < 0 || libc::dup2(high, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setgroups(groups.len(), groups.as_ptr()) != 0
+                || libc::setgid(gid) != 0
+                || libc::setuid(uid) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The helper ends with the coordinator.
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            Ok(())
+        });
+    }
+    command
 }
 
 impl Drop for Supervisor {
@@ -669,5 +665,55 @@ mod tests {
         let account = Account::of(unsafe { libc::getuid() }).unwrap();
         assert!(account.home.is_absolute());
         assert!(!account.groups.is_empty());
+    }
+
+    #[test]
+    fn a_helper_is_started_without_the_uinput_descriptors() {
+        // SAFETY: getuid has no preconditions.
+        let account = Account::of(unsafe { libc::getuid() }).unwrap();
+        let session = Session {
+            id: "c1".to_owned(),
+            uid: account.uid,
+            user: "someone".to_owned(),
+            kind: "wayland".to_owned(),
+            greeter: false,
+            display: String::new(),
+            seat: "seat0".to_owned(),
+            active: true,
+        };
+        let mut environment = HashMap::new();
+        environment.insert("WAYLAND_DISPLAY".to_owned(), "wayland-0".to_owned());
+        let command = helper_command(
+            std::path::Path::new("/proc/self/exe"),
+            &session,
+            &account,
+            &environment,
+            3,
+        );
+        let envs: Vec<(String, Option<String>)> = command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        // The helper is told which descriptor is its socket, and nothing about
+        // uinput: the coordinator keeps those descriptors.
+        assert!(
+            envs.iter()
+                .any(|(name, value)| name == SOCKET_VARIABLE && value.as_deref() == Some("3"))
+        );
+        assert!(
+            !envs.iter().any(|(name, _)| name.contains("UINPUT")),
+            "the helper's environment names a uinput descriptor: {envs:?}"
+        );
+        // Its only argument makes it a session helper; it inherits no fd list.
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["--session-helper"]);
     }
 }

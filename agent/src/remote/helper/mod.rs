@@ -1,8 +1,10 @@
 //! The installed Agent's session helpers and the coordinator's link to them.
 //! The root coordinator runs outside every graphical session, so a helper in
-//! each session captures it, injects input and shows the session's windows.
-//! On macOS launchd starts the helpers, which connect to the coordinator's
-//! socket; on Linux the coordinator starts one in each logind session itself.
+//! each session captures it and shows the session's windows. On macOS launchd
+//! starts the helpers, which connect to the coordinator's socket, and each
+//! helper injects input into its session; on Linux the coordinator starts one
+//! in each logind session itself and, since only root may open `/dev/uinput`,
+//! keeps the input descriptors and does the injection itself.
 pub(crate) mod coordinator;
 pub(crate) mod host;
 pub(crate) mod protocol;

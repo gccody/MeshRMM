@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::remote::thumbnail::{Capture, Signature};
 
 /// Bumped whenever a message changes; the coordinator refuses other helpers.
-pub(crate) const VERSION: u32 = 8;
+pub(crate) const VERSION: u32 = 9;
 /// A 2560x1600 keyframe is well under this.
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -166,6 +166,11 @@ pub(crate) enum Event {
     AudioEnded,
     /// The answer to `Request::PromptApproval`, as `Decision::to_byte`.
     ApprovalDecision(u8),
+    /// The session pasted files onto `display_id` and asks the coordinator,
+    /// which holds the uinput descriptors on Linux, to press Ctrl+V there.
+    /// The coordinator honours it only for the helper on the console with a
+    /// running session; a helper never injects input itself.
+    RequestPaste(DisplayId),
 }
 
 pub(crate) fn write<T: Serialize>(writer: &mut impl Write, message: &T) -> anyhow::Result<()> {

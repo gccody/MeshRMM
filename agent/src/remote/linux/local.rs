@@ -2,7 +2,7 @@
 //! uses them directly; the installed Agent's session helpers serve them to the
 //! coordinator.
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
@@ -14,7 +14,7 @@ use super::capture::{self, Backend, CaptureSettings, Stream};
 use super::display::Output;
 use super::encoder::{EncodedAccessUnit, EncoderSettings, FrameSink, RawFrame, VideoEncoder};
 use super::{input, keep_awake, pointer, ui, wallpaper};
-use crate::remote::helper::protocol::{InputState, SessionUi, StreamSettings};
+use crate::remote::helper::protocol::{Event, InputState, SessionUi, StreamSettings};
 use crate::remote::platform::ScreenInput;
 
 /// How long a capture the display server started has to deliver its first
@@ -445,11 +445,15 @@ pub(crate) struct LocalInput {
     cursor: Mutex<CursorShape>,
     /// Whether the annotation warning was logged this session.
     annotations_refused: AtomicBool,
+    /// Where a file paste's Ctrl+V goes when the coordinator holds the uinput
+    /// descriptors: the channel to the coordinator. Unset in a console Agent,
+    /// which injects through its own controller.
+    paste_events: Mutex<Option<mpsc::SyncSender<Event>>>,
 }
 
-/// Presses Ctrl+V on the display the viewer pasted files on, once they are
-/// on the clipboard.
-fn paste_shortcut(
+/// Presses Ctrl+V with the controller, for a console Agent that runs as root
+/// and injects input itself.
+fn paste_with_controller(
     controller: &Arc<Mutex<input::InputController>>,
 ) -> meshrmm_file_transfer::PasteShortcut {
     let controller = Arc::clone(controller);
@@ -493,7 +497,33 @@ impl LocalInput {
             cursor: Mutex::new(CursorShape::Default),
             pointer: Mutex::default(),
             annotations_refused: AtomicBool::new(false),
+            paste_events: Mutex::default(),
         })
+    }
+
+    /// Routes a file paste's Ctrl+V to the coordinator, which holds the uinput
+    /// descriptors. A session helper calls this before its session begins;
+    /// without it a console Agent presses Ctrl+V through its own controller.
+    pub(crate) fn use_coordinator_paste(&self, events: mpsc::SyncSender<Event>) {
+        *self.paste_events.lock().unwrap_or_else(|e| e.into_inner()) = Some(events);
+    }
+
+    /// The paste shortcut for the current session: through the coordinator
+    /// when one holds the descriptors, else through this process's controller.
+    fn paste_shortcut(&self) -> meshrmm_file_transfer::PasteShortcut {
+        if let Some(events) = self
+            .paste_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            return Box::new(move |display_id| {
+                events
+                    .send(Event::RequestPaste(display_id))
+                    .map_err(|_| anyhow::anyhow!("the coordinator connection closed"))
+            });
+        }
+        paste_with_controller(&self.controller)
     }
 
     /// Shows the user that a technician connected: the banner when company
@@ -506,7 +536,7 @@ impl LocalInput {
             }
         }
         *self.files.lock().unwrap_or_else(|e| e.into_inner()) = Some(
-            meshrmm_file_transfer::TransferSession::agent(paste_shortcut(&self.controller)),
+            meshrmm_file_transfer::TransferSession::agent(self.paste_shortcut()),
         );
         match ui::SessionIndicator::show(
             &session.viewer_name,
