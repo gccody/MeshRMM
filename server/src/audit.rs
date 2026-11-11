@@ -104,6 +104,13 @@ impl<'a> Target<'a> {
         }
     }
 
+    pub fn deployment_token(id: &'a str) -> Self {
+        Self {
+            kind: "deployment_token",
+            id,
+        }
+    }
+
     pub fn toolbox_script(id: &'a str) -> Self {
         Self {
             kind: "toolbox_script",

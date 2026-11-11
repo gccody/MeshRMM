@@ -546,6 +546,40 @@ CREATE TABLE agent_install_tokens (
 
 CREATE INDEX idx_agent_install_tokens_expiry ON agent_install_tokens (expires_at);
 
+-- Reusable enrollment credentials for mass deployment: every device that
+-- redeems one joins its company. Only the token's hash is kept.
+CREATE TABLE deployment_tokens (
+  id TEXT NOT NULL PRIMARY KEY,
+  name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 80),
+  token_hash TEXT NOT NULL UNIQUE CHECK (length(token_hash) = 64),
+  company_id TEXT NOT NULL REFERENCES companies (id) ON DELETE CASCADE,
+  created_by_user_id TEXT NOT NULL,
+  created_at BIGINT NOT NULL,
+  expires_at BIGINT NOT NULL,
+  -- NULL for no limit.
+  max_uses BIGINT CHECK (max_uses IS NULL OR max_uses > 0),
+  uses BIGINT NOT NULL DEFAULT 0 CHECK (uses >= 0),
+  last_used_at BIGINT,
+  revoked_at BIGINT
+);
+
+CREATE INDEX idx_deployment_tokens_expiry ON deployment_tokens (expires_at);
+CREATE INDEX idx_deployment_tokens_company ON deployment_tokens (company_id);
+
+-- The devices a deployment token enrolled, kept as long as an interrupted
+-- install may redeem it again for the same device.
+CREATE TABLE deployment_token_enrollments (
+  token_id TEXT NOT NULL REFERENCES deployment_tokens (id) ON DELETE CASCADE,
+  redemption_key_hash TEXT NOT NULL CHECK (length(redemption_key_hash) = 64),
+  computer_name TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  created_at BIGINT NOT NULL,
+  recoverable_until BIGINT NOT NULL,
+  PRIMARY KEY (token_id, redemption_key_hash)
+);
+
+CREATE INDEX idx_deployment_token_enrollments_recoverable ON deployment_token_enrollments (recoverable_until);
+
 CREATE TABLE remote_handoffs (
   token_hash TEXT NOT NULL PRIMARY KEY CHECK (length(token_hash) = 64),
   device_id TEXT NOT NULL,

@@ -17,9 +17,10 @@ use crate::{
     db::{
         self, Database,
         tables::{
-            AgentInstallTokens, Agents, Alerts, ApiTokens, DeviceApplicationChanges, DeviceMetrics,
-            FileDeliveries, Invitations, JobDevices, Jobs, PasswordResets, RemoteHandoffs,
-            RemoteSessions, ScriptRuns, ToolboxFiles, UpdateRuns, UserSessions, WakeRequests,
+            AgentInstallTokens, Agents, Alerts, ApiTokens, DeploymentTokenEnrollments,
+            DeploymentTokens, DeviceApplicationChanges, DeviceMetrics, FileDeliveries, Invitations,
+            JobDevices, Jobs, PasswordResets, RemoteHandoffs, RemoteSessions, ScriptRuns,
+            ToolboxFiles, UpdateRuns, UserSessions, WakeRequests,
         },
     },
     realtime::metrics::HISTORY_MS,
@@ -95,7 +96,9 @@ pub fn spawn(database: Database, storage: Storage) -> tokio::task::JoinHandle<()
 
 /// Deletes tokens and sessions that expired more than [`EXPIRED_GRACE_MS`]
 /// before `now_ms` (API tokens [`crate::api_tokens::EXPIRED_RETENTION_MS`]
-/// before, as their users still see them listed until then), toolbox history older than [`TOOLBOX_HISTORY_MS`], and
+/// before, as their users still see them listed until then, and deployment
+/// tokens [`crate::api::DEPLOYMENT_TOKEN_RETENTION_MS`] before, revoked or
+/// not, for the same reason), toolbox history older than [`TOOLBOX_HISTORY_MS`], and
 /// devices' resource usage older than [`HISTORY_MS`], and alerts resolved
 /// more than [`RESOLVED_RETENTION_MS`] ago, and application changes older
 /// than [`CHANGES_RETENTION_MS`], and jobs (with their devices) and wake
@@ -145,7 +148,7 @@ pub fn batch_statements(now_ms: i64) -> Vec<(String, DeleteStatement)> {
 
 /// Every table's due rows, in groups purged in order; a failure skips the
 /// rest of its group.
-fn due(now_ms: i64, batch_rows: u64) -> [Vec<Due>; 15] {
+fn due(now_ms: i64, batch_rows: u64) -> [Vec<Due>; 16] {
     let expired = now_ms - EXPIRED_GRACE_MS;
     let history = now_ms - TOOLBOX_HISTORY_MS;
     // Script runs hold up to a megabyte of output each, and installs have
@@ -192,6 +195,30 @@ fn due(now_ms: i64, batch_rows: u64) -> [Vec<Due>; 15] {
             expired,
             batch_rows,
         )],
+        // A token's enrollments go with it; those past their recovery
+        // window go first.
+        vec![
+            Due {
+                key: vec![
+                    DeploymentTokenEnrollments::TokenId.into_iden(),
+                    DeploymentTokenEnrollments::RedemptionKeyHash.into_iden(),
+                ],
+                ..Due::before(
+                    DeploymentTokenEnrollments::Table,
+                    DeploymentTokenEnrollments::TokenId,
+                    DeploymentTokenEnrollments::RecoverableUntil,
+                    expired,
+                    batch_rows,
+                )
+            },
+            Due::before(
+                DeploymentTokens::Table,
+                DeploymentTokens::Id,
+                DeploymentTokens::ExpiresAt,
+                now_ms - crate::api::DEPLOYMENT_TOKEN_RETENTION_MS,
+                batch_rows,
+            ),
+        ],
         vec![Due::before(
             RemoteHandoffs::Table,
             RemoteHandoffs::TokenHash,

@@ -86,6 +86,9 @@ enough:
   users and signing them out (`POST /v1/users/{id}/sign-out`) work;
 - creating, changing and deleting roles (`POST /v1/roles`, `PATCH` and
   `DELETE /v1/roles/{id}`); listing roles and permissions works;
+- making and revoking [deployment tokens](devices.md#deployment-tokens)
+  (`POST /v1/deployment-tokens`, `DELETE /v1/deployment-tokens/{id}`), which
+  enroll devices until they expire; listing them works;
 - the website's event socket (`/v1/events`), terminals, and starting remote
   sessions (`/v1/remote/handoffs`), which belong to a person at a browser.
 
@@ -205,6 +208,16 @@ whether its Agent is `connected`, its company, tags and a summary of its
 hardware (`system`: operating system, model, serial number, IP addresses),
 plus `companies` and `tags` to resolve their IDs. A device's ID
 is the `id` other routes take as `{id}` and `device_ids`.
+
+### Enrollment
+
+| Route | |
+|---|---|
+| `POST /v1/agent-installers` | `devices.enroll`. `{platform, company_id}`: a single-use installer authorization (`{server, install_token, expires_at_unix_ms}`) that enrolls one computer within 30 minutes. |
+| `GET /v1/deployment-tokens` | `devices.enroll`. Every [deployment token](devices.md#deployment-tokens), newest first: `id`, `name`, `company_id`, `company_name`, `created_by` (`{id, email}`, `email` `null` once the user is deleted), `created_at`, `expires_at`, `max_uses` (`null` for no limit), `uses`, `last_used_at`, `revoked_at` and `state` (`active`, `expired`, `revoked` or `exhausted`). Never the secret. Revoked and expired tokens stay listed until 30 days after they expire. |
+| `POST /v1/deployment-tokens` | Website only, `devices.enroll`. `{name, company_id, expires_in_days, max_uses}`: `name` 1 to 80 characters; `company_id` required; `expires_in_days` 1 to 365, 30 when missing; `max_uses` 1 to 1,000,000, missing or `null` for no limit. `201` with `token` (as listed) and `bootstrap` (`{server, install_token, expires_at_unix_ms}`, what the installers embed), the only time the secret is shown. `404` for an unknown company. |
+| `DELETE /v1/deployment-tokens/{id}` | Website only, `devices.enroll`. Revokes the token; `204` again for one already revoked. |
+| `POST /v1/agent-installers/redeem` | For the Agent's installer, with the installer authorization or deployment token as its bearer token. Every refusal is `401 installer_rejected`, whichever it was and whyever, and counts against the same per-address limit as other one-time tokens (`429` past it). |
 
 ### System information
 

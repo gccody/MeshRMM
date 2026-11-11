@@ -626,6 +626,16 @@ const PURGE_INDEXES: &[(&str, &str, &[&str])] = &[
         &["idx_agent_install_tokens_expiry"],
     ),
     (
+        "deployment_token_enrollments",
+        "the purge of deployment token enrollments past recovery",
+        &["idx_deployment_token_enrollments_recoverable"],
+    ),
+    (
+        "deployment_tokens",
+        "the purge of long-expired deployment tokens",
+        &["idx_deployment_tokens_expiry"],
+    ),
+    (
         "remote_handoffs",
         "the purge of expired remote handoffs",
         &["idx_remote_handoffs_expiry"],

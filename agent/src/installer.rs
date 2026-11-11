@@ -35,6 +35,34 @@ const CONFIG_LENGTH_BYTES: usize = 8;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 
+/// How the installer was started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Invocation {
+    /// Opened by a person: ask for administrator approval, then install.
+    Elevate,
+    /// Approved: install, and tell the person how it went.
+    Interactive,
+    /// Run unattended by Group Policy, an MDM or a script, already elevated:
+    /// install with no window, report through the exit code and standard
+    /// error, and leave an Agent already installed alone.
+    Quiet,
+}
+
+impl Invocation {
+    pub fn of(arguments: &[OsString]) -> Option<Self> {
+        let arguments = arguments
+            .iter()
+            .map(|argument| argument.to_str())
+            .collect::<Option<Vec<_>>>()?;
+        match arguments.as_slice() {
+            [] => Some(Self::Elevate),
+            ["--install"] => Some(Self::Interactive),
+            ["--quiet"] | ["--install", "--quiet"] | ["--quiet", "--install"] => Some(Self::Quiet),
+            _ => None,
+        }
+    }
+}
+
 pub fn launch_if_embedded() -> anyhow::Result<bool> {
     let executable = std::env::current_exe().context("could not locate the Agent installer")?;
     let bytes = std::fs::read(&executable).context("could not read the Agent installer")?;
@@ -64,8 +92,26 @@ pub fn launch_if_embedded() -> anyhow::Result<bool> {
     Ok(true)
 }
 
+/// [`Invocation::Quiet`]: the outcome goes to standard output, or the
+/// error to standard error with exit code 1.
+pub fn install_quietly() -> anyhow::Result<()> {
+    match install(true)? {
+        Installed::Already => println!("The MeshRMM Agent is already installed; nothing changed."),
+        Installed::Now(notice) => {
+            println!("MeshRMM Agent installed. The {SERVICE_NAME} service is running.");
+            if let Some(notice) = notice {
+                println!("{notice}");
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn install_and_notify() -> anyhow::Result<()> {
-    match install() {
+    match install(false).map(|installed| match installed {
+        Installed::Now(notice) => notice,
+        Installed::Already => None,
+    }) {
         Ok(notice) => {
             let mut text = String::from(
                 "MeshRMM Agent installed successfully. The LocalSystem service is running. You can now delete the downloaded installer.",
@@ -166,13 +212,22 @@ fn remove_agent() -> anyhow::Result<()> {
     remove_legacy_directories()
 }
 
-/// Installs or repairs the Agent, returning a notice for the user when legacy state was skipped.
-fn install() -> anyhow::Result<Option<String>> {
+enum Installed {
+    /// Installed or repaired, with a notice for the user when legacy state was skipped.
+    Now(Option<String>),
+    /// Left alone: `keep_installed` and the Agent is installed and enrolled.
+    Already,
+}
+
+/// Installs or repairs the Agent. With `keep_installed`, an Agent that is installed and
+/// enrolled is left as it is, so a deployment that runs the installer again on every startup
+/// neither replaces a newer Agent the updater installed with its own nor needs its enrollment
+/// to still be valid.
+fn install(keep_installed: bool) -> anyhow::Result<Installed> {
     let source_path = std::env::current_exe().context("could not locate the Agent installer")?;
     let source_bytes = std::fs::read(&source_path).context("could not read the Agent installer")?;
     let embedded = parse_embedded(&source_bytes)?
         .context("this executable does not contain a MeshRMM Agent enrollment")?;
-    let bootstrap = enrollment::validate_bootstrap(embedded.bootstrap)?;
 
     let manager = ServiceManager::local_computer(
         None::<&str>,
@@ -193,6 +248,11 @@ fn install() -> anyhow::Result<Option<String>> {
     let install_directory = program_files.join("MeshRMM").join("Agent");
     let data_root = program_data.join("MeshRMM");
     let config_directory = data_root.join("Agent");
+    if keep_installed && existing_service.is_some() && config_directory.join("agent.json").is_file()
+    {
+        return Ok(Installed::Already);
+    }
+    let bootstrap = enrollment::validate_bootstrap(embedded.bootstrap)?;
     std::fs::create_dir_all(&install_directory)
         .with_context(|| format!("failed to create {}", install_directory.display()))?;
     // The credential and the SYSTEM update helper live here, and standard users may create
@@ -273,7 +333,7 @@ fn install() -> anyhow::Result<Option<String>> {
             .context("failed to unregister the legacy Agent service")?;
         remove_legacy_directories()?;
     }
-    Ok(notice)
+    Ok(Installed::Now(notice))
 }
 
 /// Reads the configuration a repair keeps, with a notice for the user when legacy state is skipped.
@@ -731,6 +791,33 @@ mod tests {
         assert_eq!(parsed.bootstrap, config);
         let bootstrap = crate::enrollment::validate_bootstrap(parsed.bootstrap).unwrap();
         assert_eq!(bootstrap.server, "https://example.com");
+    }
+
+    #[test]
+    fn recognizes_how_the_installer_was_started() {
+        let of = |arguments: &[&str]| {
+            Invocation::of(&arguments.iter().map(OsString::from).collect::<Vec<_>>())
+        };
+        assert_eq!(of(&[]), Some(Invocation::Elevate));
+        assert_eq!(of(&["--install"]), Some(Invocation::Interactive));
+        for quiet in [
+            &["--quiet"][..],
+            &["--install", "--quiet"],
+            &["--quiet", "--install"],
+        ] {
+            assert_eq!(of(quiet), Some(Invocation::Quiet), "{quiet:?}");
+        }
+        for other in [
+            &["--service"][..],
+            &["--install", "--install"],
+            &["--quiet", "--quiet"],
+            &["/quiet"],
+            &["--install", "--quiet", "--config"],
+        ] {
+            assert_eq!(of(other), None, "{other:?}");
+        }
+        let not_unicode = OsString::from_wide(&[0xD800]);
+        assert_eq!(Invocation::of(&[not_unicode]), None);
     }
 
     #[test]

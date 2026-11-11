@@ -10,7 +10,7 @@ use sea_query::{Expr, ExprTrait, Query};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{companies, limit_token_attempts};
+use super::{companies, deployment_tokens, limit_token_attempts};
 use crate::{
     agents::{self, bearer_token, enrollment_token, hashes_match},
     audit::{self, Actor, Target},
@@ -48,9 +48,9 @@ pub struct InstallerRequest {
 /// What the website embeds in the installer it downloads.
 #[derive(Debug, Serialize)]
 pub struct InstallerBootstrap {
-    server: String,
-    install_token: String,
-    expires_at_unix_ms: i64,
+    pub(super) server: String,
+    pub(super) install_token: String,
+    pub(super) expires_at_unix_ms: i64,
 }
 
 /// `POST /v1/agent-installers`: issues an installer token for one device.
@@ -150,6 +150,44 @@ struct ClaimRow {
     company_id: Option<String>,
 }
 
+/// The device a redemption enrolls or recovers, and what it redeemed.
+struct Claim {
+    device_id: String,
+    created_by_user_id: String,
+    company_id: Option<String>,
+    source: Source,
+}
+
+enum Source {
+    Installer { id: String },
+    DeploymentToken { id: String, name: String },
+}
+
+impl From<ClaimRow> for Claim {
+    fn from(row: ClaimRow) -> Self {
+        Self {
+            device_id: row.device_id,
+            created_by_user_id: row.created_by_user_id,
+            company_id: row.company_id,
+            source: Source::Installer { id: row.id },
+        }
+    }
+}
+
+impl From<deployment_tokens::Claim> for Claim {
+    fn from(claim: deployment_tokens::Claim) -> Self {
+        Self {
+            device_id: claim.device_id,
+            created_by_user_id: claim.created_by_user_id,
+            company_id: Some(claim.company_id),
+            source: Source::DeploymentToken {
+                id: claim.token_id,
+                name: claim.token_name,
+            },
+        }
+    }
+}
+
 #[derive(sqlx::FromRow)]
 struct ExistingAgent {
     auth_token_hash: String,
@@ -169,6 +207,11 @@ fn rejected() -> ApiError {
 /// installer for the computer and enrolls a device; redeeming again with the
 /// same name and redemption key, until the installer expires, returns the
 /// same credential.
+///
+/// The bearer token may instead be a deployment token, which enrolls a
+/// device into its company for each computer that redeems it; see
+/// [`deployment_tokens::claim`]. Every refusal, whichever token it was and
+/// whyever, gets the same answer.
 pub async fn redeem(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
@@ -194,7 +237,16 @@ pub async fn redeem(
     let key_hash = token_hash(&request.redemption_key);
     let now = now_ms();
     let mut transaction = state.database.begin().await?;
-    let claim = claim_installer(&mut transaction, &installer_hash, &key_hash, &name, now).await?;
+    let claim: Claim =
+        match claim_installer(&mut transaction, &installer_hash, &key_hash, &name, now).await? {
+            Some(claim) => claim.into(),
+            None => {
+                deployment_tokens::claim(&mut transaction, &installer_hash, &key_hash, &name, now)
+                    .await?
+                    .ok_or_else(rejected)?
+                    .into()
+            }
+        };
     let agent_token = enrollment_token(&install_token, &request.redemption_key);
     let agent_token_hash = token_hash(&agent_token);
     let recovered = enroll_device(
@@ -206,23 +258,37 @@ pub async fn redeem(
         now,
     )
     .await?;
+    let (label, action, mut metadata) = match &claim.source {
+        Source::Installer { id } => (
+            "Agent installer",
+            "agent_installer.redeem",
+            json!({ "installer_id": id }),
+        ),
+        Source::DeploymentToken { id, name } => (
+            "Deployment token",
+            "deployment_token.redeem",
+            json!({
+                "deployment_token_id": id,
+                "deployment_token_name": name,
+                "company_id": claim.company_id,
+            }),
+        ),
+    };
+    metadata["issued_by_user_id"] = json!(claim.created_by_user_id);
+    metadata["name"] = json!(name);
+    metadata["platform"] = json!(request.platform);
+    metadata["recovered"] = json!(recovered);
     audit::record(
         &mut transaction,
         &Actor {
             user_id: None,
-            label: "Agent installer".to_owned(),
+            label: label.to_owned(),
             ip: Some(ip),
             api_token: None,
         },
-        "agent_installer.redeem",
+        action,
         Target::device(&claim.device_id),
-        json!({
-            "installer_id": claim.id,
-            "issued_by_user_id": claim.created_by_user_id,
-            "name": name,
-            "platform": request.platform,
-            "recovered": recovered,
-        }),
+        metadata,
     )
     .await?;
     transaction.commit().await?;
@@ -244,14 +310,14 @@ pub async fn redeem(
 }
 
 /// Claims the installer for this computer, or finds the claim this computer
-/// made earlier.
+/// made earlier. `None` when no live installer has this hash and key.
 async fn claim_installer(
     executor: &mut impl Executor,
     installer_hash: &str,
     key_hash: &str,
     name: &str,
     now: i64,
-) -> Result<ClaimRow, ApiError> {
+) -> Result<Option<ClaimRow>, ApiError> {
     executor
         .execute(
             &Query::update()
@@ -267,7 +333,7 @@ async fn claim_installer(
         )
         .await?;
     // Claimed by this request just now, or earlier by this computer.
-    let claim: ClaimRow = executor
+    Ok(executor
         .fetch_optional(
             &Query::select()
                 .columns([
@@ -283,16 +349,14 @@ async fn claim_installer(
                 .and_where(Expr::col(AgentInstallTokens::ComputerName).eq(name))
                 .to_owned(),
         )
-        .await?
-        .ok_or_else(rejected)?;
-    Ok(claim)
+        .await?)
 }
 
 /// Adds the claimed device, or confirms the installer's credential still
 /// belongs to it. Returns whether the device already existed.
 async fn enroll_device(
     executor: &mut impl Executor,
-    claim: &ClaimRow,
+    claim: &Claim,
     name: &str,
     platform: DevicePlatform,
     agent_token_hash: &str,

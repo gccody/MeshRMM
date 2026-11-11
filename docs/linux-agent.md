@@ -115,6 +115,19 @@ Running the command on an enrolled computer repairs the install and keeps
 its device identity. `sudo /opt/meshrmm/meshrmm-agent --uninstall` removes
 everything.
 
+To install on many computers, make a
+[deployment token](devices.md#deployment-tokens). Its command is the same,
+carrying the token instead of a one-time authorization, and runs as root
+without `sudo`, for configuration management or a script run as root:
+
+```sh
+curl -fsSL https://rmm.example.com/install-agent-linux.sh | sh -s -- https://rmm.example.com <authorization>
+```
+
+Every computer that runs it joins the token's company until the token
+expires, is revoked or reaches its limit. The script exits non-zero with the
+reason when enrollment fails.
+
 ## Processes
 
 - systemd runs the **root coordinator**, which keeps the signaling

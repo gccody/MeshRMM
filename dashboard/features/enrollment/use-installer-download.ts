@@ -4,14 +4,10 @@ import { type AuthorizedFetch, errorMessage } from "../../lib/http";
 import {
   type AgentInstallerBootstrap,
   type AgentPlatform,
-  INSTALLER_ASSETS,
+  downloadEnrolledInstaller,
   isWindowsPlatform,
-  enrolledInstaller,
   linuxInstallCommand,
   macInstallCommand,
-  publishedChecksum,
-  sha256Hex,
-  UPDATE_MANIFEST,
 } from "./installer";
 
 // Authorizes a one-time enrollment. For Windows it verifies the published
@@ -69,31 +65,7 @@ export function useInstallerDownload(authorizedFetch: AuthorizedFetch) {
         setDownloaded(true);
         return;
       }
-      const asset = INSTALLER_ASSETS[platform];
-      const [binaryResponse, manifestResponse] = await Promise.all([
-        fetch(asset.binary, { cache: "no-store" }),
-        fetch(UPDATE_MANIFEST, { cache: "no-store" }),
-      ]);
-      if (!binaryResponse.ok || !manifestResponse.ok) {
-        throw new Error("The selected Agent installer has not been published yet.");
-      }
-      const binary = await binaryResponse.arrayBuffer();
-      const expectedChecksum = publishedChecksum(await manifestResponse.json(), asset.target);
-      if (!expectedChecksum) {
-        throw new Error("The published Agent installer checksum is invalid.");
-      }
-      if ((await sha256Hex(binary)) !== expectedChecksum) {
-        throw new Error("The Agent installer failed its SHA-256 integrity check.");
-      }
-
-      const downloadUrl = URL.createObjectURL(enrolledInstaller(binary, bootstrap));
-      const link = document.createElement("a");
-      link.href = downloadUrl;
-      link.download = asset.fileName;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      window.setTimeout(() => URL.revokeObjectURL(downloadUrl), 1_000);
+      await downloadEnrolledInstaller(platform, bootstrap);
       setDownloaded(true);
     } catch (downloadError) {
       setError(downloadError instanceof Error ? downloadError.message : "The Agent installer could not be created.");

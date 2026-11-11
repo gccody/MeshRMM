@@ -7,6 +7,7 @@ mod applications;
 mod audit_log;
 mod automation;
 mod companies;
+mod deployment_tokens;
 mod devices;
 mod enrollment;
 mod events;
@@ -48,6 +49,7 @@ use axum::{
 use serde::Serialize;
 use tower_http::set_header::SetResponseHeaderLayer;
 
+pub use self::deployment_tokens::EXPIRED_RETENTION_MS as DEPLOYMENT_TOKEN_RETENTION_MS;
 pub use self::password_resets::create_reset;
 pub(crate) use self::users::ensure_administrator_remains;
 use crate::{
@@ -259,6 +261,17 @@ fn device_routes() -> Router<AppState> {
     Router::new()
         .route("/agent-installers", post(enrollment::create))
         .route("/agent-installers/redeem", post(enrollment::redeem))
+        // A deployment token enrolls devices until it expires, so only the
+        // website makes and revokes them; tokens may read the list, which
+        // holds no secrets.
+        .route(
+            "/deployment-tokens",
+            get(deployment_tokens::list).merge(website_only_route(post(deployment_tokens::create))),
+        )
+        .route(
+            "/deployment-tokens/{id}",
+            website_only_route(delete(deployment_tokens::revoke)),
+        )
         .route("/events", website_only_route(get(events::subscribe)))
         .route("/agents", get(devices::list))
         .route("/agents/{id}", delete(devices::delete))

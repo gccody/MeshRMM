@@ -1,7 +1,9 @@
 
 import { type FormEventHandler, type RefObject, useState } from "react";
 import { Check, Copy, Download, LoaderCircle, Terminal, X } from "lucide-react";
+import { Link } from "react-router";
 import { ModalDialog } from "../../lib/modal-dialog";
+import { VIEW_PATHS } from "../workspace/views";
 import type { Company } from "../agents/types";
 import { type AgentPlatform, isWindowsPlatform } from "./installer";
 
@@ -85,6 +87,7 @@ export function EnrollmentModal({
             : isDownloading ? "Preparing installer..." : downloaded ? "Download another installer" : "Download installer"}
         </button>
         <p className="installer-secret-note">{NOTES[platform]}</p>
+        <p className="field-help">Installing on many computers through Group Policy, an MDM or a script? <Link to={VIEW_PATHS.deployment}>Create a deployment token</Link> instead.</p>
       </form>
     </ModalDialog>
   );

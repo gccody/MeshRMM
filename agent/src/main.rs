@@ -235,11 +235,13 @@ async fn run_agent() -> anyhow::Result<()> {
     #[cfg(windows)]
     {
         let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
-        if arguments.len() == 1 && arguments[0] == "--install" {
-            return installer::install_and_notify();
-        }
-        if arguments.is_empty() && installer::launch_if_embedded()? {
-            return Ok(());
+        match installer::Invocation::of(&arguments) {
+            Some(installer::Invocation::Interactive) => return installer::install_and_notify(),
+            Some(installer::Invocation::Quiet) => return installer::install_quietly(),
+            Some(installer::Invocation::Elevate) if installer::launch_if_embedded()? => {
+                return Ok(());
+            }
+            _ => {}
         }
     }
 
