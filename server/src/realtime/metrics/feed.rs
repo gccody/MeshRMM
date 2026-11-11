@@ -1,60 +1,74 @@
-//! The readings every website event socket sends, scanned and serialised
-//! once for all of them.
+//! The readings website event sockets send: only those of the devices each
+//! socket watches.
 //!
-//! While any socket listens, one task wakes every [`FEED_INTERVAL`], takes
-//! the latest reading of each device that reported since its last scan (one
-//! scan, under the lock Agents' reports take, however many sockets listen),
-//! serialises them once outside that lock, and broadcasts the tick. The
-//! first socket to subscribe starts the task, and it stops at the first tick
-//! after the last one goes.
+//! Each socket says which devices' live readings its tab shows
+//! ([`Subscription::watch`]); the fleet-wide count of sockets watching each
+//! device is the [`Watched`] registry. While any socket is subscribed, one
+//! task wakes every [`FEED_INTERVAL`] and takes the latest reading of each
+//! watched device that reported since its last scan: one scan, under the
+//! lock Agents' reports take, of the watched devices or of the fleet,
+//! whichever is fewer. It broadcasts them as the tick. A socket sends the
+//! tick's readings of the devices it watches, looked up from whichever of
+//! the two is smaller, so what a socket costs a tick grows with what it
+//! watches, not with the fleet. Each reading's JSON is made once, by the
+//! first socket that sends it, and every other socket sends the same bytes
+//! within its own message. The first socket to subscribe starts the task,
+//! and it stops at the first tick after the last one goes.
 //!
-//! A socket that opens, asks for a new snapshot, or falls behind first sends
-//! the full set: every online device's latest reading. Sockets that ask
-//! before the next tick share one full set. Then it forwards the ticks.
+//! A socket that starts watching a device sends the device's latest reading
+//! at once, without waiting for the tick; one that asks for a new snapshot
+//! or falls behind sends every watched device's latest again.
 //!
-//! Readings are numbered in the order they are recorded. A tick holds the
-//! readings numbered after its `from`, up to and including its `to`, and
-//! each tick starts where the one before it ended. A full set holds the
-//! readings up to its `sequence`. The hand-over keeps this invariant: the
-//! first tick a socket receives after a full set starts at or before the
-//! full set's sequence, so no reading falls between them; and of that tick,
-//! the socket sends only the readings numbered after it, so none is sent
-//! twice. It holds because a socket subscribes before it takes its full set,
-//! and a full set is shared only while it is no older than the start of the
-//! next tick.
-use std::sync::{
-    Arc, Mutex, PoisonError,
-    atomic::{AtomicU64, Ordering},
+//! Readings are numbered in the order they are recorded, and a socket keeps
+//! the number of the last reading it sent for each device it watches, so it
+//! never sends a device's reading twice, but when it starts over, or one
+//! older than it sent. Nor does
+//! it miss one: a device is counted as watched before its latest reading is
+//! taken, so any newer reading is in a tick scanned after that, and the
+//! socket subscribed to the ticks before it watched anything.
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        Arc, Mutex, OnceLock, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use axum::extract::ws::Utf8Bytes;
 use meshrmm_protocol_types::METRICS_INTERVAL_SECONDS;
-use serde::Serialize;
 use tokio::{
     sync::broadcast::{self, error::RecvError},
     time::{Duration, Instant, MissedTickBehavior},
 };
 
-use super::{Metrics, Reading};
+use super::{
+    Metrics, Reading,
+    watched::{WatchSet, Watched},
+};
 
 /// How often new readings are sent: as often as Agents report.
 pub const FEED_INTERVAL: Duration = Duration::from_secs(METRICS_INTERVAL_SECONDS);
-/// Ticks a socket may fall behind by before it gets the full set again.
+/// The most devices one socket watches: more than a wall of the smallest
+/// tiles shows on a 4K screen at half zoom (about 30 columns by 15 rows,
+/// with the rows drawn either side). A watch message naming more watches
+/// the first this many and ignores the rest.
+pub const MAX_WATCHED: usize = 500;
+/// Ticks a socket may fall behind by before it sends every watched device's
+/// latest reading again.
 const BACKLOG: usize = 4;
 
-/// What the website's event socket sends about devices' resource usage.
-#[derive(Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum MetricsEvent<'a> {
-    Metrics { readings: Vec<&'a Reading> },
+/// One reading in a tick, and its JSON once a socket asked for it.
+#[derive(Debug)]
+struct Item {
+    reading: Reading,
+    json: OnceLock<Box<str>>,
 }
 
-fn serialize<'a>(readings: impl IntoIterator<Item = &'a Reading>) -> Utf8Bytes {
-    serde_json::to_string(&MetricsEvent::Metrics {
-        readings: readings.into_iter().collect(),
-    })
-    .expect("metrics events serialize")
-    .into()
+/// The latest reading of each watched device that reported in a tick, by
+/// device.
+#[derive(Debug)]
+struct Tick {
+    readings: HashMap<String, Item>,
 }
 
 #[derive(Debug, Default)]
@@ -69,52 +83,52 @@ struct State {
     ticks: Option<broadcast::Sender<Arc<Tick>>>,
     /// Where the next tick starts.
     from: u64,
-    /// The latest full set, while it is no older than `from`.
-    full: Option<Arc<Full>>,
-}
-
-/// The latest reading of each device that reported after `from`, up to and
-/// including `to`, and their JSON.
-#[derive(Debug)]
-struct Tick {
-    from: u64,
-    to: u64,
-    readings: Vec<Reading>,
-    json: Utf8Bytes,
-}
-
-/// Every online device's latest reading up to `sequence`, as JSON; none
-/// when no device has one.
-#[derive(Debug)]
-struct Full {
-    sequence: u64,
-    json: Option<Utf8Bytes>,
 }
 
 #[derive(Debug, Default)]
 struct Counters {
     scans: AtomicU64,
     ticks: AtomicU64,
-    full_sets: AtomicU64,
-    hand_overs: AtomicU64,
+    serialized: AtomicU64,
+    sent: AtomicU64,
 }
 
 /// The work the feed did, for tests.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FeedWork {
-    /// Scans for new readings: one a tick while any socket listens.
+    /// Scans for new readings of watched devices: one a tick while any
+    /// socket is subscribed.
     pub scans: u64,
-    /// Ticks broadcast, each serialised once.
+    /// Ticks broadcast: those that found a new reading.
     pub ticks: u64,
-    /// Full sets built, each a scan of every device and serialised once.
-    pub full_sets: u64,
-    /// Ticks serialised again for one socket, without the readings its full
-    /// set already had: at most once after each full set.
-    pub hand_overs: u64,
+    /// Readings serialised: each tick's once however many sockets send it,
+    /// and each sent when a socket starts watching its device or starts
+    /// over.
+    pub serialized: u64,
+    /// Readings sent, counting each socket's copy.
+    pub sent: u64,
 }
 
-fn count(counter: &AtomicU64) {
-    counter.fetch_add(1, Ordering::Relaxed);
+fn count(counter: &AtomicU64, by: usize) {
+    counter.fetch_add(by as u64, Ordering::Relaxed);
+}
+
+/// A metrics message of readings already serialised:
+/// `{"type":"metrics","readings":[...]}`.
+fn message<'a>(readings: impl IntoIterator<Item = &'a str>) -> Utf8Bytes {
+    let mut json = String::from(r#"{"type":"metrics","readings":["#);
+    for (n, reading) in readings.into_iter().enumerate() {
+        if n > 0 {
+            json.push(',');
+        }
+        json.push_str(reading);
+    }
+    json.push_str("]}");
+    json.into()
+}
+
+fn serialize(reading: &Reading) -> String {
+    serde_json::to_string(reading).expect("readings serialize")
 }
 
 impl Metrics {
@@ -126,8 +140,8 @@ impl Metrics {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Readings for an event socket: every online device's latest, then
-    /// each newer one about every [`FEED_INTERVAL`].
+    /// Readings for an event socket, of the devices it watches: none until
+    /// it watches some.
     pub fn subscribe(&self) -> Subscription {
         let mut feed = self.feed();
         let ticks = match &feed.ticks {
@@ -144,8 +158,13 @@ impl Metrics {
         Subscription {
             metrics: self.clone(),
             ticks,
-            sent: None,
+            watching: WatchSet::new(self.watched().clone()),
         }
+    }
+
+    /// The fleet's watched devices.
+    pub fn watched(&self) -> &Watched {
+        &self.watched
     }
 
     /// The work the feed did so far.
@@ -154,13 +173,13 @@ impl Metrics {
         FeedWork {
             scans: work.scans.load(Ordering::Relaxed),
             ticks: work.ticks.load(Ordering::Relaxed),
-            full_sets: work.full_sets.load(Ordering::Relaxed),
-            hand_overs: work.hand_overs.load(Ordering::Relaxed),
+            serialized: work.serialized.load(Ordering::Relaxed),
+            sent: work.sent.load(Ordering::Relaxed),
         }
     }
 
-    /// Broadcasts the new readings every [`FEED_INTERVAL`] from `first` until
-    /// no socket listens.
+    /// Broadcasts the watched devices' new readings every [`FEED_INTERVAL`]
+    /// from `first` until no socket listens.
     async fn broadcast(self, ticks: broadcast::Sender<Arc<Tick>>, first: Instant) {
         let mut interval = tokio::time::interval_at(first, FEED_INTERVAL);
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -172,58 +191,32 @@ impl Metrics {
                 // to a task that has stopped.
                 if ticks.receiver_count() == 0 {
                     feed.ticks = None;
-                    feed.full = None;
                     return;
                 }
                 feed.from
             };
-            let (readings, to) = self.since(from);
-            count(&self.feed.work.scans);
+            let (readings, to) = self.watched_since(from);
+            count(&self.feed.work.scans, 1);
+            // The next tick starts after this one, whether or not it found
+            // anything: readings of devices nobody watched are not sent
+            // later, as a socket starting to watch sends the latest itself.
+            self.feed().from = to;
             if readings.is_empty() {
-                // The next tick starts from the same place.
                 continue;
             }
-            {
-                let mut feed = self.feed();
-                feed.from = to;
-                if feed.full.as_ref().is_some_and(|full| full.sequence < to) {
-                    feed.full = None;
-                }
-            }
-            let json = serialize(&readings);
-            count(&self.feed.work.ticks);
-            let _ = ticks.send(Arc::new(Tick {
-                from,
-                to,
-                readings,
-                json,
-            }));
+            count(&self.feed.work.ticks, 1);
+            let readings = readings
+                .into_iter()
+                .map(|reading| {
+                    let item = Item {
+                        reading,
+                        json: OnceLock::new(),
+                    };
+                    (item.reading.device_id.clone(), item)
+                })
+                .collect();
+            let _ = ticks.send(Arc::new(Tick { readings }));
         }
-    }
-
-    /// Every online device's latest reading: the one taken since the last
-    /// tick, or a new one.
-    fn full_set(&self) -> Arc<Full> {
-        if let Some(full) = &self.feed().full {
-            return Arc::clone(full);
-        }
-        let (readings, sequence) = self.since(0);
-        let full = Arc::new(Full {
-            sequence,
-            json: (!readings.is_empty()).then(|| serialize(&readings)),
-        });
-        count(&self.feed.work.full_sets);
-        let mut feed = self.feed();
-        // A tick scanned since starts after it, so it can't be shared.
-        if sequence >= feed.from
-            && feed
-                .full
-                .as_ref()
-                .is_none_or(|kept| kept.sequence < sequence)
-        {
-            feed.full = Some(Arc::clone(&full));
-        }
-        full
     }
 }
 
@@ -231,69 +224,133 @@ impl Metrics {
 pub struct Subscription {
     metrics: Metrics,
     ticks: broadcast::Receiver<Arc<Tick>>,
-    /// The readings up to this were sent; none while the full set is due.
-    sent: Option<u64>,
+    watching: WatchSet,
 }
 
 impl Subscription {
-    /// Every online device's latest reading, to send after a snapshot, or
-    /// none when no device has one; the ticks go on from it. The ticks
-    /// already waiting are covered by it, so they are dropped rather than
-    /// left to make the socket fall behind.
-    pub fn restart(&mut self) -> Option<Utf8Bytes> {
-        // Subscribed again before the full set is taken, as the hand-over
-        // needs.
-        self.ticks = self.ticks.resubscribe();
-        let full = self.metrics.full_set();
-        self.sent = Some(full.sequence);
-        full.json.clone()
+    /// Watches exactly `device_ids`, at most [`MAX_WATCHED`] of them, and
+    /// returns the latest reading of each it did not watch before, or none
+    /// when none of them has one. The caller passes only devices the socket
+    /// may see.
+    pub fn watch(&mut self, device_ids: impl IntoIterator<Item = String>) -> Option<Utf8Bytes> {
+        let device_ids: HashSet<String> = device_ids.into_iter().take(MAX_WATCHED).collect();
+        let added = self.watching.replace(device_ids);
+        self.send_latest(added.iter().map(|id| &**id))
     }
 
-    /// The next readings to send: the full set first if it wasn't, and the
-    /// full set again after falling behind. Safe to cancel: nothing is lost
-    /// by dropping it while it waits.
+    /// Keeps watching only those of its devices in `device_ids`, as those
+    /// still in the fleet.
+    pub fn retain(&mut self, device_ids: impl IntoIterator<Item = String>) {
+        let kept = device_ids
+            .into_iter()
+            .filter(|id| self.watching.sent_mut(id).is_some())
+            .collect();
+        self.watching.replace(kept);
+    }
+
+    /// Stops watching the device, as when it was deleted.
+    pub fn unwatch(&mut self, device_id: &str) {
+        self.watching.remove(device_id);
+    }
+
+    /// The devices it watches.
+    pub fn watching(&self) -> impl Iterator<Item = &str> {
+        self.watching.ids()
+    }
+
+    /// Every watched device's latest reading, to send after a snapshot, or
+    /// none when none has one; the ticks go on from it. The ticks already
+    /// waiting are covered by it, so they are dropped rather than left to
+    /// make the socket fall behind.
+    pub fn restart(&mut self) -> Option<Utf8Bytes> {
+        // Subscribed again before the readings are taken, so a newer one is
+        // in a tick it receives.
+        self.ticks = self.ticks.resubscribe();
+        // Sent again, even those already sent: a tab that missed changes may
+        // have dropped a reading of a device it thought offline.
+        for (_, sent) in self.watching.iter_mut() {
+            *sent = 0;
+        }
+        let ids: Vec<String> = self.watching.ids().map(str::to_owned).collect();
+        self.send_latest(ids.iter().map(String::as_str))
+    }
+
+    /// The latest readings of the watched `device_ids` newer than any sent.
+    fn send_latest<'a>(
+        &mut self,
+        device_ids: impl IntoIterator<Item = &'a str>,
+    ) -> Option<Utf8Bytes> {
+        let mut sent = Vec::new();
+        for reading in self.metrics.latest_readings(device_ids) {
+            if let Some(last) = self.watching.sent_mut(&reading.device_id)
+                && reading.sequence > *last
+            {
+                *last = reading.sequence;
+                sent.push(serialize(&reading));
+            }
+        }
+        if sent.is_empty() {
+            return None;
+        }
+        let work = &self.metrics.feed.work;
+        count(&work.serialized, sent.len());
+        count(&work.sent, sent.len());
+        Some(message(sent.iter().map(String::as_str)))
+    }
+
+    /// The next readings to send. Safe to cancel: nothing is lost by
+    /// dropping it while it waits.
     pub async fn next(&mut self) -> Utf8Bytes {
         loop {
-            let Some(sent) = self.sent else {
-                match self.restart() {
-                    Some(json) => return json,
-                    None => continue,
-                }
-            };
             let tick = match self.ticks.recv().await {
                 Ok(tick) => tick,
-                Err(RecvError::Lagged(_)) => {
-                    self.sent = None;
-                    continue;
-                }
+                Err(RecvError::Lagged(_)) => match self.restart() {
+                    Some(json) => return json,
+                    None => continue,
+                },
                 // The feed keeps a sender while anyone is subscribed.
                 Err(RecvError::Closed) => std::future::pending().await,
             };
-            if tick.from > sent {
-                // Readings after `sent` would be missing. The invariant rules
-                // this out; were it broken, a full set makes the socket whole.
-                self.sent = None;
-                continue;
-            }
-            if tick.to <= sent {
-                // The full set had all of it.
-                continue;
-            }
-            self.sent = Some(tick.to);
-            if tick.readings.iter().all(|reading| reading.sequence > sent) {
-                return tick.json.clone();
-            }
-            // The full set had some of it: send only the rest.
-            let mut rest = tick
-                .readings
-                .iter()
-                .filter(|reading| reading.sequence > sent)
-                .peekable();
-            if rest.peek().is_some() {
-                count(&self.metrics.feed.work.hand_overs);
-                return serialize(rest);
+            if let Some(json) = self.pick(&tick) {
+                return json;
             }
         }
+    }
+
+    /// The tick's readings of the watched devices that are newer than those
+    /// sent, looked up from the smaller of the two.
+    fn pick(&mut self, tick: &Tick) -> Option<Utf8Bytes> {
+        let mut picked: Vec<&Item> = Vec::new();
+        if tick.readings.len() <= self.watching.len() {
+            for (device_id, item) in &tick.readings {
+                if let Some(sent) = self.watching.sent_mut(device_id)
+                    && item.reading.sequence > *sent
+                {
+                    *sent = item.reading.sequence;
+                    picked.push(item);
+                }
+            }
+        } else {
+            for (device_id, sent) in self.watching.iter_mut() {
+                if let Some(item) = tick.readings.get(device_id)
+                    && item.reading.sequence > *sent
+                {
+                    *sent = item.reading.sequence;
+                    picked.push(item);
+                }
+            }
+        }
+        if picked.is_empty() {
+            return None;
+        }
+        let work = &self.metrics.feed.work;
+        count(&work.sent, picked.len());
+        Some(message(picked.into_iter().map(|item| {
+            &**item.json.get_or_init(|| {
+                count(&work.serialized, 1);
+                serialize(&item.reading).into()
+            })
+        })))
     }
 }
 
@@ -356,10 +413,16 @@ mod tests {
             .collect()
     }
 
-    /// Whether every socket sent the very same bytes.
-    fn same_bytes(sent: &[Utf8Bytes]) -> bool {
-        sent.iter()
-            .all(|json| json.as_str().as_ptr() == sent[0].as_str().as_ptr())
+    /// The socket's next message, if one is ready.
+    async fn ready(socket: &mut Subscription) -> Option<BTreeMap<String, i64>> {
+        tokio::time::timeout(Duration::ZERO, socket.next())
+            .await
+            .ok()
+            .map(|json| readings(&json))
+    }
+
+    fn ids(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
     }
 
     fn device(name: &str, at: i64) -> (String, i64) {
@@ -367,187 +430,209 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_scan_a_tick_however_many_sockets_listen_and_none_while_none_do() {
+    async fn a_socket_sends_only_the_devices_it_watches() {
         let metrics = store().await;
-        metrics.record_at("a", usage(1.0), 0);
-        tick().await;
-        tick().await;
-        assert_eq!(metrics.feed_work(), FeedWork::default(), "nobody listens");
-
-        // Sockets that open in the same tick share one full set.
-        let mut sockets = (0..10).map(|_| metrics.subscribe()).collect::<Vec<_>>();
-        let mut sent = Vec::new();
-        for socket in &mut sockets {
-            sent.push(socket.next().await);
-        }
-        assert!(same_bytes(&sent));
-        assert_eq!(readings(&sent[0]), BTreeMap::from([device("a", 0)]));
-
-        // Each tick is one scan and one serialisation, sent by every socket.
-        for round in 1..=3 {
-            let at = round * 10 * SECOND_MS;
-            metrics.record_at("a", usage(1.0), at);
-            tick().await;
-            let mut sent = Vec::new();
-            for socket in &mut sockets {
-                sent.push(socket.next().await);
-            }
-            assert!(same_bytes(&sent));
-            assert_eq!(readings(&sent[0]), BTreeMap::from([device("a", at)]));
-        }
-        // A tick without new readings scans, and sends nothing.
-        tick().await;
-        let busy = FeedWork {
-            scans: 4,
-            ticks: 3,
-            full_sets: 1,
-            hand_overs: 0,
-        };
-        assert_eq!(metrics.feed_work(), busy);
-
-        // The feed stops at the first tick after the last socket goes.
-        drop(sockets);
-        tick().await;
-        metrics.record_at("a", usage(1.0), 100 * SECOND_MS);
-        tick().await;
-        tick().await;
-        assert_eq!(metrics.feed_work(), busy);
-        assert!(metrics.feed().ticks.is_none());
-
-        // And starts again for the next.
         let mut socket = metrics.subscribe();
+        for name in ["a", "b", "c"] {
+            metrics.record_at(name, usage(1.0), 0);
+        }
+        // Watching sends the latest readings at once.
+        let sent = socket.watch(ids(&["a", "b"])).unwrap();
         assert_eq!(
-            readings(&socket.next().await),
-            BTreeMap::from([device("a", 100 * SECOND_MS)])
+            readings(&sent),
+            BTreeMap::from([device("a", 0), device("b", 0)])
         );
+        let ten = 10 * SECOND_MS;
+        for name in ["a", "b", "c"] {
+            metrics.record_at(name, usage(1.0), ten);
+        }
         tick().await;
-        assert_eq!(metrics.feed_work().scans, busy.scans + 1);
+        assert_eq!(
+            ready(&mut socket).await,
+            Some(BTreeMap::from([device("a", ten), device("b", ten)]))
+        );
+
+        // A new set: the devices it adds are sent at once, without waiting
+        // for the tick; those it keeps are not sent again, and those it
+        // drops no longer.
+        let sent = socket.watch(ids(&["b", "c"])).unwrap();
+        assert_eq!(readings(&sent), BTreeMap::from([device("c", ten)]));
+        assert_eq!(socket.watch(ids(&["b", "c"])), None, "nothing new");
+        let twenty = 20 * SECOND_MS;
+        for name in ["a", "b", "c"] {
+            metrics.record_at(name, usage(1.0), twenty);
+        }
+        tick().await;
+        assert_eq!(
+            ready(&mut socket).await,
+            Some(BTreeMap::from([device("b", twenty), device("c", twenty)]))
+        );
+
+        // Watching none sends none.
+        assert_eq!(socket.watch(Vec::new()), None);
+        metrics.record_at("b", usage(1.0), 30 * SECOND_MS);
+        tick().await;
+        assert_eq!(ready(&mut socket).await, None);
+        // A device without a reading, as one offline, is watched and sent
+        // once it reports.
+        assert_eq!(socket.watch(ids(&["d"])), None);
+        metrics.record_at("d", usage(1.0), 30 * SECOND_MS);
+        tick().await;
+        assert_eq!(
+            ready(&mut socket).await,
+            Some(BTreeMap::from([device("d", 30 * SECOND_MS)]))
+        );
     }
 
     #[tokio::test]
-    async fn a_socket_opening_mid_tick_misses_no_reading_and_repeats_none() {
+    async fn a_watch_takes_at_most_the_bound() {
         let metrics = store().await;
-        let ten = 10 * SECOND_MS;
-        let mut early = metrics.subscribe();
-        metrics.record_at("a", usage(1.0), 0);
-        metrics.record_at("b", usage(1.0), 0);
-        // This full set has a and b; the next tick has them too, and what
-        // is recorded after the full set.
-        let mut late = metrics.subscribe();
-        let mut sent = vec![readings(&late.next().await)];
-        metrics.record_at("a", usage(1.0), ten);
-        metrics.record_at("c", usage(1.0), 0);
-        tick().await;
-        // The hand-over: only what the full set lacked.
-        sent.push(readings(&late.next().await));
-        assert_eq!(metrics.feed_work().hand_overs, 1);
-        // A socket asking after the tick gets a new full set, and skips the
-        // tick that it covers.
-        let mut sent_early = vec![readings(&early.next().await)];
-        metrics.record_at("b", usage(1.0), ten);
-        tick().await;
-        let (next_early, next_late) = (early.next().await, late.next().await);
-        assert!(same_bytes(&[next_early.clone(), next_late.clone()]));
-        sent.push(readings(&next_late));
-        sent_early.push(readings(&next_early));
+        let mut socket = metrics.subscribe();
+        let many = (0..MAX_WATCHED + 50).map(|n| format!("d{n:04}"));
+        socket.watch(many);
+        assert_eq!(socket.watching().count(), MAX_WATCHED);
+        assert_eq!(metrics.watched().len(), MAX_WATCHED);
+        // The first ones are kept.
+        assert!(socket.watching().all(|id| id < "d0500"));
+    }
 
-        assert_eq!(
-            sent,
-            [
-                BTreeMap::from([device("a", 0), device("b", 0)]),
-                BTreeMap::from([device("a", ten), device("c", 0)]),
-                BTreeMap::from([device("b", ten)]),
-            ]
+    #[tokio::test]
+    async fn a_tick_costs_a_socket_what_it_watches_not_the_fleet() {
+        let metrics = store().await;
+        let fleet = (0..2_000).map(|n| format!("d{n:04}")).collect::<Vec<_>>();
+        let mut sockets = (0..10).map(|_| metrics.subscribe()).collect::<Vec<_>>();
+        for socket in &mut sockets {
+            assert_eq!(socket.watch(ids(&["d0007", "d1234"])), None);
+        }
+        tick().await;
+        assert_eq!(metrics.feed_work().ticks, 0, "nothing reported");
+
+        for device in &fleet {
+            metrics.record_at(device, usage(1.0), 0);
+        }
+        tick().await;
+        let mut sent = Vec::new();
+        for socket in &mut sockets {
+            sent.push(ready(socket).await.unwrap());
+        }
+        let expected = BTreeMap::from([device("d0007", 0), device("d1234", 0)]);
+        assert!(
+            sent.iter().all(|readings| readings == &expected),
+            "{sent:?}"
         );
-        assert_eq!(
-            sent_early,
-            [
-                BTreeMap::from([device("a", ten), device("b", 0), device("c", 0)]),
-                BTreeMap::from([device("b", ten)]),
-            ]
-        );
+        // One scan a tick, each sent reading serialised once for every
+        // socket, and none of the 1,998 readings nobody watches.
         assert_eq!(
             metrics.feed_work(),
             FeedWork {
                 scans: 2,
-                ticks: 2,
-                full_sets: 2,
-                hand_overs: 1,
+                ticks: 1,
+                serialized: 2,
+                sent: 20,
             }
         );
+
+        // The feed stops at the first tick after the last socket goes.
+        drop(sockets);
+        assert!(metrics.watched().is_empty(), "the sockets left");
+        tick().await;
+        tick().await;
+        assert_eq!(metrics.feed_work().scans, 2);
+        assert!(metrics.feed().ticks.is_none());
     }
 
     #[tokio::test]
-    async fn sockets_opening_while_devices_report_get_each_reading_once() {
+    async fn sockets_watching_while_devices_report_get_each_reading_once() {
         let metrics = store().await;
-        let mut sockets = Vec::new();
-        let mut sent: Vec<Vec<BTreeMap<String, i64>>> = Vec::new();
+        let names = (0..8).map(|n| format!("d{n}")).collect::<Vec<_>>();
+        let mut sockets: Vec<(Subscription, Vec<BTreeMap<String, i64>>)> = Vec::new();
         let mut recorded = HashSet::new();
-        for round in 0..6_i64 {
-            // Devices report, and sockets open in between, each sending its
-            // full set at once.
+        for round in 0..6_usize {
+            // Devices report, and sockets open and watch, or change what
+            // they watch, in between: each sends what it starts watching at
+            // once.
             for n in 0..8 {
-                if n % 3 == round % 3 && !recorded.is_empty() {
+                if n % 3 == round % 3 {
                     let mut socket = metrics.subscribe();
-                    sent.push(vec![readings(&socket.next().await)]);
-                    sockets.push(socket);
+                    let sent = socket.watch(names.clone()).map(|json| readings(&json));
+                    sockets.push((socket, sent.into_iter().collect()));
                 }
-                let reading = device(&format!("d{n}"), round * 10 * SECOND_MS + n);
-                metrics.record_at(&reading.0, usage(1.0), reading.1);
-                recorded.insert(reading);
+                if n % 4 == round % 4
+                    && let Some((socket, sent)) = sockets.first_mut()
+                {
+                    let half = names.iter().skip(n % 2).step_by(2).cloned();
+                    sent.extend(socket.watch(half).map(|json| readings(&json)));
+                    sent.extend(socket.watch(names.clone()).map(|json| readings(&json)));
+                }
+                let at = (round as i64) * 10 * SECOND_MS + n as i64;
+                metrics.record_at(&names[n], usage(1.0), at);
+                recorded.insert(device(&names[n], at));
             }
             tick().await;
-            for (socket, sent) in sockets.iter_mut().zip(&mut sent) {
-                sent.push(readings(&socket.next().await));
+            for (socket, sent) in &mut sockets {
+                sent.extend(ready(socket).await);
             }
         }
-        assert!(metrics.feed_work().hand_overs > 0, "some ticks straddled");
         assert_eq!(metrics.feed_work().scans, 6);
-        for sent in &sent {
-            let mut seen = HashSet::new();
+        for (_, sent) in &sockets {
             let mut newest = BTreeMap::new();
-            for reading in sent.iter().flatten() {
-                let reading = (reading.0.clone(), *reading.1);
-                assert!(recorded.contains(&reading));
-                let last = newest.entry(reading.0.clone()).or_insert(reading.1);
-                assert!(reading.1 >= *last, "{reading:?} is older than one sent");
-                *last = reading.1;
-                assert!(seen.insert(reading.clone()), "{reading:?} was sent twice");
+            for (id, at) in sent.iter().flatten() {
+                assert!(recorded.contains(&(id.clone(), *at)));
+                let last = newest.entry(id.clone()).or_insert(*at);
+                assert!(*at >= *last, "{id} at {at} is older than one sent");
+                *last = *at;
             }
             // Ending with every device's latest reading.
-            for n in 0..8 {
-                let latest = metrics.latest(&format!("d{n}")).unwrap();
+            for name in &names {
+                let latest = metrics.latest(name).unwrap();
                 assert_eq!(newest[&latest.device_id], latest.at);
             }
         }
+        // A socket that never changed its set sent each reading once: only
+        // a device dropped and watched again is sent again.
+        let (_, steady) = &sockets[1];
+        let all = steady.iter().map(BTreeMap::len).sum::<usize>();
+        let distinct = steady.iter().flatten().collect::<HashSet<_>>().len();
+        assert_eq!(all, distinct, "{steady:?}");
     }
 
     #[tokio::test]
-    async fn a_socket_that_falls_behind_gets_the_full_set_again() {
+    async fn a_socket_that_falls_behind_sends_its_devices_latest_again() {
         let metrics = store().await;
         let mut lagging = metrics.subscribe();
         let mut keeping_up = metrics.subscribe();
-        metrics.record_at("d0", usage(1.0), 0);
-        lagging.next().await;
-        keeping_up.next().await;
-        let rounds = BACKLOG as i64 + 2;
-        for round in 1..=rounds {
-            metrics.record_at(&format!("d{round}"), usage(1.0), 0);
+        let names = (0..=BACKLOG + 2)
+            .map(|n| format!("d{n}"))
+            .collect::<Vec<_>>();
+        lagging.watch(names.clone());
+        keeping_up.watch(names.clone());
+        for (round, name) in names.iter().enumerate() {
+            metrics.record_at(name, usage(1.0), round as i64);
             tick().await;
             keeping_up.next().await;
         }
-        let full = readings(&lagging.next().await);
-        assert_eq!(full.len(), rounds as usize + 1, "{full:?}");
-        assert_eq!(metrics.feed_work().full_sets, 2);
-        // Then the ticks again, shared with the socket that kept up.
+        let again = readings(&lagging.next().await);
+        assert_eq!(again.len(), names.len(), "{again:?}");
+        // Then the ticks again, alike.
         metrics.record_at("d0", usage(1.0), 10 * SECOND_MS);
         tick().await;
-        let (behind, ahead) = (lagging.next().await, keeping_up.next().await);
-        assert!(same_bytes(&[behind.clone(), ahead]));
+        assert_eq!(lagging.next().await, keeping_up.next().await);
+    }
+
+    #[tokio::test]
+    async fn starting_over_sends_every_watched_devices_latest() {
+        let metrics = store().await;
+        let mut socket = metrics.subscribe();
+        metrics.record_at("a", usage(1.0), 0);
+        metrics.record_at("b", usage(1.0), 0);
+        socket.watch(ids(&["a"]));
         assert_eq!(
-            readings(&behind),
-            BTreeMap::from([device("d0", 10 * SECOND_MS)])
+            socket.restart().map(|json| readings(&json)),
+            Some(BTreeMap::from([device("a", 0)]))
         );
+        socket.unwatch("a");
+        assert_eq!(socket.restart(), None);
+        assert!(metrics.watched().is_empty());
     }
 
     #[test]
@@ -558,23 +643,28 @@ mod tests {
             metrics: usage(3.0),
             sequence: 9,
         };
-        let json: Value = serde_json::from_str(serialize([&reading]).as_str()).unwrap();
+        let one = serialize(&reading);
+        let both = message([one.as_str(), one.as_str()]);
+        let json: Value = serde_json::from_str(both.as_str()).unwrap();
+        let reading = serde_json::json!({
+            "device_id": "a",
+            "at": 5,
+            "cpu_percent": 3.0,
+            "memory_used_bytes": 1,
+            "memory_total_bytes": 2,
+            "network_received_bytes_per_second": 0,
+            "network_sent_bytes_per_second": 0,
+            "uptime_seconds": 60,
+            "volumes": [],
+        });
         assert_eq!(
             json,
-            serde_json::json!({
-                "type": "metrics",
-                "readings": [{
-                    "device_id": "a",
-                    "at": 5,
-                    "cpu_percent": 3.0,
-                    "memory_used_bytes": 1,
-                    "memory_total_bytes": 2,
-                    "network_received_bytes_per_second": 0,
-                    "network_sent_bytes_per_second": 0,
-                    "uptime_seconds": 60,
-                    "volumes": [],
-                }],
-            })
+            serde_json::json!({ "type": "metrics", "readings": [reading, reading] })
+        );
+        let empty: Value = serde_json::from_str(message([]).as_str()).unwrap();
+        assert_eq!(
+            empty,
+            serde_json::json!({ "type": "metrics", "readings": [] })
         );
     }
 }

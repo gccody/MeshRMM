@@ -211,8 +211,8 @@ being enrolled, deleted, moved to another company, tagged or having their
 notes edited, and companies and tags being created, changed or deleted, as
 they happen. **Refresh** asks for a new
 snapshot; a snapshot never contacts an Agent. A tab that misses a change
-or can't read one sends one `refresh` and holds later changes until that
-snapshot arrives. It ignores messages it doesn't recognise, so a tab left
+or can't read one sends one `{"type":"refresh"}` and holds later changes
+until that snapshot arrives. It ignores messages it doesn't recognise, so a tab left
 open across a server upgrade doesn't ask for the whole fleet on each new
 kind of event; one with a revision only moves its revision on. A snapshot
 it can't read, or a change it fails to apply, replaces the socket after
@@ -249,7 +249,28 @@ already keeps open:
 
 A device's tile or name opens its own page. Its **Usage** tab shows the latest reading, every volume's free
 space, and charts of the last 15 minutes live, or the last hour, 24 hours or
-7 days. The server keeps the live readings in memory
+7 days.
+
+The event socket sends a tab live readings only of the devices it shows.
+The tab sends `{"type":"watch","devices":[...]}` with the devices whose
+reading something on the page shows: the tiles the device wall draws
+(those in view and a row either side), or the device a device page is
+about. Pages that show no reading, such as a terminal or the file browser,
+watch none, and so does a hidden tab, which asks again for what it shows
+when it is shown (a device page then reloads its live chart for the
+points it missed). Changes, as when the wall scrolls, are sent at most
+every 250 ms, and a reconnected socket is sent the set again. The server
+sends the latest reading of each device a socket starts watching at once,
+then every 5 seconds the readings its devices took since. It takes the
+first 500 distinct IDs of a watch and ignores the rest and any ID of no
+device; a watch over 32 KiB, or any message it can't read, closes the
+socket. A reading of a device the tab no longer watches is dropped, so a
+tile scrolled back into view shows no gauges until its fresh reading
+arrives instead of an old one. A tab that has heard nothing for 30
+seconds when it is shown sends `{"type":"ping"}` and replaces the socket
+if no `{"type":"pong"}` comes within 5 seconds.
+
+The server keeps the live readings in memory
 (`server/src/realtime/metrics.rs`) and averages each minute into the
 database, where history is kept for 7 days. Finished minutes wait in memory
 and are stored together every 5 seconds, so a minute appears in the history

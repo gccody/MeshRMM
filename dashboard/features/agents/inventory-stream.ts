@@ -5,6 +5,7 @@ import { type AlertEvent, parseAlertEvent } from "../alerts/model.ts";
 import { type JobEvent, parseJobEvent } from "../automation/model.ts";
 import { type MetricsReading, parseMetricsEvent } from "../metrics/model.ts";
 import { type UpdateEvent, parseUpdateEvent } from "../updates/model.ts";
+import type { SendWatch } from "./metrics-watch.ts";
 import { parseAgentEvent } from "./model.ts";
 import type { AgentDelta, AgentEvent, AgentSnapshot, Inventory } from "./types";
 
@@ -16,14 +17,17 @@ const SESSION_CHECK_INTERVAL_MS = 60_000;
 const MAX_PENDING_EVENTS = 1_000;
 // Browsers don't show the page the server's pings, so a live socket that
 // has heard nothing for this long may be dead, as after the computer slept.
-// While any device is online the server sends resource readings every 5 s,
-// so this is six missed readings; with none online it may rightly stay
-// silent, and such a tab reconnects on its next wake: a full snapshot, but
-// only for a fleet with nothing online. Measured against the clock when
-// each message is handled, not with a timer, so a background tab's
-// throttled timers can't make a healthy socket look dead; handlers that run
-// late only make it look fresher.
+// A socket may also rightly stay quiet, as one watching no device's
+// readings in a fleet where nothing changes, so on the tab's next wake such
+// a socket is asked for a `pong` and replaced only if none comes within
+// PROBE_ANSWER_MS. Silence is measured against the clock when each message
+// is handled, not with a timer, so a background tab's throttled timers
+// can't make a healthy socket look dead; handlers that run late only make
+// it look fresher.
 export const SILENT_SOCKET_MS = 30_000;
+// How long a quiet socket has to answer a ping on wake, while the tab is
+// shown and its timers run on time.
+export const PROBE_ANSWER_MS = 5_000;
 // The server answers `refresh` before anything newer it sends, or closes the
 // socket if it can't read the devices, so only messages it sent before
 // reading the request arrive in between; the snapshot itself arrives whole,
@@ -74,8 +78,11 @@ type Options = {
   // next socket's first snapshot applies whatever its revision.
   revision: { current: number };
   inventory: InventoryTarget;
-  // Devices' latest resource usage, which carries no revision.
+  // The watched devices' latest resource usage, which carries no revision.
   onMetrics?: (readings: MetricsReading[]) => void;
+  // Which devices' readings the socket sends: told of each socket as it
+  // opens, which watches nothing until sent the set, and as it goes.
+  watch?: { attach: (send: SendWatch) => void; detach: () => void };
   // Alerts raised or changed, and the unresolved counts, for users who may
   // see them; these carry no revision either.
   onAlerts?: (event: AlertEvent) => void;
@@ -256,12 +263,17 @@ function eventSequencer({ revision, inventory, requestSnapshot, overflow }: {
   };
 }
 
+// What the page sends the server.
+export const REFRESH = JSON.stringify({ type: "refresh" });
+export const PING = JSON.stringify({ type: "ping" });
+export const watchMessage = (devices: readonly string[]) => JSON.stringify({ type: "watch", devices });
+
 // How a socket ended: the server refused it, closed it for lost access, or
 // dropped it for any other reason.
 type SocketEnd = "refused" | "revoked" | "dropped";
 
 // Handles one socket's events while it is the stream's current socket.
-function watchSocket(socket: SocketLike, { revision, inventory, onMetrics, onAlerts, onJobs, onUpdates, now, reportError, current, onHeard, onLive, onUnusable, onClose }: {
+function watchSocket(socket: SocketLike, { revision, inventory, onMetrics, onAlerts, onJobs, onUpdates, now, reportError, current, onOpen, onHeard, onLive, onUnusable, onClose }: {
   revision: { current: number };
   inventory: InventoryTarget;
   onMetrics?: (readings: MetricsReading[]) => void;
@@ -271,6 +283,7 @@ function watchSocket(socket: SocketLike, { revision, inventory, onMetrics, onAle
   now: () => number;
   reportError: (error: unknown) => void;
   current: () => boolean;
+  onOpen: () => void;
   onHeard: () => void;
   onLive: () => void;
   // The page can't carry on from this socket's events.
@@ -285,7 +298,7 @@ function watchSocket(socket: SocketLike, { revision, inventory, onMetrics, onAle
   const requestSnapshot = () => {
     if (askedAt !== null || socket.readyState !== SOCKET_OPEN) return;
     askedAt = now();
-    socket.send("refresh");
+    socket.send(REFRESH);
   };
   const sequencer = eventSequencer({
     revision,
@@ -358,6 +371,7 @@ function watchSocket(socket: SocketLike, { revision, inventory, onMetrics, onAle
   socket.addEventListener("open", () => {
     if (!current()) return;
     opened = true;
+    onOpen();
   });
   socket.addEventListener("message", (message) => {
     const data = (message as MessageEvent).data;
@@ -379,6 +393,7 @@ export function inventoryStream({
   revision,
   inventory,
   onMetrics,
+  watch,
   onAlerts,
   onJobs,
   onUpdates,
@@ -394,6 +409,13 @@ export function inventoryStream({
   // Whether the socket delivered its snapshot, and when it last sent anything.
   let live = false;
   let heardAt = 0;
+  // The wait for a quiet socket's `pong`, while one is asked for.
+  let probe: unknown;
+  const cancelProbe = () => {
+    if (probe === undefined) return;
+    timers.clearTimeout(probe);
+    probe = undefined;
+  };
   // When a refused socket last asked for a session check; null once the
   // stream is live, so the next outage's first refusal checks at once.
   let sessionCheckedAt: number | null = null;
@@ -412,6 +434,8 @@ export function inventoryStream({
   const lose = () => {
     socket = null;
     live = false;
+    cancelProbe();
+    watch?.detach();
     // The server may have restarted its revisions; an HTTP load until the
     // next socket must not be measured against the lost one's.
     revision.current = -1;
@@ -435,8 +459,12 @@ export function inventoryStream({
     now: timers.now,
     reportError,
     current: () => !stopped && socket === nextSocket,
+    onOpen: () => watch?.attach((devices) => {
+      if (socket === nextSocket && nextSocket.readyState === SOCKET_OPEN) nextSocket.send(watchMessage(devices));
+    }),
     onHeard: () => {
       heardAt = timers.now();
+      cancelProbe();
     },
     // Only a socket that delivered its snapshot resets the backoff; one the
     // server accepts and then fails, before or while sending it, keeps
@@ -481,18 +509,32 @@ export function inventoryStream({
     // Called when the tab is shown, the network returns or Refresh is
     // pressed. A live socket kept receiving changes in the background, and
     // one still connecting or awaiting its snapshot is about to deliver it,
-    // so neither asks the server to send the whole fleet again. A live socket that went silent is replaced, since a dead
-    // one would deliver no snapshot. Without a socket it skips the backoff
-    // wait but keeps the step: only going live restarts it.
+    // so neither asks the server to send the whole fleet again. A live
+    // socket that went silent is asked for a `pong`, and replaced if it
+    // sends nothing in time, since a dead one would deliver no snapshot.
+    // Without a socket it skips the backoff wait but keeps the step: only
+    // going live restarts it.
     wake() {
       if (stopped) return;
       if (!socket) {
         connect();
         return;
       }
-      if (!live || timers.now() - heardAt <= SILENT_SOCKET_MS) return;
-      drop(socket, "website replaced a silent socket");
-      connect();
+      if (!live || timers.now() - heardAt <= SILENT_SOCKET_MS || probe !== undefined) return;
+      const quiet = socket;
+      const replace = () => {
+        drop(quiet, "website replaced a silent socket");
+        connect();
+      };
+      if (quiet.readyState !== SOCKET_OPEN) {
+        replace();
+        return;
+      }
+      quiet.send(PING);
+      probe = timers.setTimeout(() => {
+        probe = undefined;
+        if (!stopped && socket === quiet) replace();
+      }, PROBE_ANSWER_MS);
     },
     setOnline(next: boolean) {
       connection.setOnline(next);
@@ -500,6 +542,8 @@ export function inventoryStream({
     stop() {
       stopped = true;
       reconnect.cancel();
+      cancelProbe();
+      watch?.detach();
       socket?.close(1000, "website closed the inventory");
       socket = null;
     },
