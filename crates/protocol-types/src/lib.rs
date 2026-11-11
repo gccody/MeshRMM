@@ -39,5 +39,7 @@ mod applications;
 pub use applications::*;
 mod monitors;
 pub use monitors::*;
+mod registry;
 mod tools;
+pub use registry::*;
 pub use tools::*;

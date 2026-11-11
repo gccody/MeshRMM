@@ -175,7 +175,8 @@ input.
 - `files`: the file browser's requests to Agents, its downloads and uploads,
   and the relay between each transfer's HTTP request and the socket its
   Agent opened. See [file browser](files.md).
-- `tools`: the remote tools' requests to Agents (processes and services),
+- `tools`: the remote tools' requests to Agents (processes, services and
+  the Windows registry),
   each answered over the control connection. See
   [remote tools](remote-tools.md).
 - `maintenance`: the periodic task that purges expired tokens, old runs,

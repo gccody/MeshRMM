@@ -277,6 +277,7 @@ yet.
 | Account | Logon account | The running job's user | `User=` |
 | Description | The service's | The job file's path | `Description=` |
 | As the system account | SYSTEM | root | root |
+| [Registry](remote-tools.md#registry) | Yes | — | — |
 
 - **Windows** session numbers are Windows's own: 0 for services, 1 and up
   for signed-in users. macOS and Linux have no equivalent to list.
@@ -287,6 +288,8 @@ yet.
   the system domain is listed: each user's agents (`gui/<uid>`) come and go
   with their sessions, and launchd describes jobs in no more words than
   their labels and job files.
+- **macOS and Linux** have no registry; their settings are files, which
+  the [file browser](files.md) reaches.
 - **Linux** services are systemd's alone: on a distribution without it,
   the services tool answers with what running `systemctl` failed with. A
   unit's startup is its unit file state; `static`, `indirect` and

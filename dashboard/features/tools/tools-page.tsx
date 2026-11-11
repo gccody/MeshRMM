@@ -1,4 +1,4 @@
-import { ArrowLeft, CircleAlert, Cog, LoaderCircle, MonitorOff, Workflow } from "lucide-react";
+import { ArrowLeft, CircleAlert, Cog, FolderTree, LoaderCircle, MonitorOff, Workflow } from "lucide-react";
 import { Suspense, lazy, useEffect } from "react";
 import { Link, useSearchParams } from "react-router";
 import type { Agent } from "../agents/types";
@@ -9,8 +9,8 @@ import { TOOLS, TOOL_LABELS, type Tool, canManageTool, canViewTool, parseTool, t
 // The panels load when the page opens; they are a chunk of their own.
 const ToolPanel = lazy(() => import("./tools-panels"));
 
-// `/tools?id=…&tool=…`: a device's processes and services, without a remote
-// session.
+// `/tools?id=…&tool=…`: a device's processes, services and registry, without
+// a remote session.
 export function ToolsPage() {
   const { inventory, can, setPageTitle } = useWorkspace();
   const [params] = useSearchParams();
@@ -47,7 +47,7 @@ export function ToolsPage() {
       {!canViewTool(can, tool) ? (
         <div className="empty-state compact"><CircleAlert size={22} aria-hidden="true" /><strong>You can’t use this tool</strong><span>Your role doesn’t include seeing {TOOL_LABELS[tool].toLowerCase()}.</span></div>
       ) : unavailable ? (
-        <div className="empty-state compact"><CircleAlert size={22} aria-hidden="true" /><strong>{TOOL_LABELS[tool]} aren’t available here</strong><span>{unavailable}</span></div>
+        <div className="empty-state compact"><CircleAlert size={22} aria-hidden="true" /><strong>{tool === "registry" ? "There’s no registry here" : `${TOOL_LABELS[tool]} aren’t available here`}</strong><span>{unavailable}</span></div>
       ) : !agent.connected ? (
         <div className="empty-state compact"><MonitorOff size={22} aria-hidden="true" /><strong>The device is offline</strong><span>The tools work again when it reconnects.</span></div>
       ) : (
@@ -59,6 +59,8 @@ export function ToolsPage() {
   );
 }
 
+const TAB_ICONS: Record<Tool, typeof Cog> = { processes: Workflow, services: Cog, registry: FolderTree };
+
 // The tools, as tabs. One the device's platform lacks shows, disabled, with
 // why.
 export function ToolTabs({ agent, current, visible }: { agent: Agent; current: Tool; visible: readonly Tool[] }) {
@@ -66,7 +68,7 @@ export function ToolTabs({ agent, current, visible }: { agent: Agent; current: T
     <nav className="toolbox-tabs area-tabs" aria-label="Remote tools">
       {visible.map((tool) => {
         const reason = unavailableReason(tool, agent.platform);
-        const Icon = tool === "processes" ? Workflow : Cog;
+        const Icon = TAB_ICONS[tool];
         return reason ? (
           <span key={tool} className="tool-tab-unavailable" aria-disabled="true" title={reason}>
             <Icon size={16} aria-hidden="true" />{TOOL_LABELS[tool]}<em>{reason}</em>

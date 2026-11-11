@@ -84,6 +84,8 @@ permissions! {
     ToolsProcessesManage = "tools.processes.manage": "End processes and process trees on devices, as SYSTEM or root, in the website's remote tools.",
     ToolsServicesView = "tools.services.view": "See devices' services, their state, how they start and the accounts they run as, in the website's remote tools.",
     ToolsServicesManage = "tools.services.manage": "Start, stop and restart devices' services and change how they start, in the website's remote tools.",
+    ToolsRegistryView = "tools.registry.view": "Browse Windows devices' registries, their keys and values, in the website's remote tools.",
+    ToolsRegistryManage = "tools.registry.manage": "Create, change, rename and delete keys and values in Windows devices' registries, in the website's remote tools.",
     JobsRunWide = "jobs.run_wide": "Run scripts and send files on whole companies or on every device at once.",
     AutomationManage = "automation.manage": "Create, edit and delete automation policies, which run shared scripts, scan for or install updates and wake devices on a schedule, or run on newly enrolled devices.",
     UpdatesView = "updates.view": "See devices' pending operating system updates, scans and update history, and ask devices to scan.",

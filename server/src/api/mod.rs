@@ -25,6 +25,7 @@ mod notes;
 mod notification_channels;
 mod passkeys;
 mod password_resets;
+mod registry;
 mod remote;
 mod reports;
 mod roles;
@@ -409,6 +410,22 @@ fn remote_tool_routes() -> Router<AppState> {
         .route(
             "/agents/{id}/services/startup",
             post(tools::set_service_startup),
+        )
+        .route("/agents/{id}/registry", get(registry::list_key))
+        .route("/agents/{id}/registry/value", get(registry::get_value))
+        .route("/agents/{id}/registry/keys", post(registry::create_key))
+        .route(
+            "/agents/{id}/registry/keys/delete",
+            post(registry::delete_key),
+        )
+        .route("/agents/{id}/registry/values", post(registry::set_value))
+        .route(
+            "/agents/{id}/registry/values/rename",
+            post(registry::rename_value),
+        )
+        .route(
+            "/agents/{id}/registry/values/delete",
+            post(registry::delete_value),
         )
 }
 

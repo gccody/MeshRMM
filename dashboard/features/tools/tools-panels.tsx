@@ -55,6 +55,7 @@ import {
   visibleServices,
 } from "./lists";
 import type { Tool } from "./model";
+import { RegistryPanel } from "./registry-panel";
 import { controlService, endProcesses, listProcesses, listServices, setServiceStartup } from "./tools-api";
 
 // The tools' panels, loaded only when the tools page opens, so the
@@ -71,6 +72,7 @@ const problemOf = (error: unknown, fallback: string): Problem => ({
 });
 
 export default function ToolPanel({ agent, tool, canManage }: { agent: Agent; tool: Tool; canManage: boolean }) {
+  if (tool === "registry") return <RegistryPanel agent={agent} canManage={canManage} />;
   return tool === "processes"
     ? <ProcessesPanel agent={agent} canManage={canManage} />
     : <ServicesPanel agent={agent} canManage={canManage} />;

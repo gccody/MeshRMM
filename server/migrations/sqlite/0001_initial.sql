@@ -190,6 +190,8 @@ INSERT INTO role_permissions (role_id, permission) VALUES
   ('technician', 'tools.processes.manage'),
   ('technician', 'tools.services.view'),
   ('technician', 'tools.services.manage'),
+  ('technician', 'tools.registry.view'),
+  ('technician', 'tools.registry.manage'),
   ('technician', 'scripts.run'),
   ('technician', 'files.deliver'),
   ('technician', 'alerts.view'),
