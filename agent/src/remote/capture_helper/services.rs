@@ -60,6 +60,7 @@ pub(super) fn helper_uses_user_token(kind: HelperKind, target: DesktopTarget) ->
 // Keep the helper's startup options and independently shared event destinations explicit.
 #[allow(clippy::too_many_arguments)]
 fn start_input_helper(
+    launcher: &HelperLauncher,
     start: ParentCommand,
     target: DesktopTarget,
     display_id: DisplayId,
@@ -73,7 +74,7 @@ fn start_input_helper(
     let kind = HelperKind::started_by(&start).context("not a desktop helper start command")?;
     // Clipboard data can be owned/delayed-rendered by an interactive user app.
     // Use that user's token on the normal desktop, as the file helper does.
-    let launched = launch_helper(target, helper_uses_user_token(kind, target))?;
+    let launched = launcher(target, helper_uses_user_token(kind, target))?;
     let status: HelperStatus = Arc::new(Mutex::new(None));
     let (started_tx, started_rx) = mpsc::sync_channel(1);
     let reader_status = Arc::clone(&status);
@@ -306,6 +307,7 @@ impl DesktopCaptureStreamer {
         display_id: DisplayId,
     ) -> anyhow::Result<RunningInputHelper> {
         start_input_helper(
+            &self.launcher,
             start,
             target,
             display_id,

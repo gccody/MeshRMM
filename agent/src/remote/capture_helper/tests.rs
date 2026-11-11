@@ -11,6 +11,8 @@ mod held_input_tests;
 #[cfg(test)]
 mod isolation_tests;
 #[cfg(test)]
+mod restart_tests;
+#[cfg(test)]
 mod service_command_tests;
 #[cfg(test)]
 mod service_event_tests;
@@ -243,7 +245,11 @@ fn capture_reader_accepts_reconfiguration_and_discards_frames_while_unrouted() {
         let status = Arc::new(Mutex::new(None));
         dispatch_child_events(
             bytes.as_slice(),
-            Arc::new(Mutex::new(enabled.then_some(sink))),
+            Arc::new(Mutex::new(if enabled {
+                FrameRoute::starting(sink)
+            } else {
+                FrameRoute::default()
+            })),
             started_tx,
             Arc::clone(&status),
             Arc::new(Mutex::new((CursorShape::Default, false, None))),
@@ -647,7 +653,7 @@ fn helpers_report_a_console_without_displays() {
     let status = Arc::new(Mutex::new(None));
     dispatch_child_events(
         bytes.as_slice(),
-        Arc::new(Mutex::new(None)),
+        Arc::new(Mutex::new(FrameRoute::default())),
         started_tx,
         Arc::clone(&status),
         Arc::new(Mutex::new((CursorShape::Default, false, None))),

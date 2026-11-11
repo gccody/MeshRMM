@@ -96,12 +96,21 @@ impl DesktopCaptureStreamer {
             }
         }
         if self.running.is_some() {
-            let result = self.reconfigure(config, display_id, Arc::clone(&sink));
-            if result.is_ok() {
-                return result;
+            let begun = Instant::now();
+            match self.reconfigure(config, display_id, Arc::clone(&sink)) {
+                Ok(started) => {
+                    tracing::info!(
+                        restart_ms = begun.elapsed().as_millis(),
+                        "desktop helper restarted capture in place"
+                    );
+                    return Ok(started);
+                }
+                Err(error) => {
+                    // A helper that failed or stalled is not asked again.
+                    tracing::warn!(error = ?error, "capture helper did not restart capture in place; starting a replacement");
+                    self.terminate();
+                }
             }
-            tracing::warn!(error = ?result.err(), "could not reuse capture helper; starting a replacement");
-            let _ = self.stop();
         }
         let preferred = if background {
             DesktopTarget::Background
@@ -161,12 +170,9 @@ impl DesktopCaptureStreamer {
             .running
             .as_ref()
             .context("capture helper is not running")?;
-        // Drop old-stream output before sending the command. The Started event
-        // is a pipe-order barrier: all old encoder output precedes its reply.
-        *running
-            .sink
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = None;
+        // The old stream's frames still on the pipe are dropped; the new
+        // stream's begin with its Started event.
+        *lock_frames(&running.sink) = FrameRoute::starting(sink);
         send_command(
             &running.input,
             &ParentCommand::Start {
@@ -183,19 +189,10 @@ impl DesktopCaptureStreamer {
         )?;
         let started = running
             .started
-            .recv_timeout(self.start_timeout())
-            .context("capture helper did not reconfigure promptly")??;
+            .recv_timeout(self.with_headless_arrival(self.restart_timeout))
+            .context("capture helper did not restart capture in time")??;
         let target = running.target;
         self.ensure_input_helper(target, started.active_display.id)?;
-        let running = self
-            .running
-            .as_ref()
-            .context("capture helper disappeared")?;
-        *running
-            .sink
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(sink);
-        self.request_keyframe()?;
         Ok(self.with_background_display(started))
     }
 
@@ -230,10 +227,16 @@ impl DesktopCaptureStreamer {
     }
 
     fn start_timeout(&self) -> Duration {
+        self.with_headless_arrival(START_TIMEOUT)
+    }
+
+    /// `timeout`, and the time a virtual display takes to arrive if the
+    /// console has one.
+    fn with_headless_arrival(&self, timeout: Duration) -> Duration {
         if self.virtual_display.is_some() {
-            START_TIMEOUT + HEADLESS_ARRIVAL
+            timeout + HEADLESS_ARRIVAL
         } else {
-            START_TIMEOUT
+            timeout
         }
     }
 
@@ -244,10 +247,10 @@ impl DesktopCaptureStreamer {
         display_id: Option<DisplayId>,
         sink: EncodedFrameSink,
     ) -> anyhow::Result<StartedDesktop> {
-        let launched = launch_system_helper(target)?;
+        let launched = (self.launcher)(target, false)?;
         let status: HelperStatus = Arc::new(Mutex::new(None));
         let (started_tx, started_rx) = mpsc::channel();
-        let sink = Arc::new(Mutex::new(Some(sink)));
+        let sink = Arc::new(Mutex::new(FrameRoute::starting(sink)));
         let reader_sink = Arc::clone(&sink);
         let reader_status = Arc::clone(&status);
         let reader_cursor = Arc::clone(&self.cursor);

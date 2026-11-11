@@ -28,6 +28,53 @@ const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 
 type CaptureStatus = Arc<Mutex<Option<Result<(), String>>>>;
+type StartReply = mpsc::SyncSender<Result<ActiveFormat, String>>;
+
+/// A request to replace the encoder of running capture.
+struct EncoderRestart {
+    config: StreamConfig,
+    sink: EncodedFrameSink,
+    reply: StartReply,
+}
+
+/// The encoder restart the capture worker is asked for, if any. Closed when
+/// the worker ends, so a request made after that fails at once.
+#[derive(Default)]
+struct RestartSlot(Mutex<RestartState>);
+
+#[derive(Default)]
+struct RestartState {
+    pending: Option<EncoderRestart>,
+    closed: bool,
+}
+
+impl RestartSlot {
+    fn lock(&self) -> std::sync::MutexGuard<'_, RestartState> {
+        self.0.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// False when the worker has ended.
+    fn request(&self, restart: EncoderRestart) -> bool {
+        let mut state = self.lock();
+        if state.closed {
+            return false;
+        }
+        state.pending = Some(restart);
+        true
+    }
+
+    fn take(&self) -> Option<EncoderRestart> {
+        self.lock().pending.take()
+    }
+
+    /// Drops a request the worker will not answer, which its requester
+    /// then sees as the worker gone.
+    fn close(&self) {
+        let mut state = self.lock();
+        state.closed = true;
+        state.pending = None;
+    }
+}
 
 /// GPU capture built on DXGI Desktop Duplication.
 ///
@@ -87,9 +134,11 @@ impl WindowsDesktopDuplicationStreamer {
         };
         let stop = Arc::new(AtomicBool::new(false));
         let status: CaptureStatus = Arc::new(Mutex::new(None));
+        let restart = Arc::new(RestartSlot::default());
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let thread_stop = Arc::clone(&stop);
         let thread_status = Arc::clone(&status);
+        let thread_restart = Arc::clone(&restart);
         let controls = Arc::clone(&self.controls);
         let worker = thread::Builder::new()
             .name("meshrmm-desktop-duplication".into())
@@ -101,6 +150,7 @@ impl WindowsDesktopDuplicationStreamer {
                     sink,
                     controls,
                     thread_stop,
+                    &thread_restart,
                     started_tx,
                 );
                 if let Err(error) = &result {
@@ -137,9 +187,46 @@ impl WindowsDesktopDuplicationStreamer {
         self.running = Some(RunningCapture {
             stop,
             status,
+            restart,
             worker: Some(worker),
         });
         Ok(format)
+    }
+
+    /// Replaces the encoder of running capture with one for `config`, whose
+    /// frames go to `sink`. Capture of the display goes on: its duplication,
+    /// the D3D device the encoder shares with it, and the desktop image
+    /// already captured are kept, so the new encoder's first frame, a
+    /// keyframe, does not wait for the desktop to change. What the old
+    /// encoder has not delivered yet is discarded. After an error, capture
+    /// has stopped.
+    pub fn restart_encoder(
+        &mut self,
+        config: StreamConfig,
+        sink: EncodedFrameSink,
+    ) -> Result<ActiveFormat, Error> {
+        let running = self.running.as_ref().ok_or(Error::NotRunning)?;
+        let (reply, replied) = mpsc::sync_channel(1);
+        let message = if !running.restart.request(EncoderRestart {
+            config,
+            sink,
+            reply,
+        }) {
+            "capture stopped before the encoder restart".to_owned()
+        } else {
+            match replied.recv_timeout(START_TIMEOUT) {
+                Ok(Ok(format)) => return Ok(format),
+                Ok(Err(message)) => message,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    "the encoder did not restart within 5 seconds".to_owned()
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    "capture stopped during the encoder restart".to_owned()
+                }
+            }
+        };
+        let _ = self.stop();
+        Err(Error::DesktopDuplication(message))
     }
 
     pub fn set_cursor_capture(&self, enabled: bool) {
@@ -218,6 +305,7 @@ impl Drop for WindowsDesktopDuplicationStreamer {
 struct RunningCapture {
     stop: Arc<AtomicBool>,
     status: CaptureStatus,
+    restart: Arc<RestartSlot>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -237,6 +325,8 @@ impl RunningCapture {
     }
 }
 
+// The worker's inputs, kept explicit.
+#[allow(clippy::too_many_arguments)]
 fn capture_loop(
     monitor: Option<Monitor>,
     display_id: u32,
@@ -244,7 +334,8 @@ fn capture_loop(
     sink: EncodedFrameSink,
     controls: Arc<ControlState>,
     stop: Arc<AtomicBool>,
-    started: mpsc::SyncSender<Result<ActiveFormat, String>>,
+    restart: &RestartSlot,
+    started: StartReply,
 ) -> Result<(), Error> {
     let mut started = Some(started);
     let result = capture_loop_inner(
@@ -252,10 +343,12 @@ fn capture_loop(
         display_id,
         config,
         sink,
-        controls,
-        stop,
+        &controls,
+        &stop,
+        restart,
         &mut started,
     );
+    restart.close();
     if let Some(started) = started.take() {
         let _ = started.send(Err(match &result {
             Ok(()) => "capture stopped before initialization".into(),
@@ -265,81 +358,76 @@ fn capture_loop(
     result
 }
 
+// The worker's inputs, kept explicit.
+#[allow(clippy::too_many_arguments)]
 fn capture_loop_inner(
     monitor: Option<Monitor>,
     display_id: u32,
-    config: StreamConfig,
-    sink: EncodedFrameSink,
-    controls: Arc<ControlState>,
-    stop: Arc<AtomicBool>,
-    started: &mut Option<mpsc::SyncSender<Result<ActiveFormat, String>>>,
+    mut config: StreamConfig,
+    mut sink: EncodedFrameSink,
+    controls: &ControlState,
+    stop: &AtomicBool,
+    restart: &RestartSlot,
+    started: &mut Option<StartReply>,
 ) -> Result<(), Error> {
     let CaptureSources {
         mut duplication,
         device,
         context,
-        mut desktop,
+        desktop,
         cursor_compositor,
         width,
         height,
     } = open_sources(monitor, display_id, &config)?;
-    let Pipeline {
-        converter,
-        encoder,
-        frames_per_second,
-    } = crate::software::pipeline(
-        &device,
-        &context,
-        &PipelineConfig {
-            width,
-            height,
-            frames_per_second: config.frames_per_second,
-            bitrate_bits_per_second: config.bitrate_bits_per_second,
-            codec: config.codec,
-            pixel_format: config.pixel_format,
-            grayscale: config.grayscale,
-        },
-    )?;
-    if let Some(desktop) = desktop.as_mut() {
-        desktop.set_frames_per_second(frames_per_second);
-    }
-    let format = ActiveFormat {
-        width,
-        height,
-        frames_per_second,
-        bitrate_bits_per_second: config.bitrate_bits_per_second,
-        codec: config.codec,
-        pixel_format: config.pixel_format,
-    };
-    if let Some(started) = started.take() {
-        let _ = started.send(Ok(format));
-    }
-
-    let mut capture = CaptureLoop {
-        stats: CaptureStats::new(monotonic_timestamp_us()?),
-        cached_yuv: None,
-        keyframe_input_pending: false,
-        frame_pacer: FramePacer::new(frames_per_second),
-        refinement: StaticRefinement::new(
-            width,
-            height,
-            frames_per_second,
-            config.bitrate_bits_per_second,
-        ),
-        encoded_cursor: None,
-        desktop_pending: false,
+    let mut kept = KeptCapture {
+        context,
+        desktop,
+        cursor_compositor,
         desktop_cached: false,
         separate_cursor_visible: false,
         pointer: PointerHistory::new(),
-        encoder,
-        converter,
-        cursor_compositor,
-        desktop,
-        context,
-        width,
-        height,
     };
-    capture.run(duplication.as_mut(), &controls, &stop, &sink)
+    loop {
+        let mut capture = CaptureLoop::new(&device, kept, &config, width, height)?;
+        if let Some(started) = started.take() {
+            let _ = started.send(Ok(capture.format(&config)));
+        }
+        let Some(next) = capture.run(duplication.as_mut(), controls, stop, &sink, restart)? else {
+            return Ok(());
+        };
+        kept = capture.into_kept();
+        // As a start does: the new encoder's static media type has the new
+        // bitrate, so a runtime request left for the old one is dropped.
+        controls
+            .capture_cursor
+            .store(next.config.capture_cursor, Ordering::Release);
+        controls.requested_bitrate.store(0, Ordering::Release);
+        controls
+            .runtime_bitrate_disabled
+            .store(false, Ordering::Release);
+        controls.request_keyframe.store(false, Ordering::Release);
+        config = next.config;
+        sink = next.sink;
+        *started = Some(next.reply);
+        tracing::info!(
+            display_id,
+            bits_per_second = config.bitrate_bits_per_second,
+            codec = config.codec.name(),
+            pixel_format = config.pixel_format.name(),
+            "restarting the encoder of running capture"
+        );
+    }
+}
+
+/// What one stream's capture loop leaves to the next encoder on the same
+/// capture: the sources, and the desktop image the cursor compositor holds.
+struct KeptCapture {
+    context: ID3D11DeviceContext,
+    desktop: Option<DesktopCapture>,
+    cursor_compositor: Option<CursorCompositor>,
+    desktop_cached: bool,
+    separate_cursor_visible: bool,
+    pointer: PointerHistory,
 }
 
 struct CaptureSources {
@@ -463,17 +551,130 @@ struct CaptureLoop {
     context: ID3D11DeviceContext,
     width: u32,
     height: u32,
+    frames_per_second: u32,
 }
 
 impl CaptureLoop {
+    /// A stream with a new encoder for `config` on `kept` capture.
+    fn new(
+        device: &ID3D11Device,
+        kept: KeptCapture,
+        config: &StreamConfig,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, Error> {
+        let KeptCapture {
+            context,
+            mut desktop,
+            cursor_compositor,
+            desktop_cached,
+            separate_cursor_visible,
+            pointer,
+        } = kept;
+        let Pipeline {
+            converter,
+            encoder,
+            frames_per_second,
+        } = crate::software::pipeline(
+            device,
+            &context,
+            &PipelineConfig {
+                width,
+                height,
+                frames_per_second: config.frames_per_second,
+                bitrate_bits_per_second: config.bitrate_bits_per_second,
+                codec: config.codec,
+                pixel_format: config.pixel_format,
+                grayscale: config.grayscale,
+            },
+        )?;
+        if let Some(desktop) = desktop.as_mut() {
+            desktop.set_frames_per_second(frames_per_second);
+        }
+        Ok(Self {
+            stats: CaptureStats::new(monotonic_timestamp_us()?),
+            cached_yuv: None,
+            keyframe_input_pending: false,
+            frame_pacer: FramePacer::new(frames_per_second),
+            refinement: StaticRefinement::new(
+                width,
+                height,
+                frames_per_second,
+                config.bitrate_bits_per_second,
+            ),
+            // Unknown, so a desktop image already captured is encoded at
+            // once: the new encoder's keyframe.
+            encoded_cursor: None,
+            desktop_pending: desktop_cached,
+            desktop_cached,
+            separate_cursor_visible,
+            pointer,
+            encoder,
+            converter,
+            cursor_compositor,
+            desktop,
+            context,
+            width,
+            height,
+            frames_per_second,
+        })
+    }
+
+    fn format(&self, config: &StreamConfig) -> ActiveFormat {
+        ActiveFormat {
+            width: self.width,
+            height: self.height,
+            frames_per_second: self.frames_per_second,
+            bitrate_bits_per_second: config.bitrate_bits_per_second,
+            codec: config.codec,
+            pixel_format: config.pixel_format,
+        }
+    }
+
+    /// Ends this stream's encoder, after its frames in flight, and keeps the
+    /// capture for the next one.
+    fn into_kept(self) -> KeptCapture {
+        let Self {
+            cached_yuv,
+            encoder,
+            converter,
+            cursor_compositor,
+            desktop,
+            context,
+            desktop_cached,
+            separate_cursor_visible,
+            pointer,
+            ..
+        } = self;
+        // In the order the stream's fields drop: the converter's surface,
+        // the encoder, which settles first, then the converter.
+        drop(cached_yuv);
+        drop(encoder);
+        drop(converter);
+        KeptCapture {
+            context,
+            desktop,
+            cursor_compositor,
+            desktop_cached,
+            separate_cursor_visible,
+            pointer,
+        }
+    }
+
+    /// Captures and encodes until `stop`, or until an encoder restart is
+    /// asked for, which it returns.
     fn run(
         &mut self,
         mut duplication: Option<&mut DxgiDuplicationApi>,
         controls: &ControlState,
         stop: &AtomicBool,
         sink: &EncodedFrameSink,
-    ) -> Result<(), Error> {
+        restart: &RestartSlot,
+    ) -> Result<Option<EncoderRestart>, Error> {
         while !stop.load(Ordering::Acquire) {
+            if let Some(restart) = restart.take() {
+                return Ok(Some(restart));
+            }
             // Apply controls and drain output independently of desktop damage.
             // Media Foundation encoders are asynchronous: submit() may return no
             // output and signal it a few milliseconds later. Previously a static
@@ -536,7 +737,7 @@ impl CaptureLoop {
                 thread::sleep(CAPTURE_POLL_INTERVAL);
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     fn apply_controls(&mut self, controls: &ControlState) -> Result<(), Error> {

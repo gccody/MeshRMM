@@ -46,7 +46,7 @@ pub(super) fn child_event_name(event: &ChildEvent) -> &'static str {
 
 pub(super) fn dispatch_child_events(
     output: impl Read,
-    sink: Arc<Mutex<Option<EncodedFrameSink>>>,
+    sink: HelperFrames,
     started_tx: mpsc::Sender<Result<StartedDesktop, StartFailure>>,
     status: HelperStatus,
     cursor: HelperCursor,
@@ -58,6 +58,7 @@ pub(super) fn dispatch_child_events(
         match read_event(&mut output) {
             Ok(ChildEvent::Started(started)) => {
                 *last_frame.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+                lock_frames(&sink).started();
                 if started_tx.send(Ok(started)).is_err() {
                     break;
                 }
@@ -70,11 +71,7 @@ pub(super) fn dispatch_child_events(
             }
             Ok(ChildEvent::Frame(frame)) => {
                 *last_frame.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
-                if let Some(sink) = sink
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .as_ref()
-                {
+                if let Some(sink) = lock_frames(&sink).current.as_ref() {
                     (sink)(frame);
                 }
             }
