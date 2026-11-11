@@ -38,11 +38,15 @@ pub(crate) fn write(formats: Formats<'_>) -> anyhow::Result<()> {
                     .setString_forType(&NSString::from_str(text), unsafe { NSPasteboardTypeString })
             })
         };
-        if formats.image_first {
-            set_image() && set_html_and_text()
+        // Programs are offered the types in the order they were added.
+        let image: &dyn Fn() -> bool = &set_image;
+        let html_and_text: &dyn Fn() -> bool = &set_html_and_text;
+        let [first, second] = if formats.image_first {
+            [image, html_and_text]
         } else {
-            set_html_and_text() && set_image()
-        }
+            [html_and_text, image]
+        };
+        first() && second()
     });
     ensure!(written, "the pasteboard refused the copy");
     Ok(())
