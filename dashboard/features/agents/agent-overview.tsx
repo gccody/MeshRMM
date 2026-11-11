@@ -25,12 +25,15 @@ import {
   Terminal,
   Trash2,
   WifiOff,
+  Wrench,
 } from "lucide-react";
 import { usePopover } from "../../lib/use-popover";
 import { useGridRows, useWindowedRows } from "../../lib/use-windowed-rows";
 import { terminalPagePath } from "../terminal/model";
 import { filesPagePath } from "../files/model";
 import { DeviceUsage } from "../metrics/usage-meter";
+import { MAINTENANCE_FORMAT } from "../maintenance/device-maintenance";
+import { maintenanceLine } from "../maintenance/model";
 import { HeaderActions } from "../workspace/header-actions";
 import { type TagMatch, matchesTagName, tagLookup } from "../tags/model";
 import { TagChip, TagChips } from "../tags/tag-chip";
@@ -86,6 +89,8 @@ type Props = {
   onRunScript: (agent: Agent, opener: HTMLElement) => void;
   // Wakes offline devices.
   onWake: (agents: Agent[], opener: HTMLElement) => void;
+  // Puts devices in maintenance, or ends it.
+  onMaintenance: (agents: Agent[], opener: HTMLElement) => void;
   // The devices chosen for a job, and what to do with them.
   selection: DeviceSelection;
 };
@@ -112,6 +117,8 @@ export type DeviceActions = {
   files: boolean;
   // Wake offline devices with Wake-on-LAN.
   wake: boolean;
+  // Put devices in maintenance and end it.
+  maintenance: boolean;
   deliverFiles: boolean;
   delete: boolean;
   enroll: boolean;
@@ -176,6 +183,7 @@ const FILTERS: { id: AgentStatusFilter; label: string }[] = [
   { id: "all", label: "All" },
   { id: "online", label: "Online" },
   { id: "offline", label: "Offline" },
+  { id: "maintenance", label: "Maintenance" },
 ];
 
 export function AgentOverview({
@@ -209,16 +217,17 @@ export function AgentOverview({
   onDelete,
   onRunScript,
   onWake,
+  onMaintenance,
   selection,
 }: Props) {
   const { devices, thumbnails } = inventory;
-  const { total, online } = useDeviceCounts(devices);
-  const counts: Record<AgentStatusFilter, number> = { all: total, online, offline: total - online };
+  const { total, online, maintenance } = useDeviceCounts(devices);
+  const counts: Record<AgentStatusFilter, number> = { all: total, online, offline: total - online, maintenance };
   const hasFilters = Boolean(query.trim() || status !== "all" || company || tagFilter.length);
   const hasData = inventory.status !== "loading";
   const stale = inventory.status === "stale";
   const browserOffline = inventory.connection === "offline";
-  const selectable = allowed.runScripts || allowed.deliverFiles || allowed.wake || allowed.editTags;
+  const selectable = allowed.runScripts || allowed.deliverFiles || allowed.wake || allowed.maintenance || allowed.editTags;
   // The chosen devices still in the inventory, found by ID.
   const fleet = useDeviceLookup(devices);
   const chosen = useMemo(() => chosenAgents(selection.ids, fleet), [fleet, selection.ids]);
@@ -242,9 +251,9 @@ export function AgentOverview({
     <>
       <HeaderActions>
         <div className="segmented" role="group" aria-label="Show devices">
-          {FILTERS.map(({ id, label }) => (
+          {FILTERS.filter(({ id }) => id !== "maintenance" || maintenance > 0 || status === "maintenance").map(({ id, label }) => (
             <button key={id} type="button" aria-pressed={status === id} onClick={() => onStatusChange(id)}>
-              {id !== "all" && <i className={`led ${id}`} aria-hidden="true" />}{label}<span>{hasData ? counts[id] : "–"}</span>
+              {id === "maintenance" ? <Wrench size={13} aria-hidden="true" /> : id !== "all" && <i className={`led ${id}`} aria-hidden="true" />}{label}<span>{hasData ? counts[id] : "–"}</span>
             </button>
           ))}
         </div>
@@ -256,7 +265,7 @@ export function AgentOverview({
       </HeaderActions>
 
       <InventoryStrip inventory={inventory} onReconnect={onReconnect} />
-      {selectable && selectedCount > 0 && <SelectionBar count={selectedCount} allowed={allowed} selection={selection} shown={filteredAgents} chosen={chosen} onWake={onWake} onEditTags={onEditTags} />}
+      {selectable && selectedCount > 0 && <SelectionBar count={selectedCount} allowed={allowed} selection={selection} shown={filteredAgents} chosen={chosen} onWake={onWake} onMaintenance={onMaintenance} onEditTags={onEditTags} />}
 
       {filteredAgents.length > 0 ? (
         <DeviceWall agents={filteredAgents} className={`device-wall${stale ? " stale" : ""}${selectedCount > 0 ? " selecting" : ""}`}>
@@ -286,6 +295,7 @@ export function AgentOverview({
               onDelete={onDelete}
               onRunScript={onRunScript}
               onWake={onWake}
+              onMaintenance={onMaintenance}
               onMove={onMove}
               onEditTags={onEditTags}
               onShowScreen={onShowScreen}
@@ -325,7 +335,7 @@ function DeviceWall({ agents, className, children }: {
 }
 
 // What to do with the devices chosen on the wall.
-function SelectionBar({ count, allowed, selection, shown, chosen, onWake, onEditTags }: {
+function SelectionBar({ count, allowed, selection, shown, chosen, onWake, onMaintenance, onEditTags }: {
   count: number;
   allowed: DeviceActions;
   selection: DeviceSelection;
@@ -333,6 +343,7 @@ function SelectionBar({ count, allowed, selection, shown, chosen, onWake, onEdit
   // The chosen devices still in the inventory.
   chosen: Agent[];
   onWake: (agents: Agent[], opener: HTMLElement) => void;
+  onMaintenance: (agents: Agent[], opener: HTMLElement) => void;
   onEditTags: (agents: Agent[], opener: HTMLElement) => void;
 }) {
   const allShown = shown.every((agent) => selection.ids.has(agent.id));
@@ -346,6 +357,7 @@ function SelectionBar({ count, allowed, selection, shown, chosen, onWake, onEdit
         {allowed.runScripts && <button type="button" className="primary-button" onClick={(event) => selection.onStartJob("script", event.currentTarget)} aria-haspopup="dialog"><SquareTerminal size={16} aria-hidden="true" />Run script</button>}
         {allowed.deliverFiles && <button type="button" className="secondary-button" onClick={(event) => selection.onStartJob("file", event.currentTarget)} aria-haspopup="dialog"><Send size={16} aria-hidden="true" />Send file</button>}
         {allowed.wake && offline.length > 0 && <button type="button" className="secondary-button" onClick={(event) => onWake(offline, event.currentTarget)} aria-haspopup="dialog"><Power size={16} aria-hidden="true" />Wake {offline.length} offline</button>}
+        {allowed.maintenance && <button type="button" className="secondary-button" onClick={(event) => onMaintenance(chosen, event.currentTarget)} aria-haspopup="dialog"><Wrench size={16} aria-hidden="true" />Maintenance</button>}
         {allowed.editTags && <button type="button" className="secondary-button" onClick={(event) => onEditTags(chosen, event.currentTarget)} aria-haspopup="dialog"><TagIcon size={16} aria-hidden="true" />Tag</button>}
       </span>
     </div>
@@ -510,7 +522,7 @@ function TagFilterList({ tags, chosen, match, onChange }: {
 
 // Memoised, with props that keep their identity: a device's change, or its
 // reading, redraws its own tile and no other.
-const DeviceTile = memo(function DeviceTile({ agent, position, setSize, companyName, tagsFor, devices, thumbnails, allowed, selected, onSelect, stale, browserOffline, connecting, background, deleting, closing, anyClosing, onRemote, onRemoteBackground, onCloseSession, onDelete, onRunScript, onWake, onMove, onEditTags, onShowScreen }: {
+const DeviceTile = memo(function DeviceTile({ agent, position, setSize, companyName, tagsFor, devices, thumbnails, allowed, selected, onSelect, stale, browserOffline, connecting, background, deleting, closing, anyClosing, onRemote, onRemoteBackground, onCloseSession, onDelete, onRunScript, onWake, onMaintenance, onMove, onEditTags, onShowScreen }: {
   agent: Agent;
   // Where it is on the wall, which draws only some of its tiles.
   position: number;
@@ -537,6 +549,7 @@ const DeviceTile = memo(function DeviceTile({ agent, position, setSize, companyN
   onDelete: (agent: Agent) => void;
   onRunScript: (agent: Agent, opener: HTMLElement) => void;
   onWake: (agents: Agent[], opener: HTMLElement) => void;
+  onMaintenance: (agents: Agent[], opener: HTMLElement) => void;
   onMove: (agent: Agent, opener: HTMLElement) => void;
   onEditTags: (agents: Agent[], opener: HTMLElement) => void;
   onShowScreen: (agent: Agent, opener: HTMLElement) => void;
@@ -553,16 +566,18 @@ const DeviceTile = memo(function DeviceTile({ agent, position, setSize, companyN
   const canRunScripts = reachable && allowed.runScripts;
   const canOpenTerminal = reachable && allowed.terminal;
   const tone = agent.connected ? "online" : agent.updating_to ? "updating" : "offline";
+  const maintenance = agent.maintenance?.current;
 
   // The device's name links to the same page, so the screen is for pointers only.
   return (
-    <li className={`device-tile ${tone}${busy ? " busy" : ""}${selected ? " selected" : ""}`} aria-posinset={position} aria-setsize={setSize}>
+    <li className={`device-tile ${tone}${busy ? " busy" : ""}${selected ? " selected" : ""}${maintenance ? " in-maintenance" : ""}`} aria-posinset={position} aria-setsize={setSize}>
       <div className="device-screen">
         {selected !== null && (
           <label className="tile-select" title={selected ? "Chosen for a job" : "Choose for a job"}>
             <input type="checkbox" checked={selected} onChange={(event) => onSelect(agent, event.target.checked)} aria-label={`Select ${agent.name}`} />
           </label>
         )}
+        {maintenance && <span className="maintenance-badge" title={maintenanceLine(maintenance, maintenance.starts_at, MAINTENANCE_FORMAT)}><Wrench size={12} aria-hidden="true" />Maintenance</span>}
         <Link className="screen-link" to={devicePath(agent)} tabIndex={-1} aria-hidden="true">
           {thumbnail ? <img src={thumbnail.url} alt="" /> : <span className="screen-blank">{agent.connected ? <Monitor size={26} /> : <MonitorOff size={26} />}</span>}
           {(busy || !agent.connected) && (
@@ -587,7 +602,7 @@ const DeviceTile = memo(function DeviceTile({ agent, position, setSize, companyN
         <div className="device-meta">
           <i className={`led ${tone}`} aria-hidden="true" />
           <strong title={agent.name}><Link to={devicePath(agent)}>{agent.name}</Link></strong>
-          <span className="sr-only">{tone === "online" ? "Online" : tone === "updating" ? `Updating to ${agent.updating_to}` : "Offline"}</span>
+          <span className="sr-only">{tone === "online" ? "Online" : tone === "updating" ? `Updating to ${agent.updating_to}` : "Offline"}{maintenance ? `, in maintenance: ${maintenance.reason}` : ""}</span>
           <DeviceMenu
             agent={agent}
             allowed={allowed}
@@ -597,6 +612,7 @@ const DeviceTile = memo(function DeviceTile({ agent, position, setSize, companyN
             onCloseSession={onCloseSession}
             onDelete={onDelete}
             onWake={onWake}
+            onMaintenance={onMaintenance}
             onMove={onMove}
             onEditTags={onEditTags}
           />
@@ -658,7 +674,7 @@ function ConnectButton({ agent, allowed, stale, onRemote, onRemoteBackground }: 
   );
 }
 
-function DeviceMenu({ agent, allowed, state, hasScreen, onShowScreen, onCloseSession, onDelete, onWake, onMove, onEditTags }: {
+function DeviceMenu({ agent, allowed, state, hasScreen, onShowScreen, onCloseSession, onDelete, onWake, onMaintenance, onMove, onEditTags }: {
   agent: Agent;
   allowed: DeviceActions;
   state: TileState;
@@ -667,6 +683,7 @@ function DeviceMenu({ agent, allowed, state, hasScreen, onShowScreen, onCloseSes
   onCloseSession: (agent: Agent) => void;
   onDelete: (agent: Agent) => void;
   onWake: (agents: Agent[], opener: HTMLElement) => void;
+  onMaintenance: (agents: Agent[], opener: HTMLElement) => void;
   onMove: (agent: Agent, opener: HTMLElement) => void;
   onEditTags: (agents: Agent[], opener: HTMLElement) => void;
 }) {
@@ -687,6 +704,7 @@ function DeviceMenu({ agent, allowed, state, hasScreen, onShowScreen, onCloseSes
         <div id={menuId} className="popover menu" role="group" aria-label={`Actions for ${agent.name}`}>
           {hasScreen && <button type="button" onClick={() => choose(onShowScreen)} aria-haspopup="dialog"><Expand size={16} aria-hidden="true" />View screen</button>}
           {allowed.wake && !agent.connected && <button type="button" disabled={state.deleting} onClick={() => choose((opener) => onWake([agent], opener))} aria-haspopup="dialog"><Power size={16} aria-hidden="true" />Wake device</button>}
+          {allowed.maintenance && <button type="button" disabled={state.deleting} onClick={() => choose((opener) => onMaintenance([agent], opener))} aria-haspopup="dialog"><Wrench size={16} aria-hidden="true" />{agent.maintenance?.current ? "Maintenance…" : "Put in maintenance…"}</button>}
           {allowed.terminal && agent.connected && <a href={terminalPagePath(agent.id)} target="_blank" rel="noreferrer" onClick={close}><Terminal size={16} aria-hidden="true" />Open terminal</a>}
           {allowed.files && agent.connected && <a href={filesPagePath(agent.id)} target="_blank" rel="noreferrer" onClick={close}><FolderOpen size={16} aria-hidden="true" />Browse files</a>}
           {allowed.closeSession && <button type="button" disabled={state.anyClosing || state.connecting || state.deleting} onClick={() => choose(() => onCloseSession(agent))}><Square size={16} aria-hidden="true" />Close active session</button>}

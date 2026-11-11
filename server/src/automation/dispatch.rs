@@ -527,12 +527,15 @@ struct JobRow {
     offline: String,
     expires_at: i64,
     requested_by_user_id: String,
+    policy_id: Option<String>,
     policy_name: Option<String>,
+    scheduled: bool,
+    maintenance_during_install: bool,
     created_at: i64,
 }
 
 /// The columns of [`JobRow`].
-const JOB_COLUMNS: [Jobs; 17] = [
+const JOB_COLUMNS: [Jobs; 20] = [
     Jobs::Id,
     Jobs::Kind,
     Jobs::ItemId,
@@ -548,7 +551,10 @@ const JOB_COLUMNS: [Jobs; 17] = [
     Jobs::Offline,
     Jobs::ExpiresAt,
     Jobs::RequestedByUserId,
+    Jobs::PolicyId,
     Jobs::PolicyName,
+    Jobs::Scheduled,
+    Jobs::MaintenanceDuringInstall,
     Jobs::CreatedAt,
 ];
 
@@ -965,7 +971,17 @@ async fn try_wakes(
     let mut claimed = Vec::new();
     let mut transaction = state.database.begin().await?;
     for device_id in devices {
-        let (next, detail) = if !asleep.contains(device_id) {
+        let in_maintenance = job
+            .scheduled
+            .then(|| {
+                state
+                    .maintenance_windows
+                    .skip_reason(device_id, Kind::Wake, now)
+            })
+            .flatten();
+        let (next, detail) = if let Some(reason) = in_maintenance.as_deref() {
+            (DeviceState::Skipped, Some(reason))
+        } else if !asleep.contains(device_id) {
             (DeviceState::Skipped, Some("The device is online already"))
         } else if !planned.covers(device_id) {
             (DeviceState::Missed, Some(DELETED))
@@ -1048,6 +1064,32 @@ async fn fail_wakes(
 /// taking messages and the connection ends, after which it is offline.
 /// Returns whether it started.
 async fn start(state: &AppState, job: &JobRow, device_id: &str, now: i64) -> anyhow::Result<bool> {
+    let Some(kind) = Kind::parse(&job.kind) else {
+        tracing::error!(job_id = job.id, "stored job is invalid");
+        return Ok(false);
+    };
+    // A scheduled run that reaches a device in maintenance skips it: one
+    // that entered maintenance since the job was planned, or a waiting
+    // device that connected during its window.
+    if job.scheduled
+        && let Some(reason) = state.maintenance_windows.skip_reason(device_id, kind, now)
+    {
+        state
+            .database
+            .execute(
+                &Query::update()
+                    .table(JobDevices::Table)
+                    .value(JobDevices::State, DeviceState::Skipped.as_str())
+                    .value(JobDevices::Detail, reason)
+                    .value(JobDevices::UpdatedAt, now)
+                    .and_where(Expr::col(JobDevices::JobId).eq(job.id.as_str()))
+                    .and_where(Expr::col(JobDevices::DeviceId).eq(device_id))
+                    .and_where(Expr::col(JobDevices::State).eq(DeviceState::Queued.as_str()))
+                    .to_owned(),
+            )
+            .await?;
+        return Ok(false);
+    }
     let place = match state.agents.reserve(device_id) {
         Ok(place) => place,
         Err(Unsent::Full) => return Ok(false),
@@ -1062,10 +1104,6 @@ async fn start(state: &AppState, job: &JobRow, device_id: &str, now: i64) -> any
             .await?;
             return Ok(false);
         }
-    };
-    let Some(kind) = Kind::parse(&job.kind) else {
-        tracing::error!(job_id = job.id, "stored job is invalid");
-        return Ok(false);
     };
     // A device installs one thing at a time; this waits for the install it
     // is running.
@@ -1203,6 +1241,9 @@ async fn start(state: &AppState, job: &JobRow, device_id: &str, now: i64) -> any
                 },
             )
             .await?;
+            if install.is_some() && job.maintenance_during_install {
+                install_window(&mut transaction, job, device_id, &id, now).await?;
+            }
             Some(update_runs::command(&id, update_kind, install.as_ref()))
         }
         // Started together by `start_wakes`.
@@ -1268,6 +1309,9 @@ async fn start(state: &AppState, job: &JobRow, device_id: &str, now: i64) -> any
         return Ok(false);
     }
     transaction.commit().await?;
+    if kind == Kind::UpdateInstall && job.maintenance_during_install {
+        crate::maintenance_windows::changed(state, &[device_id.to_owned()], now).await;
+    }
     let Some(command) = command else {
         return Ok(true);
     };
@@ -1305,6 +1349,10 @@ async fn start(state: &AppState, job: &JobRow, device_id: &str, now: i64) -> any
         }
         Kind::UpdateScan | Kind::UpdateInstall => {
             update_runs::discard(&mut transaction, &id).await?;
+            if job.maintenance_during_install {
+                crate::maintenance_windows::store::delete_for_install(&mut transaction, &id)
+                    .await?;
+            }
         }
         Kind::AppInstall | Kind::AppUpdate | Kind::AppUninstall => {
             crate::applications::runs::discard(&mut transaction, &id).await?;
@@ -1313,7 +1361,84 @@ async fn start(state: &AppState, job: &JobRow, device_id: &str, now: i64) -> any
     }
     unqueue(&mut transaction, job, device_id, DeviceState::Started, now).await?;
     transaction.commit().await?;
+    if kind == Kind::UpdateInstall && job.maintenance_during_install {
+        crate::maintenance_windows::changed(state, &[device_id.to_owned()], now).await;
+    }
     Ok(false)
+}
+
+/// Puts the device in maintenance for the update install `run_id` it is
+/// starting: from now until its report ends it, at most as long as the
+/// server waits for that report. Set by the job's policy, or by the user
+/// who started the job.
+async fn install_window(
+    transaction: &mut crate::db::Transaction,
+    job: &JobRow,
+    device_id: &str,
+    run_id: &str,
+    now: i64,
+) -> db::Result<()> {
+    use crate::maintenance_windows::{Automation, INSTALL_WINDOW_MS, store};
+    let (created_by, reason) = match &job.policy_name {
+        Some(name) => (
+            format!("policy \u{201c}{name}\u{201d}"),
+            format!("Installing updates for the policy \u{201c}{name}\u{201d}"),
+        ),
+        None => (
+            crate::users::by_id(&mut *transaction, &job.requested_by_user_id)
+                .await?
+                .map_or_else(
+                    || "A removed user".to_owned(),
+                    |user| {
+                        if user.display_name.trim().is_empty() {
+                            user.email
+                        } else {
+                            user.display_name
+                        }
+                    },
+                ),
+            "Installing updates".to_owned(),
+        ),
+    };
+    let window = store::NewWindow {
+        id: crate::users::new_id(),
+        device_id,
+        starts_at: now,
+        ends_at: Some(now + INSTALL_WINDOW_MS),
+        reason: &reason,
+        automation: Automation::Skip,
+        created_by_user_id: Some(&job.requested_by_user_id),
+        created_by: &created_by,
+        policy: job.policy_id.as_deref().zip(job.policy_name.as_deref()),
+        update_run_id: Some(run_id),
+    };
+    store::insert(&mut *transaction, std::slice::from_ref(&window), now).await?;
+    let actor = crate::audit::Actor {
+        user_id: job
+            .policy_id
+            .is_none()
+            .then(|| job.requested_by_user_id.clone()),
+        label: created_by.clone(),
+        ip: None,
+        api_token: None,
+    };
+    crate::audit::record(
+        &mut *transaction,
+        &actor,
+        "maintenance_window.start",
+        crate::audit::Target::device(device_id),
+        serde_json::json!({
+            "window_id": window.id,
+            "reason": reason,
+            "starts_at": now,
+            "ends_at": window.ends_at,
+            "automation": Automation::Skip,
+            "policy_id": job.policy_id,
+            "job_id": job.id,
+            "update_run_id": run_id,
+        }),
+    )
+    .await
 }
 
 /// A device in state `from` turned out to be offline: it waits again, or is

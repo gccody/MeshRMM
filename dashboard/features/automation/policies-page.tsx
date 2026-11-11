@@ -88,8 +88,13 @@ export function PoliciesPage() {
   }, policy.enabled ? "The policy could not be turned off." : "The policy could not be turned on.");
 
   const run = (policy: Policy) => act(policy, async () => {
-    const job = await runPolicy(authorizedFetch, policy.id);
-    void navigate(`/job?id=${encodeURIComponent(job.id)}`);
+    const ran = await runPolicy(authorizedFetch, policy.id);
+    if ("maintenance" in ran) {
+      // It set windows, not a job: they show under Maintenance.
+      void navigate(`/maintenance`);
+      return;
+    }
+    void navigate(`/job?id=${encodeURIComponent(ran.id)}`);
   }, "The policy could not be run.");
 
   const remove = (policy: Policy) => {
@@ -161,7 +166,10 @@ export function PoliciesPage() {
                           <span className="policy-last-job"><JobProgressBar counts={policy.last_job.counts} />{isJobFinished(policy.last_job) ? countsSummary(policy.last_job.counts) : "Running"}</span>
                           <span><Link to={`/jobs?policy=${encodeURIComponent(policy.id)}`}>All runs</Link></span>
                         </>
-                      ) : policy.last_run_at ? formatDateTime(policy.last_run_at) : <span>Not yet</span>}
+                      ) : policy.last_run_at ? <>
+                        {formatDateTime(policy.last_run_at)}
+                        {policy.last_maintenance && <span><Link to="/maintenance">{policy.last_maintenance.devices === 1 ? "1 device" : `${policy.last_maintenance.devices} devices`} in maintenance</Link>{policy.last_maintenance.ends_at !== null && ` until ${formatDateTime(policy.last_maintenance.ends_at)}`}</span>}
+                      </> : <span>Not yet</span>}
                       {policy.last_problem && <span className="policy-problem"><TriangleAlert size={14} aria-hidden="true" />{policy.last_problem}</span>}
                     </td>
                     <td>

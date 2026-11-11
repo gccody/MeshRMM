@@ -8,7 +8,8 @@ main flows with `curl`. The feature pages hold every route and field:
 [automation](automation.md#api), [patch management](patch-management.md#api),
 [alerts](alerts.md#api), [monitors and self-healing](monitors.md#api),
 [reports](reports.md#api),
-[Wake-on-LAN](wake-on-lan.md#api) and
+[Wake-on-LAN](wake-on-lan.md#api),
+[maintenance windows](maintenance-windows.md#api) and
 [the toolbox](toolbox.md).
 
 The API is not versioned beyond `/v1` yet, and MeshRMM is still in heavy

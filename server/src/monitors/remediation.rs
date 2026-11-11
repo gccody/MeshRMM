@@ -471,6 +471,14 @@ async fn due(state: &AppState, alert_id: &str, now: i64) -> anyhow::Result<()> {
     {
         return Ok(());
     }
+    // Self-healing waits while the device is in maintenance, someone being
+    // at work on it.
+    if state
+        .maintenance_windows
+        .in_maintenance(&alert.device_id, now)
+    {
+        return Ok(());
+    }
     let Some(rule) = rules::by_id(&mut database, &alert.rule_id).await? else {
         return Ok(());
     };

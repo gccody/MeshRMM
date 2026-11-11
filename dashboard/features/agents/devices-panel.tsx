@@ -11,6 +11,7 @@ import { TagDevicesDialog } from "../tags/tag-dialogs";
 import type { TagMatch } from "../tags/model";
 import { RunScriptModal } from "../toolbox/run-script-modal";
 import { WakeDialog } from "../wake/wake-dialog";
+import { StartMaintenanceDialog } from "../maintenance/maintenance-dialog";
 import { type ActionErrorSource, listActionErrors } from "../workspace/action-errors";
 import { useWorkspace } from "../workspace/workspace-context";
 import { AgentOverview, type DeviceActions } from "./agent-overview";
@@ -59,6 +60,7 @@ export function DevicesPanel() {
     terminal: can("terminal.connect") || can("terminal.connect_system"),
     files: can("files.browse"),
     wake: can("devices.wake"),
+    maintenance: can("devices.maintenance"),
     deliverFiles: can("files.deliver"),
     delete: can("devices.delete"),
     enroll: can("devices.enroll"),
@@ -77,6 +79,8 @@ export function DevicesPanel() {
   // The offline devices being woken, and the control that asked.
   const [waking, setWaking] = useState<Agent[] | null>(null);
   const wakeOpener = useRef<HTMLElement | null>(null);
+  const [maintaining, setMaintaining] = useState<Agent[] | null>(null);
+  const maintenanceOpener = useRef<HTMLElement | null>(null);
   // The device being moved to another company, and the menu that asked.
   const [moving, setMoving] = useState<Agent | null>(null);
   const moveOpener = useRef<HTMLElement | null>(null);
@@ -100,6 +104,7 @@ export function DevicesPanel() {
   const onDelete = useCallback((agent: Agent) => void deleteAgent(agent), [deleteAgent]);
   const onRunScript = useCallback((agent: Agent, opener: HTMLElement) => { runScriptOpener.current = opener; setRunScriptOn(agent); }, []);
   const onWake = useCallback((chosen: Agent[], opener: HTMLElement) => { wakeOpener.current = opener; setWaking(chosen); }, []);
+  const onMaintenance = useCallback((chosen: Agent[], opener: HTMLElement) => { maintenanceOpener.current = opener; setMaintaining(chosen); }, []);
   const onMove = useCallback((agent: Agent, opener: HTMLElement) => { moveOpener.current = opener; setMoving(agent); }, []);
   const onEditTags = useCallback((chosen: Agent[], opener: HTMLElement) => { tagOpener.current = opener; setTagging(chosen); }, []);
   const onSelect = useCallback((agent: Agent, chosen: boolean) => setSelected((current) => {
@@ -188,6 +193,7 @@ export function DevicesPanel() {
         onDelete={onDelete}
         onRunScript={onRunScript}
         onWake={onWake}
+        onMaintenance={onMaintenance}
         selection={{
           ids: selected,
           onChange: onSelect,
@@ -222,6 +228,7 @@ export function DevicesPanel() {
         returnFocus={runScriptOpener}
       />}
       {waking && <WakeDialog agents={waking} returnFocus={wakeOpener} onClose={() => setWaking(null)} />}
+      {maintaining && <StartMaintenanceDialog agents={maintaining} returnFocus={maintenanceOpener} onClose={() => setMaintaining(null)} />}
       {tagging && <TagDevicesDialog agents={tagging} returnFocus={tagOpener} onClose={() => setTagging(null)} />}
       {moving && <MoveDeviceDialog agent={moving} returnFocus={moveOpener} onClose={() => setMoving(null)} />}
       {pendingConnect && <ConnectionReasonModal

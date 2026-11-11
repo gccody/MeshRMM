@@ -1816,6 +1816,7 @@ fn update_scan(target: automation::jobs::Target) -> automation::jobs::NewJob {
             ip: None,
             api_token: None,
         },
+        scheduled: None,
     }
 }
 

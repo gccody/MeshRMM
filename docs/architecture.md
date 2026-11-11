@@ -356,7 +356,8 @@ statement.
 Roles are built from these permissions (`server/src/rbac.rs`):
 
 `devices.view`, `devices.edit`, `devices.enroll`, `devices.delete`,
-`devices.rotate_credentials`, `devices.wake`, `companies.manage`,
+`devices.rotate_credentials`, `devices.wake`, `devices.maintenance`,
+`companies.manage`,
 `tags.manage`, `sessions.connect`,
 `sessions.connect_background`, `sessions.close_any`, `terminal.connect`,
 `terminal.connect_system`, `scripts.run`,

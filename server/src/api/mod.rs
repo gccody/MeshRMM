@@ -17,6 +17,7 @@ mod handoffs;
 mod instance;
 mod invitations;
 mod jobs;
+mod maintenance_windows;
 mod metrics;
 mod monitors;
 mod notes;
@@ -85,6 +86,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .merge(automation_routes())
         .merge(application_routes())
         .merge(report_routes())
+        .merge(maintenance_window_routes())
         .layer(middleware::from_fn_with_state(state, csrf::check))
         // Responses carry account data; browsers and proxies must not keep them.
         .layer(SetResponseHeaderLayer::if_not_present(
@@ -477,6 +479,30 @@ fn report_routes() -> Router<AppState> {
             put(reports::update_schedule).delete(reports::delete_schedule),
         )
         .route("/report-schedules/{id}/run", post(reports::run_schedule))
+}
+
+fn maintenance_window_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/maintenance-windows",
+            get(maintenance_windows::list).post(maintenance_windows::start),
+        )
+        .route(
+            "/maintenance-windows/end",
+            post(maintenance_windows::end_many),
+        )
+        .route(
+            "/maintenance-windows/{id}",
+            get(maintenance_windows::get).patch(maintenance_windows::update),
+        )
+        .route(
+            "/maintenance-windows/{id}/end",
+            post(maintenance_windows::end),
+        )
+        .route(
+            "/agents/{id}/maintenance-windows",
+            get(maintenance_windows::device_windows),
+        )
 }
 
 fn monitor_routes() -> Router<AppState> {

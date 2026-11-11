@@ -87,7 +87,14 @@ pub struct PresenceAgent {
     /// What the device list shows and searches from the device's latest
     /// system information snapshot, once it has one.
     pub system: Option<Box<system_info::Summary>>,
+    /// The device's maintenance window in force and when its next starts,
+    /// if it has either.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maintenance: Option<Box<MaintenanceWindowsState>>,
 }
+
+/// What presence shows of a device's maintenance windows.
+pub type MaintenanceWindowsState = crate::maintenance_windows::DeviceMaintenance;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, sqlx::FromRow)]
 pub struct PresenceCompany {
@@ -175,6 +182,8 @@ pub struct Presence {
 struct Inner {
     database: Database,
     hub: AgentHub,
+    /// Which devices are in maintenance, decided when publishing.
+    maintenance: crate::maintenance_windows::MaintenanceWindows,
     update_grace: Duration,
     state: Mutex<State>,
     /// Numbers reads in the order they start.
@@ -289,10 +298,22 @@ fn company_select() -> sea_query::SelectStatement {
 
 impl Presence {
     pub fn new(database: Database, hub: AgentHub, update_grace: Duration) -> Self {
+        Self::with_maintenance(database, hub, update_grace, Default::default())
+    }
+
+    /// Presence that shows the devices' maintenance windows from
+    /// `maintenance`.
+    pub fn with_maintenance(
+        database: Database,
+        hub: AgentHub,
+        update_grace: Duration,
+        maintenance: crate::maintenance_windows::MaintenanceWindows,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 database,
                 hub,
+                maintenance,
                 update_grace,
                 state: Mutex::default(),
                 tickets: AtomicU64::new(0),
@@ -578,6 +599,26 @@ impl Presence {
         }
     }
 
+    /// The devices' maintenance windows changed, or one started or ended:
+    /// publishes those whose maintenance shows differently now. It is kept
+    /// in memory, so this reads nothing; each keeps the ticket of the read
+    /// it was last published from, so a refresh that read the database
+    /// meanwhile still lands.
+    pub async fn maintenance_changed(&self, device_ids: &[String]) {
+        let now = now_ms();
+        let mut state = self.inner.state.lock().await;
+        for device_id in device_ids {
+            let Some(published) = state.published.get(device_id) else {
+                continue;
+            };
+            let (ticket, Some(mut agent)) = (published.read, published.value.clone()) else {
+                continue;
+            };
+            agent.maintenance = self.inner.maintenance.device(device_id, now).map(Box::new);
+            self.publish(&mut state, ticket, device_id, Some(agent));
+        }
+    }
+
     /// The device's Agent connected; any update it was installing is over.
     pub async fn connected(&self, device_id: &str) {
         self.inner.state.lock().await.updating.remove(device_id);
@@ -656,7 +697,6 @@ impl Presence {
                 .then(|| state.updating.get(&id).map(|update| update.version.clone()))
                 .flatten(),
             connected,
-            id,
             name,
             platform,
             company_id,
@@ -664,6 +704,8 @@ impl Presence {
             notes_revision: details.notes_revision,
             created_at,
             system: details.system.map(Box::new),
+            maintenance: self.inner.maintenance.device(&id, now_ms()).map(Box::new),
+            id,
         }
     }
 
@@ -839,6 +881,7 @@ mod tests {
             notes_revision: 0,
             created_at: 0,
             system: None,
+            maintenance: None,
         }
     }
 

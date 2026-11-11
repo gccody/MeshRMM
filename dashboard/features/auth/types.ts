@@ -28,6 +28,7 @@ export type Permission =
   | "companies.manage"
   | "tags.manage"
   | "devices.wake"
+  | "devices.maintenance"
   | "sessions.connect"
   | "sessions.connect_background"
   | "sessions.close_any"

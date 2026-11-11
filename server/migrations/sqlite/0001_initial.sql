@@ -171,13 +171,14 @@ CREATE TABLE role_permissions (
 -- is an editable default.
 INSERT INTO roles (id, name, description, builtin, created_at, updated_at) VALUES
   ('administrator', 'Administrator', 'Every permission, including users, roles and settings.', 'administrator', 0, 0),
-  ('technician', 'Technician', 'Enrolls, connects to and wakes devices, tags devices and keeps their notes, opens terminals, browses and manages their files, runs toolbox scripts and files, installs updates, deploys and updates applications, and responds to alerts.', 'technician', 0, 0);
+  ('technician', 'Technician', 'Enrolls, connects to and wakes devices, tags devices, keeps their notes and puts them in maintenance, opens terminals, browses and manages their files, runs toolbox scripts and files, installs updates, deploys and updates applications, and responds to alerts.', 'technician', 0, 0);
 
 INSERT INTO role_permissions (role_id, permission) VALUES
   ('technician', 'devices.view'),
   ('technician', 'devices.enroll'),
   ('technician', 'devices.wake'),
   ('technician', 'devices.edit'),
+  ('technician', 'devices.maintenance'),
   ('technician', 'sessions.connect'),
   ('technician', 'sessions.connect_background'),
   ('technician', 'terminal.connect'),
@@ -896,6 +897,11 @@ CREATE TABLE jobs (
   -- The policy that started it, and its name then.
   policy_id TEXT,
   policy_name TEXT,
+  -- Started by its policy's schedule or a device's enrollment, not by a
+  -- person: devices in maintenance are skipped (maintenance_windows).
+  scheduled INTEGER NOT NULL DEFAULT 0 CHECK (scheduled IN (0, 1)),
+  -- Update installs: each device is in maintenance while it installs.
+  maintenance_during_install INTEGER NOT NULL DEFAULT 0 CHECK (maintenance_during_install IN (0, 1)),
   created_at INTEGER NOT NULL,
   -- Its devices are still being written, a batch per transaction. Until it
   -- is cleared, in the transaction that records the job's start, nothing
@@ -952,12 +958,20 @@ CREATE TABLE automation_policies (
   -- for operating system updates; 'update_install' installs the pending
   -- updates in update_categories (comma-separated; NULL for all), then
   -- restarts as reboot says.
-  action TEXT NOT NULL DEFAULT 'script' CHECK (action IN ('script', 'update_scan', 'update_install', 'wake', 'app_install', 'app_update')),
+  -- 'maintenance' puts its devices in maintenance for maintenance_minutes.
+  action TEXT NOT NULL DEFAULT 'script' CHECK (action IN ('script', 'update_scan', 'update_install', 'wake', 'app_install', 'app_update', 'maintenance')),
   script_id TEXT,
   run_as TEXT CHECK (run_as IS NULL OR run_as IN ('system', 'user')),
   update_categories TEXT,
   reboot TEXT CHECK (reboot IS NULL OR reboot IN ('never', 'if_required', 'always')),
   reboot_delay_minutes INTEGER,
+  -- Update installs: each device is in maintenance while it installs.
+  maintenance_during_install INTEGER NOT NULL DEFAULT 0 CHECK (maintenance_during_install IN (0, 1)),
+  -- Maintenance: how long each window lasts, its reason (empty for the
+  -- policy's name) and what automation it lets run.
+  maintenance_minutes INTEGER,
+  maintenance_reason TEXT,
+  maintenance_automation TEXT CHECK (maintenance_automation IS NULL OR maintenance_automation IN ('skip', 'scans', 'run')),
   -- Every device, the companies in automation_policy_companies, the devices
   -- in automation_policy_devices, or the devices with any or all
   -- (tag_match) of the tags in automation_policy_tags. Resolved each time
@@ -1475,3 +1489,37 @@ CREATE INDEX idx_reports_created ON reports (created_at);
 CREATE INDEX idx_reports_expires ON reports (expires_at);
 CREATE INDEX idx_reports_status ON reports (status, created_at);
 CREATE INDEX idx_reports_delivery ON reports (delivery);
+
+-- Maintenance windows: a device in one raises no alerts, and its scheduled
+-- automation skips it as automation says ('skip' everything, 'scans' all
+-- but update scans, 'run' nothing). It is in force from starts_at until
+-- ends_at, or until someone ends it while ends_at is NULL. Ending one early,
+-- or before it starts, sets ends_at to then and names who did (ended_by), so
+-- a window that ends before it starts never was in force. See
+-- docs/maintenance-windows.md.
+CREATE TABLE maintenance_windows (
+  id TEXT NOT NULL PRIMARY KEY,
+  device_id TEXT NOT NULL REFERENCES agents (id) ON DELETE CASCADE,
+  starts_at INTEGER NOT NULL,
+  ends_at INTEGER,
+  reason TEXT NOT NULL CHECK (length(reason) BETWEEN 1 AND 500),
+  automation TEXT NOT NULL CHECK (automation IN ('skip', 'scans', 'run')),
+  -- Who set it: a user, or the policy (with its owner as the user).
+  created_by_user_id TEXT,
+  created_by TEXT NOT NULL,
+  policy_id TEXT REFERENCES automation_policies (id) ON DELETE SET NULL,
+  policy_name TEXT,
+  -- The update install it covers; it ends when the install reports.
+  update_run_id TEXT,
+  ended_by_user_id TEXT,
+  ended_by TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX idx_maintenance_windows_device ON maintenance_windows (device_id, starts_at);
+-- The windows not over yet, which the server keeps in memory, and those
+-- old enough to purge.
+CREATE INDEX idx_maintenance_windows_ends ON maintenance_windows (ends_at);
+CREATE INDEX idx_maintenance_windows_policy ON maintenance_windows (policy_id, created_at);
+CREATE INDEX idx_maintenance_windows_install ON maintenance_windows (update_run_id) WHERE update_run_id IS NOT NULL AND ended_by IS NULL;

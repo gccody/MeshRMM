@@ -132,7 +132,11 @@ async fn check(state: &AppState, run_id: &str, now: i64) -> anyhow::Result<()> {
         return Ok(());
     }
     let failures = failures(&run);
-    if failures.is_empty() {
+    if failures.is_empty()
+        || state
+            .maintenance_windows
+            .in_maintenance(&run.device_id, now)
+    {
         return Ok(());
     }
     let Some(device) = crate::targets::device(&mut database, &run.device_id).await? else {

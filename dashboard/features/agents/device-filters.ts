@@ -3,7 +3,8 @@ import type { Agent, Tag } from "./types.ts";
 
 // The Devices filters live in the URL (?q=…&status=…&company=…&tags=…) so a
 // reload, a shared link, or the Devices navigation entry restores them.
-export type AgentStatusFilter = "all" | "online" | "offline";
+// "maintenance" is the devices in maintenance now, online or not.
+export type AgentStatusFilter = "all" | "online" | "offline" | "maintenance";
 
 // A company's ID, NO_COMPANY for devices in none, or "" for every device.
 export type CompanyFilter = string;
@@ -18,7 +19,7 @@ const MAX_COMPANY_LENGTH = 64;
 const MAX_TAG_ID_LENGTH = 64;
 export const MAX_FILTER_TAGS = 20;
 
-const STATUSES: readonly AgentStatusFilter[] = ["all", "online", "offline"];
+const STATUSES: readonly AgentStatusFilter[] = ["all", "online", "offline", "maintenance"];
 
 export function isAgentStatusFilter(value: unknown): value is AgentStatusFilter {
   return STATUSES.includes(value as AgentStatusFilter);
@@ -68,12 +69,13 @@ export function searchText(agent: Pick<Agent, "id" | "name" | "system" | "tag_id
 }
 
 // `tags` are the inventory's, whose names the search matches.
-export function filterAgents<T extends Pick<Agent, "id" | "name" | "connected" | "company_id" | "system" | "tag_ids">>(agents: readonly T[], filters: DeviceFilters, tags: readonly Tag[] = []) {
+export function filterAgents<T extends Pick<Agent, "id" | "name" | "connected" | "company_id" | "system" | "tag_ids"> & Partial<Pick<Agent, "maintenance">>>(agents: readonly T[], filters: DeviceFilters, tags: readonly Tag[] = []) {
   const { query, status, company, tagMatch } = filters;
   const search = query.trim().toLowerCase();
   return agents.filter((agent) => {
     const matchesSearch = !search || searchText(agent, tags).includes(search);
-    const matchesStatus = status === "all" || (status === "online" ? agent.connected : !agent.connected);
+    const matchesStatus = status === "all"
+      || (status === "maintenance" ? Boolean(agent.maintenance?.current) : status === "online" ? agent.connected : !agent.connected);
     const matchesCompany = !company || (company === NO_COMPANY ? !agent.company_id : agent.company_id === company);
     return matchesSearch && matchesStatus && matchesCompany && hasTags(agent, filters.tags, tagMatch);
   });

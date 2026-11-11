@@ -27,6 +27,33 @@ export type Agent = {
   created_at?: number;
   /** The device list's summary of its latest system information, once it sent one. */
   system?: SystemSummary | null;
+  /** Its maintenance, with a window in force or to come; see docs/maintenance-windows.md. */
+  maintenance?: DeviceMaintenance | null;
+};
+
+/** What a device's maintenance lets run of its scheduled automation. */
+export type MaintenanceAutomation = "skip" | "scans" | "run";
+
+/** The device's maintenance in force, as presence shows it. */
+export type CurrentMaintenance = {
+  /** The window in force that lasts longest. */
+  window_id: string;
+  reason: string;
+  /** A person's name, or `policy “…”`. */
+  created_by: string;
+  starts_at: number;
+  /** When it ends as its windows stand; null until someone ends it. */
+  ends_at: number | null;
+  /** The strictest of the windows in force. */
+  automation: MaintenanceAutomation;
+  /** How many windows are in force. */
+  windows: number;
+};
+
+export type DeviceMaintenance = {
+  current: CurrentMaintenance | null;
+  /** When the next window that hasn't started starts. */
+  next_starts_at: number | null;
 };
 
 /** What the device list shows and searches from a device's hardware and software. */

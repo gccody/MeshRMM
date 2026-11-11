@@ -17,11 +17,12 @@ use crate::{
     auth::Authorized,
     automation::{
         jobs::{self, Viewer},
-        policies::{self, Action, ActionKind, Policy, PolicyInput, PolicyView, Valid},
+        policies::{self, Action, Policy, PolicyInput, PolicyView, Valid},
         schedule::Trigger,
     },
     db::{Executor, tables::AutomationPolicies},
     http::{ApiError, AppState, JsonBody},
+    maintenance_windows::store as maintenance_store,
     rbac::Permission,
     time::now_ms,
     users::new_id,
@@ -40,9 +41,12 @@ fn require_manage(actor: &Authorized) -> Result<(), ApiError> {
 }
 
 /// Saving a policy hands it the saver's access, which must do what it does.
-fn require_save(actor: &Authorized, action: ActionKind) -> Result<(), ApiError> {
+fn require_save(actor: &Authorized, action: &Action) -> Result<(), ApiError> {
     require_manage(actor)?;
-    actor.require(action.permission())
+    for permission in action.permissions() {
+        actor.require(permission)?;
+    }
+    Ok(())
 }
 
 fn not_found() -> ApiError {
@@ -63,20 +67,27 @@ pub async fn list(
         .collect::<Vec<_>>();
     let jobs = jobs::by_ids(&mut database, &job_ids, now_ms()).await?;
     let viewer = Viewer::new(&actor.user.id, &actor.permissions);
-    let listed = policies
-        .into_iter()
-        .map(|policy| {
-            let last_job = policy
-                .last_job_id
-                .as_ref()
-                .and_then(|id| jobs.iter().find(|job| &job.id == id))
-                .map(|job| json!(viewer.view(job)));
-            Listed {
-                policy: policy.view(&actor.user.id),
-                last_job,
+    let mut listed = Vec::with_capacity(policies.len());
+    for policy in policies {
+        let last_job = policy
+            .last_job_id
+            .as_ref()
+            .and_then(|id| jobs.iter().find(|job| &job.id == id))
+            .map(|job| json!(viewer.view(job)));
+        // A maintenance policy's last run set windows, not a job.
+        let last_maintenance = match (&policy.action, policy.last_run_at) {
+            (Action::Maintenance { .. }, Some(at)) => {
+                Some(maintenance_store::policy_run(&mut database, &policy.id, at).await?)
             }
-        })
-        .collect::<Vec<_>>();
+            _ => None,
+        };
+        let mut view = policy.view(&actor.user.id);
+        view.last_maintenance = last_maintenance;
+        listed.push(Listed {
+            policy: view,
+            last_job,
+        });
+    }
     Ok(Json(json!({ "policies": listed })))
 }
 
@@ -146,13 +157,24 @@ fn metadata(policy: &Policy) -> Value {
             categories,
             reboot,
             reboot_delay_minutes,
+            maintenance,
         } => {
             metadata["categories"] = json!(categories);
             metadata["reboot"] = reboot.as_str().into();
             metadata["reboot_delay_minutes"] = (*reboot_delay_minutes).into();
+            metadata["maintenance_during_install"] = (*maintenance).into();
         }
         Action::Applications { spec, .. } => {
             metadata["applications"] = json!(spec);
+        }
+        Action::Maintenance {
+            minutes,
+            reason,
+            automation,
+        } => {
+            metadata["maintenance_minutes"] = (*minutes).into();
+            metadata["maintenance_reason"] = reason.as_str().into();
+            metadata["maintenance_automation"] = automation.as_str().into();
         }
     }
     metadata
@@ -166,7 +188,7 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<PolicyView>), ApiError> {
     require_manage(&actor)?;
     let input = input.validate()?;
-    require_save(&actor, input.action.kind())?;
+    require_save(&actor, &input.action)?;
     let id = new_id();
     let now = now_ms();
     let mut transaction = state.database.begin().await?;
@@ -199,7 +221,7 @@ pub async fn update(
     require_manage(&actor)?;
     let id = parse_id(&id, "policy")?;
     let input = input.validate()?;
-    require_save(&actor, input.action.kind())?;
+    require_save(&actor, &input.action)?;
     let now = now_ms();
     let mut transaction = state.database.begin().await?;
     policies::by_id(&mut transaction, &id)
@@ -268,8 +290,32 @@ pub async fn run(
     let policy = policies::by_id(&mut database, &id)
         .await?
         .ok_or_else(not_found)?;
-    require_save(&actor, policy.action.kind())?;
+    require_save(&actor, &policy.action)?;
     let now = now_ms();
+    if matches!(policy.action, Action::Maintenance { .. }) {
+        let label = if actor.user.display_name.trim().is_empty() {
+            actor.user.email.clone()
+        } else {
+            actor.user.display_name.clone()
+        };
+        let audit_actor = actor.actor();
+        let run = policies::run_maintenance_now(
+            &state,
+            &policy,
+            (&actor.user.id, &label, &audit_actor),
+            now,
+        )
+        .await?;
+        audit::record(
+            &mut database,
+            &audit_actor,
+            "automation_policy.run",
+            AuditTarget::automation_policy(&id),
+            json!({ "name": policy.name, "maintenance_windows": run.devices }),
+        )
+        .await?;
+        return Ok((StatusCode::CREATED, Json(json!({ "maintenance": run }))));
+    }
     let job_id = policies::run_now(&state, &policy, &actor.user.id, actor.actor(), now).await?;
     audit::record(
         &mut database,

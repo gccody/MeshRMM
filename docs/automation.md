@@ -253,7 +253,9 @@ run. A policy has:
   [application deployment](application-deployment.md#policies)); or wake the devices
   that are offline (see [Wake-on-LAN](wake-on-lan.md#outcomes)), which
   skips online devices, never waits for offline ones, and can't run on
-  enrollment;
+  enrollment; or put the devices in maintenance for a while (see
+  [maintenance policies](maintenance-windows.md#maintenance-policies)),
+  which starts no job;
 - its devices: every device, chosen companies, the devices with any (or
   all) of chosen tags, or chosen devices. Companies and tags are resolved
   each time it runs, so a device tagged after the policy was saved is
@@ -266,6 +268,13 @@ run. A policy has:
 
 **Run now** starts a job of the policy at once, as the user who chose it,
 without changing its schedule.
+
+A scheduled run skips the devices in a
+[maintenance window](maintenance-windows.md) that holds back its kind of
+run: each is recorded on the job as skipped, "In maintenance until …", and
+the run doesn't happen later. That is checked when the job is planned and
+again when the dispatcher would start a device that waited for it. Run now
+and jobs people start are never skipped for maintenance.
 
 ### When a policy runs
 
@@ -306,8 +315,10 @@ starts a job.
 A policy runs with the access of the user who last saved it, shown as its
 owner. Saving one needs `automation.manage` and what it does needs:
 `scripts.run` for a script, `updates.view` for a scan, `updates.install` for
-an install, `devices.wake` for a wake, `applications.deploy` for installing or
-updating applications. When it is due, its owner must still be enabled and hold both
+an install (and `devices.maintenance` too for one that puts its devices in
+maintenance while installing), `devices.wake` for a wake, `applications.deploy`
+for installing or updating applications, `devices.maintenance` for a
+maintenance window. When it is due, its owner must still be enabled and hold both
 permissions; otherwise it
 doesn't run, records why, and shows it on the policies page. Saving the
 policy again makes the saver its owner and clears the problem.
@@ -369,7 +380,7 @@ time out or never report, like runs started by hand.
 | `updates.view`, `updates.install` | Scan and install [update](patch-management.md) jobs on chosen devices, and seeing one's own jobs. | Yes |
 | `applications.view`, `applications.deploy` | Seeing one's own [application](application-deployment.md) jobs; install, update and uninstall jobs on chosen devices. | Yes |
 | `jobs.run_wide` | Running scripts, sending files and updating on whole companies, tags or every device. | No |
-| `automation.manage` | Seeing, creating, changing and deleting policies, and seeing their jobs. With what a policy does needs (`scripts.run`, `updates.view`, `updates.install`, `devices.wake` or `applications.deploy`), saving and running it. | No |
+| `automation.manage` | Seeing, creating, changing and deleting policies, and seeing their jobs. With what a policy does needs (`scripts.run`, `updates.view`, `updates.install`, `devices.wake`, `applications.deploy` or `devices.maintenance`), saving and running it. | No |
 | `audit.view` | Seeing everyone's jobs and runs. | No |
 
 Administrators have every permission. Grant `jobs.run_wide` and

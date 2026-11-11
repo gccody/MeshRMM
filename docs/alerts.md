@@ -102,6 +102,12 @@ evaluation.
 Resolved alerts are kept for 90 days (`alerts::RESOLVED_RETENTION_MS`), then
 the maintenance task deletes them.
 
+A device in a [maintenance window](maintenance-windows.md) raises no alerts
+and notifies nobody, and self-healing waits. Its open alerts stay as they
+were until it leaves maintenance, when it is judged again at once; script,
+update install and application install failures during the window are
+dropped. See [what happens at the edges](maintenance-windows.md#what-happens-at-the-edges).
+
 ## Evaluation and restarts
 
 `server/src/alerts/` holds it all. The engine's task

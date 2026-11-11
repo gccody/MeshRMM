@@ -32,6 +32,7 @@ import { UsageBar } from "../metrics/usage-meter";
 import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
 import { useDevice } from "../agents/use-devices";
+import { MaintenanceNotice } from "../maintenance/device-maintenance";
 import { type Chosen, DeleteDialog, MoveDialog, NewFolderDialog, RenameDialog } from "./file-dialogs";
 import { FileList, type RowAction } from "./file-list";
 import { createDownload, createFolder, deleteEntries, listFolder, listRoots, moveEntries, renameEntry } from "./files-api";
@@ -439,6 +440,7 @@ function FileBrowser({ agent, account, accounts, path, authorizedFetch, canManag
             <span aria-hidden="true">·</span>
             <span>As {shown?.account ?? roots?.account ?? accountLabel(account, platform)}</span>
           </p>
+          {agent.maintenance?.current && <MaintenanceNotice current={agent.maintenance.current} />}
         </div>
 
         {offline && (

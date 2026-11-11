@@ -1,7 +1,7 @@
 // Jobs and automation policies as the server sends them, and how the website
 // words them. See docs/automation.md. Imports carry the .ts extension so
 // node:test can load this module directly.
-import type { Agent, DevicePlatform, Tag } from "../agents/types.ts";
+import type { Agent, DevicePlatform, MaintenanceAutomation, Tag } from "../agents/types.ts";
 import { type TagMatch, describeTagTarget, hasTags } from "../tags/model.ts";
 import { type RunAs, type ScriptLanguage, LANGUAGE_LABELS, runsOn } from "../toolbox/model.ts";
 import type { Permission } from "../auth/types.ts";
@@ -192,7 +192,7 @@ export type JobEvent = { type: "job_update"; job: Job } | { type: "jobs_resync" 
 export type TriggerKind = "interval" | "daily" | "weekly" | "once" | "enroll";
 
 // What a policy does each time it runs.
-export type PolicyAction = "script" | "update_scan" | "update_install" | "wake" | "app_install" | "app_update";
+export type PolicyAction = "script" | "update_scan" | "update_install" | "wake" | "app_install" | "app_update" | "maintenance";
 
 export const ACTION_LABELS: Record<PolicyAction, string> = {
   script: "Run a script",
@@ -201,6 +201,7 @@ export const ACTION_LABELS: Record<PolicyAction, string> = {
   wake: "Wake devices",
   app_install: "Install applications",
   app_update: "Update applications",
+  maintenance: "Maintenance window",
 };
 
 // GET /v1/automation-policies
@@ -220,6 +221,13 @@ export type Policy = {
   update_categories?: UpdateCategory[] | null;
   reboot?: RebootBehavior | null;
   reboot_delay_minutes?: number | null;
+  // An install policy puts each device in maintenance while it installs.
+  maintenance_during_install?: boolean;
+  // A maintenance policy's windows: how long each lasts, why (empty for
+  // the policy's name) and what automation it lets run.
+  maintenance_minutes?: number | null;
+  maintenance_reason?: string | null;
+  maintenance_automation?: MaintenanceAutomation | null;
   // An application policy's library applications and packages (as
   // source:id), and for an update which outdated ones it covers.
   applications?: ApplicationPolicySpec | null;
@@ -253,7 +261,20 @@ export type Policy = {
   updated_at: number;
   // The list's latest job of the policy.
   last_job?: Job | null;
+  // A maintenance policy's last run: how many windows it set, ending when.
+  last_maintenance?: { devices: number; ends_at: number | null } | null;
 };
+
+export const MIN_MAINTENANCE_MINUTES = 5;
+export const MAX_MAINTENANCE_MINUTES = 7 * 24 * 60;
+export const MAX_MAINTENANCE_REASON_CHARS = 500;
+
+// "3 hours", "90 minutes", "2 days".
+export function minutesText(minutes: number) {
+  if (minutes % (24 * 60) === 0) return minutes === 24 * 60 ? "1 day" : `${minutes / (24 * 60)} days`;
+  if (minutes % 60 === 0) return minutes === 60 ? "1 hour" : `${minutes / 60} hours`;
+  return minutes === 1 ? "1 minute" : `${minutes} minutes`;
+}
 
 export const MIN_INTERVAL_MINUTES = 5;
 export const MAX_INTERVAL_MINUTES = 28 * 24 * 60;
@@ -512,7 +533,7 @@ function describeApplicationUpdate(spec: ApplicationPolicySpec | null | undefine
 
 // What a policy does, in words: its script, the updates it scans or
 // installs, or the applications it installs or updates.
-export function describePolicyAction(policy: Pick<Policy, "action" | "script_name" | "update_categories"> & Partial<Pick<Policy, "applications">>) {
+export function describePolicyAction(policy: Pick<Policy, "action" | "script_name" | "update_categories"> & Partial<Pick<Policy, "applications" | "maintenance_minutes">>) {
   switch (policy.action) {
     case "app_install": {
       const count = policy.applications?.application_ids.length ?? 0;
@@ -522,6 +543,7 @@ export function describePolicyAction(policy: Pick<Policy, "action" | "script_nam
     case "update_scan": return "Scan for updates";
     case "update_install": return installName(policy.update_categories ?? []);
     case "wake": return "Wake devices";
+    case "maintenance": return policy.maintenance_minutes ? `Maintenance for ${minutesText(policy.maintenance_minutes)}` : "Maintenance";
     default: return policy.script_name ?? "Deleted script";
   }
 }
@@ -535,6 +557,7 @@ export const SAVE_PERMISSION: Record<PolicyAction, Permission> = {
   wake: "devices.wake",
   app_install: "applications.deploy",
   app_update: "applications.deploy",
+  maintenance: "devices.maintenance",
 };
 
 // Which devices a policy runs on, in words.
@@ -578,6 +601,10 @@ export type PolicyDraft = {
   updateCategories: UpdateCategory[];
   reboot: RebootBehavior;
   rebootDelayMinutes: number;
+  maintenanceDuringInstall: boolean;
+  maintenanceMinutes: string;
+  maintenanceReason: string;
+  maintenanceAutomation: MaintenanceAutomation;
   applicationIds: string[];
   // Packages as source:id, one a line.
   packages: string;
@@ -612,6 +639,10 @@ export function policyDraft(policy: Policy | null, timeZone: string, action: Pol
     updateCategories: [...(policy?.update_categories ?? (policy ? [] : ["security", "critical"]))],
     reboot: policy?.reboot ?? "if_required",
     rebootDelayMinutes: policy?.reboot_delay_minutes ?? DEFAULT_REBOOT_DELAY_MINUTES,
+    maintenanceDuringInstall: policy?.maintenance_during_install ?? false,
+    maintenanceMinutes: String(policy?.maintenance_minutes ?? 180),
+    maintenanceReason: policy?.maintenance_reason ?? "",
+    maintenanceAutomation: policy?.maintenance_automation ?? "skip",
     applicationIds: [...(policy?.applications?.application_ids ?? [])],
     packages: (policy?.applications?.packages ?? []).join("\n"),
     updateMode: policy?.applications?.mode ?? "all",
@@ -659,6 +690,14 @@ export function policyDraftProblem(draft: PolicyDraft, zones: readonly string[] 
     const problem = rebootDelayProblem(draft.rebootDelayMinutes);
     if (problem) return problem;
   }
+  if (draft.action === "maintenance") {
+    const minutes = Number(draft.maintenanceMinutes);
+    if (!Number.isInteger(minutes) || minutes < MIN_MAINTENANCE_MINUTES || minutes > MAX_MAINTENANCE_MINUTES) {
+      return `Each window lasts ${MIN_MAINTENANCE_MINUTES} minutes to ${MAX_MAINTENANCE_MINUTES / (24 * 60)} days, in whole minutes.`;
+    }
+    if (Array.from(draft.maintenanceReason.trim()).length > MAX_MAINTENANCE_REASON_CHARS) return `Keep the reason to ${MAX_MAINTENANCE_REASON_CHARS} characters.`;
+    if (draft.trigger === "enroll") return "A maintenance policy runs on a schedule.";
+  }
   if (draft.target === "companies" && !draft.companyIds.length) return "Choose at least one company.";
   if (draft.target === "devices" && !draft.deviceIds.length) return "Choose at least one device.";
   if (draft.target === "tags" && !draft.tagIds.length) return "Choose at least one tag.";
@@ -674,7 +713,7 @@ export function policyDraftProblem(draft: PolicyDraft, zones: readonly string[] 
   if (draft.trigger === "weekly" && !draft.weekdays.length) return "Choose the days of the week it runs on.";
   if (draft.trigger === "once" && !validDate(draft.runAt)) return "Choose the date and time it runs.";
   if (usesZone(draft.trigger) && (!draft.timeZone || (zones.length > 0 && !zones.includes(draft.timeZone)))) return "Choose a time zone.";
-  if (draft.action !== "wake" && (draft.offline === "wait" || draft.trigger === "enroll")) {
+  if (draft.action !== "wake" && draft.action !== "maintenance" && (draft.offline === "wait" || draft.trigger === "enroll")) {
     const problem = waitHoursProblem(draft.catchUpHours);
     if (problem) return `Catch offline devices up for 1 to ${MAX_WAIT_HOURS} hours.`;
   }
@@ -697,8 +736,9 @@ export function policyInput(draft: PolicyDraft) {
     tag_ids: draft.target === "tags" ? draft.tagIds : [],
     tag_match: draft.tagMatch,
     trigger: draft.trigger,
-    // A wake policy is for offline devices; it never waits for them.
-    offline: draft.action === "wake" ? "skip" : draft.offline,
+    // A wake policy is for offline devices, and a maintenance window covers
+    // devices online or not: neither waits for them.
+    offline: draft.action === "wake" || draft.action === "maintenance" ? "skip" : draft.offline,
     catch_up_hours: waitHoursProblem(draft.catchUpHours) ? DEFAULT_WAIT_HOURS : Number(draft.catchUpHours),
     channel_ids: draft.channelIds,
   };
@@ -710,6 +750,12 @@ export function policyInput(draft: PolicyDraft) {
     body.update_categories = [...draft.updateCategories];
     body.reboot = draft.reboot;
     body.reboot_delay_minutes = draft.rebootDelayMinutes;
+    body.maintenance_during_install = draft.maintenanceDuringInstall;
+  }
+  if (draft.action === "maintenance") {
+    body.maintenance_minutes = Number(draft.maintenanceMinutes);
+    body.maintenance_reason = draft.maintenanceReason.trim();
+    body.maintenance_automation = draft.maintenanceAutomation;
   }
   if (draft.action === "app_install") body.applications = { application_ids: draft.applicationIds, packages: [], mode: "all" };
   if (draft.action === "app_update") {

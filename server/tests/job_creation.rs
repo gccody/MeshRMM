@@ -78,6 +78,7 @@ async fn update_scan(app: &App) -> jobs::NewJob {
             ip: None,
             api_token: None,
         },
+        scheduled: None,
     }
 }
 

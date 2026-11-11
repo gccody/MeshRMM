@@ -23,6 +23,7 @@ import {
   statusText,
 } from "./model";
 import type { TerminalControls } from "./terminal-view";
+import { MaintenanceNotice } from "../maintenance/device-maintenance";
 
 // xterm.js is large, so it loads only when a terminal opens.
 const TerminalView = lazy(() => import("./terminal-view"));
@@ -171,6 +172,7 @@ export function TerminalPage() {
               {agent.system?.os && <><span aria-hidden="true">·</span><span>{agent.system.os}</span></>}
             </p>
           )}
+          {agent?.maintenance?.current && <MaintenanceNotice current={agent.maintenance.current} />}
         </div>
 
         {!agent ? (

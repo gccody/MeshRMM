@@ -19,6 +19,7 @@ pub mod http;
 pub mod logging;
 pub mod mail;
 pub mod maintenance;
+pub mod maintenance_windows;
 pub mod monitors;
 pub mod notes;
 pub mod notifications;
@@ -89,7 +90,16 @@ pub async fn prepare(config: Config) -> anyhow::Result<AppState> {
     );
     let agents = AgentHub::default();
     let idle = Duration::from_secs(config.remote.idle_timeout_seconds);
-    let presence = Presence::new(database.clone(), agents.clone(), UPDATE_GRACE);
+    let maintenance_windows = maintenance_windows::MaintenanceWindows::default();
+    maintenance_windows
+        .load(&mut &database, time::now_ms())
+        .await?;
+    let presence = Presence::with_maintenance(
+        database.clone(),
+        agents.clone(),
+        UPDATE_GRACE,
+        maintenance_windows.clone(),
+    );
     Ok(AppState {
         config: Arc::new(config),
         accounts: Arc::new(Accounts::new(presence.access_changes())),
@@ -102,6 +112,7 @@ pub async fn prepare(config: Config) -> anyhow::Result<AppState> {
         updates: updates::Engine::default(),
         wake: wake::Engine::default(),
         reports: reports::Engine::default(),
+        maintenance_windows,
         sessions: Sessions::new(Timeouts::new(idle)),
         terminals: terminals::Terminals::default(),
         files: files::Files::default(),
@@ -168,6 +179,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let updating = updates::spawn(state.clone());
     let applying = applications::spawn(state.clone());
     let reporting = reports::spawn(state.clone());
+    let windows = maintenance_windows::spawn(state.clone());
     let storing_metrics = state.metrics.spawn_writer();
     let handle = Handle::<serve::Endpoint>::new();
     tokio::spawn({
@@ -186,6 +198,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     updating.abort();
     applying.abort();
     reporting.abort();
+    windows.abort();
     // Before the database closes, so the finished minutes waiting are kept.
     storing_metrics.stop().await;
     state.turn.stop().await;

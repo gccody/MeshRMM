@@ -239,6 +239,12 @@ the device has no supported update manager. A policy's channels get
 | Update install failed | An install failed, partly or entirely, or never reported | By a person |
 | Restart pending | The device has had to restart for N days | When a scan says it no longer has to |
 
+An install job or policy can put each device in
+[maintenance](maintenance-windows.md#maintenance-while-installing) while it
+installs, so its alerts are held back through the install and its restart;
+the install's own failure still alerts. A maintenance window can also let
+scheduled update scans run while holding back installs.
+
 ## Permissions and audit
 
 | Permission | Allows | Technician |

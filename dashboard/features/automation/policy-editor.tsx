@@ -10,6 +10,8 @@ import { RebootFields } from "../updates/reboot-fields";
 import { useWorkspace } from "../workspace/workspace-context";
 import { useCompanies, useDevices, useTags } from "../agents/use-devices";
 import { ApplicationPolicyFields } from "../applications/policy-fields";
+import { AUTOMATION_CHOICES } from "../maintenance/model";
+import type { MaintenanceAutomation } from "../agents/types";
 import { savePolicy } from "./automation-api";
 import { DevicePicker } from "../device-picker/device-picker";
 import {
@@ -39,6 +41,7 @@ const ACTION_INTROS: Record<PolicyAction, string> = {
   wake: "The server wakes the devices that are offline with Wake-on-LAN, as a job, through online devices on their network: before a patch window, for example.",
   app_install: "The server has the devices install the chosen library applications, as a job; devices that have them already are left as they are. It also runs on each device that enrolls, so new devices get them.",
   app_update: "The server has the devices update outdated applications with their package managers, as a job: all of them, only chosen ones, or all but chosen ones.",
+  maintenance: "The server puts the devices in maintenance for a while each time: their alerts are held back and, as you choose, their scheduled automation is too. Every Sunday from 02:00 to 05:00, for example.",
 };
 
 const browserZone = () => currentZoneName(Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
@@ -79,7 +82,10 @@ export function PolicyEditor({ policy, scripts, channels, returnFocus, onClose, 
   const enrolling = draft.trigger === "enroll";
   const isScript = draft.action === "script";
   const isWake = draft.action === "wake";
-  const triggers = isWake ? TRIGGERS.filter((trigger) => trigger !== "enroll") : TRIGGERS;
+  const isMaintenance = draft.action === "maintenance";
+  // Neither waits for devices nor runs on a new one.
+  const scheduledOnly = isWake || isMaintenance;
+  const triggers = scheduledOnly ? TRIGGERS.filter((trigger) => trigger !== "enroll") : TRIGGERS;
   const missingPermission = can(SAVE_PERMISSION[draft.action]) ? null : `Saving a policy that does this needs the ${SAVE_PERMISSION[draft.action]} permission.`;
 
   const submit = async (event: FormEvent) => {
@@ -105,7 +111,7 @@ export function PolicyEditor({ policy, scripts, channels, returnFocus, onClose, 
           <label htmlFor="policy-name">Name<input id="policy-name" required maxLength={120} value={draft.name} onChange={(event) => update({ name: event.target.value })} placeholder="Nightly cleanup" /></label>
           {actions.length > 1 && (
             <div className="segmented action-choice" role="group" aria-label="What the policy does">
-              {actions.map((action) => <button key={action} type="button" aria-pressed={draft.action === action} onClick={() => update(action === "wake" && draft.trigger === "enroll" ? { action, trigger: "daily" } : { action })}>{ACTION_LABELS[action]}</button>)}
+              {actions.map((action) => <button key={action} type="button" aria-pressed={draft.action === action} onClick={() => update((action === "wake" || action === "maintenance") && draft.trigger === "enroll" ? { action, trigger: "daily" } : { action })}>{ACTION_LABELS[action]}</button>)}
             </div>
           )}
           {isScript && <>
@@ -134,6 +140,29 @@ export function PolicyEditor({ policy, scripts, channels, returnFocus, onClose, 
           {draft.action === "update_install" && <>
             <CategoryChoice categories={draft.updateCategories} onToggle={(category, checked) => update({ updateCategories: checked ? [...draft.updateCategories, category] : draft.updateCategories.filter((candidate) => candidate !== category) })} />
             <RebootFields name="policy-reboot" reboot={draft.reboot} delay={draft.rebootDelayMinutes} onReboot={(reboot) => update({ reboot })} onDelay={(rebootDelayMinutes) => update({ rebootDelayMinutes })} />
+            <label className="checkbox-row">
+              <input type="checkbox" checked={draft.maintenanceDuringInstall} disabled={!can("devices.maintenance") && !draft.maintenanceDuringInstall} onChange={(event) => update({ maintenanceDuringInstall: event.target.checked })} />
+              <span><strong>Put each device in maintenance while it installs</strong>{can("devices.maintenance") ? "Its alerts are held back from when it starts until it reports, and through its restart; a failed install still alerts." : "Needs the devices.maintenance permission."}</span>
+            </label>
+          </>}
+          {isMaintenance && <>
+            <label htmlFor="policy-maintenance-minutes">Each window lasts
+              <span className="input-with-unit">
+                <input id="policy-maintenance-minutes" type="number" inputMode="numeric" min={5} step={1} required value={draft.maintenanceMinutes} onChange={(event) => update({ maintenanceMinutes: event.target.value })} />
+                <span aria-hidden="true">minutes</span>
+              </span>
+            </label>
+            <label htmlFor="policy-maintenance-reason">Reason<input id="policy-maintenance-reason" maxLength={500} value={draft.maintenanceReason} onChange={(event) => update({ maintenanceReason: event.target.value })} placeholder={draft.name.trim() || "Weekly maintenance"} /></label>
+            <small className="field-help">Left empty, the windows give the policy&apos;s name as their reason. A run the server missed while it was down still starts its windows for what is left of them.</small>
+            <fieldset className="choice-list">
+              <legend>Scheduled automation</legend>
+              {(Object.keys(AUTOMATION_CHOICES) as MaintenanceAutomation[]).map((automation) => (
+                <label key={automation}>
+                  <input type="radio" name="policy-maintenance-automation" checked={draft.maintenanceAutomation === automation} onChange={() => update({ maintenanceAutomation: automation })} />
+                  <span><strong>{AUTOMATION_CHOICES[automation].label}</strong>{AUTOMATION_CHOICES[automation].help}</span>
+                </label>
+              ))}
+            </fieldset>
           </>}
           {(draft.action === "app_install" || draft.action === "app_update") && <ApplicationPolicyFields install={draft.action === "app_install"} applicationIds={draft.applicationIds} packages={draft.packages} mode={draft.updateMode} onChange={update} />}
           {isWake && <p className="field-help">Online devices are skipped. A device that comes online within 10 minutes of its packets counts as woken; one that no online device shares a network with fails. Run it a few minutes before the work that needs the devices.</p>}
@@ -206,14 +235,14 @@ export function PolicyEditor({ policy, scripts, channels, returnFocus, onClose, 
           {draft.target === "tags" && <TagTargetFields tags={tags} chosen={draft.tagIds} match={draft.tagMatch} onChange={({ tagIds, tagMatch }) => update({ ...(tagIds && { tagIds }), ...(tagMatch && { tagMatch }) })} />}
           {draft.target === "devices" && <DevicePicker agents={agents} chosen={draft.deviceIds} onChange={(deviceIds) => update({ deviceIds: [...deviceIds] })} language={isScript ? script?.language ?? null : null} />}
 
-          {!enrolling && !isWake && (
+          {!enrolling && !scheduledOnly && (
             <fieldset className="choice-list">
               <legend>Offline devices</legend>
               <label><input type="radio" name="policy-offline" checked={draft.offline === "wait"} onChange={() => update({ offline: "wait" })} /><span><strong>Catch them up</strong>Run when they connect within the time below, unless the policy runs again first.</span></label>
               <label><input type="radio" name="policy-offline" checked={draft.offline === "skip"} onChange={() => update({ offline: "skip" })} /><span><strong>Skip them</strong>They wait for the next run.</span></label>
             </fieldset>
           )}
-          {!isWake && (enrolling || draft.offline === "wait") && (
+          {!scheduledOnly && (enrolling || draft.offline === "wait") && (
             <label htmlFor="policy-catch-up">{enrolling ? "Wait for the new device up to" : "Catch up within"}
               <span className="input-with-unit">
                 <input id="policy-catch-up" type="number" inputMode="numeric" min={1} max={MAX_WAIT_HOURS} step={1} required value={draft.catchUpHours} onChange={(event) => update({ catchUpHours: event.target.value })} />
@@ -222,7 +251,7 @@ export function PolicyEditor({ policy, scripts, channels, returnFocus, onClose, 
             </label>
           )}
 
-          {channels === null ? (
+          {isMaintenance ? null : channels === null ? (
             <p className="field-help">You can&apos;t see notification channels, so this policy can&apos;t notify anyone of failures. Someone with the alerts.manage permission can add them.</p>
           ) : (
             <fieldset className="choice-list">

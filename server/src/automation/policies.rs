@@ -35,7 +35,7 @@ use serde_json::json;
 
 use super::{
     dispatch::QUEUE_CHUNK,
-    jobs::{self, DeviceState, NewJob, Offline, Payload, Target, TargetKind},
+    jobs::{self, DeviceState, NewJob, Offline, Payload, Scheduled, Target, TargetKind},
     schedule::{self, MAX_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES, Trigger, Weekdays},
 };
 use crate::{
@@ -50,9 +50,10 @@ use crate::{
         },
     },
     http::{ApiError, AppState},
+    maintenance_windows::{self, Automation, store::PolicyRun},
     rbac::{self, Permission},
     targets::{Choice, TagMatch},
-    time::HOUR_MS,
+    time::{HOUR_MS, MINUTE_MS},
     updates::runs::Install,
     users,
 };
@@ -83,6 +84,9 @@ fn default_catch_up_hours() -> i64 {
 }
 
 pub const DEFAULT_REBOOT_DELAY_MINUTES: u32 = 5;
+/// How long a maintenance policy's windows may last.
+pub const MIN_MAINTENANCE_MINUTES: i64 = 5;
+pub const MAX_MAINTENANCE_MINUTES: i64 = 7 * 24 * 60;
 
 /// What a policy does when it fires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -95,6 +99,7 @@ pub enum ActionKind {
     Wake,
     AppInstall,
     AppUpdate,
+    Maintenance,
 }
 
 impl ActionKind {
@@ -106,6 +111,7 @@ impl ActionKind {
             Self::Wake => "wake",
             Self::AppInstall => "app_install",
             Self::AppUpdate => "app_update",
+            Self::Maintenance => "maintenance",
         }
     }
 
@@ -117,6 +123,7 @@ impl ActionKind {
             "wake" => Some(Self::Wake),
             "app_install" => Some(Self::AppInstall),
             "app_update" => Some(Self::AppUpdate),
+            "maintenance" => Some(Self::Maintenance),
             _ => None,
         }
     }
@@ -130,6 +137,7 @@ impl ActionKind {
             Self::UpdateInstall => Permission::UpdatesInstall,
             Self::Wake => Permission::DevicesWake,
             Self::AppInstall | Self::AppUpdate => Permission::ApplicationsDeploy,
+            Self::Maintenance => Permission::DevicesMaintenance,
         }
     }
 }
@@ -142,11 +150,13 @@ pub enum Action {
         run_as: RunAs,
     },
     UpdateScan,
-    /// Installs the pending updates in `categories`, or every one.
+    /// Installs the pending updates in `categories`, or every one; with
+    /// `maintenance`, each device is in maintenance while it installs.
     UpdateInstall {
         categories: Vec<UpdateCategory>,
         reboot: RebootBehavior,
         reboot_delay_minutes: u32,
+        maintenance: bool,
     },
     /// Wakes the devices that are offline.
     Wake,
@@ -154,6 +164,13 @@ pub enum Action {
     Applications {
         install: bool,
         spec: PolicySpec,
+    },
+    /// Puts the devices in maintenance for `minutes`, for `reason` (the
+    /// policy's name when empty).
+    Maintenance {
+        minutes: i64,
+        reason: String,
+        automation: Automation,
     },
 }
 
@@ -166,7 +183,24 @@ impl Action {
             Self::Wake => ActionKind::Wake,
             Self::Applications { install: true, .. } => ActionKind::AppInstall,
             Self::Applications { install: false, .. } => ActionKind::AppUpdate,
+            Self::Maintenance { .. } => ActionKind::Maintenance,
         }
+    }
+
+    /// The permissions, besides `automation.manage`, whoever saves the
+    /// policy (and so whose access it runs with) must hold.
+    pub fn permissions(&self) -> Vec<Permission> {
+        let mut permissions = vec![self.kind().permission()];
+        if matches!(
+            self,
+            Self::UpdateInstall {
+                maintenance: true,
+                ..
+            }
+        ) {
+            permissions.push(Permission::DevicesMaintenance);
+        }
+        permissions
     }
 
     /// Whether it keeps applications installed, which newly enrolled
@@ -204,6 +238,18 @@ pub struct PolicyInput {
     pub reboot: Option<RebootBehavior>,
     #[serde(default)]
     pub reboot_delay_minutes: Option<i64>,
+    /// For an install policy: each device is in maintenance while it
+    /// installs.
+    #[serde(default)]
+    pub maintenance_during_install: bool,
+    /// For a maintenance policy: how long each window lasts, why (empty for
+    /// the policy's name) and what automation it lets run.
+    #[serde(default)]
+    pub maintenance_minutes: Option<i64>,
+    #[serde(default)]
+    pub maintenance_reason: Option<String>,
+    #[serde(default)]
+    pub maintenance_automation: Option<Automation>,
     /// For an application policy.
     #[serde(default)]
     pub applications: Option<PolicySpec>,
@@ -281,6 +327,25 @@ impl PolicyInput {
             }
             ActionKind::UpdateScan => Action::UpdateScan,
             ActionKind::Wake => Action::Wake,
+            ActionKind::Maintenance => Action::Maintenance {
+                minutes: self
+                    .maintenance_minutes
+                    .filter(|minutes| {
+                        (MIN_MAINTENANCE_MINUTES..=MAX_MAINTENANCE_MINUTES).contains(minutes)
+                    })
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "a maintenance window lasts {MIN_MAINTENANCE_MINUTES} minutes to {} days",
+                            MAX_MAINTENANCE_MINUTES / (24 * 60)
+                        ))
+                    })?,
+                reason: match self.maintenance_reason.as_deref().map(str::trim) {
+                    None | Some("") => String::new(),
+                    Some(reason) => maintenance_windows::reason(reason)
+                        .map_err(|error| invalid(error.message().to_owned()))?,
+                },
+                automation: self.maintenance_automation.unwrap_or_default(),
+            },
             ActionKind::AppInstall | ActionKind::AppUpdate => {
                 let install = self.action == ActionKind::AppInstall;
                 Action::Applications {
@@ -309,6 +374,7 @@ impl PolicyInput {
                         .reboot
                         .ok_or_else(|| invalid("choose when the computer restarts"))?,
                     reboot_delay_minutes,
+                    maintenance: self.maintenance_during_install,
                 }
             }
         };
@@ -380,6 +446,9 @@ impl PolicyInput {
             return Err(invalid(
                 "a policy that wakes devices runs on a schedule: newly enrolled devices are online",
             ));
+        }
+        if trigger == Trigger::Enroll && matches!(action, Action::Maintenance { .. }) {
+            return Err(invalid("a maintenance policy runs on a schedule"));
         }
         // A device that just enrolled has no tags yet.
         if trigger == Trigger::Enroll && matches!(target, Target::Devices(_) | Target::Tags { .. })
@@ -524,7 +593,13 @@ pub struct PolicyView {
     pub update_categories: Option<Vec<UpdateCategory>>,
     pub reboot: Option<RebootBehavior>,
     pub reboot_delay_minutes: Option<u32>,
+    pub maintenance_during_install: Option<bool>,
     pub applications: Option<PolicySpec>,
+    pub maintenance_minutes: Option<i64>,
+    pub maintenance_reason: Option<String>,
+    pub maintenance_automation: Option<Automation>,
+    /// For a maintenance policy: the windows its last run set.
+    pub last_maintenance: Option<PolicyRun>,
     #[serde(flatten)]
     pub target: Target,
     pub trigger: &'static str,
@@ -584,16 +659,27 @@ impl Policy {
             Action::Script { script_id, run_as } => (Some(script_id.clone()), Some(*run_as)),
             _ => (None, None),
         };
-        let (update_categories, reboot, reboot_delay_minutes) = match &self.action {
-            Action::UpdateInstall {
-                categories,
-                reboot,
-                reboot_delay_minutes,
-            } => (
-                Some(categories.clone()),
-                Some(*reboot),
-                Some(*reboot_delay_minutes),
-            ),
+        let (update_categories, reboot, reboot_delay_minutes, maintenance_during_install) =
+            match &self.action {
+                Action::UpdateInstall {
+                    categories,
+                    reboot,
+                    reboot_delay_minutes,
+                    maintenance,
+                } => (
+                    Some(categories.clone()),
+                    Some(*reboot),
+                    Some(*reboot_delay_minutes),
+                    Some(*maintenance),
+                ),
+                _ => (None, None, None, None),
+            };
+        let (maintenance_minutes, maintenance_reason, maintenance_automation) = match &self.action {
+            Action::Maintenance {
+                minutes,
+                reason,
+                automation,
+            } => (Some(*minutes), Some(reason.clone()), Some(*automation)),
             _ => (None, None, None),
         };
         let applications = match &self.action {
@@ -615,7 +701,12 @@ impl Policy {
             update_categories,
             reboot,
             reboot_delay_minutes,
+            maintenance_during_install,
             applications,
+            maintenance_minutes,
+            maintenance_reason,
+            maintenance_automation,
+            last_maintenance: None,
             target: self.target,
             interval_minutes,
             time,
@@ -651,6 +742,10 @@ struct PolicyRow {
     update_categories: Option<String>,
     reboot: Option<String>,
     reboot_delay_minutes: Option<i64>,
+    maintenance_during_install: bool,
+    maintenance_minutes: Option<i64>,
+    maintenance_reason: Option<String>,
+    maintenance_automation: Option<String>,
     target: String,
     tag_match: String,
     trigger_type: String,
@@ -685,6 +780,12 @@ fn action_of(row: &PolicyRow, applications: Option<&PolicySpec>) -> Option<Actio
             categories: Install::parse_categories(row.update_categories.as_deref()),
             reboot: RebootBehavior::parse(row.reboot.as_deref()?)?,
             reboot_delay_minutes: u32::try_from(row.reboot_delay_minutes?).ok()?,
+            maintenance: row.maintenance_during_install,
+        },
+        ActionKind::Maintenance => Action::Maintenance {
+            minutes: row.maintenance_minutes?,
+            reason: row.maintenance_reason.clone().unwrap_or_default(),
+            automation: Automation::parse(row.maintenance_automation.as_deref()?)?,
         },
         kind @ (ActionKind::AppInstall | ActionKind::AppUpdate) => Action::Applications {
             install: kind == ActionKind::AppInstall,
@@ -755,6 +856,22 @@ pub async fn load(executor: &mut impl Executor, id: Option<&str>) -> db::Result<
             (
                 AutomationPolicies::Table,
                 AutomationPolicies::RebootDelayMinutes,
+            ),
+            (
+                AutomationPolicies::Table,
+                AutomationPolicies::MaintenanceDuringInstall,
+            ),
+            (
+                AutomationPolicies::Table,
+                AutomationPolicies::MaintenanceMinutes,
+            ),
+            (
+                AutomationPolicies::Table,
+                AutomationPolicies::MaintenanceReason,
+            ),
+            (
+                AutomationPolicies::Table,
+                AutomationPolicies::MaintenanceAutomation,
             ),
             (AutomationPolicies::Table, AutomationPolicies::Target),
             (AutomationPolicies::Table, AutomationPolicies::TagMatch),
@@ -980,19 +1097,34 @@ pub async fn save(
         Action::Script { script_id, run_as } => (Some(script_id.as_str()), Some(run_as.as_str())),
         _ => (None, None),
     };
-    let (categories, reboot, reboot_delay_minutes) = match &policy.action {
-        Action::UpdateInstall {
-            categories,
-            reboot,
-            reboot_delay_minutes,
+    let (categories, reboot, reboot_delay_minutes, maintenance_during_install) =
+        match &policy.action {
+            Action::UpdateInstall {
+                categories,
+                reboot,
+                reboot_delay_minutes,
+                maintenance,
+            } => (
+                Install::categories_text(categories),
+                Some(reboot.as_str()),
+                Some(i64::from(*reboot_delay_minutes)),
+                *maintenance,
+            ),
+            _ => (None, None, None, false),
+        };
+    let (maintenance_minutes, maintenance_reason, maintenance_automation) = match &policy.action {
+        Action::Maintenance {
+            minutes,
+            reason,
+            automation,
         } => (
-            Install::categories_text(categories),
-            Some(reboot.as_str()),
-            Some(i64::from(*reboot_delay_minutes)),
+            Some(*minutes),
+            Some(reason.as_str()),
+            Some(automation.as_str()),
         ),
         _ => (None, None, None),
     };
-    let values: [(AutomationPolicies, sea_query::Value); 21] = [
+    let values: [(AutomationPolicies, sea_query::Value); 25] = [
         (AutomationPolicies::Name, policy.name.as_str().into()),
         (AutomationPolicies::Enabled, policy.enabled.into()),
         (
@@ -1006,6 +1138,22 @@ pub async fn save(
         (
             AutomationPolicies::RebootDelayMinutes,
             reboot_delay_minutes.into(),
+        ),
+        (
+            AutomationPolicies::MaintenanceDuringInstall,
+            maintenance_during_install.into(),
+        ),
+        (
+            AutomationPolicies::MaintenanceMinutes,
+            maintenance_minutes.into(),
+        ),
+        (
+            AutomationPolicies::MaintenanceReason,
+            maintenance_reason.into(),
+        ),
+        (
+            AutomationPolicies::MaintenanceAutomation,
+            maintenance_automation.into(),
         ),
         (
             AutomationPolicies::Target,
@@ -1131,10 +1279,19 @@ async fn problem(executor: &mut impl Executor, policy: &Policy) -> db::Result<Op
         )));
     };
     let permissions = rbac::permissions_of(&rbac::user_roles(executor, &owner.id).await?);
-    let needed = policy.action.kind().permission();
-    if !permissions.contains(&Permission::AutomationManage) || !permissions.contains(&needed) {
+    let needed = policy.action.permissions();
+    if !permissions.contains(&Permission::AutomationManage)
+        || !needed
+            .iter()
+            .all(|permission| permissions.contains(permission))
+    {
+        let names = needed
+            .iter()
+            .map(|permission| permission.as_str())
+            .collect::<Vec<_>>()
+            .join(" and ");
         return Ok(Some(format!(
-            "{}, whose access it runs with, no longer has the automation.manage and {needed} permissions; save the policy to run it with your access",
+            "{}, whose access it runs with, no longer has the automation.manage and {names} permissions; save the policy to run it with your access",
             policy.owner
         )));
     }
@@ -1147,6 +1304,8 @@ async fn payload(executor: &mut impl Executor, policy: &Policy) -> db::Result<Op
         Action::Script { script_id, run_as } => (script_id, *run_as),
         Action::UpdateScan => return Ok(Some(Payload::UpdateScan)),
         Action::Wake => return Ok(Some(Payload::Wake)),
+        // It starts windows, not a job.
+        Action::Maintenance { .. } => return Ok(None),
         Action::Applications { install, spec } => {
             return Ok(match spec.spec(executor, *install).await {
                 Ok(spec) => Some(Payload::Applications(Box::new(spec))),
@@ -1164,11 +1323,13 @@ async fn payload(executor: &mut impl Executor, policy: &Policy) -> db::Result<Op
             categories,
             reboot,
             reboot_delay_minutes,
+            maintenance,
         } => {
             return Ok(Some(Payload::UpdateInstall {
                 categories: categories.clone(),
                 reboot: *reboot,
                 reboot_delay_minutes: *reboot_delay_minutes,
+                maintenance: *maintenance,
             }));
         }
     };
@@ -1230,6 +1391,7 @@ async fn prepare(
     policy: &Policy,
     target: Target,
     starter: Starter<'_>,
+    now: i64,
 ) -> Result<Prepared, ApiError> {
     let mut database = &state.database;
     if matches!(starter, Starter::Policy)
@@ -1246,6 +1408,11 @@ async fn prepare(
             },
         ));
     };
+    // Its own runs skip devices in maintenance; Run now is a person's.
+    let scheduled = matches!(starter, Starter::Policy).then(|| Scheduled {
+        windows: state.maintenance_windows.clone(),
+        at: now,
+    });
     let (requested_by_user_id, actor) = match starter {
         Starter::Policy => (policy.owner_user_id.clone(), policy.actor()),
         Starter::User { user_id, actor } => (user_id.to_owned(), actor),
@@ -1258,6 +1425,7 @@ async fn prepare(
         requested_by_user_id,
         policy: Some((policy.id.clone(), policy.name.clone())),
         actor,
+        scheduled,
     };
     match jobs::plan(&mut database, &state.agents, job).await {
         Ok(plan) => Ok(Prepared::Job(Box::new(plan))),
@@ -1564,6 +1732,9 @@ enum Step {
     /// Its last run still has devices queued: skip, if they still are.
     Busy,
     Start(Prepared),
+    /// A maintenance policy's windows, on these devices, or why it can't
+    /// set them.
+    Maintenance(Result<Vec<maintenance_windows::Device>, String>),
 }
 
 /// How claiming a planned firing went.
@@ -1594,13 +1765,20 @@ pub async fn plan_firing(
     if !policy.enabled || policy.next_run_at != Some(due_at) {
         return Ok(None);
     }
-    let step = if now - due_at > MISSED_GRACE_MS && !policy.trigger.catches_up_late() {
+    let step = if let Action::Maintenance { minutes, .. } = &policy.action {
+        // Late, its windows still start for what is left of them.
+        if due_at + minutes * MINUTE_MS <= now {
+            Step::Missed
+        } else {
+            Step::Maintenance(maintenance_devices(state, &policy).await?)
+        }
+    } else if now - due_at > MISSED_GRACE_MS && !policy.trigger.catches_up_late() {
         Step::Missed
     } else if queued_devices(&mut &state.database, &policy.id).await? > 0 {
         Step::Busy
     } else {
         Step::Start(
-            prepare(state, &policy, policy.target.clone(), Starter::Policy)
+            prepare(state, &policy, policy.target.clone(), Starter::Policy, now)
                 .await
                 .map_err(failed)?,
         )
@@ -1637,6 +1815,35 @@ pub async fn write_firing(state: &AppState, firing: &Firing) -> anyhow::Result<F
             .next_after(std::cmp::max(now, due_at), anchor),
     };
     let mut transaction = state.database.begin().await?;
+    if let Step::Maintenance(devices) = step {
+        if !claim.take(&mut transaction).await? {
+            transaction.rollback().await?;
+            return Ok(still_due(state, &policy.id, due_at).await?);
+        }
+        let started = match devices {
+            Ok(devices) => {
+                let Action::Maintenance { minutes, .. } = &policy.action else {
+                    unreachable!("a maintenance step is for a maintenance policy");
+                };
+                let ends_at = due_at + minutes * MINUTE_MS;
+                set_windows(&mut transaction, policy, devices, None, now, ends_at).await?;
+                true
+            }
+            Err(problem) => {
+                record_problem(&mut transaction, policy, problem, Some(due_at), now).await?;
+                false
+            }
+        };
+        transaction.commit().await?;
+        if let Ok(devices) = devices {
+            let ids = devices
+                .iter()
+                .map(|device| device.id.clone())
+                .collect::<Vec<_>>();
+            maintenance_windows::changed(state, &ids, now).await;
+        }
+        return Ok(Fired::Claimed { started });
+    }
     let problem = if matches!(step, Step::Missed) {
         Some(format!(
             "Missed its run at {} because the server wasn't running",
@@ -1752,6 +1959,7 @@ pub async fn run_now(
         policy,
         policy.target.clone(),
         Starter::User { user_id, actor },
+        now,
     )
     .await?;
     // Nothing is written for a job that can't start.
@@ -1780,6 +1988,116 @@ pub async fn run_now(
     }
 }
 
+/// The devices a maintenance policy's run puts in maintenance, read through
+/// the readers, or why it can't: its owner lost the access it runs with, or
+/// it covers no devices.
+async fn maintenance_devices(
+    state: &AppState,
+    policy: &Policy,
+) -> anyhow::Result<Result<Vec<maintenance_windows::Device>, String>> {
+    let mut database = &state.database;
+    if let Some(problem) = problem(&mut database, policy).await? {
+        return Ok(Err(problem));
+    }
+    let devices = maintenance_windows::resolve(&mut database, &policy.target).await?;
+    Ok(if devices.is_empty() {
+        Err(NO_DEVICES.to_owned())
+    } else {
+        Ok(devices)
+    })
+}
+
+/// Who chose Run now: their ID, the name windows show, and the audit actor.
+type RunBy<'a> = (&'a str, &'a str, &'a Actor);
+
+/// Writes the maintenance policy's windows on `devices` from `now` to
+/// `ends_at`, set by the policy or, with `user`, by a person who chose Run
+/// now, and notes it as the policy's last run.
+async fn set_windows(
+    transaction: &mut Transaction,
+    policy: &Policy,
+    devices: &[maintenance_windows::Device],
+    user: Option<RunBy<'_>>,
+    now: i64,
+    ends_at: i64,
+) -> db::Result<()> {
+    let Action::Maintenance {
+        reason, automation, ..
+    } = &policy.action
+    else {
+        return Ok(());
+    };
+    let plan = maintenance_windows::Plan {
+        starts_at: now,
+        ends_at: Some(ends_at),
+        reason: if reason.is_empty() {
+            policy.name.clone()
+        } else {
+            reason.clone()
+        },
+        automation: *automation,
+    };
+    let policy_actor = policy.actor();
+    let setter = match user {
+        Some((user_id, label, actor)) => maintenance_windows::Setter {
+            user_id: Some(user_id),
+            label,
+            actor,
+            policy: Some((&policy.id, &policy.name)),
+        },
+        None => maintenance_windows::Setter {
+            user_id: Some(&policy.owner_user_id),
+            label: &policy_actor.label,
+            actor: &policy_actor,
+            policy: Some((&policy.id, &policy.name)),
+        },
+    };
+    maintenance_windows::write(transaction, devices, &plan, &setter, now).await?;
+    transaction
+        .execute(
+            &Query::update()
+                .table(AutomationPolicies::Table)
+                .value(AutomationPolicies::LastRunAt, now)
+                .value(AutomationPolicies::LastJobId, Option::<String>::None)
+                .value(AutomationPolicies::LastProblem, Option::<String>::None)
+                .value(AutomationPolicies::LastProblemAt, Option::<i64>::None)
+                .and_where(Expr::col(AutomationPolicies::Id).eq(policy.id.as_str()))
+                .to_owned(),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Puts a maintenance policy's devices in maintenance now, for its windows'
+/// length, as the user who chose Run now. The schedule is unchanged.
+pub async fn run_maintenance_now(
+    state: &AppState,
+    policy: &Policy,
+    user: RunBy<'_>,
+    now: i64,
+) -> Result<PolicyRun, ApiError> {
+    let Action::Maintenance { minutes, .. } = &policy.action else {
+        return Err(ApiError::internal());
+    };
+    let devices = maintenance_windows::resolve(&mut &state.database, &policy.target).await?;
+    if devices.is_empty() {
+        return Err(ApiError::conflict(NO_DEVICES).with_code("policy_cannot_run"));
+    }
+    let ends_at = now + minutes * MINUTE_MS;
+    let mut transaction = state.database.begin().await?;
+    set_windows(&mut transaction, policy, &devices, Some(user), now, ends_at).await?;
+    transaction.commit().await?;
+    let ids = devices
+        .iter()
+        .map(|device| device.id.clone())
+        .collect::<Vec<_>>();
+    maintenance_windows::changed(state, &ids, now).await;
+    Ok(PolicyRun {
+        devices: ids.len() as i64,
+        ends_at: Some(ends_at),
+    })
+}
+
 /// Starts the enabled enrollment policies that cover a newly enrolled device
 /// on it. Returns how many started.
 pub async fn device_enrolled(state: &AppState, device_id: &str, now: i64) -> anyhow::Result<usize> {
@@ -1802,6 +2120,7 @@ pub async fn device_enrolled(state: &AppState, device_id: &str, now: i64) -> any
             &enrolling,
             Target::Devices(vec![device_id.to_owned()]),
             Starter::Policy,
+            now,
         )
         .await
         .map_err(failed)?;

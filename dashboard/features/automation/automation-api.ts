@@ -59,7 +59,8 @@ export async function deletePolicy(authorizedFetch: AuthorizedFetch, id: string)
   await expectOk(await authorizedFetch(`/v1/automation-policies/${encodeURIComponent(id)}`, { method: "DELETE" }), "The policy could not be deleted.");
 }
 
-// Starts a job of the policy now; returns the job.
+// Runs the policy now; returns its job, or for a maintenance policy how
+// many windows it set.
 export async function runPolicy(authorizedFetch: AuthorizedFetch, id: string) {
-  return expectJson<Job>(await authorizedFetch(`/v1/automation-policies/${encodeURIComponent(id)}/run`, jsonBody({})), "The policy could not be run.");
+  return expectJson<Job | { maintenance: { devices: number; ends_at: number | null } }>(await authorizedFetch(`/v1/automation-policies/${encodeURIComponent(id)}/run`, jsonBody({})), "The policy could not be run.");
 }

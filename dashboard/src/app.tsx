@@ -11,6 +11,7 @@ import { PoliciesPage } from "../features/automation/policies-page";
 import { DevicePage } from "../features/metrics/device-page";
 import { CompaniesPanel } from "../features/companies/companies-panel";
 import { TagsPage } from "../features/tags/tags-page";
+import { MaintenancePage } from "../features/maintenance/maintenance-page";
 import { DeploymentPage } from "../features/deployment/deployment-page";
 import { AuditPanel } from "../features/audit/audit-panel";
 import { AuthenticationPanel } from "../features/authentication/authentication-panel";
@@ -46,6 +47,7 @@ export function App() {
             <Route path="files" element={<FilesPage />} />
             <Route path="companies" element={<CompaniesPanel />} />
             <Route path="tags" element={<TagsPage />} />
+            <Route path="maintenance" element={<MaintenancePage />} />
             <Route path="deployment" element={<DeploymentPage />} />
             <Route path="software" element={<SoftwarePage />} />
             <Route path="updates" element={<UpdatesPage />} />
