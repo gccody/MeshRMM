@@ -347,10 +347,7 @@ pub(super) fn judge_events(
             Some(unread) => Outcome::passing(format!(
                 "No matching events in the entries read since the last check; {unread}."
             ))
-            .output(format!(
-                "({unread})
-"
-            )),
+            .output(format!("({unread})\n")),
             None => Outcome::passing("No matching events since the last check."),
         }
         .value(0.0);
