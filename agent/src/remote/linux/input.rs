@@ -312,6 +312,15 @@ impl InputController {
     }
 
     /// The pointer's axis values for a point on the active display.
+    ///
+    /// The viewer sends the point as a fraction of the picture, 0 to
+    /// `u16::MAX` each way, and the picture shows the whole display, so the
+    /// fraction is the same of the display in the desktop's logical layout,
+    /// whatever the stream's pixel size: at 200%, the stream's pixel
+    /// (1920, 1080) of 3840x2160 is the point (960, 540) of a 1920x1080
+    /// display. The point is then placed in the bounding box of every
+    /// display, offsets included, which the absolute axes span; the display
+    /// server maps them onto that same logical layout.
     fn position(&self, x: u16, y: u16) -> anyhow::Result<(i32, i32)> {
         let display = self
             .active_display

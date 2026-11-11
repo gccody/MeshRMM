@@ -2,7 +2,8 @@
 //! uses them directly; the installed Agent's session helpers serve them to the
 //! coordinator.
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use meshrmm_protocol::{
@@ -16,19 +17,255 @@ use super::{input, keep_awake, pointer, ui, wallpaper};
 use crate::remote::helper::protocol::{InputState, SessionUi, StreamSettings};
 use crate::remote::platform::ScreenInput;
 
+/// How long a capture the display server started has to deliver its first
+/// frame, which tells the stream's size. The backends wait up to 10 seconds
+/// for the display server to start a capture and the coordinator 15 for the
+/// helper to answer, so a start that needs both still answers in time.
+///
+/// A display that is asleep, or a compositor that draws only when something
+/// changes, may send nothing until the technician moves the pointer, which
+/// takes a started stream. So a capture that is still running after this
+/// time starts at the display's size in the layout, as every stream once
+/// did; if its first frame then has another size, as on a scaled display,
+/// the stream ends there and the next start announces that frame's size.
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
+/// How often the wait for the first frame checks whether the capture ended.
+const FIRST_FRAME_POLL: Duration = Duration::from_millis(50);
+
+/// A started stream. The displays are in the desktop's logical layout (see
+/// [`super::display`]), which the viewer's normalized pointer positions are
+/// mapped onto; the format is the size of the H.264 pictures, from the
+/// frames the capture delivers. With display scaling on Wayland the two
+/// differ: a 3840x2160 panel at 200% is a 1920x1080 display streamed at
+/// 3840x2160.
 pub(crate) struct Started {
     pub displays: Vec<Display>,
     pub active_display: Display,
     pub format: VideoFormat,
 }
 
-/// What a running capture needs to start again with the same settings.
+/// A running capture, and what it needs to start again with the same
+/// settings.
 struct Running {
     output: Output,
     settings: StreamSettings,
+    /// The size of the frames the capture delivers, whose encoded size the
+    /// stream announced.
+    size: (u32, u32),
+    gate: Arc<SizeGate>,
     stream: Box<dyn Stream>,
     encoder: Arc<VideoEncoder>,
     sink: FrameSink,
+}
+
+impl Running {
+    /// Starts capturing `output` into a new encoder. Without `size`, waits up
+    /// to `first_frame` for the first frame, whose size the stream then
+    /// keeps; with it, the capture must keep that size, as when a capture
+    /// starts again under a format already announced.
+    fn start(
+        backend: &mut dyn Backend,
+        output: Output,
+        settings: StreamSettings,
+        sink: FrameSink,
+        size: Option<(u32, u32)>,
+        first_frame: Duration,
+    ) -> anyhow::Result<Self> {
+        let encoder = Arc::new(VideoEncoder::start(
+            EncoderSettings {
+                frames_per_second: settings.frames_per_second,
+                bitrate_bits_per_second: settings.bitrate_bits_per_second,
+                grayscale: settings.grayscale,
+            },
+            Arc::clone(&sink),
+        )?);
+        let gate = Arc::new(SizeGate::new(size));
+        let frames: capture::FrameSink = {
+            let (gate, encoder) = (Arc::clone(&gate), Arc::clone(&encoder));
+            Arc::new(move |frame: &RawFrame<'_>| {
+                if frame.encodable() && gate.admit((frame.width, frame.height)) {
+                    encoder.submit(frame);
+                }
+            })
+        };
+        let mut stream = backend.start(
+            &output,
+            CaptureSettings {
+                frames_per_second: settings.frames_per_second,
+                capture_cursor: settings.capture_cursor,
+            },
+            frames,
+        )?;
+        let size = match size {
+            Some(size) => size,
+            None => match gate.wait_for_size(first_frame, || stream.poll_ended())? {
+                Some(size) => size,
+                None => {
+                    let size = gate.assume((output.width, output.height));
+                    tracing::warn!(
+                        width = size.0,
+                        height = size.1,
+                        "the display server has sent no picture yet; starting the stream at the display's size"
+                    );
+                    size
+                }
+            },
+        };
+        Ok(Self {
+            output,
+            settings,
+            size,
+            gate,
+            stream,
+            encoder,
+            sink,
+        })
+    }
+
+    /// The format the stream's frames are encoded in.
+    fn format(&self) -> VideoFormat {
+        stream_format(self.size, &self.settings)
+    }
+
+    /// Why the stream must end, once it must: the capture stopped, the
+    /// encoder failed, or the frames changed size, which the viewer can
+    /// learn only from a new stream.
+    fn poll_ended(&mut self) -> Option<anyhow::Error> {
+        if let Some(size) = self.gate.changed() {
+            return Some(anyhow::anyhow!(
+                "the captured display changed from {}x{} to {}x{} pixels",
+                self.size.0,
+                self.size.1,
+                size.0,
+                size.1
+            ));
+        }
+        self.stream.poll_ended().or_else(|| {
+            self.encoder
+                .failure()
+                .map(|failure| anyhow::anyhow!(failure).context("the H.264 encoder stopped"))
+        })
+    }
+}
+
+/// The format of a stream whose frames are `size`: their encoded size,
+/// whatever size the display has in the desktop's layout.
+fn stream_format(size: (u32, u32), settings: &StreamSettings) -> VideoFormat {
+    let (width, height) = super::encoder::encoded_size(size.0, size.1);
+    VideoFormat {
+        width,
+        height,
+        frames_per_second: settings.frames_per_second as u16,
+        codec: Codec::H264,
+        pixel_format: PixelFormat::Nv12,
+        bitrate_bits_per_second: settings.bitrate_bits_per_second,
+    }
+}
+
+/// The frame sizes a stream saw.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Sizes {
+    /// The stream's size: its first frame's, or the one already announced.
+    stream: Option<(u32, u32)>,
+    /// The first size that differed from it.
+    changed: Option<(u32, u32)>,
+}
+
+impl Sizes {
+    /// Whether a frame of `size` belongs to the stream. The first frame
+    /// fixes the stream's size; a frame of another size is kept from the
+    /// encoder, so nothing is encoded at a size the viewer was not told.
+    fn admit(&mut self, size: (u32, u32)) -> bool {
+        match self.stream {
+            None => {
+                self.stream = Some(size);
+                true
+            }
+            Some(stream) if stream == size => true,
+            Some(_) => {
+                self.changed.get_or_insert(size);
+                false
+            }
+        }
+    }
+}
+
+/// Stands between a capture and its encoder, letting through only frames of
+/// the stream's size.
+struct SizeGate {
+    sizes: Mutex<Sizes>,
+    first: Condvar,
+}
+
+impl SizeGate {
+    fn new(stream: Option<(u32, u32)>) -> Self {
+        Self {
+            sizes: Mutex::new(Sizes {
+                stream,
+                changed: None,
+            }),
+            first: Condvar::new(),
+        }
+    }
+
+    fn admit(&self, size: (u32, u32)) -> bool {
+        let mut sizes = self.sizes.lock().unwrap_or_else(|e| e.into_inner());
+        let first = sizes.stream.is_none();
+        let admitted = sizes.admit(size);
+        drop(sizes);
+        if first {
+            self.first.notify_all();
+        }
+        admitted
+    }
+
+    /// The size the frames changed to, once they have.
+    fn changed(&self) -> Option<(u32, u32)> {
+        self.sizes.lock().unwrap_or_else(|e| e.into_inner()).changed
+    }
+
+    /// Fixes the stream's size at `size` unless a frame has fixed it
+    /// meanwhile, and returns the stream's size.
+    fn assume(&self, size: (u32, u32)) -> (u32, u32) {
+        *self
+            .sizes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stream
+            .get_or_insert(size)
+    }
+
+    /// The stream's size, once the first frame arrives; `None` when none
+    /// came within `timeout` and the capture is still running. Fails when
+    /// `ended` says the capture stopped.
+    fn wait_for_size(
+        &self,
+        timeout: Duration,
+        mut ended: impl FnMut() -> Option<anyhow::Error>,
+    ) -> anyhow::Result<Option<(u32, u32)>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            {
+                let sizes = self.sizes.lock().unwrap_or_else(|e| e.into_inner());
+                let wait = deadline.saturating_duration_since(Instant::now());
+                let (sizes, _) = self
+                    .first
+                    .wait_timeout_while(sizes, wait.min(FIRST_FRAME_POLL), |sizes| {
+                        sizes.stream.is_none()
+                    })
+                    .unwrap_or_else(|e| e.into_inner());
+                if sizes.stream.is_some() {
+                    return Ok(sizes.stream);
+                }
+            }
+            if let Some(error) = ended() {
+                return Err(error.context("the capture stopped before its first frame"));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+        }
+    }
 }
 
 /// Captures and encodes one display at a time.
@@ -92,59 +329,31 @@ impl LocalScreen {
         self.input
             .controller()?
             .set_active_display(active_display.clone(), displays.clone())?;
-        let running = self.capture(output, settings, Arc::new(sink))?;
+        // The format is announced once the first frame tells its size.
+        let running = self.capture(output, settings, Arc::new(sink), None)?;
+        let format = running.format();
         self.running = Some(running);
         Ok(Started {
             displays,
             active_display,
-            format: VideoFormat {
-                width: active_display_size(&self.running).0,
-                height: active_display_size(&self.running).1,
-                frames_per_second: settings.frames_per_second as u16,
-                codec: Codec::H264,
-                pixel_format: PixelFormat::Nv12,
-                bitrate_bits_per_second: settings.bitrate_bits_per_second,
-            },
+            format,
         })
     }
 
+    /// Starts capturing `output`; see [`Running::start`].
     fn capture(
         &mut self,
         output: Output,
         settings: StreamSettings,
         sink: FrameSink,
+        size: Option<(u32, u32)>,
     ) -> anyhow::Result<Running> {
-        let encoder = Arc::new(VideoEncoder::start(
-            EncoderSettings {
-                frames_per_second: settings.frames_per_second,
-                bitrate_bits_per_second: settings.bitrate_bits_per_second,
-                grayscale: settings.grayscale,
-            },
-            Arc::clone(&sink),
-        )?);
-        let frames = Arc::clone(&encoder);
-        let stream = self.backend()?.start(
-            &output,
-            CaptureSettings {
-                frames_per_second: settings.frames_per_second,
-                capture_cursor: settings.capture_cursor,
-            },
-            Arc::new(move |frame: &RawFrame<'_>| frames.submit(frame)),
-        );
-        let stream = match stream {
-            Ok(stream) => stream,
-            Err(error) => {
-                self.backend = None;
-                return Err(error);
-            }
-        };
-        Ok(Running {
-            output,
-            settings,
-            stream,
-            encoder,
-            sink,
-        })
+        let backend = self.backend()?.as_mut();
+        let running = Running::start(backend, output, settings, sink, size, FIRST_FRAME_TIMEOUT);
+        if running.is_err() {
+            self.backend = None;
+        }
+        running
     }
 
     pub(crate) fn stop(&mut self) {
@@ -154,12 +363,7 @@ impl LocalScreen {
     pub(crate) fn poll_ended(&mut self) -> Option<anyhow::Error> {
         let running = self.running.as_mut()?;
         self.input.set_cursor(running.stream.cursor_shape());
-        let error = running.stream.poll_ended().or_else(|| {
-            running
-                .encoder
-                .failure()
-                .map(|failure| anyhow::anyhow!(failure).context("the H.264 encoder stopped"))
-        })?;
+        let error = running.poll_ended()?;
         self.running = None;
         // The display server may have restarted; connect again next time.
         self.backend = None;
@@ -198,25 +402,22 @@ impl LocalScreen {
         let Some(Running {
             output,
             settings,
+            size,
             sink,
             ..
         }) = self.running.take()
         else {
             return;
         };
-        match self.capture(output, settings, sink) {
+        // The restarted capture keeps to the announced size; a frame of
+        // another size ends the stream.
+        match self.capture(output, settings, sink, Some(size)) {
             Ok(running) => self.running = Some(running),
             Err(error) => {
                 tracing::warn!(error = ?error, "could not restart capture for the pointer")
             }
         }
     }
-}
-
-fn active_display_size(running: &Option<Running>) -> (u32, u32) {
-    running.as_ref().map_or((0, 0), |running| {
-        super::encoder::encoded_size(running.output.width, running.output.height)
-    })
 }
 
 /// Keyboard, pointer, clipboard, files, chat and the maintenance controls of
@@ -520,5 +721,275 @@ impl ScreenInput for LocalInput {
     }
     fn chat_ready(&self) -> Arc<tokio::sync::Notify> {
         self.chat.outgoing_ready()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::remote::linux::encoder::PixelLayout;
+
+    fn settings() -> StreamSettings {
+        StreamSettings {
+            frames_per_second: 30,
+            bitrate_bits_per_second: 2_000_000,
+            codec: Codec::H264,
+            capture_cursor: true,
+            grayscale: false,
+        }
+    }
+
+    /// A display as a Wayland backend enumerates it, in the logical layout.
+    fn output(width: u32, height: u32) -> Output {
+        Output {
+            name: "eDP-1".to_owned(),
+            x: 0,
+            y: 0,
+            width,
+            height,
+            primary: true,
+        }
+    }
+
+    fn deliver(sink: &capture::FrameSink, (width, height): (u32, u32)) {
+        let data = vec![0x80; width as usize * height as usize * 4];
+        sink(&RawFrame {
+            data: &data,
+            width,
+            height,
+            stride: width as usize * 4,
+            layout: PixelLayout::Bgrx,
+            timestamp_us: 1,
+        });
+    }
+
+    /// A capture backend that delivers frames of the given sizes as the
+    /// capture starts, whatever the display's size, as PipeWire does with a
+    /// scaled display.
+    #[derive(Default)]
+    struct Fake {
+        frames: Vec<(u32, u32)>,
+        /// Why the stream ended, when it ends at once.
+        ended: Option<&'static str>,
+        /// The capture's sink, for frames sent later.
+        sink: Arc<Mutex<Option<capture::FrameSink>>>,
+    }
+
+    impl Backend for Fake {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn outputs(&mut self) -> anyhow::Result<Vec<Output>> {
+            Ok(Vec::new())
+        }
+
+        fn start(
+            &mut self,
+            _output: &Output,
+            _settings: CaptureSettings,
+            sink: capture::FrameSink,
+        ) -> anyhow::Result<Box<dyn Stream>> {
+            for &size in &self.frames {
+                deliver(&sink, size);
+            }
+            *self.sink.lock().unwrap() = Some(sink);
+            Ok(Box::new(FakeStream { ended: self.ended }))
+        }
+    }
+
+    struct FakeStream {
+        ended: Option<&'static str>,
+    }
+
+    impl Stream for FakeStream {
+        fn poll_ended(&mut self) -> Option<anyhow::Error> {
+            self.ended.take().map(|reason| anyhow::anyhow!(reason))
+        }
+
+        fn set_cursor_capture(&mut self, _enabled: bool) -> bool {
+            true
+        }
+    }
+
+    fn start(
+        fake: &mut Fake,
+        display: Output,
+        size: Option<(u32, u32)>,
+        first_frame: Duration,
+    ) -> anyhow::Result<Running> {
+        Running::start(
+            fake,
+            display,
+            settings(),
+            Arc::new(|_| {}),
+            size,
+            first_frame,
+        )
+    }
+
+    #[test]
+    fn the_format_is_the_frames_encoded_size_whatever_the_displays_scale() {
+        // A 3840x2160 panel at 100%, 150% and 200%: its display in the
+        // logical layout, and the frames PipeWire delivers.
+        for (display, frames) in [
+            ((3840, 2160), (3840, 2160)),
+            ((2560, 1440), (3840, 2160)),
+            ((1920, 1080), (3840, 2160)),
+        ] {
+            let format = stream_format(frames, &settings());
+            assert_eq!((format.width, format.height), (3840, 2160), "{display:?}");
+        }
+        // Odd sizes lose a row and a column, and larger than 4K is scaled
+        // to fit: a 5120x2880 panel at 200% is a 2560x1440 display.
+        let format = stream_format((1365, 767), &settings());
+        assert_eq!((format.width, format.height), (1364, 766));
+        let format = stream_format((5120, 2880), &settings());
+        assert_eq!((format.width, format.height), (3840, 2160));
+        assert_eq!(format.frames_per_second, 30);
+        assert_eq!(format.bitrate_bits_per_second, 2_000_000);
+    }
+
+    #[test]
+    fn the_first_frame_fixes_the_size_and_another_size_is_kept_from_the_encoder() {
+        let mut sizes = Sizes::default();
+        assert!(sizes.admit((3840, 2160)));
+        assert!(sizes.admit((3840, 2160)));
+        // The scale went from 200% to 150% with the stream at 4K, then the
+        // resolution changed again.
+        assert!(!sizes.admit((2560, 1440)));
+        assert!(!sizes.admit((1920, 1080)));
+        assert_eq!(
+            sizes,
+            Sizes {
+                stream: Some((3840, 2160)),
+                changed: Some((2560, 1440)),
+            }
+        );
+        // A capture started again under an announced size keeps to it.
+        let mut restarted = Sizes {
+            stream: Some((3840, 2160)),
+            changed: None,
+        };
+        assert!(!restarted.admit((1920, 1080)));
+        assert_eq!(restarted.changed, Some((1920, 1080)));
+    }
+
+    #[test]
+    fn announces_the_size_the_capture_delivers_rather_than_the_displays() {
+        // A 640x360 panel at 200% and 150%, and frames of an odd size.
+        for (display, frames, announced) in [
+            ((320, 180), (640, 360), (640, 360)),
+            ((427, 240), (640, 360), (640, 360)),
+            ((320, 180), (641, 361), (640, 360)),
+        ] {
+            let mut fake = Fake {
+                frames: vec![frames],
+                ..Fake::default()
+            };
+            let running = start(
+                &mut fake,
+                output(display.0, display.1),
+                None,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            let format = running.format();
+            assert_eq!((format.width, format.height), announced, "{display:?}");
+            // The display keeps its logical size, which input maps onto.
+            let shown = running.output.display();
+            assert_eq!((shown.width, shown.height), display);
+        }
+    }
+
+    #[test]
+    fn a_capture_without_a_first_frame_starts_at_the_displays_size() {
+        // A display that is asleep sends nothing until the technician wakes
+        // it, which takes a started stream.
+        let wait = Duration::from_millis(200);
+        let mut fake = Fake::default();
+        let sink = Arc::clone(&fake.sink);
+        let mut running = start(&mut fake, output(320, 180), None, wait).unwrap();
+        let format = running.format();
+        assert_eq!((format.width, format.height), (320, 180));
+        // Not scaled: its frames have the display's size and the stream
+        // goes on.
+        let sink = sink.lock().unwrap().clone().unwrap();
+        deliver(&sink, (320, 180));
+        assert!(running.poll_ended().is_none());
+
+        // Scaled: the first frame has another size, which ends the stream
+        // for a start that announces it.
+        let mut fake = Fake::default();
+        let sink = Arc::clone(&fake.sink);
+        let mut running = start(&mut fake, output(320, 180), None, wait).unwrap();
+        let sink = sink.lock().unwrap().clone().unwrap();
+        deliver(&sink, (640, 360));
+        let error = running
+            .poll_ended()
+            .expect("the stream went on at a size it did not announce");
+        assert!(
+            format!("{error:#}").contains("from 320x180 to 640x360"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_capture_that_ends_before_its_first_frame_does_not_start() {
+        // It says why, without waiting out the time.
+        let mut fake = Fake {
+            ended: Some("the compositor ended the screencast"),
+            ..Fake::default()
+        };
+        let waited = Instant::now();
+        let Err(error) = start(&mut fake, output(320, 180), None, Duration::from_secs(30)) else {
+            panic!("a stream started after its capture ended");
+        };
+        assert!(waited.elapsed() < Duration::from_secs(5));
+        assert!(
+            format!("{error:#}").contains("the compositor ended the screencast"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_size_change_mid_stream_ends_the_stream() {
+        let mut fake = Fake {
+            frames: vec![(640, 360)],
+            ..Fake::default()
+        };
+        let sink = Arc::clone(&fake.sink);
+        let mut running = start(&mut fake, output(320, 180), None, Duration::from_secs(5)).unwrap();
+        let sink = sink.lock().unwrap().clone().unwrap();
+        deliver(&sink, (640, 360));
+        assert!(running.poll_ended().is_none());
+        // The user changes the scale and the compositor renegotiates.
+        deliver(&sink, (960, 540));
+        let error = running
+            .poll_ended()
+            .expect("the stream went on at a new size");
+        assert!(
+            format!("{error:#}").contains("from 640x360 to 960x540"),
+            "{error:#}"
+        );
+        let format = running.format();
+        assert_eq!((format.width, format.height), (640, 360));
+    }
+
+    #[test]
+    fn a_capture_started_again_keeps_to_the_announced_size() {
+        // As when the pointer setting restarts the capture.
+        let mut fake = Fake {
+            frames: vec![(960, 540)],
+            ..Fake::default()
+        };
+        let mut running = start(
+            &mut fake,
+            output(320, 180),
+            Some((640, 360)),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(running.poll_ended().is_some());
     }
 }

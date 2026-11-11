@@ -77,6 +77,12 @@ impl RawFrame<'_> {
             && self.stride >= self.width as usize * 4
             && self.data.len() >= self.stride * (self.height as usize - 1) + self.width as usize * 4
     }
+
+    /// Whether the encoder takes the frame: its rows fit and it is at least
+    /// two pixels a side.
+    pub(crate) fn encodable(&self) -> bool {
+        self.valid() && self.width >= 2 && self.height >= 2
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -349,7 +355,7 @@ impl VideoEncoder {
 
     /// Converts `frame` and queues it in place of any frame still waiting.
     pub(crate) fn submit(&self, frame: &RawFrame<'_>) {
-        if !frame.valid() || frame.width < 2 || frame.height < 2 {
+        if !frame.encodable() {
             return;
         }
         let mut picture = self
