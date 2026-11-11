@@ -13,6 +13,8 @@ test-support = ["dep:rustls"]
 anyhow.workspace = true
 bytes.workspace = true
 meshrmm-protocol.workspace = true
+# The version webrtc's DTLS stack uses, whose key pair it accepts.
+rcgen = "0.13.2"
 rustls = { workspace = true, optional = true }
 tokio.workspace = true
 tracing.workspace = true
@@ -20,6 +22,8 @@ webrtc = { workspace = true, features = ["pem"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+time = "0.3.55"
 [dev-dependencies]
 rustls.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+x509-parser = "0.16.0"

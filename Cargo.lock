@@ -3244,13 +3244,16 @@ dependencies = [
  "anyhow",
  "bytes",
  "meshrmm-protocol",
+ "rcgen 0.13.2",
  "rustls",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "time",
  "tokio",
  "tracing",
  "webrtc",
+ "x509-parser 0.16.0",
 ]
 
 [[package]]
