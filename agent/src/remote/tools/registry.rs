@@ -933,8 +933,10 @@ mod tests {
                 .iter()
                 .any(|key| key.name == "Microsoft" && key.has_subkeys)
         );
-        assert!(native.subkeys.iter().any(|key| key.name == "WOW6432Node"));
+        // Whether the 64-bit view shows WOW6432Node depends on the machine
+        // (CI's Windows Server images don't), but the 32-bit view never does.
         let wow = list_key(&software(RegistryView::Bits32)).unwrap();
+        assert!(wow.subkeys.iter().any(|key| key.name == "Microsoft"));
         assert!(wow.subkeys.iter().all(|key| key.name != "WOW6432Node"));
         let roots = list_key(&RegistryKey {
             root: RegistryRoot::LocalMachine,
