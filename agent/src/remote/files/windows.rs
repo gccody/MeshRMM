@@ -5,6 +5,7 @@ use std::fs::{self, Metadata};
 use std::io::{self, Write};
 use std::os::windows::ffi::OsStringExt;
 use std::os::windows::fs::{FileTypeExt, MetadataExt};
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,11 +15,14 @@ use meshrmm_protocol::{
 use windows::Win32::Foundation::{FILETIME, HANDLE, SYSTEMTIME};
 use windows::Win32::Security::{ImpersonateLoggedOnUser, RevertToSelf};
 use windows::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_READONLY,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SYSTEM, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_FLAGS_AND_ATTRIBUTES, FileTimeToLocalFileTime, GetDiskFreeSpaceExW, GetDriveTypeW,
-    GetFileAttributesW, GetFileInformationByHandle, GetLogicalDrives, GetVolumeInformationW,
-    GetVolumePathNameW, INVALID_FILE_ATTRIBUTES, SetFileAttributesW,
+    BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_ATTRIBUTE_SYSTEM, FILE_CREATION_DISPOSITION, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileTimeToLocalFileTime,
+    GetDiskFreeSpaceExW, GetDriveTypeW, GetFileAttributesW, GetFileInformationByHandle,
+    GetLogicalDrives, GetVolumeInformationW, GetVolumePathNameW, INVALID_FILE_ATTRIBUTES,
+    OPEN_EXISTING, SetFileAttributesW,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
@@ -30,10 +34,13 @@ use windows::Win32::UI::Shell::{
 use windows::core::{GUID, PCWSTR};
 
 use super::account::{Account, nobody_signed_in};
-use super::{io_error, paths};
+use super::{Deadline, io_error, paths, timed_out};
 use crate::remote::config::ExecutionMode;
 use crate::remote::toolbox::windows::{UserLogon, own_account, signed_in_user};
 use crate::win32::wide;
+
+/// How much of a file a copy writes between looks at its deadline.
+const COPY_PIECE: u64 = 16 * 1024 * 1024;
 
 const DRIVE_REMOVABLE: u32 = 2;
 const DRIVE_FIXED: u32 = 3;
@@ -141,7 +148,6 @@ pub(super) fn open_plain(options: &mut fs::OpenOptions, path: &Path) -> io::Resu
 
 /// Whether an open file is a regular file, not a link, with no other names.
 pub(super) fn plain_file(file: &fs::File) -> io::Result<bool> {
-    use std::os::windows::io::AsRawHandle as _;
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
         return Ok(false);
@@ -183,6 +189,179 @@ pub(super) fn copy_link(source: &Path, _target: &Path) -> Result<(), FileError> 
             "{} is a link, which can't be moved to another drive.",
             source.display()
         ),
+    ))
+}
+
+/// The error for an entry whose kind changed under the copy, as when a user
+/// swaps a folder for a junction while it runs.
+fn changed(path: &Path) -> FileError {
+    FileError::new(
+        FileErrorCode::Changed,
+        format!("{} changed while it was being copied.", path.display()),
+    )
+}
+
+/// Opens `path` through a handle without following a reparse point in its
+/// place, with the access and flags given, and reads its information from the
+/// handle. `FILE_FLAG_OPEN_REPARSE_POINT` opens a junction or link itself, so
+/// the caller can see it on the handle and refuse it.
+fn open_handle(
+    path: &Path,
+    access: u32,
+    disposition: FILE_CREATION_DISPOSITION,
+    flags: FILE_FLAGS_AND_ATTRIBUTES,
+) -> io::Result<(fs::File, BY_HANDLE_FILE_INFORMATION)> {
+    let wide_path = wide(path);
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide_path.as_ptr()),
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            disposition,
+            flags | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .map_err(io::Error::other)?;
+    // SAFETY: CreateFileW returned a fresh, owned handle on success; File
+    // closes it when dropped.
+    let file = unsafe { fs::File::from_raw_handle(handle.0 as *mut _) };
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the handle is open and info is a valid out-parameter.
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle() as _), &mut info) }
+        .map_err(io::Error::other)?;
+    Ok((file, info))
+}
+
+fn is_reparse(info: &BY_HANDLE_FILE_INFORMATION) -> bool {
+    info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+}
+
+fn is_directory(info: &BY_HANDLE_FILE_INFORMATION) -> bool {
+    info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0
+}
+
+/// A file's identity, the same across two handles only for the same file.
+fn identity(info: &BY_HANDLE_FILE_INFORMATION) -> (u32, u32, u32) {
+    (
+        info.dwVolumeSerialNumber,
+        info.nFileIndexHigh,
+        info.nFileIndexLow,
+    )
+}
+
+/// Opens a real directory through a handle, refusing a junction or link in
+/// its place.
+fn open_directory(path: &Path) -> io::Result<(fs::File, BY_HANDLE_FILE_INFORMATION)> {
+    open_handle(
+        path,
+        FILE_GENERIC_READ.0,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+    )
+}
+
+/// Copies `source` to `target`, a folder with everything in it. Ownership on
+/// Windows is inherited from the folder, so there is nothing to adopt; the
+/// walk's job is to never follow a junction or link a local user swapped into
+/// a privileged copy's path. Each folder and file is opened through a handle
+/// with `FILE_FLAG_OPEN_REPARSE_POINT` and refused if it turns out to be a
+/// reparse point, and each new file is created with `CREATE_NEW` so a planted
+/// link can't be followed or an existing file overwritten. Stops at the
+/// deadline, before an entry or a piece of a file.
+pub(super) fn copy_tree(
+    _account: &Account,
+    source: &Path,
+    target: &Path,
+    deadline: &Deadline,
+) -> Result<(), FileError> {
+    copy_entry(source, target, deadline)
+}
+
+fn copy_entry(source: &Path, target: &Path, deadline: &Deadline) -> Result<(), FileError> {
+    if deadline.passed() {
+        return Err(timed_out("The device ran out of time."));
+    }
+    let metadata = fs::symlink_metadata(source).map_err(|error| io_error(&error, source))?;
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        // A symbolic link, copied as a link, which across drives can't be done.
+        return copy_link(source, target);
+    }
+    if file_type.is_dir() {
+        // A junction has the directory attribute too, so it reaches here; the
+        // handle shows the reparse point and the walk refuses to follow it.
+        let (_source_dir, source_info) =
+            open_directory(source).map_err(|error| io_error(&error, source))?;
+        if is_reparse(&source_info) {
+            return Err(changed(source));
+        }
+        let source_id = identity(&source_info);
+        fs::create_dir(target).map_err(|error| io_error(&error, target))?;
+        // What we just made must be a real directory, not a junction a user
+        // put in its place.
+        let (_target_dir, target_info) =
+            open_directory(target).map_err(|error| io_error(&error, target))?;
+        if is_reparse(&target_info) {
+            return Err(changed(target));
+        }
+        for item in fs::read_dir(source).map_err(|error| io_error(&error, source))? {
+            let item = item.map_err(|error| io_error(&error, source))?;
+            // The directory being read must still be the one that was
+            // verified, or an ancestor was swapped under the walk.
+            let (_again, again_info) =
+                open_directory(source).map_err(|error| io_error(&error, source))?;
+            if is_reparse(&again_info) || identity(&again_info) != source_id {
+                return Err(changed(source));
+            }
+            copy_entry(&item.path(), &target.join(item.file_name()), deadline)?;
+        }
+        return Ok(());
+    }
+    if file_type.is_file() {
+        let (mut source_file, source_info) = open_handle(
+            source,
+            FILE_GENERIC_READ.0,
+            OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+        )
+        .map_err(|error| io_error(&error, source))?;
+        // A link or directory swapped in where a regular file was is refused.
+        if is_reparse(&source_info) || is_directory(&source_info) {
+            return Err(changed(source));
+        }
+        // CREATE_NEW never follows a link or overwrites an existing file.
+        let (mut target_file, _target_info) = open_handle(
+            target,
+            FILE_GENERIC_WRITE.0,
+            CREATE_NEW,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+        )
+        .map_err(|error| io_error(&error, target))?;
+        loop {
+            use std::io::Read;
+            let copied = io::copy(
+                &mut Read::by_ref(&mut source_file).take(COPY_PIECE),
+                &mut target_file,
+            )
+            .map_err(|error| io_error(&error, target))?;
+            if copied < COPY_PIECE {
+                break;
+            }
+            if deadline.passed() {
+                return Err(timed_out("The device ran out of time."));
+            }
+        }
+        let _ = target_file.set_permissions(metadata.permissions());
+        if let Ok(modified) = metadata.modified() {
+            let _ = target_file.set_modified(modified);
+        }
+        return Ok(());
+    }
+    Err(FileError::new(
+        FileErrorCode::Failed,
+        format!("{} isn't a regular file, folder or link.", source.display()),
     ))
 }
 
@@ -485,6 +664,52 @@ mod tests {
         let (year, ..) = local_civil(SystemTime::now()).unwrap();
         assert!(year >= 2026);
         assert_eq!(random_id().len(), 6);
+    }
+
+    #[test]
+    fn a_copy_does_not_follow_a_directory_junction_swapped_into_the_tree() {
+        use std::process::Command;
+        let base = std::env::temp_dir().join(format!("meshrmm-junction-{}", uuid::Uuid::new_v4()));
+        let secret = base.join("secret");
+        fs::create_dir_all(&secret).unwrap();
+        fs::write(secret.join("loot"), b"loot").unwrap();
+        let source = base.join("src");
+        fs::create_dir(&source).unwrap();
+        let trap = source.join("trap");
+        // A directory junction needs no elevation, unlike a symbolic link.
+        let made = Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &trap.to_string_lossy(),
+                &secret.to_string_lossy(),
+            ])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        let is_reparse_point = fs::symlink_metadata(&trap)
+            .map(|metadata| metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0)
+            .unwrap_or(false);
+        if !made || !is_reparse_point {
+            eprintln!("skipped: could not create a directory junction");
+            let _ = fs::remove_dir_all(&base);
+            return;
+        }
+        let account = Account {
+            label: own_account(),
+            home: None,
+            user: None,
+        };
+        let target = base.join("dst");
+        let result = copy_tree(&account, &source, &target, &Deadline::distant());
+        // The privileged copy refuses the junction instead of following it.
+        assert!(result.is_err(), "the copy must refuse the junction");
+        assert!(
+            !target.join("trap").join("loot").exists(),
+            "the junction's target must not be copied through"
+        );
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

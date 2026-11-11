@@ -1,9 +1,18 @@
 //! The file browser on macOS and Linux: accounts, entry flags, volumes,
 //! ownership and the Trash.
-use std::ffi::CString;
+//!
+//! A privileged operation (SYSTEM or root, in the Agent's own account) runs
+//! inside folders a local unprivileged user may control, so the copy walk
+//! and ownership adoption here never act on a path a second time after
+//! checking it. They descend with directory descriptors, opening every
+//! component with `O_NOFOLLOW` (and `O_DIRECTORY` for folders), and change
+//! an owner with `fchown` on the descriptor of the thing just created, so a
+//! link swapped in between a check and the act can't redirect root.
+use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, Metadata};
 use std::io;
-use std::os::unix::ffi::OsStrExt;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
@@ -14,7 +23,10 @@ use meshrmm_protocol::{
 };
 
 use super::account::{Account, nobody_signed_in};
-use super::{io_error, paths};
+use super::{Deadline, io_error, paths, timed_out};
+
+/// How much of a file a copy writes between looks at its deadline.
+const COPY_PIECE: u64 = 16 * 1024 * 1024;
 use crate::remote::config::ExecutionMode;
 use crate::remote::user_database::UserEntry;
 
@@ -209,12 +221,6 @@ pub(super) fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// Copies the link `source` as a link to the same place.
-pub(super) fn copy_link(source: &Path, target: &Path) -> Result<(), FileError> {
-    let points_to = fs::read_link(source).map_err(|error| io_error(&error, source))?;
-    std::os::unix::fs::symlink(points_to, target).map_err(|error| io_error(&error, target))
-}
-
 pub(super) fn remove_link(path: &Path, _metadata: &Metadata) -> io::Result<()> {
     fs::remove_file(path)
 }
@@ -223,19 +229,412 @@ pub(super) fn remove_file(path: &Path) -> io::Result<()> {
     fs::remove_file(path)
 }
 
+/// Whether an operation runs with the Agent's own privileges: as root, in
+/// the Agent's own account rather than as the signed-in user. Only then does
+/// what it creates take its folder's owner, and only then must the strict
+/// descriptor walk guard against a local user swapping a link into a path.
+fn privileged(account: &Account) -> bool {
+    !account.is_user() && effective_uid() == 0
+}
+
 /// Gives what root made the owner and group of the folder it's in, so files
 /// put in a user's folder stay theirs. What a user makes is theirs already.
+///
+/// The owner comes from the opened parent directory, and `fchown` acts on
+/// the entry opened without following a link, so a user who swaps the path
+/// for a link can't make root hand them another file.
 pub(super) fn adopt_parent_owner(account: &Account, path: &Path) {
-    if account.is_user() || effective_uid() != 0 {
+    if !privileged(account) {
         return;
     }
-    let Some(parent) = path.parent() else { return };
-    let Ok(folder) = fs::metadata(parent) else {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return;
     };
-    if let Err(error) = std::os::unix::fs::lchown(path, Some(folder.uid()), Some(folder.gid())) {
+    let adopt = || -> io::Result<()> {
+        let parent = open_dir(parent)?;
+        let owner = fstat(parent.as_fd())?;
+        let entry = open_no_follow(parent.as_fd(), name)?;
+        std::os::unix::fs::fchown(&entry, Some(owner.st_uid), Some(owner.st_gid))
+    };
+    if let Err(error) = adopt() {
         tracing::debug!(%error, path = %path.display(), "could not give a new entry its folder's owner");
     }
+}
+
+/// Changes `child`'s owner and group to those of the opened directory
+/// `parent`, both held as descriptors, so nothing is reached by a path that
+/// could have changed. Used by the copy walk, which already has the
+/// descriptors in hand.
+fn adopt_owner(parent: BorrowedFd, child: BorrowedFd) {
+    let owner = match fstat(parent) {
+        Ok(owner) => owner,
+        Err(_) => return,
+    };
+    if let Err(error) = std::os::unix::fs::fchown(child, Some(owner.st_uid), Some(owner.st_gid)) {
+        tracing::debug!(%error, "could not give a copied entry its folder's owner");
+    }
+}
+
+/// A path component's bytes as a C string, for the `*at` system calls.
+fn c_name(name: &OsStr) -> io::Result<CString> {
+    CString::new(name.as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
+}
+
+/// Opens a directory by path, following links in the folders above it (the
+/// path a technician chose is trusted); the descent below it never follows a
+/// link.
+fn open_dir(path: &Path) -> io::Result<OwnedFd> {
+    let text = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: the path is NUL-terminated; the flags are constants.
+    let fd = unsafe {
+        libc::open(
+            text.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: open returned a fresh, owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Opens the directory `name` inside `dir` without following a link in its
+/// place: a link, or anything that isn't a directory, fails rather than
+/// redirecting the walk.
+fn open_dir_at(dir: BorrowedFd, name: &OsStr) -> io::Result<OwnedFd> {
+    let name = c_name(name)?;
+    // SAFETY: the name is NUL-terminated; the flags are constants.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a fresh, owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Opens `name` inside `dir` for reading without following a link in its
+/// place. A directory opens too; the caller checks the kind on the
+/// descriptor. A link fails with `ELOOP`.
+fn open_no_follow(dir: BorrowedFd, name: &OsStr) -> io::Result<OwnedFd> {
+    let name = c_name(name)?;
+    // SAFETY: the name is NUL-terminated; the flags are constants.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a fresh, owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Creates the new file `name` inside `dir`, failing if it already exists or
+/// is a link, and opens it for writing.
+fn create_file_at(dir: BorrowedFd, name: &OsStr) -> io::Result<OwnedFd> {
+    let name = c_name(name)?;
+    // SAFETY: the name is NUL-terminated; the flags and mode are plain
+    // values. O_EXCL | O_NOFOLLOW means the file is brand new and not a link.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600 as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a fresh, owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Creates the directory `name` inside `dir`.
+fn mkdir_at(dir: BorrowedFd, name: &OsStr) -> io::Result<()> {
+    let name = c_name(name)?;
+    // SAFETY: the name is NUL-terminated.
+    if unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), 0o777) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The kind and owner of `name` inside `dir`, seen without following a link
+/// in its place.
+fn lstat_at(dir: BorrowedFd, name: &OsStr) -> io::Result<libc::stat> {
+    let name = c_name(name)?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: the name is NUL-terminated; fstatat fills `stat`.
+    if unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstatat filled it in.
+    Ok(unsafe { stat.assume_init() })
+}
+
+/// The kind and owner of an open descriptor.
+fn fstat(fd: BorrowedFd) -> io::Result<libc::stat> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: fstat fills `stat` for a valid descriptor.
+    if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstat filled it in.
+    Ok(unsafe { stat.assume_init() })
+}
+
+/// Where the link `name` inside `dir` points, read without following it.
+fn read_link_at(dir: BorrowedFd, name: &OsStr) -> io::Result<PathBuf> {
+    let c = c_name(name)?;
+    let mut buffer = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: the name is NUL-terminated; the buffer holds `buffer.len()`
+    // bytes for readlinkat to write into.
+    let len = unsafe {
+        libc::readlinkat(
+            dir.as_raw_fd(),
+            c.as_ptr(),
+            buffer.as_mut_ptr() as *mut libc::c_char,
+            buffer.len(),
+        )
+    };
+    if len < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    buffer.truncate(len as usize);
+    Ok(PathBuf::from(OsString::from_vec(buffer)))
+}
+
+/// Creates a link `name` inside `dir` pointing where `points_to` says.
+fn symlink_at(points_to: &Path, dir: BorrowedFd, name: &OsStr) -> io::Result<()> {
+    let target = CString::new(points_to.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let name = c_name(name)?;
+    // SAFETY: both strings are NUL-terminated.
+    if unsafe { libc::symlinkat(target.as_ptr(), dir.as_raw_fd(), name.as_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The names in the directory `dir`, without `.` and `..`, read from the
+/// descriptor so nothing is reached by a path.
+fn read_dir_names(dir: BorrowedFd) -> io::Result<Vec<OsString>> {
+    // fdopendir takes over the descriptor it reads and closedir closes it,
+    // so give it a duplicate and keep ours to open the entries through.
+    // SAFETY: dup of a valid descriptor.
+    let duplicate = unsafe { libc::dup(dir.as_raw_fd()) };
+    if duplicate < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the duplicate is a fresh directory descriptor.
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        let error = io::Error::last_os_error();
+        // SAFETY: fdopendir did not take the descriptor, so close it.
+        unsafe { libc::close(duplicate) };
+        return Err(error);
+    }
+    let mut names = Vec::new();
+    let result = loop {
+        clear_errno();
+        // SAFETY: the stream is open; readdir returns its own static storage
+        // or null. closedir below frees the stream.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            break if errno == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(errno))
+            };
+        }
+        // SAFETY: entry points to a valid dirent while the stream is open.
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let bytes = name.to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        names.push(OsStr::from_bytes(bytes).to_owned());
+    };
+    // SAFETY: closes the stream and its duplicate descriptor.
+    unsafe { libc::closedir(stream) };
+    result.map(|()| names)
+}
+
+/// Clears `errno`, so a following `readdir` returning null can be told apart
+/// as the end of the directory (`errno` unchanged) or an error.
+fn clear_errno() {
+    #[cfg(target_os = "linux")]
+    // SAFETY: __errno_location returns a valid pointer to this thread's errno.
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
+    #[cfg(target_os = "macos")]
+    // SAFETY: __error returns a valid pointer to this thread's errno.
+    unsafe {
+        *libc::__error() = 0;
+    }
+}
+
+/// The error for an entry whose kind changed under the copy, as when a user
+/// swaps a file or folder for a link while it runs.
+fn changed(path: &Path) -> FileError {
+    FileError::new(
+        FileErrorCode::Changed,
+        format!("{} changed while it was being copied.", path.display()),
+    )
+}
+
+/// A `NOFOLLOW` open that failed because a link or the wrong kind was in the
+/// path becomes a "changed" error; anything else keeps its own meaning.
+fn changed_or_io(error: &io::Error, path: &Path) -> FileError {
+    match error.raw_os_error() {
+        Some(libc::ELOOP) | Some(libc::ENOTDIR) => changed(path),
+        _ => io_error(error, path),
+    }
+}
+
+/// Copies `source` to `target`, a folder with everything in it, descending
+/// with directory descriptors so a link swapped into the walk can't make a
+/// privileged copy read or write somewhere the user chose. Links are copied
+/// as links, never followed. Stops at the deadline, before an entry or a
+/// piece of a file.
+pub(super) fn copy_tree(
+    account: &Account,
+    source: &Path,
+    target: &Path,
+    deadline: &Deadline,
+) -> Result<(), FileError> {
+    let (Some(source_parent), Some(source_name)) = (source.parent(), source.file_name()) else {
+        return Err(io_error(&io::ErrorKind::InvalidInput.into(), source));
+    };
+    let (Some(target_parent), Some(target_name)) = (target.parent(), target.file_name()) else {
+        return Err(io_error(&io::ErrorKind::InvalidInput.into(), target));
+    };
+    let source_parent = open_dir(source_parent).map_err(|error| io_error(&error, source))?;
+    let target_parent = open_dir(target_parent).map_err(|error| io_error(&error, target))?;
+    copy_entry(
+        privileged(account),
+        source_parent.as_fd(),
+        source_name,
+        source,
+        target_parent.as_fd(),
+        target_name,
+        target,
+        deadline,
+    )
+}
+
+/// Copies one entry, `source_name` inside `source_parent`, to `target_name`
+/// inside `target_parent`, both named by descriptor. `source` and `target`
+/// are the paths only for error messages. Recurses into folders through the
+/// descriptors it opens. `adopt` gives each new entry its folder's owner.
+// The mode constants are `mode_t`, 32 bits on Linux and 16 on macOS, so the
+// casts are needed on one and a no-op on the other.
+#[allow(clippy::too_many_arguments, clippy::unnecessary_cast)]
+fn copy_entry(
+    adopt: bool,
+    source_parent: BorrowedFd,
+    source_name: &OsStr,
+    source: &Path,
+    target_parent: BorrowedFd,
+    target_name: &OsStr,
+    target: &Path,
+    deadline: &Deadline,
+) -> Result<(), FileError> {
+    if deadline.passed() {
+        return Err(timed_out("The device ran out of time."));
+    }
+    let stat = lstat_at(source_parent, source_name).map_err(|error| io_error(&error, source))?;
+    let kind = (stat.st_mode as u32) & (libc::S_IFMT as u32);
+    if kind == (libc::S_IFLNK as u32) {
+        let points_to =
+            read_link_at(source_parent, source_name).map_err(|error| io_error(&error, source))?;
+        return symlink_at(&points_to, target_parent, target_name)
+            .map_err(|error| io_error(&error, target));
+    }
+    if kind == (libc::S_IFDIR as u32) {
+        mkdir_at(target_parent, target_name).map_err(|error| io_error(&error, target))?;
+        let target_dir = open_dir_at(target_parent, target_name)
+            .map_err(|error| changed_or_io(&error, target))?;
+        if adopt {
+            adopt_owner(target_parent, target_dir.as_fd());
+        }
+        let source_dir = open_dir_at(source_parent, source_name)
+            .map_err(|error| changed_or_io(&error, source))?;
+        for name in read_dir_names(source_dir.as_fd()).map_err(|error| io_error(&error, source))? {
+            copy_entry(
+                adopt,
+                source_dir.as_fd(),
+                &name,
+                &source.join(&name),
+                target_dir.as_fd(),
+                &name,
+                &target.join(&name),
+                deadline,
+            )?;
+        }
+        return Ok(());
+    }
+    if kind == (libc::S_IFREG as u32) {
+        let source_file = open_no_follow(source_parent, source_name)
+            .map_err(|error| changed_or_io(&error, source))?;
+        let mut source_file = fs::File::from(source_file);
+        let metadata = source_file
+            .metadata()
+            .map_err(|error| io_error(&error, source))?;
+        // The kind is read again on the open descriptor: a file swapped for a
+        // directory passes the NOFOLLOW open but is not a regular file.
+        if !metadata.is_file() {
+            return Err(changed(source));
+        }
+        let target_file =
+            create_file_at(target_parent, target_name).map_err(|error| io_error(&error, target))?;
+        let mut target_file = fs::File::from(target_file);
+        loop {
+            use std::io::Read;
+            let copied = io::copy(&mut source_file.by_ref().take(COPY_PIECE), &mut target_file)
+                .map_err(|error| io_error(&error, target))?;
+            if copied < COPY_PIECE {
+                break;
+            }
+            if deadline.passed() {
+                return Err(timed_out("The device ran out of time."));
+            }
+        }
+        let _ = target_file.set_permissions(metadata.permissions());
+        if let Ok(modified) = metadata.modified() {
+            let _ = target_file.set_modified(modified);
+        }
+        if adopt {
+            adopt_owner(target_parent, target_file.as_fd());
+        }
+        return Ok(());
+    }
+    Err(FileError::new(
+        FileErrorCode::Failed,
+        format!("{} isn't a regular file, folder or link.", source.display()),
+    ))
 }
 
 /// `time` on the device's clock: year, month, day, hour, minute, second.
@@ -666,6 +1065,72 @@ mod tests {
             "/home/ada/a%20b%25.txt"
         );
         assert_eq!(local_time_text().len(), 19);
+    }
+
+    /// A temporary folder removed when the test ends.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("meshrmm-{tag}-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn opening_a_source_file_does_not_follow_a_symlink_swapped_in() {
+        let dir = TempDir::new("nofollow");
+        let secret = dir.0.join("secret");
+        fs::write(&secret, b"SECRET").unwrap();
+        std::os::unix::fs::symlink(&secret, dir.0.join("item")).unwrap();
+        let parent = open_dir(&dir.0).unwrap();
+        // The descriptor walk refuses a link in place of the regular file it
+        // meant to read, so a privileged copy can't be made to read it out.
+        let refused = open_no_follow(parent.as_fd(), OsStr::new("item"));
+        assert_eq!(refused.unwrap_err().raw_os_error(), Some(libc::ELOOP));
+        // A plain open by path, as the code did before, would have followed
+        // the link and read the secret.
+        assert_eq!(fs::read(dir.0.join("item")).unwrap(), b"SECRET");
+        // A real regular file opens as before.
+        assert!(open_no_follow(parent.as_fd(), OsStr::new("secret")).is_ok());
+    }
+
+    #[test]
+    fn descending_does_not_follow_a_directory_symlink() {
+        let dir = TempDir::new("descend");
+        fs::create_dir(dir.0.join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.0.join("real"), dir.0.join("link")).unwrap();
+        let parent = open_dir(&dir.0).unwrap();
+        // A link in place of a subfolder is refused, so the walk never
+        // descends into somewhere a user chose.
+        assert!(open_dir_at(parent.as_fd(), OsStr::new("link")).is_err());
+        // A real directory opens.
+        assert!(open_dir_at(parent.as_fd(), OsStr::new("real")).is_ok());
+    }
+
+    #[test]
+    fn ownership_adoption_decides_from_the_parent_descriptor_and_skips_a_link() {
+        let dir = TempDir::new("adopt");
+        // The owner to adopt is the parent folder's, read from the opened
+        // descriptor rather than a path that could be swapped.
+        let parent = open_dir(&dir.0).unwrap();
+        let owner = fstat(parent.as_fd()).unwrap();
+        let folder = fs::metadata(&dir.0).unwrap();
+        assert_eq!((owner.st_uid, owner.st_gid), (folder.uid(), folder.gid()));
+        // fchown goes to the entry opened without following a link; a link
+        // swapped into its place is refused, so root never chowns the link's
+        // target. The chown itself needs root and isn't exercised here.
+        fs::write(dir.0.join("made"), b"x").unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", dir.0.join("swapped")).unwrap();
+        assert!(open_no_follow(parent.as_fd(), OsStr::new("made")).is_ok());
+        assert!(open_no_follow(parent.as_fd(), OsStr::new("swapped")).is_err());
     }
 
     #[test]
