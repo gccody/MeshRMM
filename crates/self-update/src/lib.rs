@@ -263,14 +263,6 @@ pub fn manifest_url(server: &str) -> String {
     )
 }
 
-pub fn validate_manifest_url(value: &str) -> anyhow::Result<()> {
-    let url = url::Url::parse(value).context("update manifest URL is invalid")?;
-    if url.scheme() != "https" || url.host_str().is_none() {
-        bail!("update manifest URL must use HTTPS");
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,6 +467,5 @@ mod tests {
             manifest_url("https://rmm.example.com/"),
             "https://rmm.example.com/downloads/update-manifest.json"
         );
-        validate_manifest_url(&manifest_url("https://rmm.example.com")).unwrap();
     }
 }

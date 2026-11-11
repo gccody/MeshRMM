@@ -7,10 +7,10 @@ use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
+use meshrmm_self_update::CURRENT_VERSION;
 use meshrmm_self_update::windows::{
     PreviousProcess, current_process_created, helper_cleanup_command,
 };
-use meshrmm_self_update::{CURRENT_VERSION, UpdateManifest};
 use tracing_subscriber::EnvFilter;
 use windows::Win32::Foundation::ERROR_SERVICE_ALREADY_RUNNING;
 use windows_service::service::{Service, ServiceAccess, ServiceState};
@@ -26,7 +26,6 @@ use crate::update_policy::{
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
-const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_UPDATE_BYTES: u64 = 256 * 1024 * 1024;
 const ATTEMPTS_FILE: &str = "update-attempts.json";
 /// The stopping service waits up to 5 seconds for each tray and 25 seconds for its coordinator to
@@ -100,9 +99,7 @@ impl StagedUpdate {
 /// Downloads and stages a newer release, if there is one; [`StagedUpdate::start`] installs it.
 pub fn check_and_stage(config: &Config) -> anyhow::Result<Option<StagedUpdate>> {
     let http = http_agent();
-    let manifest_bytes = download(&http, &config.update_manifest_url, MAX_MANIFEST_BYTES)
-        .context("failed to download the Agent update manifest")?;
-    let manifest = UpdateManifest::parse(&manifest_bytes)?;
+    let manifest = crate::update_check::fetch_manifest(&http, config)?;
     let config_directory = config
         .config_path
         .parent()
@@ -617,16 +614,6 @@ fn http_agent() -> ureq::Agent {
         .tls_config(https_tls_config())
         .build()
         .new_agent()
-}
-
-fn download(http: &ureq::Agent, url: &str, maximum: u64) -> anyhow::Result<Vec<u8>> {
-    let response = http.get(url).call()?;
-    response
-        .into_body()
-        .into_with_config()
-        .limit(maximum)
-        .read_to_vec()
-        .context("download exceeded its size limit or could not be read")
 }
 
 /// Downloads the Agent update from `body` into `staged`, a new file in the private update

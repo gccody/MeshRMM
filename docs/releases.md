@@ -32,8 +32,11 @@ for macOS is the company's Developer ID build when the server signs them
 (`/downloads/developer-id/<file>`). It writes
 `/downloads/update-manifest.json` from `artifacts.json` and the signed builds,
 with every URL on its own `public_url`. Upgrading the server therefore
-upgrades its Agents and viewers: Agents check the manifest at startup and
-every six hours, and viewers check it when a session starts. The server
+upgrades its Agents and viewers: Agents ask the server for their update at
+startup and every six hours, and viewers check the manifest when a session
+starts. An Agent gets the manifest from an update check that authenticates
+it, so the server can offer a new release to some devices before others; see
+[staged rollouts](devices.md#staged-rollouts). The server
 refuses to start if a listed build is missing or doesn't match its SHA-256,
 and logs a warning if a build isn't signed with the release key it was built
 with.

@@ -12,6 +12,7 @@ use serde_json::json;
 
 use super::{companies, deployment_tokens, limit_token_attempts};
 use crate::{
+    agent_rollout,
     agents::{self, bearer_token, enrollment_token, hashes_match},
     audit::{self, Actor, Target},
     auth::{Authorized, limits::ip_key},
@@ -136,7 +137,6 @@ pub struct AgentConfig {
     server: String,
     device_id: String,
     agent_token: String,
-    update_manifest_url: String,
     frames_per_second: u32,
     bitrate_bits_per_second: u32,
     json_logs: bool,
@@ -300,7 +300,6 @@ pub async fn redeem(
     }
     Ok(Json(AgentConfig {
         server: state.config.public_origin(),
-        update_manifest_url: meshrmm_self_update::manifest_url(&state.config.public_origin()),
         device_id: claim.device_id,
         agent_token,
         frames_per_second: FRAMES_PER_SECOND,
@@ -386,6 +385,7 @@ async fn enroll_device(
                             Agents::CompanyId,
                             Agents::CreatedAt,
                             Agents::UpdatedAt,
+                            Agents::RolloutBucket,
                         ])
                         .values_panic([
                             claim.device_id.as_str().into(),
@@ -396,6 +396,7 @@ async fn enroll_device(
                             claim.company_id.clone().into(),
                             now.into(),
                             now.into(),
+                            i64::from(agent_rollout::bucket(&claim.device_id)).into(),
                         ])
                         .to_owned(),
                 )

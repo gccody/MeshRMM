@@ -190,6 +190,14 @@ impl Restarted {
     pub async fn finish(self) {
         self.state.database.close().await;
     }
+
+    /// `agent`, sending its requests to this server.
+    pub fn agent(&self, agent: &Agent) -> Agent {
+        Agent {
+            router: self.router.clone(),
+            ..agent.clone()
+        }
+    }
 }
 
 /// An app listening on a loopback port.
@@ -239,7 +247,10 @@ impl App {
     }
 
     pub async fn sqlite_with(customize: Customize) -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        Self::sqlite_in(tempfile::tempdir().unwrap(), customize).await
+    }
+
+    async fn sqlite_in(dir: TempDir, customize: Customize) -> Self {
         let config = config(dir.path(), "tls.mode = \"proxy\"");
         Self::new("sqlite", config, None, dir, customize).await
     }
@@ -249,7 +260,10 @@ impl App {
     }
 
     pub async fn postgres_with(admin_url: &str, customize: Customize) -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        Self::postgres_in(admin_url, tempfile::tempdir().unwrap(), customize).await
+    }
+
+    async fn postgres_in(admin_url: &str, dir: TempDir, customize: Customize) -> Self {
         let database = postgres_with(admin_url, false).await;
         let config = config(
             dir.path(),
@@ -310,6 +324,12 @@ impl App {
         &self.state.database
     }
 
+    /// Replaces the downloads with release `version`'s, which the server
+    /// ships once it restarts ([`App::restarted`]).
+    pub fn ship(&self, version: &str) {
+        write_release(self._dir.path(), version);
+    }
+
     pub async fn finish(self) {
         self.state.database.close().await;
         if let Some(database) = self.database {
@@ -321,6 +341,58 @@ impl App {
 /// A server on every backend under test.
 pub async fn apps() -> Vec<App> {
     apps_with(|_| {}).await
+}
+
+/// A server on every backend under test that ships Agent and viewer release
+/// `version` ([`write_release`]).
+pub async fn apps_releasing(version: &str) -> Vec<App> {
+    let dir = || {
+        let dir = tempfile::tempdir().unwrap();
+        write_release(dir.path(), version);
+        dir
+    };
+    let mut apps = vec![App::sqlite_in(dir(), |_| {}).await];
+    if let Some(admin_url) = postgres_admin_url() {
+        apps.push(App::postgres_in(&admin_url, dir(), |_| {}).await);
+    }
+    apps
+}
+
+/// The Agent and viewer targets [`write_release`] ships, in order.
+pub const RELEASE_TARGETS: [&str; 3] =
+    ["agent-linux-x64", "agent-windows-x64", "client-windows-x64"];
+
+/// Downloads in `dir` for release `version`: a build of each of
+/// [`RELEASE_TARGETS`], unsigned, listed in its artifacts.json.
+pub fn write_release(dir: &Path, version: &str) {
+    use sha2::Digest;
+    let downloads = dir.join("downloads");
+    let _ = std::fs::remove_dir_all(&downloads);
+    std::fs::create_dir_all(&downloads).unwrap();
+    let mut artifacts = serde_json::Map::new();
+    for target in RELEASE_TARGETS {
+        let file = format!("meshrmm-{target}");
+        let contents = format!("{target} {version}");
+        std::fs::write(downloads.join(&file), &contents).unwrap();
+        artifacts.insert(
+            target.to_owned(),
+            serde_json::json!({
+                "file": file,
+                "sha256": format!("{:x}", sha2::Sha256::digest(contents.as_bytes())),
+                "signature": null,
+            }),
+        );
+    }
+    std::fs::write(
+        downloads.join("artifacts.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "version": version,
+            "artifacts": artifacts,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 }
 
 /// A server on every backend under test, each changed by `customize`.
@@ -553,6 +625,13 @@ impl Agent {
             .body(body)
             .unwrap();
         self.send(request).await
+    }
+
+    /// Checks for an Agent update as this device running `version`: the
+    /// update manifest the server offers it.
+    pub async fn update_check(&self, version: &str) -> Response {
+        self.report("update-check", serde_json::json!({ "version": version }))
+            .await
     }
 
     /// The same Agent with another credential.

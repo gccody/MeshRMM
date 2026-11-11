@@ -652,6 +652,19 @@ td.row-actions > * + * { margin-left: 6px; }
 .connection-approval-buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
 .connection-approval-buttons span { padding: 6px 16px; border: 1px solid #4b5563; border-radius: 4px; font-size: 13px; }
 .connection-approval-buttons span:last-child { border-color: #6366f1; background: #6366f1; color: #fff; }
+.settings-section > p.agent-rollout-stage { margin-top: 18px; color: var(--text); font-size: 14px; }
+.agent-rollout-mode { margin: 18px 0 0; padding: 0; display: grid; gap: 10px; border: 0; }
+.agent-rollout-mode legend { margin-bottom: 8px; padding: 0; color: var(--text-2); font-size: 13px; font-weight: 500; }
+.agent-rollout-mode label { display: flex; align-items: center; gap: 10px; font-size: 14px; cursor: pointer; }
+.agent-rollout-mode .field-help { margin: 0 0 0 26px; }
+.agent-rollout-actions { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 8px; }
+.agent-rollout-inline { margin-top: 18px; display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; }
+.agent-rollout-inline label { display: grid; gap: 6px; color: var(--text-2); font-size: 13px; font-weight: 500; }
+.agent-rollout > .field-help, .agent-rollout-progress .field-help { margin-top: 8px; }
+.agent-rollout-progress { margin-top: 24px; padding-top: 18px; border-top: 1px solid var(--rule); }
+.agent-rollout-progress h3 { font-size: 15px; }
+.agent-rollout-progress ul { margin: 8px 0 0; padding-left: 18px; font-size: 14px; line-height: 1.7; }
+.agent-rollout-progress .secondary-button { margin-top: 12px; }
 .settings-save { position: sticky; bottom: 0; z-index: 5; margin-top: 28px; padding: 14px 0; display: flex; align-items: center; justify-content: flex-end; gap: 16px; border-top: 1px solid var(--rule); background: rgb(19 24 33 / 94%); backdrop-filter: blur(8px); }
 .settings-save-error { margin: 0; color: var(--danger); font-size: 13.5px; }
 .company-settings-form > p[role=alert] { margin: 14px 0 0; color: var(--warn); font-size: 13.5px; }

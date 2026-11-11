@@ -85,6 +85,7 @@ export function formatIdleDisconnect(minutes: number | null) {
 
 export const SETTINGS_TABS = [
   { id: "general", label: "General" },
+  { id: "agent-updates", label: "Agent updates" },
   { id: "remote-sessions", label: "Remote sessions" },
   { id: "terminals", label: "Terminals" },
   { id: "files", label: "Files" },

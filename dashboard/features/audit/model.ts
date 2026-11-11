@@ -83,6 +83,7 @@ const ACTION_LABELS: Record<string, string> = {
   "role.update": "Changed a role",
   "role.delete": "Deleted a role",
   "settings.update": "Changed settings",
+  "settings.agent_rollout_update": "Changed how Agent updates roll out",
   "settings.authentication_update": "Changed the sign-in policy",
   "settings.smtp_update": "Changed email settings",
   "settings.smtp_delete": "Turned off email",

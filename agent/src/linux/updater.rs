@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
-use meshrmm_self_update::{CURRENT_VERSION, UpdateManifest};
+use meshrmm_self_update::CURRENT_VERSION;
 
 use super::installer::{EXECUTABLE, INSTALL_DIRECTORY, SERVICE, systemctl};
 use crate::remote::config::Config;
@@ -28,7 +28,6 @@ use crate::update_policy::{
 };
 
 const SCHEDULE_TICK: Duration = Duration::from_secs(30);
-const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_UPDATE_BYTES: u64 = 256 * 1024 * 1024;
 /// The coordinator ends remote sessions and runs their close actions first.
 const COORDINATOR_EXIT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -163,15 +162,7 @@ fn stage(config: &Config) -> anyhow::Result<Option<Staged>> {
         .tls_config(crate::enrollment::https_tls_config())
         .build()
         .new_agent();
-    let manifest = read_limited(
-        http.get(&config.update_manifest_url)
-            .call()
-            .context("could not download the update manifest")?
-            .into_body()
-            .into_reader(),
-        MAX_MANIFEST_BYTES,
-    )?;
-    let manifest = UpdateManifest::parse(&manifest)?;
+    let manifest = crate::update_check::fetch_manifest(&http, config)?;
     let Some(release) = manifest.newer_release(TARGET, CURRENT_VERSION)? else {
         return Ok(None);
     };
@@ -254,13 +245,6 @@ fn stage_executable(
         .context("could not make the Agent update executable")?;
     verified.keep();
     Ok(())
-}
-
-fn read_limited(reader: impl Read, limit: u64) -> anyhow::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    reader.take(limit + 1).read_to_end(&mut bytes)?;
-    anyhow::ensure!(bytes.len() as u64 <= limit, "the download is too large");
-    Ok(bytes)
 }
 
 /// Starts the staged Agent's `--apply-update` in its own systemd unit; a
@@ -395,12 +379,6 @@ fn main_pid() -> Option<u32> {
 mod tests {
     use super::*;
     use crate::update_download::tests::{Staging, crash_during_download, release_of_bytes};
-
-    #[test]
-    fn reads_downloads_up_to_the_limit() {
-        assert_eq!(read_limited(&b"abc"[..], 3).unwrap(), b"abc");
-        assert!(read_limited(&b"abcd"[..], 3).is_err());
-    }
 
     #[test]
     fn removes_what_earlier_updates_left_unless_an_installer_runs() {

@@ -28,6 +28,8 @@ mod service;
 #[cfg(windows)]
 mod tray;
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+mod update_check;
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 mod update_download;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod update_files;

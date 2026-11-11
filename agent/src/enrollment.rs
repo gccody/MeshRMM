@@ -25,7 +25,6 @@ pub(crate) struct ProvisionedAgentConfig {
     pub server: String,
     pub device_id: String,
     pub agent_token: String,
-    pub update_manifest_url: String,
     pub frames_per_second: u32,
     pub bitrate_bits_per_second: u32,
     pub json_logs: bool,
@@ -157,7 +156,5 @@ fn redeem_installer(
     if config.device_id.is_empty() || config.agent_token.is_empty() || config.server.is_empty() {
         bail!("the Agent enrollment service returned an incomplete configuration");
     }
-    meshrmm_self_update::validate_manifest_url(&config.update_manifest_url)
-        .context("the Agent enrollment service returned an invalid update manifest URL")?;
     Ok(config)
 }

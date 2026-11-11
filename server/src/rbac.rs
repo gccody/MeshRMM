@@ -89,7 +89,7 @@ permissions! {
     AlertsManage = "alerts.manage": "Create, edit and delete alert rules and notification channels.",
     UsersManage = "users.manage": "Invite, disable and remove users and assign their roles.",
     RolesManage = "roles.manage": "Create, edit and delete roles.",
-    SettingsManage = "settings.manage": "Change the instance name and remote session policy.",
+    SettingsManage = "settings.manage": "Change the instance name, remote session policy and how new Agent releases roll out to devices.",
     AuthenticationManage = "authentication.manage": "Change the sign-in policy: two-factor requirement, password length, session lifetime and whether API tokens work.",
     ApiTokensManage = "api_tokens.manage": "See and revoke every user's API tokens.",
     AuditView = "audit.view": "Read the audit log.",

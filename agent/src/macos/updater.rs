@@ -13,13 +13,12 @@
 //! by the same team; an ad-hoc signed one takes the release build, which the
 //! release key vouches for.
 use std::ffi::OsStr;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
-use meshrmm_self_update::{AGENT_MACOS, CURRENT_VERSION, UpdateManifest, macos};
+use meshrmm_self_update::{AGENT_MACOS, CURRENT_VERSION, macos};
 
 use super::installer::{APP, BUNDLE_IDENTIFIER, DAEMON_LABEL, HELPER_LABEL};
 use crate::remote::config::Config;
@@ -31,7 +30,6 @@ use crate::update_policy::{
 };
 
 const SCHEDULE_TICK: Duration = Duration::from_secs(30);
-const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_UPDATE_BYTES: u64 = 256 * 1024 * 1024;
 /// The coordinator ends remote sessions and runs their close actions first.
 const COORDINATOR_EXIT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -177,15 +175,7 @@ fn stage(config: &Config) -> anyhow::Result<Option<Staged>> {
         .tls_config(crate::enrollment::https_tls_config())
         .build()
         .new_agent();
-    let manifest = read_limited(
-        http.get(&config.update_manifest_url)
-            .call()
-            .context("could not download the update manifest")?
-            .into_body()
-            .into_reader(),
-        MAX_MANIFEST_BYTES,
-    )?;
-    let manifest = UpdateManifest::parse(&manifest)?;
+    let manifest = crate::update_check::fetch_manifest(&http, config)?;
     // Without this team's signature, macOS would also forget the Agent's
     // privacy permissions.
     let team = macos::team_identifier(Path::new(APP));
@@ -268,13 +258,6 @@ fn record_next_check(next: &NextCheck) {
     if let Err(error) = written {
         tracing::warn!(error = ?error, "could not record when the next Agent update check is due");
     }
-}
-
-fn read_limited(reader: impl Read, limit: u64) -> anyhow::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    reader.take(limit + 1).read_to_end(&mut bytes)?;
-    anyhow::ensure!(bytes.len() as u64 <= limit, "the download is too large");
-    Ok(bytes)
 }
 
 fn start_installer(app: &Path, staging: &Path) -> anyhow::Result<()> {
@@ -477,12 +460,6 @@ mod tests {
         drop(installer);
         remove_leftovers_unless_installing(&updates.0).unwrap();
         assert_eq!(updates.names(), ["install.lock"]);
-    }
-
-    #[test]
-    fn reads_downloads_up_to_the_limit() {
-        assert_eq!(read_limited(&b"abc"[..], 3).unwrap(), b"abc");
-        assert!(read_limited(&b"abcd"[..], 3).is_err());
     }
 
     #[test]

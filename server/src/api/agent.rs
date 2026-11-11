@@ -74,7 +74,7 @@ fn too_large(message: &'static str) -> ApiError {
 /// `stall`: there is no limit in total, so a slow body that keeps moving
 /// arrives. Agent routes read their body only after authenticating, so
 /// nobody else can make the server buffer one.
-async fn read_body(
+pub(super) async fn read_body(
     headers: &HeaderMap,
     body: Body,
     limit: usize,

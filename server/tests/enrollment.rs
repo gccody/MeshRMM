@@ -25,10 +25,8 @@ async fn installers_enroll_one_computer_that_can_recover_its_credential() {
         let config = redeem(&app, &token, "  DESKTOP-1 ", &key).await;
         assert_eq!(config.status, StatusCode::OK, "{name}: {:?}", config.body);
         assert_eq!(config.body["server"], common::ORIGIN);
-        assert_eq!(
-            config.body["update_manifest_url"],
-            format!("{}/downloads/update-manifest.json", common::ORIGIN)
-        );
+        // The Agent asks the server for its updates as itself; see agent_rollout.rs.
+        assert_eq!(config.body.get("update_manifest_url"), None);
         assert_eq!(config.body["frames_per_second"], 60);
         let device_id = config.body["device_id"].as_str().unwrap().to_owned();
         let agent_token = config.body["agent_token"].as_str().unwrap().to_owned();

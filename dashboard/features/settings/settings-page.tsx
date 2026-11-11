@@ -4,6 +4,7 @@ import { type FormEvent, useEffect, useState } from "react";
 import { AuthenticationRequired, errorText, expectJson, jsonBody } from "../../lib/http";
 import { CategoryTabs } from "../workspace/category-tabs";
 import { useWorkspace } from "../workspace/workspace-context";
+import { AgentRolloutSection } from "./agent-rollout-section";
 import {
   DEFAULT_BLACKOUT_MESSAGE,
   DEFAULT_CONNECTION_APPROVAL_MESSAGE,
@@ -200,6 +201,7 @@ export function SettingsPanel() {
             </section>
             <ConnectionApprovalSection draft={draft} updateDraft={updateDraft} displayName={displayName} hidden={settingsTab !== "connection-approval"} />
           </fieldset>
+          {settingsTab !== "agent-updates" && <>
           {settingsTab !== "general" && !instanceNameValid && <p role="alert">Check the server name before saving: it needs 1 to {MAX_INSTANCE_NAME_LENGTH} characters.</p>}
           {settingsTab !== "blackout" && !blackoutMessageValid && <p role="alert">Check the blackout message before saving: it must contain text and be no larger than 2 KB.</p>}
           {settingsTab !== "connection-notification" && !notificationMessageValid && <p role="alert">Check the connection notification message before saving: it must contain text and be no larger than 512 bytes.</p>}
@@ -209,7 +211,10 @@ export function SettingsPanel() {
             <button className="primary-button" disabled={isSaving || !instanceNameValid || !blackoutMessageValid || !notificationMessageValid || !approvalValid || draftMatchesSettings(draft, settings)}>{isSaving && <LoaderCircle size={16} className="spin" />} Save settings</button>
           </div>
           {settingsNotice && <p role="status" className="session-notice">{settingsNotice}</p>}
+          </>}
         </form>
+        {/* Outside the form: it saves each change itself. */}
+        <AgentRolloutSection hidden={settingsTab !== "agent-updates"} />
       </>}
     </div>
   );

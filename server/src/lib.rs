@@ -1,6 +1,7 @@
 //! The self-hosted MeshRMM server: the website, the API, Agent and viewer
 //! connections, and downloads, for one company.
 pub mod admin;
+pub mod agent_rollout;
 pub mod agents;
 pub mod alerts;
 pub mod api;
@@ -75,6 +76,11 @@ pub async fn prepare(config: Config) -> anyhow::Result<AppState> {
     let database = Database::connect_with(&config.database_url(), config.database_limits()).await?;
     database.migrate().await?;
     let downloads = Downloads::load(&config).await?;
+    if let Some(version) = downloads.version()
+        && agent_rollout::begin_release(&mut &database, version).await?
+    {
+        tracing::info!(version, "the Agent rollout starts again for this release");
+    }
     tracing::info!(
         backend = ?database.backend(),
         schema_version = database.backend().expected_schema_version(),
