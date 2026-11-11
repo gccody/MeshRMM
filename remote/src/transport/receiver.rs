@@ -130,7 +130,9 @@ pub async fn run_receiver(
     // end. This activity-driven flusher always queues that burst's newest
     // position after the coalescing window.
     let pointer_flusher = tokio::spawn(flush_pointer_motion(viewer_control.clone()));
+    let video_pause = viewer_control.tell_device_of_pauses();
     let result = session.run(&mut signaling, &mut events).await;
+    video_pause.abort();
     session
         .finish(result, &mut signaling, pointer_flusher)
         .await
@@ -400,6 +402,9 @@ impl SignalingLoop<'_> {
         self.poll_presenter_end()
     }
 
+    /// Fails the attempt when no video shows for 30 seconds. A paused device
+    /// sends none, but only a window that presented the stream can pause it,
+    /// so the wait never counts a pause.
     fn check_video_arrived(&mut self) -> anyhow::Result<()> {
         let presenter_missing = self.presenter.lock().is_ok_and(|guard| {
             let presented = guard
@@ -408,6 +413,7 @@ impl SignalingLoop<'_> {
             self.lifecycle.observe_presentation(presented);
             presented.is_none()
         });
+        self.viewer_control.set_video_presented(!presenter_missing);
         if presenter_missing {
             let waiting_since = self
                 .presenter_missing_since

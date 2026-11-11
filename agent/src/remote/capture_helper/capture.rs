@@ -188,6 +188,10 @@ impl DesktopCaptureStreamer {
             .recv_timeout(self.with_headless_arrival(self.restart_timeout))
             .context("capture helper did not restart capture in time")??;
         let target = running.target;
+        if let Some(running) = self.running.as_mut() {
+            // Capture runs again, a paused helper's too.
+            running.paused = false;
+        }
         self.ensure_input_helper(target, started.active_display.id)?;
         Ok(self.with_background_display(started))
     }
@@ -334,6 +338,7 @@ impl DesktopCaptureStreamer {
             sink,
             started: started_rx,
             last_frame,
+            paused: false,
             process: launched.process,
             process_id: launched.process_id,
             target,

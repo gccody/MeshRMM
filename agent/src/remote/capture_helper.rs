@@ -94,6 +94,7 @@ const EVENT_NO_DISPLAYS: u8 = 15;
 const COMMAND_PROMPT_CONNECTION_APPROVAL: u8 = 26;
 const COMMAND_CAPTURE_THUMBNAIL: u8 = 27;
 const COMMAND_ANNOTATE: u8 = 28;
+const COMMAND_PAUSE_CAPTURE: u8 = 29;
 const MAX_CODEC_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 64 * 1024;
@@ -176,6 +177,10 @@ enum ParentCommand {
         /// The virtual monitor the service added to a console without one.
         headless: Option<HeadlessTarget>,
     },
+    /// Stops capture and the encoder until the next Start, which resumes
+    /// capture in the same helper. The helper, its pipes and its display
+    /// border stay.
+    PauseCapture,
     RequestKeyframe,
     SetBitrate(u32),
     SetCursorCapture(bool),
@@ -541,7 +546,9 @@ impl DesktopCaptureStreamer {
             return Some(result);
         }
         let running = self.running.as_ref()?;
+        // A paused helper renders nothing, which is not a stall.
         if running.target == DesktopTarget::Background
+            && !running.paused
             && running
                 .last_frame
                 .lock()
@@ -579,6 +586,21 @@ impl DesktopCaptureStreamer {
         if let Some(running) = &self.running {
             lock_frames(&running.sink).current = None;
         }
+    }
+
+    /// Stops capture and the encoder in the running helper while the viewer
+    /// shows no video. The helper stays on its desktop, with its pipes, its
+    /// display border and the input and other helpers beside it, so the
+    /// next start resumes capture in it instead of launching one. The
+    /// stream's frames still on the pipe are dropped.
+    pub fn pause(&mut self) -> anyhow::Result<()> {
+        let Some(running) = self.running.as_mut() else {
+            return Ok(());
+        };
+        *lock_frames(&running.sink) = FrameRoute::default();
+        running.paused = true;
+        send_command(&running.input, &ParentCommand::PauseCapture)
+            .context("failed to pause the desktop helper")
     }
 
     /// Ends a helper that did not do what it was asked in time, or failed.
@@ -640,6 +662,8 @@ impl Drop for DesktopCaptureStreamer {
 
 struct RunningHelper {
     last_frame: Arc<Mutex<Instant>>,
+    /// Paused since the last start; see [`DesktopCaptureStreamer::pause`].
+    paused: bool,
     sink: HelperFrames,
     started: mpsc::Receiver<Result<StartedDesktop, StartFailure>>,
     process: OwnedHandle,

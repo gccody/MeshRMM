@@ -87,6 +87,9 @@ pub(super) struct RemoteViewIvars {
     reconnect_ticking: std::cell::Cell<bool>,
     debug_visible: RefCell<bool>,
     debug_refreshed: RefCell<Instant>,
+    /// Whether the window shows the video: not while it is miniaturised or
+    /// the application is hidden.
+    shows_video: crate::video_pause::VideoWindow,
 }
 
 define_class!(
@@ -155,9 +158,31 @@ define_class!(
         fn window_did_resign_key(&self, _notification: &NSNotification) {
             self.disable_input();
         }
+
+        #[unsafe(method(windowDidMiniaturize:))]
+        fn window_did_miniaturize(&self, _notification: &NSNotification) {
+            self.update_shows_video();
+        }
+
+        #[unsafe(method(windowDidDeminiaturize:))]
+        fn window_did_deminiaturize(&self, _notification: &NSNotification) {
+            self.update_shows_video();
+        }
+
+        // Also posted when the application hides or unhides.
+        #[unsafe(method(windowDidChangeOcclusionState:))]
+        fn window_did_change_occlusion_state(&self, _notification: &NSNotification) {
+            self.update_shows_video();
+        }
     }
 
     impl RemoteView {
+        /// `NSApplicationDidHideNotification` and its unhide counterpart.
+        #[unsafe(method(applicationVisibilityChanged:))]
+        fn application_visibility_changed(&self, _notification: &NSNotification) {
+            self.update_shows_video();
+        }
+
         #[unsafe(method(acceptsFirstResponder))]
         fn accepts_first_responder(&self) -> bool {
             true
@@ -561,6 +586,8 @@ impl RemoteView {
         debug_label.setHidden(true);
         let reconnect_panel = ReconnectPanel::new(mtm, frame);
         let command = command_key(&control);
+        // The window is brought to the front once its view exists.
+        let shows_video = control.video_window(true);
         let this = Self::alloc(mtm).set_ivars(RemoteViewIvars {
             active_display: RefCell::new(active_display),
             displays: RefCell::new(displays),
@@ -586,6 +613,7 @@ impl RemoteView {
             reconnect_ticking: std::cell::Cell::new(false),
             debug_visible: RefCell::new(false),
             debug_refreshed: RefCell::new(Instant::now()),
+            shows_video,
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
         this.addSubview(&this.ivars().debug_label);
@@ -600,7 +628,41 @@ impl RemoteView {
         }
         this.install_toolbar(mtm, frame);
         this.install_key_up_monitor();
+        this.observe_application_visibility();
         this
+    }
+
+    /// Hiding the application hides its windows without miniaturising them.
+    /// The notification center holds its observers weakly.
+    fn observe_application_visibility(&self) {
+        let center = objc2_foundation::NSNotificationCenter::defaultCenter();
+        // Safety: the selector names a method of this class that takes the
+        // notification, and the names are AppKit's constants.
+        unsafe {
+            for name in [
+                objc2_app_kit::NSApplicationDidHideNotification,
+                objc2_app_kit::NSApplicationDidUnhideNotification,
+            ] {
+                center.addObserver_selector_name_object(
+                    self,
+                    sel!(applicationVisibilityChanged:),
+                    Some(name),
+                    None,
+                );
+            }
+        }
+    }
+
+    /// Tells the session whether this window shows the video. Only a
+    /// miniaturised window or a hidden application does not; a window that
+    /// other windows cover still does.
+    fn update_shows_video(&self) {
+        let Some(window) = self.window() else {
+            return;
+        };
+        let hidden =
+            window.isMiniaturized() || NSApplication::sharedApplication(self.mtm()).isHidden();
+        self.ivars().shows_video.set_shown(!hidden);
     }
 
     /// AppKit does not send `keyUp:` for keys released while Command is held,

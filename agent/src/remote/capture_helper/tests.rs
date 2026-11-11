@@ -479,6 +479,7 @@ fn command_protocol_round_trips_desktop_input() {
             viewer_name: "Zoë 王".into(),
             show_banner: true,
         },
+        ParentCommand::PauseCapture,
         ParentCommand::RequestKeyframe,
         ParentCommand::SetBitrate(4_000_000),
         ParentCommand::StartInput {
@@ -771,6 +772,7 @@ fn command_name(command: &ParentCommand) -> u8 {
         ParentCommand::SetPreventIdleLock(_) => 21,
         ParentCommand::SetCursorCapture(_) => 18,
         ParentCommand::SetDisplayBorder(_) => 20,
+        ParentCommand::PauseCapture => COMMAND_PAUSE_CAPTURE,
         ParentCommand::RequestKeyframe => COMMAND_REQUEST_KEYFRAME,
         ParentCommand::SetBitrate(_) => COMMAND_SET_BITRATE,
         ParentCommand::StartInput { .. } => COMMAND_START_INPUT,

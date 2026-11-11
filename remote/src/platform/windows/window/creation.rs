@@ -76,6 +76,9 @@ pub(in crate::platform::windows) unsafe fn create_window(
     context.layout_toolbar(window);
     context.show_session_choices();
     let _ = unsafe { ShowWindow(window, SW_SHOW) };
+    context
+        .shows_video
+        .set_shown(!unsafe { IsIconic(window) }.as_bool());
     close_launch_status();
     Ok(window)
 }
@@ -178,7 +181,12 @@ impl WindowContext {
         debug: DebugInfo,
         title: HSTRING,
     ) -> Self {
+        // Not shown until the window is; a window created minimised, as a
+        // session window that was minimised comes back after a reconnect,
+        // stays so.
+        let shows_video = control.video_window(false);
         Self {
+            shows_video,
             window: Cell::new(HWND::default()),
             video_width: Cell::new(format.width),
             video_height: Cell::new(format.height),

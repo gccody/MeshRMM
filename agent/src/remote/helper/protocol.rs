@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::remote::thumbnail::{Capture, Signature};
 
 /// Bumped whenever a message changes; the coordinator refuses other helpers.
-pub(crate) const VERSION: u32 = 7;
+pub(crate) const VERSION: u32 = 8;
 /// A 2560x1600 keyframe is well under this.
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -57,6 +57,9 @@ pub(crate) enum Request {
         settings: StreamSettings,
     },
     StopCapture,
+    /// Stops capture and the encoder until the next `Start`, keeping what
+    /// the session shows, such as the display border.
+    PauseCapture,
     Keyframe,
     SetBitrate(u32),
     SetCursorCapture(bool),

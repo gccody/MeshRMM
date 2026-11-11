@@ -103,6 +103,9 @@ pub struct ViewerResumeState {
     restarting: Arc<Mutex<Option<bool>>>,
     /// The technician's toolbox, with runs and files followed across reconnects.
     toolbox: crate::toolbox::Toolbox,
+    /// Whether the session's windows show its video, or a recording keeps
+    /// it, which each connection tells the device.
+    video_pause: crate::video_pause::VideoPause,
 }
 
 impl Default for ViewerResumeState {
@@ -110,6 +113,8 @@ impl Default for ViewerResumeState {
         let recording_outgoing =
             Arc::new(Mutex::new(None::<mpsc::UnboundedSender<SessionMessage>>));
         let activity = Arc::clone(&recording_outgoing);
+        let video_pause = crate::video_pause::VideoPause::default();
+        let recording_keeps_video = video_pause.clone();
         Self {
             idle: Default::default(),
             idle_disconnect: Default::default(),
@@ -131,6 +136,7 @@ impl Default for ViewerResumeState {
                 {
                     let _ = outgoing.send(SessionMessage::SetRecording { enabled });
                 }
+                recording_keeps_video.set_recording(enabled);
             }),
             recording_outgoing,
             reconnecting: Default::default(),
@@ -139,6 +145,7 @@ impl Default for ViewerResumeState {
             approval_wait: Default::default(),
             restarting: Default::default(),
             toolbox: Default::default(),
+            video_pause,
         }
     }
 }

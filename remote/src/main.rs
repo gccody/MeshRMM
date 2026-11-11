@@ -35,6 +35,7 @@ mod transport;
 mod updater;
 #[cfg(any(windows, test))]
 mod video_layout;
+mod video_pause;
 
 use anyhow::Context;
 use launch_status::LaunchStatus;

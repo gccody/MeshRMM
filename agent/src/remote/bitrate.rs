@@ -122,6 +122,13 @@ impl AdaptiveBitrate {
         Some(self.current)
     }
 
+    /// Forgets how long the link has looked healthy, after a pause in which
+    /// nothing was sent: that time says nothing about the network, so it
+    /// must not count toward the next increase.
+    pub(super) fn restart_observation(&mut self) {
+        self.healthy_since_us = 0;
+    }
+
     pub(super) fn observe(
         &mut self,
         now_us: u64,
@@ -272,6 +279,14 @@ impl RestartLadder {
         if self.maximum != maximum {
             *self = Self::new(maximum);
         }
+    }
+
+    /// Forgets how long the link has looked healthy or congested, after a
+    /// pause in which nothing was sent, so that neither a step up nor a
+    /// step down counts the time paused.
+    pub(super) fn restart_observation(&mut self) {
+        self.healthy_since_us = 0;
+        self.congested_since_us = 0;
     }
 
     fn steps(&self) -> [u32; LADDER_STEPS_PERCENT.len()] {
@@ -458,6 +473,53 @@ mod tests {
         assert_eq!(video_pacing_bitrate(3_000_000, 110_000), 2_890_000);
         assert_eq!(video_pacing_bitrate(1_000_000, 1_536_000), 500_000);
         assert_eq!(video_pacing_bitrate(2, u32::MAX), 1);
+    }
+
+    #[test]
+    fn a_pause_is_not_healthy_time_for_a_live_increase() {
+        let mut bitrate = AdaptiveBitrate::new(12_000_000);
+        let congested_bytes = bitrate.congested_bytes();
+        assert_eq!(
+            bitrate.observe(1_000, congested_bytes, 0, false),
+            Some(9_000_000)
+        );
+        let healthy_start = 2_000_000;
+        assert_eq!(bitrate.observe(healthy_start, 0, 0, false), None);
+        // Ten minutes paused, in which nothing was sent.
+        bitrate.restart_observation();
+        let resumed = healthy_start + 600_000_000;
+        assert_eq!(bitrate.observe(resumed, 0, 0, false), None);
+        assert_eq!(
+            bitrate.observe(resumed + BITRATE_INCREASE_INTERVAL_US, 0, 0, false),
+            Some(10_800_000),
+            "the rate rises once the resumed stream has looked healthy long enough"
+        );
+    }
+
+    #[test]
+    fn a_pause_is_not_healthy_time_for_an_encoder_step_up() {
+        let mut ladder = RestartLadder::new(10_000_000);
+        // Congested long enough to step down to 70%.
+        let mut now = 1_000_000;
+        let stepped = (0..20).find_map(|_| {
+            now += 500_000;
+            ladder.observe(now, 10_000_000, true, false, false)
+        });
+        assert_eq!(stepped, Some(7_000_000));
+        // Healthy at the lower step, then ten minutes paused.
+        now += LADDER_RESTART_SPACING_US;
+        assert_eq!(ladder.observe(now, 7_000_000, false, true, false), None);
+        ladder.restart_observation();
+        now += 600_000_000;
+        assert_eq!(
+            ladder.observe(now, 7_000_000, false, true, false),
+            None,
+            "the time paused does not count toward the hold"
+        );
+        assert_eq!(
+            ladder.observe(now + LADDER_INITIAL_HOLD_US, 7_000_000, false, true, false),
+            Some(10_000_000)
+        );
     }
 
     #[test]

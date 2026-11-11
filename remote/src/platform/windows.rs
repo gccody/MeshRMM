@@ -891,6 +891,7 @@ fn test_sink(
         toolbox: Default::default(),
         quality: Default::default(),
         chroma: Default::default(),
+        video_pause: Default::default(),
         profiles: Arc::new(vec![
             VideoProfile {
                 codec: Codec::H264,

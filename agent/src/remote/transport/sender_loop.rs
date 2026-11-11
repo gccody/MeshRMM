@@ -155,7 +155,8 @@ impl SenderLoop<'_> {
             | ControlCommand::InputOwnership(_)
             | ControlCommand::Recording(_)
             | ControlCommand::VideoProfileRejected { .. }
-            | ControlCommand::SelectDisplay(_)) => {
+            | ControlCommand::SelectDisplay(_)
+            | ControlCommand::VideoPaused(_)) => {
                 self.capture_tx
                     .try_send(command)
                     .map_err(|_| anyhow::anyhow!("capture command queue full or closed"))?;

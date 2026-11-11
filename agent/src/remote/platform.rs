@@ -48,6 +48,12 @@ pub trait ScreenStreamer: Send {
     fn end_stream(&mut self) -> anyhow::Result<()> {
         self.stop()
     }
+    /// Stops capture and encoding while the viewer shows no video, until the
+    /// next `start`, which begins another stream. Unlike `stop`, it keeps
+    /// everything else the session shows or uses: the helpers, which idle
+    /// instead of ending, the display border and the session indicator.
+    /// `poll_ended` and `take_display_catalog` go on reporting meanwhile.
+    fn pause(&mut self) -> anyhow::Result<()>;
     fn shutdown(&mut self) -> anyhow::Result<()> {
         self.stop()
     }
@@ -376,6 +382,18 @@ impl ScreenStreamer for PlatformScreenStreamer {
             }
             CaptureBackend::Direct(_) => self.stop(),
         }
+    }
+
+    fn pause(&mut self) -> anyhow::Result<()> {
+        match &mut self.inner {
+            // The service's helper idles on its desktop; see
+            // `DesktopCaptureStreamer::pause`.
+            CaptureBackend::Desktop(streamer) => streamer.pause(),
+            // Console mode stops Windows.Graphics.Capture and its encoder,
+            // and keeps the banner, the border and the notification.
+            CaptureBackend::Direct(streamer) => streamer.stop().map_err(anyhow::Error::from),
+        }
+        .context("Windows capture pause failed")
     }
 
     fn shutdown(&mut self) -> anyhow::Result<()> {

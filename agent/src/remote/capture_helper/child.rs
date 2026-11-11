@@ -248,6 +248,7 @@ fn start_stream(
     })?;
     Ok(Some(CaptureStream {
         streamer,
+        paused: false,
         border,
         active_display,
         display_id: start.display_id,
@@ -360,6 +361,9 @@ enum CaptureEnd {
 /// streamer stops before the display border closes.
 struct CaptureStream {
     streamer: WindowsDesktopDuplicationStreamer,
+    /// Capture and the encoder are stopped until the next Start, which
+    /// resumes them on this stream's display; the border stays.
+    paused: bool,
     border: Option<crate::remote::display_border::DisplayBorder>,
     active_display: Display,
     /// What the stream's Start asked to capture.
@@ -392,6 +396,22 @@ impl CaptureStream {
                     *border_enabled = enabled && !background;
                     self.set_border(*border_enabled, output)?;
                 }
+                Ok(Ok(ParentCommand::PauseCapture)) => {
+                    if !self.paused {
+                        if let Err(error) = self.streamer.stop() {
+                            return Ok(CaptureEnd::Finished(Some(error.to_string())));
+                        }
+                        self.paused = true;
+                        tracing::info!("paused capture and the encoder; the helper idles");
+                    }
+                }
+                // A paused stream has no capture or encoder to change; the
+                // Start that resumes it carries the settings.
+                Ok(Ok(
+                    ParentCommand::SetCursorCapture(_)
+                    | ParentCommand::RequestKeyframe
+                    | ParentCommand::SetBitrate(_),
+                )) if self.paused => {}
                 Ok(Ok(ParentCommand::SetCursorCapture(enabled))) => {
                     self.streamer.set_cursor_capture(enabled);
                 }
@@ -494,7 +514,17 @@ impl CaptureStream {
         }
         let begun = Instant::now();
         let (sink, announcement) = stream_frames(Arc::clone(output), Arc::clone(ipc_failed));
-        match self.streamer.restart_encoder(start.config, sink) {
+        let restarted = if self.paused {
+            // Resumes capture of the same display in this process, keeping
+            // its border; a desktop that changed meanwhile fails the start,
+            // and the parent replaces the helper as after any failure.
+            self.streamer
+                .start(start.config, self.active_display.id.0, sink)
+                .inspect(|_| self.paused = false)
+        } else {
+            self.streamer.restart_encoder(start.config, sink)
+        };
+        match restarted {
             Ok(format) => {
                 tracing::info!(
                     restart_ms = begun.elapsed().as_millis(),

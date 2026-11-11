@@ -6,10 +6,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use bytes::Bytes;
 use meshrmm_protocol::{DEFAULT_FRAGMENT_PAYLOAD, EncodedFrame, VideoStreamId, fragment_frame};
 use meshrmm_session_transport::MeteredChannel;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
 use webrtc::data_channel::RTCDataChannel;
 
-use super::ControlCommand;
+use super::{ControlCommand, VideoPause};
 use crate::remote::bitrate::{
     AdaptiveBitrate, EncoderStatus, RestartLadder, VideoPacer, video_backlog_bytes,
     video_pacing_bitrate,
@@ -20,6 +20,9 @@ use crate::remote::video::LatestFrameSlot;
 
 const VIDEO_BUFFER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(80);
 const KEYFRAME_RETRY_INTERVAL_US: u64 = 250_000;
+/// How long capture may take to make the stream's first keyframe, not
+/// counting time paused.
+const BOOTSTRAP_KEYFRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_video_sender(
@@ -31,6 +34,7 @@ pub(super) fn spawn_video_sender(
     quality_ceiling: Arc<AtomicU32>,
     encoder_status: Arc<EncoderStatus>,
     audio_bits: Arc<AtomicU32>,
+    mut pause: watch::Receiver<VideoPause>,
     failure: mpsc::UnboundedSender<anyhow::Error>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -42,7 +46,9 @@ pub(super) fn spawn_video_sender(
         // login screen can paint immediately. We still request a fresh IDR to
         // establish a current predictive chain for subsequent frames.
         decoder_ready.notified().await;
-        let Some(bootstrap_keyframe) = bootstrap_keyframe(&slot, &recovery, &failure).await else {
+        let Some(bootstrap_keyframe) =
+            bootstrap_keyframe(&slot, &recovery, &failure, &mut pause).await
+        else {
             return;
         };
         VideoSender::new(
@@ -52,6 +58,7 @@ pub(super) fn spawn_video_sender(
             quality_ceiling,
             encoder_status,
             audio_bits,
+            pause,
             failure,
         )
         .run(bootstrap_keyframe)
@@ -83,23 +90,36 @@ impl VideoChannel for MeteredChannel {
     }
 }
 
+/// The keyframe the stream starts with. Capture has 10 seconds to make it,
+/// of time not paused: while the viewer shows no video there is none to
+/// make, and the stream that resumes capture starts with its own.
 async fn bootstrap_keyframe(
     slot: &LatestFrameSlot,
     recovery: &mpsc::UnboundedSender<ControlCommand>,
     failure: &mpsc::UnboundedSender<anyhow::Error>,
+    pause: &mut watch::Receiver<VideoPause>,
 ) -> Option<Arc<EncodedFrame>> {
     slot.clear_pending();
     let _ = recovery.send(ControlCommand::Keyframe);
-    match tokio::time::timeout(std::time::Duration::from_secs(10), slot.keyframe()).await {
-        Ok(frame) => {
-            slot.discard_through(frame.frame_id);
-            Some(frame)
-        }
-        Err(_) => {
-            let _ = failure.send(anyhow::anyhow!(
-                "capture/encoder produced no bootstrap keyframe for 10 seconds"
-            ));
-            None
+    let keyframe = slot.keyframe();
+    tokio::pin!(keyframe);
+    // False once capture control has ended, which ends this task too.
+    let mut watching = true;
+    loop {
+        let paused = pause.borrow_and_update().paused;
+        let deadline = tokio::time::sleep(BOOTSTRAP_KEYFRAME_TIMEOUT);
+        tokio::select! {
+            frame = &mut keyframe => {
+                slot.discard_through(frame.frame_id);
+                return Some(frame);
+            }
+            changed = pause.changed(), if watching => watching = changed.is_ok(),
+            () = deadline, if !paused => {
+                let _ = failure.send(anyhow::anyhow!(
+                    "capture/encoder produced no bootstrap keyframe for 10 seconds"
+                ));
+                return None;
+            }
         }
     }
 }
@@ -159,6 +179,9 @@ struct VideoSender<C> {
     quality_ceiling: Arc<AtomicU32>,
     encoder_status: Arc<EncoderStatus>,
     audio_bits: Arc<AtomicU32>,
+    pause: watch::Receiver<VideoPause>,
+    /// The pauses the rate feedback has started over after.
+    pauses_seen: u64,
     failure: mpsc::UnboundedSender<anyhow::Error>,
     stats: VideoStats,
     last_sent: Option<(VideoStreamId, u64)>,
@@ -170,6 +193,7 @@ struct VideoSender<C> {
 }
 
 impl<C: VideoChannel> VideoSender<C> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         channel: C,
         slot: Arc<LatestFrameSlot>,
@@ -177,9 +201,11 @@ impl<C: VideoChannel> VideoSender<C> {
         quality_ceiling: Arc<AtomicU32>,
         encoder_status: Arc<EncoderStatus>,
         audio_bits: Arc<AtomicU32>,
+        pause: watch::Receiver<VideoPause>,
         failure: mpsc::UnboundedSender<anyhow::Error>,
     ) -> Self {
         let maximum = quality_ceiling.load(Ordering::Acquire).max(1);
+        let pauses_seen = pause.borrow().pauses;
         Self {
             channel,
             slot,
@@ -187,6 +213,8 @@ impl<C: VideoChannel> VideoSender<C> {
             quality_ceiling,
             encoder_status,
             audio_bits,
+            pause,
+            pauses_seen,
             failure,
             stats: VideoStats::new(),
             last_sent: None,
@@ -215,10 +243,12 @@ impl<C: VideoChannel> VideoSender<C> {
                 // Desktop Duplication may produce no frame while the display is
                 // completely static. The main sender loop independently polls
                 // the capture worker for real failures, so idleness is not an
-                // error and this task can wait until the next changed frame.
+                // error and this task can wait until the next changed frame,
+                // as it does while the viewer shows no video.
                 self.slot.next().await
             };
 
+            self.observe_pause();
             let reference_chain_lost = self.track_reference_chain(&source);
             let now_us = self.channel.now_us();
             let (live_bitrate, queued_bytes) =
@@ -237,6 +267,19 @@ impl<C: VideoChannel> VideoSender<C> {
             if self.send_frame(&source).await.is_break() {
                 return;
             }
+        }
+    }
+
+    /// Starts the rate feedback over after a pause, whose silence says
+    /// nothing about the network: the link must look healthy again before
+    /// the rate rises, and congested again before it falls.
+    fn observe_pause(&mut self) {
+        let pauses = self.pause.borrow().pauses;
+        if pauses != self.pauses_seen {
+            self.pauses_seen = pauses;
+            self.bitrate.restart_observation();
+            self.ladder.restart_observation();
+            self.stats = VideoStats::new();
         }
     }
 
@@ -667,6 +710,7 @@ mod tests {
         let (commands, encoder_commands) = mpsc::unbounded_channel();
         let (viewer_packets, packets) = mpsc::unbounded_channel();
         let (failure, _failures) = mpsc::unbounded_channel();
+        let (_viewer_shows_video, mut pause) = watch::channel(VideoPause::default());
         let encoder_log = Arc::new(Mutex::new(EncoderLog::default()));
         let decoded = Arc::new(Mutex::new(Vec::new()));
         let encoder_status = Arc::new(EncoderStatus::default());
@@ -688,6 +732,7 @@ mod tests {
             Arc::new(AtomicU32::new(scenario.ceiling)),
             encoder_status,
             Arc::new(AtomicU32::new(scenario.audio_bits_per_second)),
+            pause.clone(),
             failure.clone(),
         );
         let tasks = [
@@ -702,7 +747,7 @@ mod tests {
             tokio::spawn({
                 let slot = Arc::clone(&slot);
                 async move {
-                    let bootstrap = bootstrap_keyframe(&slot, &commands, &failure)
+                    let bootstrap = bootstrap_keyframe(&slot, &commands, &failure, &mut pause)
                         .await
                         .unwrap();
                     sender.run(bootstrap).await;
@@ -805,5 +850,80 @@ mod tests {
             "{:?}",
             outcome.encoder.bitrates
         );
+    }
+
+    const PAUSED: VideoPause = VideoPause {
+        paused: true,
+        pauses: 1,
+    };
+
+    /// Waits for the stream's bootstrap keyframe as the sender does, while
+    /// the viewer's pause state is what `pause` holds.
+    fn wait_for_bootstrap(
+        slot: &Arc<LatestFrameSlot>,
+        pause: watch::Receiver<VideoPause>,
+    ) -> (
+        tokio::task::JoinHandle<Option<Arc<EncodedFrame>>>,
+        mpsc::UnboundedReceiver<ControlCommand>,
+        mpsc::UnboundedReceiver<anyhow::Error>,
+    ) {
+        let (recovery, requests) = mpsc::unbounded_channel();
+        let (failure, failures) = mpsc::unbounded_channel();
+        let slot = Arc::clone(slot);
+        let mut pause = pause;
+        let waiting = tokio::spawn(async move {
+            bootstrap_keyframe(&slot, &recovery, &failure, &mut pause).await
+        });
+        (waiting, requests, failures)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_viewer_gets_its_first_keyframe_when_it_resumes_however_long_it_waited() {
+        let slot = Arc::new(LatestFrameSlot::default());
+        let (viewer, pause) = watch::channel(PAUSED);
+        let (waiting, mut requests, mut failures) = wait_for_bootstrap(&slot, pause);
+
+        // A minute paused: the session is not failed, and nobody asks for
+        // keyframes again.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(!waiting.is_finished());
+        assert!(failures.try_recv().is_err());
+        assert!(matches!(requests.try_recv(), Ok(ControlCommand::Keyframe)));
+        assert!(requests.try_recv().is_err());
+
+        // The stream that resumes capture brings its keyframe, which the
+        // sender starts with.
+        viewer.send_modify(|state| state.paused = false);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        slot.publish(EncodedFrame {
+            stream_id: VideoStreamId(2),
+            frame_id: 5,
+            capture_timestamp_us: 1,
+            encode_complete_timestamp_us: 1,
+            send_timestamp_us: 0,
+            keyframe: true,
+            data: vec![0; 8].into(),
+        });
+        let first = waiting.await.unwrap().expect("the resumed keyframe");
+        assert_eq!((first.stream_id, first.frame_id), (VideoStreamId(2), 5));
+        assert!(failures.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_bootstrap_deadline_counts_only_time_not_paused() {
+        let slot = Arc::new(LatestFrameSlot::default());
+        let (viewer, pause) = watch::channel(PAUSED);
+        let (waiting, _requests, mut failures) = wait_for_bootstrap(&slot, pause);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        viewer.send_modify(|state| state.paused = false);
+
+        // Capture that makes no keyframe once resumed still fails the
+        // stream, 10 seconds after the resume.
+        tokio::time::sleep(BOOTSTRAP_KEYFRAME_TIMEOUT - Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished());
+        assert!(failures.try_recv().is_err());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(waiting.await.unwrap().is_none());
+        assert!(failures.try_recv().is_ok());
     }
 }

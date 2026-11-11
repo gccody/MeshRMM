@@ -327,6 +327,7 @@ fn handle(request: Request, served: &Served) -> anyhow::Result<Reply> {
             settings,
         } => return served.start_capture(display_id, settings),
         Request::StopCapture => screen.lock().unwrap_or_else(|e| e.into_inner()).stop(),
+        Request::PauseCapture => screen.lock().unwrap_or_else(|e| e.into_inner()).pause(),
         Request::Keyframe => screen
             .lock()
             .unwrap_or_else(|e| e.into_inner())

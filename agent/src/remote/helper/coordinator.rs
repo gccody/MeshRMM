@@ -632,8 +632,11 @@ struct Desired {
 pub(crate) struct Remote {
     registry: Arc<Registry>,
     current: Mutex<Option<Arc<Connection>>>,
-    /// The helper capture last started on, until it stops.
+    /// The helper capture last started on, until it stops. While paused,
+    /// the helper the session waits in, whose console is still watched.
     capturing: Mutex<Option<Arc<Connection>>>,
+    /// Set from a pause until the next start.
+    paused: AtomicBool,
     events: Arc<SessionEvents>,
     desired: Mutex<Desired>,
     /// What every helper the session uses shows; the notification only once.
@@ -667,6 +670,7 @@ impl Remote {
             registry,
             current: Mutex::default(),
             capturing: Mutex::default(),
+            paused: AtomicBool::new(false),
             events: Arc::default(),
             desired: Mutex::default(),
             ui: Mutex::new(ui),
@@ -867,6 +871,7 @@ impl Remote {
         settings: StreamSettings,
         publish: impl Fn(Frame) + Send + 'static,
     ) -> anyhow::Result<Started> {
+        self.paused.store(false, Ordering::SeqCst);
         let helper = self.follow_console()?;
         let display_id = display_id.filter(|_| !self.moved.load(Ordering::SeqCst));
         *self.events.frames.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -967,13 +972,35 @@ impl Remote {
         }
     }
 
+    /// Stops capture while the viewer shows no video, keeping the session in
+    /// its helper with what it shows there, such as the display border. Unlike
+    /// [`Self::stop`], the session goes on following the console: when another
+    /// session takes it, [`Self::poll_ended`] leaves this helper and moves the
+    /// session to the console's at once, where the next start resumes capture.
+    pub(crate) fn pause(&self) -> anyhow::Result<()> {
+        *self.events.frames.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.paused.store(true, Ordering::SeqCst);
+        let capturing = self
+            .capturing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        match capturing {
+            Some(helper) if !helper.closed.load(Ordering::SeqCst) => {
+                helper.call(Request::PauseCapture).map(|_| ())
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Why capture must restart: the helper stopped capturing or left, the
     /// session moved to another helper, or another session took the console.
     /// The last leaves the session's helper at once, so that neither the
     /// picture nor input stays with a session that is off the console; the
-    /// restart then moves to the console's helper. Capture control asks every
-    /// 100 ms; on Linux the console is logind's as the session supervisor
-    /// reads it every second, on macOS the console user at the time.
+    /// restart then moves to the console's helper, or, while paused, the
+    /// session moves there now. Each is reported once. Capture control asks
+    /// every 100 ms; on Linux the console is logind's as the session
+    /// supervisor reads it every second, on macOS the console user at the time.
     pub(crate) fn poll_ended(&self) -> Option<anyhow::Error> {
         if let Some(error) = self
             .events
@@ -989,7 +1016,14 @@ impl Remote {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()?;
+        let forget = || {
+            self.capturing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+        };
         if capturing.closed.load(Ordering::SeqCst) {
+            forget();
             return Some(anyhow::anyhow!("the session helper disconnected"));
         }
         let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
@@ -997,6 +1031,7 @@ impl Remote {
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, &capturing))
         {
+            forget();
             return Some(anyhow::anyhow!(
                 "the session moved to another session helper"
             ));
@@ -1004,10 +1039,14 @@ impl Remote {
         let console = (self.registry.console)();
         if !console.served_by(&capturing) {
             self.leave(current.take(), &console);
-            self.capturing
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take();
+            // A paused session moves now, so that what goes on besides the
+            // video, such as chat and the clipboard, follows the console.
+            let next = if self.paused.load(Ordering::SeqCst) {
+                self.attach(&mut current, console).ok()
+            } else {
+                None
+            };
+            *self.capturing.lock().unwrap_or_else(|e| e.into_inner()) = next;
             return Some(anyhow::anyhow!("another session took the console"));
         }
         None
@@ -1668,6 +1707,41 @@ mod tests {
         input.apply(click(true)).unwrap();
         input.apply_chat("hello".into()).unwrap();
         assert_eq!(names(&b.received()), ["Input", "Chat"]);
+        assert!(a.received().is_empty());
+        assert!(remote.poll_ended().is_none());
+    }
+
+    #[test]
+    fn a_paused_session_follows_the_console_and_resumes_capture_where_it_went() {
+        let console = Arc::new(Mutex::new(A.console()));
+        let registry = registry_on(&console);
+        let a = FakeHelper::connect(&registry, A);
+        let b = FakeHelper::connect(&registry, B);
+        let remote = Arc::new(Remote::with_registry(
+            Arc::clone(&registry),
+            SessionUi::default(),
+        ));
+        let input = HelperInput(Arc::clone(&remote));
+        start(&remote, None).unwrap();
+        assert_eq!(names(&a.received()), ["BeginSession", "Start"]);
+        remote.pause().unwrap();
+        assert_eq!(names(&a.received()), ["PauseCapture"]);
+        assert!(remote.poll_ended().is_none());
+
+        // The session leaves A at once and moves to B's helper, where it
+        // stays paused: nothing starts capture there.
+        *console.lock().unwrap() = B.console();
+        let ended = remote.poll_ended().expect("the console moved");
+        assert!(format!("{ended}").contains("another session took the console"));
+        assert_eq!(names(&a.received()), ["EndSession"]);
+        assert_eq!(names(&b.received()), ["BeginSession"]);
+        assert!(remote.poll_ended().is_none(), "the move is reported once");
+        input.apply_chat("hello".into()).unwrap();
+        assert_eq!(names(&b.received()), ["Chat"]);
+
+        // Showing the video again resumes capture in B's helper.
+        start(&remote, None).unwrap();
+        assert_eq!(names(&b.received()), ["Start"]);
         assert!(a.received().is_empty());
         assert!(remote.poll_ended().is_none());
     }

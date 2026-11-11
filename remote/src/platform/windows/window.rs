@@ -136,6 +136,8 @@ struct WindowContext {
     controls: Cell<Controls>,
     toolbar: RefCell<toolbar::ToolbarModel>,
     chat_popup: OnceCell<meshrmm_chat::ChatPopup>,
+    /// Whether the window shows the video: not while it is minimised.
+    shows_video: crate::video_pause::VideoWindow,
 }
 
 impl Drop for WindowContext {

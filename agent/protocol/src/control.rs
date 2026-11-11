@@ -197,6 +197,15 @@ pub enum SessionMessage {
     DisplayCatalog {
         displays: Vec<Display>,
     },
+    /// Sent by the viewer when nothing on its computer shows the session's
+    /// video or keeps its frames (`paused`), and when something does again.
+    /// While paused the Agent captures, encodes and sends no video; the rest
+    /// of the session goes on. Resuming starts a new stream: the viewer gets
+    /// a `DisplayConfiguration`, then the new stream's keyframe. Each
+    /// connection starts unpaused.
+    SetVideoPaused {
+        paused: bool,
+    },
 }
 
 /// Size of the virtual monitor a Windows Agent adds to a console that has no
@@ -503,6 +512,17 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn video_pause_round_trips() {
+        for paused in [false, true] {
+            let message = SessionMessage::SetVideoPaused { paused };
+            assert_eq!(
+                SessionMessage::decode(&message.encode().unwrap()).unwrap(),
+                message
+            );
+        }
+    }
 
     #[test]
     fn session_close_action_is_appended_and_round_trips() {
