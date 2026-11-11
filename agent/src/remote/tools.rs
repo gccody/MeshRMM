@@ -1,5 +1,6 @@
-//! The website's remote tools on this computer: its processes and services,
-//! listed and changed as SYSTEM or root. See docs/remote-tools.md.
+//! The website's remote tools on this computer: its processes, services and
+//! (on Windows) registry, listed and changed as SYSTEM or root. See
+//! docs/remote-tools.md.
 //!
 //! The server asks over the control connection ([`ToolRequest`]) and the
 //! Agent answers there ([`Tools::next`]), as for the file browser. Each
@@ -28,6 +29,8 @@ mod parse;
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(windows)]
+mod registry;
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
@@ -329,10 +332,54 @@ fn operate(sampler: &Mutex<Sampler>, operation: ToolOperation, deadline: &Deadli
         ToolOperation::SetServiceStartup { name, startup } => {
             platform::set_service_startup(&name, startup, deadline).map(ToolReply::Service)
         }
+        operation => registry(operation),
     };
     result.unwrap_or_else(|error| ToolReply::Failed {
         error: error.sanitized(),
     })
+}
+
+/// Runs a registry request: Windows has a registry, macOS and Linux don't.
+#[cfg(windows)]
+fn registry(operation: ToolOperation) -> Result<ToolReply, ToolError> {
+    match operation {
+        ToolOperation::ListRegistryKey { key } => {
+            registry::list_key(&key).map(ToolReply::RegistryKey)
+        }
+        ToolOperation::GetRegistryValue { key, name } => {
+            registry::get_value(&key, &name).map(ToolReply::RegistryValue)
+        }
+        ToolOperation::CreateRegistryKey { key } => {
+            registry::create_key(&key).map(|()| ToolReply::RegistryChanged)
+        }
+        ToolOperation::DeleteRegistryKey { key, recursive } => {
+            registry::delete_key(&key, recursive).map(|()| ToolReply::RegistryChanged)
+        }
+        ToolOperation::SetRegistryValue {
+            key,
+            name,
+            data,
+            create,
+        } => registry::set_value(&key, &name, &data, create).map(ToolReply::RegistryValue),
+        ToolOperation::RenameRegistryValue { key, from, to } => {
+            registry::rename_value(&key, &from, &to).map(|()| ToolReply::RegistryChanged)
+        }
+        ToolOperation::DeleteRegistryValue { key, name } => {
+            registry::delete_value(&key, &name).map(|()| ToolReply::RegistryChanged)
+        }
+        operation => Err(ToolError::new(
+            ToolErrorCode::Unsupported,
+            format!("The Agent doesn't know {}.", operation.name()),
+        )),
+    }
+}
+
+#[cfg(not(windows))]
+fn registry(_: ToolOperation) -> Result<ToolReply, ToolError> {
+    Err(ToolError::new(
+        ToolErrorCode::Unsupported,
+        "Only Windows has a registry.",
+    ))
 }
 
 fn lock(sampler: &Mutex<Sampler>) -> std::sync::MutexGuard<'_, Sampler> {

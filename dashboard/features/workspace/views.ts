@@ -103,7 +103,7 @@ const VIEW_ACCESS: Record<View, readonly Permission[]> = {
   policies: ["automation.manage"],
   terminal: ["terminal.connect", "terminal.connect_system"],
   files: ["files.browse"],
-  tools: ["tools.processes.view", "tools.services.view"],
+  tools: ["tools.processes.view", "tools.services.view", "tools.registry.view"],
 };
 
 export function canView(account: Pick<Account, "permissions" | "is_administrator"> | null, view: View) {

@@ -1,5 +1,6 @@
-//! Remote tools: a device's processes and services, listed and changed from
-//! the website without a remote session. See docs/remote-tools.md.
+//! Remote tools: a device's processes, services and Windows registry, listed
+//! and changed from the website without a remote session. See
+//! docs/remote-tools.md.
 //!
 //! Like the file browser's listings, each request is small and goes over
 //! the control connection: the server sends
@@ -10,7 +11,10 @@
 //! [`ServiceList::bound`]) to well within what one control message carries.
 use serde::{Deserialize, Serialize};
 
-use crate::{truncate_text, valid_launchd_label, valid_unit_name};
+use crate::{
+    RegistryData, RegistryKey, RegistryListing, RegistryValue, truncate_text, valid_launchd_label,
+    valid_unit_name,
+};
 
 /// The most processes one list carries.
 pub const MAX_LISTED_PROCESSES: usize = 5000;
@@ -33,8 +37,8 @@ const MAX_LABEL_BYTES: usize = 256;
 /// The longest program path a list carries, in bytes.
 const MAX_PATH_BYTES: usize = 1024;
 
-/// What the server asks the Agent to do with the device's processes or
-/// services.
+/// What the server asks the Agent to do with the device's processes,
+/// services or registry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolRequest {
     pub request_id: String,
@@ -66,6 +70,41 @@ pub enum ToolOperation {
         name: String,
         startup: ServiceStartup,
     },
+    /// A key's subkeys and values, each value's data cut short.
+    ListRegistryKey {
+        key: RegistryKey,
+    },
+    /// One value, whole, to edit it.
+    GetRegistryValue {
+        key: RegistryKey,
+        name: String,
+    },
+    /// Creates `key`, which must not exist, under its parent, which must.
+    CreateRegistryKey {
+        key: RegistryKey,
+    },
+    /// Deletes `key`; one with subkeys only when `recursive`, with them.
+    DeleteRegistryKey {
+        key: RegistryKey,
+        recursive: bool,
+    },
+    /// Sets the value `name` of `key`. With `create`, fails if it exists.
+    SetRegistryValue {
+        key: RegistryKey,
+        name: String,
+        data: RegistryData,
+        create: bool,
+    },
+    /// Renames the value `from` of `key` to `to`, which must not exist.
+    RenameRegistryValue {
+        key: RegistryKey,
+        from: String,
+        to: String,
+    },
+    DeleteRegistryValue {
+        key: RegistryKey,
+        name: String,
+    },
 }
 
 impl ToolOperation {
@@ -77,17 +116,29 @@ impl ToolOperation {
             Self::ListServices => "list_services",
             Self::ControlService { .. } => "control_service",
             Self::SetServiceStartup { .. } => "set_service_startup",
+            Self::ListRegistryKey { .. } => "list_registry_key",
+            Self::GetRegistryValue { .. } => "get_registry_value",
+            Self::CreateRegistryKey { .. } => "create_registry_key",
+            Self::DeleteRegistryKey { .. } => "delete_registry_key",
+            Self::SetRegistryValue { .. } => "set_registry_value",
+            Self::RenameRegistryValue { .. } => "rename_registry_value",
+            Self::DeleteRegistryValue { .. } => "delete_registry_value",
         }
     }
 
     /// Whether it may take a while on the device: a service waits to start
-    /// or stop, and an ended process gets a few seconds to exit.
+    /// or stop, an ended process gets a few seconds to exit, and a key
+    /// deleted with its subkeys may have many.
     pub fn slow(&self) -> bool {
         matches!(
             self,
             Self::EndProcesses { .. }
                 | Self::ControlService { .. }
                 | Self::SetServiceStartup { .. }
+                | Self::DeleteRegistryKey {
+                    recursive: true,
+                    ..
+                }
         )
     }
 }
@@ -410,6 +461,10 @@ pub enum ToolErrorCode {
     Invalid,
     /// Other running services depend on it.
     Dependents,
+    /// A registry key or value of that name already exists.
+    Exists,
+    /// A registry key has subkeys and wasn't deleted with them.
+    NotEmpty,
     /// This device's platform doesn't have the tool.
     Unsupported,
     /// The Agent is running as many tool requests as it runs at once, or
@@ -430,6 +485,8 @@ impl ToolErrorCode {
             Self::Changed => "changed",
             Self::Invalid => "invalid",
             Self::Dependents => "dependents",
+            Self::Exists => "exists",
+            Self::NotEmpty => "not_empty",
             Self::Unsupported => "unsupported",
             Self::Busy => "busy",
             Self::TimedOut => "timed_out",
@@ -484,6 +541,11 @@ pub enum ToolReply {
     Services(ServiceList),
     /// The service after a change.
     Service(ServiceInfo),
+    RegistryKey(RegistryListing),
+    /// The value read, or as written.
+    RegistryValue(RegistryValue),
+    /// A key or value was created, deleted or renamed.
+    RegistryChanged,
     Failed {
         error: ToolError,
     },

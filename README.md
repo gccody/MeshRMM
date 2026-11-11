@@ -50,6 +50,9 @@ MeshRMM is in heavy development and not production ready.
   command lines, ending a process or a whole tree after listing every one
   that will end, and starting, stopping, restarting and changing the startup
   type of Windows services, launchd jobs and systemd units.
+- The Windows registry in the website, as SYSTEM: browse every root in the
+  64-bit or 32-bit view, and create, edit, rename and delete keys and values
+  of every common type.
 - A toolbox of PowerShell, Command Prompt and shell (zsh or bash) scripts and a file library,
   private or shared, run and delivered from the website or the viewer as the
   signed-in user or as SYSTEM/root.
@@ -258,8 +261,8 @@ For developers:
   their traffic and flow control work
 - [File browser](docs/files.md): browsing and changing a device's files,
   and how downloads and uploads stream and are checked
-- [Remote tools](docs/remote-tools.md): a device's processes and services,
-  and how they're listed and changed
+- [Remote tools](docs/remote-tools.md): a device's processes, services and
+  Windows registry, and how they're listed and changed
 - [Toolbox](docs/toolbox.md): scripts and files
 - [Patch management](docs/patch-management.md): scanning for and installing
   operating system updates

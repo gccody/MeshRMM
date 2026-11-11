@@ -1,4 +1,4 @@
-import { Activity, AppWindow, ArrowLeft, Building2, CircleAlert, Cog, Cpu, FolderOpen, Gauge, Laptop, LoaderCircle, MonitorOff, Network, Package, Radar, ShieldCheck, Tag, Terminal, Workflow } from "lucide-react";
+import { Activity, AppWindow, ArrowLeft, Building2, CircleAlert, Cog, Cpu, FolderOpen, FolderTree, Gauge, Laptop, LoaderCircle, MonitorOff, Network, Package, Radar, ShieldCheck, Tag, Terminal, Workflow } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import { NO_COMPANY, DEFAULT_DEVICE_FILTERS, serializeDeviceFilters } from "../agents/device-filters";
@@ -253,7 +253,7 @@ export function DevicePage() {
 }
 
 // The remote tools' icons, for their links beside the terminal and files.
-const TOOL_ICONS: Record<Tool, typeof Cog> = { processes: Workflow, services: Cog };
+const TOOL_ICONS: Record<Tool, typeof Cog> = { processes: Workflow, services: Cog, registry: FolderTree };
 
 function StatusLine({ connected, updatingTo, latest }: { connected: boolean; updatingTo?: string; latest: MetricsReading | null }) {
   const tone = connected ? "online" : updatingTo ? "updating" : "offline";

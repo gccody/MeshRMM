@@ -243,7 +243,10 @@ pub fn agent_error(error: ToolError) -> ApiError {
     let status = match error.code {
         ToolErrorCode::NotFound => StatusCode::NOT_FOUND,
         ToolErrorCode::AccessDenied | ToolErrorCode::Protected => StatusCode::FORBIDDEN,
-        ToolErrorCode::Changed | ToolErrorCode::Dependents => StatusCode::CONFLICT,
+        ToolErrorCode::Changed
+        | ToolErrorCode::Dependents
+        | ToolErrorCode::Exists
+        | ToolErrorCode::NotEmpty => StatusCode::CONFLICT,
         ToolErrorCode::Invalid | ToolErrorCode::Unsupported => StatusCode::BAD_REQUEST,
         ToolErrorCode::Busy => StatusCode::TOO_MANY_REQUESTS,
         ToolErrorCode::TimedOut => StatusCode::GATEWAY_TIMEOUT,

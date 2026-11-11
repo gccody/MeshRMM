@@ -34,7 +34,7 @@ const AUDITED_PROCESSES: usize = 100;
 /// platform. Every route here authorizes its device through this, and only
 /// this: a device that isn't enrolled, or that the actor may not reach, is
 /// not found.
-async fn authorized_device(
+pub(super) async fn authorized_device(
     state: &AppState,
     actor: &Authorized,
     id: &str,
@@ -48,7 +48,7 @@ async fn authorized_device(
     Ok((device_id, platform))
 }
 
-fn unexpected() -> ApiError {
+pub(super) fn unexpected() -> ApiError {
     ApiError::new(
         StatusCode::BAD_GATEWAY,
         "the device answered with something unexpected",
@@ -56,7 +56,7 @@ fn unexpected() -> ApiError {
 }
 
 /// Records `action` on the device; a failure only logs.
-async fn record(
+pub(super) async fn record(
     state: &AppState,
     actor: &Authorized,
     device_id: &str,
@@ -79,7 +79,7 @@ async fn record(
 /// `metadata` with the result of a change the device refused or never
 /// confirmed: `failed` with the device's code, or `unconfirmed` when it
 /// didn't answer in time or disconnected, so may have made it.
-fn failure(mut metadata: Value, error: &ApiError) -> Value {
+pub(super) fn failure(mut metadata: Value, error: &ApiError) -> Value {
     metadata["result"] = if tools::unconfirmed(error) {
         "unconfirmed"
     } else {

@@ -47,6 +47,8 @@ export type Permission =
   | "tools.processes.manage"
   | "tools.services.view"
   | "tools.services.manage"
+  | "tools.registry.view"
+  | "tools.registry.manage"
   | "updates.view"
   | "updates.install"
   | "applications.view"
