@@ -21,6 +21,13 @@ use crate::remote::platform::ScreenInput;
 /// frame, which tells the stream's size. The backends wait up to 10 seconds
 /// for the display server to start a capture and the coordinator 15 for the
 /// helper to answer, so a start that needs both still answers in time.
+///
+/// A display that is asleep, or a compositor that draws only when something
+/// changes, may send nothing until the technician moves the pointer, which
+/// takes a started stream. So a capture that is still running after this
+/// time starts at the display's size in the layout, as every stream once
+/// did; if its first frame then has another size, as on a scaled display,
+/// the stream ends there and the next start announces that frame's size.
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 /// How often the wait for the first frame checks whether the capture ended.
 const FIRST_FRAME_POLL: Duration = Duration::from_millis(50);
@@ -91,7 +98,18 @@ impl Running {
         )?;
         let size = match size {
             Some(size) => size,
-            None => gate.wait_for_size(first_frame, || stream.poll_ended())?,
+            None => match gate.wait_for_size(first_frame, || stream.poll_ended())? {
+                Some(size) => size,
+                None => {
+                    let size = gate.assume((output.width, output.height));
+                    tracing::warn!(
+                        width = size.0,
+                        height = size.1,
+                        "the display server has sent no picture yet; starting the stream at the display's size"
+                    );
+                    size
+                }
+            },
         };
         Ok(Self {
             output,
@@ -206,13 +224,25 @@ impl SizeGate {
         self.sizes.lock().unwrap_or_else(|e| e.into_inner()).changed
     }
 
-    /// The stream's size, once the first frame arrives within `timeout`.
-    /// Fails sooner when `ended` says the capture stopped.
+    /// Fixes the stream's size at `size` unless a frame has fixed it
+    /// meanwhile, and returns the stream's size.
+    fn assume(&self, size: (u32, u32)) -> (u32, u32) {
+        *self
+            .sizes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stream
+            .get_or_insert(size)
+    }
+
+    /// The stream's size, once the first frame arrives; `None` when none
+    /// came within `timeout` and the capture is still running. Fails when
+    /// `ended` says the capture stopped.
     fn wait_for_size(
         &self,
         timeout: Duration,
         mut ended: impl FnMut() -> Option<anyhow::Error>,
-    ) -> anyhow::Result<(u32, u32)> {
+    ) -> anyhow::Result<Option<(u32, u32)>> {
         let deadline = Instant::now() + timeout;
         loop {
             {
@@ -224,18 +254,15 @@ impl SizeGate {
                         sizes.stream.is_none()
                     })
                     .unwrap_or_else(|e| e.into_inner());
-                if let Some(size) = sizes.stream {
-                    return Ok(size);
+                if sizes.stream.is_some() {
+                    return Ok(sizes.stream);
                 }
             }
             if let Some(error) = ended() {
                 return Err(error.context("the capture stopped before its first frame"));
             }
             if Instant::now() >= deadline {
-                bail!(
-                    "the display server sent no picture within {} seconds of starting the capture",
-                    timeout.as_secs_f32()
-                );
+                return Ok(None);
             }
         }
     }
@@ -876,21 +903,40 @@ mod tests {
     }
 
     #[test]
-    fn a_capture_without_a_first_frame_does_not_start() {
+    fn a_capture_without_a_first_frame_starts_at_the_displays_size() {
+        // A display that is asleep sends nothing until the technician wakes
+        // it, which takes a started stream.
+        let wait = Duration::from_millis(200);
         let mut fake = Fake::default();
-        let Err(error) = start(
-            &mut fake,
-            output(320, 180),
-            None,
-            Duration::from_millis(200),
-        ) else {
-            panic!("a stream started without a frame to tell its size");
-        };
+        let sink = Arc::clone(&fake.sink);
+        let mut running = start(&mut fake, output(320, 180), None, wait).unwrap();
+        let format = running.format();
+        assert_eq!((format.width, format.height), (320, 180));
+        // Not scaled: its frames have the display's size and the stream
+        // goes on.
+        let sink = sink.lock().unwrap().clone().unwrap();
+        deliver(&sink, (320, 180));
+        assert!(running.poll_ended().is_none());
+
+        // Scaled: the first frame has another size, which ends the stream
+        // for a start that announces it.
+        let mut fake = Fake::default();
+        let sink = Arc::clone(&fake.sink);
+        let mut running = start(&mut fake, output(320, 180), None, wait).unwrap();
+        let sink = sink.lock().unwrap().clone().unwrap();
+        deliver(&sink, (640, 360));
+        let error = running
+            .poll_ended()
+            .expect("the stream went on at a size it did not announce");
         assert!(
-            format!("{error:#}").contains("sent no picture"),
+            format!("{error:#}").contains("from 320x180 to 640x360"),
             "{error:#}"
         );
-        // One that ends first says why, without waiting out the time.
+    }
+
+    #[test]
+    fn a_capture_that_ends_before_its_first_frame_does_not_start() {
+        // It says why, without waiting out the time.
         let mut fake = Fake {
             ended: Some("the compositor ended the screencast"),
             ..Fake::default()
