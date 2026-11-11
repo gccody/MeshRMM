@@ -3050,8 +3050,12 @@ dependencies = [
  "anyhow",
  "arboard",
  "clipboard-win",
+ "image",
  "meshrmm-file-transfer",
  "meshrmm-protocol",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
 ]
 
 [[package]]

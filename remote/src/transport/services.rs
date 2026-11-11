@@ -244,7 +244,12 @@ impl ServiceWorker {
                                 outgoing.clear();
                                 if crate::preferences::clipboard_sync()
                                     && let Some(clipboard) = clipboard.as_mut()
-                                    && let Err(error) = clipboard.apply(content) { tracing::warn!(%error, "viewer clipboard apply failed"); }
+                                {
+                                    if let Some(problem) = content.left_out_problem() {
+                                        show_clipboard_problem(&viewer, format!("Clipboard from the device: {problem}"));
+                                    }
+                                    if let Err(error) = clipboard.apply(content) { tracing::warn!(%error, "viewer clipboard apply failed"); }
+                                }
                             }
                             Ok(None) => {},
                             Err(error) => tracing::warn!(%error, "invalid viewer clipboard payload"),
@@ -279,8 +284,19 @@ impl ServiceWorker {
                     let open = control.borrow().as_ref().is_some_and(|c| c.ready_state() == RTCDataChannelState::Open);
                     if !open { continue; }
                     if let Some(clipboard) = clipboard.as_mut() {
-                        match clipboard.poll().and_then(|c| Ok(c.map(|c| c.messages()).transpose()?)) {
-                            Ok(Some(messages)) => outgoing = messages.into(),
+                        match clipboard.poll() {
+                            Ok(Some(content)) => {
+                                if let Some(problem) = content.left_out_problem() {
+                                    show_clipboard_problem(&viewer, format!("Clipboard: {problem}"));
+                                }
+                                // Nothing of the copy fits: the device keeps what it has.
+                                if content.has_formats() {
+                                    match content.messages() {
+                                        Ok(messages) => outgoing = messages.into(),
+                                        Err(error) => tracing::warn!(%error, "viewer clipboard encoding failed"),
+                                    }
+                                }
+                            }
                             Ok(None) => {},
                             Err(error) => tracing::warn!(%error, "viewer clipboard poll failed"),
                         }
@@ -292,6 +308,15 @@ impl ServiceWorker {
             viewer.chat.set_available(false);
         }
     }
+}
+
+/// Tells the technician that a copy arrived without what was too large for the
+/// session, in the alert that shows the device's maintenance errors.
+fn show_clipboard_problem(viewer: &ViewerControlQueue, problem: String) {
+    if let Ok(mut state) = viewer.maintenance.lock() {
+        state.error = Some(problem);
+    }
+    crate::platform::refresh_open_controls();
 }
 
 #[cfg(test)]
