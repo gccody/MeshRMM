@@ -215,7 +215,13 @@ impl Backend for Mutter {
         };
         tracing::info!(node, output = %output.name, "Mutter started a screencast");
         let cursor = Arc::default();
-        let stream = pipewire::Stream::connect(None, node, sink, Arc::clone(&cursor))?;
+        let stream = pipewire::Stream::connect(
+            None,
+            node,
+            settings.frames_per_second,
+            sink,
+            Arc::clone(&cursor),
+        )?;
         Ok(Box::new(MutterStream {
             session: session_proxy,
             stream: Some(stream),

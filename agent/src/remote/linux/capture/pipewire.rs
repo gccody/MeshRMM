@@ -5,16 +5,23 @@
 //! `libpipewire-0.3` is loaded when a capture starts, so the Agent runs on
 //! computers without it. The few functions, structures and SPA pods used
 //! here are declared by hand from the stable PipeWire 0.3 ABI.
+//!
+//! The compositor is asked for no more frames a second than the stream
+//! encodes. One that sends more anyway is paced before its frames are
+//! converted: an early frame's buffer is held, newest first, and converted
+//! when its time comes, so the last frame of a burst is still shown.
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::Instant;
 
 use anyhow::{Context, bail};
 use meshrmm_protocol::CursorShape;
 
 use super::FrameSink;
+use super::pacing::{Admit, FramePacer};
 use crate::remote::linux::cursor::ThemeShapes;
-use crate::remote::linux::encoder::{PixelLayout, RawFrame};
+use crate::remote::linux::encoder::{MAX_FRAMES_PER_SECOND, PixelLayout, RawFrame};
 
 // SPA types, from spa/utils/type.h.
 const SPA_TYPE_ID: u32 = 3;
@@ -42,6 +49,7 @@ const SPA_FORMAT_MEDIA_SUBTYPE: u32 = 2;
 const SPA_FORMAT_VIDEO_FORMAT: u32 = 0x20001;
 const SPA_FORMAT_VIDEO_SIZE: u32 = 0x20003;
 const SPA_FORMAT_VIDEO_FRAMERATE: u32 = 0x20004;
+const SPA_FORMAT_VIDEO_MAX_FRAMERATE: u32 = 0x20005;
 const SPA_MEDIA_TYPE_VIDEO: u32 = 2;
 const SPA_MEDIA_SUBTYPE_RAW: u32 = 1;
 // spa/param/video/raw.h
@@ -305,8 +313,11 @@ impl PodWriter {
 }
 
 /// The formats to offer: 32-bit RGB in any order, of any size and rate,
-/// in shared memory rather than GPU buffers.
-fn enum_format() -> Vec<u8> {
+/// in shared memory rather than GPU buffers, at most `frames_per_second`
+/// frames a second. A rate of 0/1 is a variable rate, a frame for each
+/// change, as Mutter and KWin send; they keep to the maximum the format
+/// settles on, which they offer as a range from 1/1 to the display's rate.
+fn enum_format(frames_per_second: u32) -> Vec<u8> {
     let mut pod = PodWriter::default();
     pod.object(SPA_TYPE_OBJECT_FORMAT, SPA_PARAM_ENUM_FORMAT, |pod| {
         pod.property(SPA_FORMAT_MEDIA_TYPE);
@@ -343,6 +354,13 @@ fn enum_format() -> Vec<u8> {
             SPA_TYPE_FRACTION,
             8,
             &[&[0, 1], &[0, 1], &[1000, 1]],
+        );
+        pod.property(SPA_FORMAT_VIDEO_MAX_FRAMERATE);
+        pod.choice(
+            SPA_CHOICE_RANGE,
+            SPA_TYPE_FRACTION,
+            8,
+            &[&[frames_per_second, 1], &[1, 1], &[frames_per_second, 1]],
         );
     });
     pod.0
@@ -389,8 +407,18 @@ fn cursor_meta() -> Vec<u8> {
     pod.0
 }
 
-/// The pixel layout and size of a negotiated format pod.
-fn parse_format(pod: &[u8]) -> Option<(PixelLayout, u32, u32)> {
+/// A negotiated format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Format {
+    layout: PixelLayout,
+    width: u32,
+    height: u32,
+    /// The maximum frame rate it settled on, if it names one.
+    max_framerate: Option<(u32, u32)>,
+}
+
+/// The format a negotiated format pod describes.
+fn parse_format(pod: &[u8]) -> Option<Format> {
     let word = |offset: usize| -> Option<u32> {
         Some(u32::from_ne_bytes(
             pod.get(offset..offset + 4)?.try_into().ok()?,
@@ -402,7 +430,7 @@ fn parse_format(pod: &[u8]) -> Option<(PixelLayout, u32, u32)> {
     }
     let end = (8 + size).min(pod.len());
     let mut offset = 16;
-    let (mut layout, mut dimensions) = (None, None);
+    let (mut layout, mut dimensions, mut max_framerate) = (None, None, None);
     while offset + 16 <= end {
         let key = word(offset)?;
         let value_size = word(offset + 8)? as usize;
@@ -426,25 +454,74 @@ fn parse_format(pod: &[u8]) -> Option<(PixelLayout, u32, u32)> {
             (SPA_FORMAT_VIDEO_SIZE, SPA_TYPE_RECTANGLE) => {
                 dimensions = Some((word(body)?, word(body + 4)?));
             }
+            (SPA_FORMAT_VIDEO_MAX_FRAMERATE, SPA_TYPE_FRACTION) => {
+                max_framerate = Some((word(body)?, word(body + 4)?));
+            }
             _ => {}
         }
         offset += 16 + value_size.div_ceil(8) * 8;
     }
     let (width, height) = dimensions?;
-    Some((layout?, width, height))
+    Some(Format {
+        layout: layout?,
+        width,
+        height,
+        max_framerate,
+    })
 }
 
 /// State the PipeWire thread shares with the stream's owner.
 struct Callbacks {
     api: &'static Api,
+    thread_loop: *mut Opaque,
     stream: *mut Opaque,
     sink: FrameSink,
-    format: Mutex<Option<(PixelLayout, u32, u32)>>,
+    format: Mutex<Option<Format>>,
     /// The pointer's shape, from the cursor metadata.
     cursor: Arc<Mutex<CursorShape>>,
     shapes: Mutex<ThemeShapes>,
+    pacing: Mutex<Pacing>,
+    /// A frame was held, or the stream is stopping.
+    held_changed: Condvar,
     ended: Mutex<Option<String>>,
     stopped: AtomicBool,
+}
+
+/// Frames paced to the stream's rate.
+struct Pacing {
+    pacer: FramePacer,
+    /// The newest frame that came too soon after the last converted one,
+    /// dequeued until it is converted or a newer frame replaces it, and
+    /// when it may be converted.
+    held: Option<(*mut PwBuffer, Instant)>,
+}
+
+/// The stream's callbacks, for the thread that converts held frames.
+struct HeldFrames(*const Callbacks);
+
+// SAFETY: the callbacks outlive the thread, which `Stream`'s drop joins
+// first, and the thread touches the stream only under the loop's lock.
+unsafe impl Send for HeldFrames {}
+
+impl Callbacks {
+    /// Takes a held frame back from the pacer without converting it,
+    /// returning it to the stream.
+    ///
+    /// # Safety
+    ///
+    /// Called on the PipeWire thread, or holding the loop's lock.
+    unsafe fn release_held(&self) {
+        let held = self
+            .pacing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .held
+            .take();
+        if let Some((buffer, _)) = held {
+            // SAFETY: the held buffer was dequeued from this stream.
+            unsafe { (self.api.stream_queue_buffer)(self.stream, buffer) };
+        }
+    }
 }
 
 unsafe extern "C" fn on_state_changed(
@@ -483,7 +560,13 @@ unsafe extern "C" fn on_param_changed(data: *mut c_void, id: u32, param: *const 
     // SAFETY: the pod is `size` bytes long.
     let pod = unsafe { std::slice::from_raw_parts(param.cast::<u8>(), size) };
     let format = parse_format(pod);
-    tracing::info!(?format, "the screencast's format is set");
+    // A compositor that does not name the maximum it settled on may send
+    // more, which is paced here instead.
+    let max_framerate = format.and_then(|format| format.max_framerate);
+    tracing::info!(?format, ?max_framerate, "the screencast's format is set");
+    // A frame held in the old format is not converted in the new one.
+    // SAFETY: called on the PipeWire thread.
+    unsafe { callbacks.release_held() };
     *callbacks.format.lock().unwrap_or_else(|e| e.into_inner()) = format;
     let (buffers, meta) = (buffers(), cursor_meta());
     let mut params = [
@@ -505,7 +588,7 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
     // SAFETY: `data` is the Callbacks this listener was added with.
     let callbacks = unsafe { &*data.cast::<Callbacks>() };
     let api = callbacks.api;
-    // Only the newest buffer is wanted; older ones go straight back.
+    // Only the newest frame is wanted; older buffers go straight back.
     let mut newest: *mut PwBuffer = std::ptr::null_mut();
     loop {
         // SAFETY: called on the PipeWire thread with a live stream.
@@ -516,6 +599,13 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
         // Each buffer may carry a new cursor, even one not delivered.
         // SAFETY: a dequeued buffer stays valid until it is queued again.
         unsafe { read_cursor(callbacks, &*buffer) };
+        // SAFETY: as above.
+        if unsafe { frame_data(&*buffer) }.is_none() {
+            // Only the cursor's metadata, which must not replace a frame.
+            // SAFETY: the buffer was dequeued from this stream.
+            unsafe { (api.stream_queue_buffer)(callbacks.stream, buffer) };
+            continue;
+        }
         if !newest.is_null() {
             // SAFETY: the buffer was dequeued from this stream.
             unsafe { (api.stream_queue_buffer)(callbacks.stream, newest) };
@@ -525,10 +615,101 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
     if newest.is_null() {
         return;
     }
-    // SAFETY: a dequeued buffer stays valid until it is queued again.
-    unsafe { deliver(callbacks, &*newest) };
-    // SAFETY: as above.
-    unsafe { (api.stream_queue_buffer)(callbacks.stream, newest) };
+    let mut pacing = callbacks.pacing.lock().unwrap_or_else(|e| e.into_inner());
+    let admit = pacing.pacer.admit(Instant::now());
+    let replaced = match admit {
+        Admit::Now => pacing.held.take(),
+        Admit::At(at) => pacing.held.replace((newest, at)),
+    };
+    drop(pacing);
+    if let Some((older, _)) = replaced {
+        // SAFETY: the held buffer was dequeued from this stream.
+        unsafe { (api.stream_queue_buffer)(callbacks.stream, older) };
+    }
+    match admit {
+        Admit::Now => {
+            // SAFETY: a dequeued buffer stays valid until it is queued again.
+            unsafe { deliver(callbacks, &*newest) };
+            // SAFETY: as above.
+            unsafe { (api.stream_queue_buffer)(callbacks.stream, newest) };
+        }
+        Admit::At(_) => callbacks.held_changed.notify_one(),
+    }
+}
+
+unsafe extern "C" fn on_remove_buffer(data: *mut c_void, buffer: *mut PwBuffer) {
+    // SAFETY: `data` is the Callbacks this listener was added with.
+    let callbacks = unsafe { &*data.cast::<Callbacks>() };
+    let mut pacing = callbacks.pacing.lock().unwrap_or_else(|e| e.into_inner());
+    if pacing.held.is_some_and(|(held, _)| held == buffer) {
+        pacing.held = None;
+    }
+}
+
+/// Converts each held frame when the pacer lets it through, unless a newer
+/// frame came first, until the stream stops.
+fn convert_held_frames(callbacks: &Callbacks) {
+    let api = callbacks.api;
+    let mut pacing = callbacks.pacing.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if callbacks.stopped.load(Ordering::SeqCst) {
+            return;
+        }
+        let now = Instant::now();
+        match pacing.held {
+            None => {
+                pacing = callbacks
+                    .held_changed
+                    .wait(pacing)
+                    .unwrap_or_else(|e| e.into_inner());
+            }
+            Some((_, at)) if at > now => {
+                pacing = callbacks
+                    .held_changed
+                    .wait_timeout(pacing, at - now)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
+            }
+            Some(_) => {
+                // The loop's lock comes before the pacing lock, as on the
+                // PipeWire thread.
+                drop(pacing);
+                // SAFETY: the loop lives until this thread is joined.
+                unsafe { (api.thread_loop_lock)(callbacks.thread_loop) };
+                let ready = {
+                    let mut pacing = callbacks.pacing.lock().unwrap_or_else(|e| e.into_inner());
+                    match pacing.held {
+                        // A newer frame may have been converted or held
+                        // meanwhile.
+                        Some((buffer, at)) if at <= Instant::now() => {
+                            match pacing.pacer.admit(Instant::now()) {
+                                Admit::Now => {
+                                    pacing.held = None;
+                                    Some(buffer)
+                                }
+                                Admit::At(at) => {
+                                    pacing.held = Some((buffer, at));
+                                    None
+                                }
+                            }
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(buffer) = ready {
+                    // SAFETY: holding the loop's lock, the held buffer is
+                    // still dequeued from the live stream.
+                    unsafe {
+                        deliver(callbacks, &*buffer);
+                        (api.stream_queue_buffer)(callbacks.stream, buffer);
+                    }
+                }
+                // SAFETY: locked above.
+                unsafe { (api.thread_loop_unlock)(callbacks.thread_loop) };
+                pacing = callbacks.pacing.lock().unwrap_or_else(|e| e.into_inner());
+            }
+        }
+    }
 }
 
 /// Names the cursor in a buffer's metadata, when it carries a new image.
@@ -619,32 +800,51 @@ fn cursor_image(
     Some(classify(width, height, &mask))
 }
 
+/// A buffer's frame: its mapped data and the chunk describing it, or `None`
+/// for a buffer without one.
+///
+/// # Safety
+///
+/// `buffer` must be dequeued from the stream.
+unsafe fn frame_data(buffer: &PwBuffer) -> Option<(&SpaData, &SpaChunk)> {
+    // SAFETY: a dequeued buffer has a valid spa_buffer.
+    let spa = unsafe { &*buffer.buffer };
+    if spa.data_count == 0 || spa.datas.is_null() {
+        return None;
+    }
+    // SAFETY: there is at least one data entry.
+    let data = unsafe { &*spa.datas };
+    if data.data.is_null() || data.chunk.is_null() {
+        return None;
+    }
+    // SAFETY: the chunk belongs to the data entry.
+    let chunk = unsafe { &*data.chunk };
+    // An empty chunk updates only the cursor metadata.
+    if chunk.size == 0 || chunk.flags & SPA_CHUNK_FLAG_CORRUPTED != 0 {
+        return None;
+    }
+    Some((data, chunk))
+}
+
 /// Sends a buffer's frame to the sink.
 ///
 /// # Safety
 ///
 /// `buffer` must be dequeued from the stream and mapped.
 unsafe fn deliver(callbacks: &Callbacks, buffer: &PwBuffer) {
-    let Some((layout, width, height)) = *callbacks.format.lock().unwrap_or_else(|e| e.into_inner())
+    let Some(Format {
+        layout,
+        width,
+        height,
+        ..
+    }) = *callbacks.format.lock().unwrap_or_else(|e| e.into_inner())
     else {
         return;
     };
-    // SAFETY: a dequeued buffer has a valid spa_buffer.
-    let spa = unsafe { &*buffer.buffer };
-    if spa.data_count == 0 || spa.datas.is_null() {
+    // SAFETY: as this function's.
+    let Some((data, chunk)) = (unsafe { frame_data(buffer) }) else {
         return;
-    }
-    // SAFETY: there is at least one data entry.
-    let data = unsafe { &*spa.datas };
-    if data.data.is_null() || data.chunk.is_null() {
-        return;
-    }
-    // SAFETY: the chunk belongs to the data entry.
-    let chunk = unsafe { &*data.chunk };
-    // An empty chunk updates only the cursor metadata.
-    if chunk.size == 0 || chunk.flags & SPA_CHUNK_FLAG_CORRUPTED != 0 {
-        return;
-    }
+    };
     let stride = if chunk.stride > 0 {
         chunk.stride as usize
     } else {
@@ -674,6 +874,8 @@ pub(crate) struct Stream {
     _hook: Box<SpaHook>,
     callbacks: Box<Callbacks>,
     _events: Box<StreamEvents>,
+    /// Converts held frames when their time comes.
+    held_frames: Option<std::thread::JoinHandle<()>>,
 }
 
 // SAFETY: every PipeWire call after setup happens under the thread loop's
@@ -683,14 +885,18 @@ unsafe impl Send for Stream {}
 impl Stream {
     /// Connects to screencast node `node`, through `fd` when a portal handed
     /// one out, or to the session's PipeWire daemon. `cursor` follows the
-    /// pointer's shape when the compositor sends it as metadata.
+    /// pointer's shape when the compositor sends it as metadata. Frames are
+    /// converted at most `frames_per_second` times a second, and no more
+    /// often than the encoder takes them.
     pub(crate) fn connect(
         fd: Option<c_int>,
         node: u32,
+        frames_per_second: u32,
         sink: FrameSink,
         cursor: Arc<Mutex<CursorShape>>,
     ) -> anyhow::Result<Self> {
         let api = api()?;
+        let frames_per_second = frames_per_second.clamp(1, MAX_FRAMES_PER_SECOND);
         // SAFETY: the calls follow PipeWire's documented setup order; every
         // pointer is checked before it is used.
         unsafe {
@@ -726,11 +932,17 @@ impl Stream {
                 _hook: Box::new(std::mem::zeroed()),
                 callbacks: Box::new(Callbacks {
                     api,
+                    thread_loop,
                     stream: std::ptr::null_mut(),
                     sink,
                     format: Mutex::new(None),
                     cursor,
                     shapes: Mutex::default(),
+                    pacing: Mutex::new(Pacing {
+                        pacer: FramePacer::new(frames_per_second),
+                        held: None,
+                    }),
+                    held_changed: Condvar::new(),
                     ended: Mutex::new(None),
                     stopped: AtomicBool::new(false),
                 }),
@@ -742,12 +954,13 @@ impl Stream {
                     io_changed: None,
                     param_changed: Some(on_param_changed),
                     add_buffer: None,
-                    remove_buffer: None,
+                    remove_buffer: Some(on_remove_buffer),
                     process: Some(on_process),
                     drained: None,
                     command: None,
                     trigger_done: None,
                 }),
+                held_frames: None,
             };
             if core.is_null() {
                 (api.thread_loop_unlock)(thread_loop);
@@ -768,7 +981,7 @@ impl Stream {
                 &raw const *stream._events,
                 (&raw const *stream.callbacks).cast_mut().cast(),
             );
-            let format = enum_format();
+            let format = enum_format(frames_per_second);
             let mut params = [format.as_ptr().cast::<c_void>()];
             let result = (api.stream_connect)(
                 stream.stream,
@@ -782,6 +995,18 @@ impl Stream {
             if result < 0 {
                 bail!("could not connect to the screencast's PipeWire node ({result})");
             }
+            let callbacks = HeldFrames(&raw const *stream.callbacks);
+            stream.held_frames = Some(
+                std::thread::Builder::new()
+                    .name("meshrmm-pipewire-pace".into())
+                    .spawn(move || {
+                        // The whole wrapper moves here, not its pointer.
+                        let callbacks = callbacks;
+                        // See `HeldFrames` for why the callbacks are alive.
+                        convert_held_frames(&*callbacks.0)
+                    })
+                    .context("could not start pacing the screencast")?,
+            );
             Ok(stream)
         }
     }
@@ -800,11 +1025,24 @@ impl Drop for Stream {
     fn drop(&mut self) {
         let api = self.api;
         self.callbacks.stopped.store(true, Ordering::SeqCst);
+        // Taking the pacing lock orders the store before the thread's next
+        // check, so the wakeup is not missed.
+        drop(
+            self.callbacks
+                .pacing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        self.callbacks.held_changed.notify_all();
+        if let Some(thread) = self.held_frames.take() {
+            let _ = thread.join();
+        }
         // SAFETY: tearing down in the reverse order of setup, holding the
         // loop's lock for the objects it runs.
         unsafe {
             (api.thread_loop_lock)(self.thread_loop);
             if !self.stream.is_null() {
+                self.callbacks.release_held();
                 (api.stream_disconnect)(self.stream);
                 (api.stream_destroy)(self.stream);
             }
@@ -825,13 +1063,78 @@ mod tests {
 
     #[test]
     fn the_offered_format_is_a_well_formed_pod() {
-        let pod = enum_format();
+        let pod = enum_format(30);
         assert_eq!(pod.len() % 8, 0);
         let size = u32::from_ne_bytes(pod[..4].try_into().unwrap()) as usize;
         assert_eq!(size + 8, pod.len());
         assert_eq!(
             u32::from_ne_bytes(pod[4..8].try_into().unwrap()),
             SPA_TYPE_OBJECT
+        );
+    }
+
+    /// The property `key` of an object pod: its flags and value pod.
+    fn property_of(pod: &[u8], key: u32) -> Option<&[u8]> {
+        let word = |offset: usize| u32::from_ne_bytes(pod[offset..offset + 4].try_into().unwrap());
+        let mut offset = 16;
+        while offset + 16 <= pod.len() {
+            let size = 16 + (word(offset + 8) as usize).div_ceil(8) * 8;
+            if word(offset) == key {
+                return Some(&pod[offset + 4..offset + size]);
+            }
+            offset += size;
+        }
+        None
+    }
+
+    #[test]
+    fn the_offered_format_asks_for_at_most_the_stream_rate() {
+        let words = |words: &[u32]| -> Vec<u8> {
+            words.iter().flat_map(|word| word.to_ne_bytes()).collect()
+        };
+        // A variable rate, a frame for each change.
+        let pod = enum_format(24);
+        assert_eq!(
+            property_of(&pod, SPA_FORMAT_VIDEO_FRAMERATE),
+            Some(
+                &words(&[
+                    0,
+                    40,
+                    SPA_TYPE_CHOICE,
+                    SPA_CHOICE_RANGE,
+                    0,
+                    8,
+                    SPA_TYPE_FRACTION,
+                    0,
+                    1,
+                    0,
+                    1,
+                    1000,
+                    1
+                ])[..]
+            )
+        );
+        // A maximum of 24/1, from 1/1 to 24/1, as gnome-remote-desktop asks
+        // Mutter and KWin.
+        assert_eq!(
+            property_of(&pod, SPA_FORMAT_VIDEO_MAX_FRAMERATE),
+            Some(
+                &words(&[
+                    0,
+                    40,
+                    SPA_TYPE_CHOICE,
+                    SPA_CHOICE_RANGE,
+                    0,
+                    8,
+                    SPA_TYPE_FRACTION,
+                    24,
+                    1,
+                    1,
+                    1,
+                    24,
+                    1
+                ])[..]
+            )
         );
     }
 
@@ -850,8 +1153,18 @@ mod tests {
             pod.u32(1440);
             pod.property(SPA_FORMAT_VIDEO_FRAMERATE);
             pod.choice(SPA_CHOICE_NONE, SPA_TYPE_FRACTION, 8, &[&[0, 1]]);
+            pod.property(SPA_FORMAT_VIDEO_MAX_FRAMERATE);
+            pod.choice(SPA_CHOICE_NONE, SPA_TYPE_FRACTION, 8, &[&[30, 1]]);
         });
-        assert_eq!(parse_format(&pod.0), Some((PixelLayout::Rgbx, 2560, 1440)));
+        assert_eq!(
+            parse_format(&pod.0),
+            Some(Format {
+                layout: PixelLayout::Rgbx,
+                width: 2560,
+                height: 1440,
+                max_framerate: Some((30, 1)),
+            })
+        );
         assert_eq!(parse_format(&buffers()), None);
     }
 

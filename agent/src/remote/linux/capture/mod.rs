@@ -4,6 +4,7 @@
 //! since Wayland has no common capture interface without a prompt.
 mod kwin;
 mod mutter;
+mod pacing;
 mod pipewire;
 mod wayland;
 mod wlroots;

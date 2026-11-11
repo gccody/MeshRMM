@@ -181,8 +181,8 @@ impl Scale {
 impl Picture {
     /// Converts `frame` at its [`encoded_size`], reusing this picture's
     /// buffers. A larger frame is scaled down bilinearly. Bands of rows are
-    /// converted in parallel.
-    fn convert(&mut self, frame: &RawFrame<'_>, grayscale: bool) {
+    /// converted in parallel on `pool`.
+    fn convert(&mut self, frame: &RawFrame<'_>, grayscale: bool, pool: &BandPool) {
         let (width, height) = encoded_size(frame.width, frame.height);
         let (width, height) = (width as usize, height as usize);
         self.width = width;
@@ -193,30 +193,215 @@ impl Picture {
         self.v.resize(width * height / 4, 0);
         let scale = ((width, height) != (frame.width as usize & !1, frame.height as usize & !1))
             .then(|| Scale::new(frame, width, height));
-        let threads = std::thread::available_parallelism().map_or(1, |threads| threads.get());
         // Pairs of rows, as 4:2:0 needs.
-        let band = height.div_ceil(2).div_ceil(threads.clamp(1, 8)) * 2;
+        let band = height.div_ceil(2).div_ceil(pool.threads()) * 2;
         let chroma_width = width / 2;
-        std::thread::scope(|scope| {
-            let mut bands = self
-                .y
-                .chunks_mut(band * width)
-                .zip(self.u.chunks_mut(band / 2 * chroma_width))
-                .zip(self.v.chunks_mut(band / 2 * chroma_width))
-                .enumerate()
-                .map(|(index, ((y, u), v))| {
-                    let scale = scale.as_ref();
-                    move || convert_band(frame, scale, width, index * band, y, u, v, grayscale)
-                });
-            // This thread converts the first band while others do the rest.
-            let first = bands.next();
-            for convert in bands {
-                scope.spawn(convert);
-            }
-            if let Some(mut convert) = first {
-                convert();
+        let bands: Vec<_> = self
+            .y
+            .chunks_mut(band * width)
+            .zip(self.u.chunks_mut(band / 2 * chroma_width))
+            .zip(self.v.chunks_mut(band / 2 * chroma_width))
+            .map(|band| Mutex::new(Some(band)))
+            .collect();
+        pool.run(bands.len(), |index| {
+            let taken = bands[index]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(((y, u), v)) = taken {
+                convert_band(
+                    frame,
+                    scale.as_ref(),
+                    width,
+                    index * band,
+                    y,
+                    u,
+                    v,
+                    grayscale,
+                );
             }
         });
+    }
+}
+
+/// The most threads a picture is converted on.
+const MAX_CONVERSION_THREADS: usize = 8;
+
+/// Threads that convert a picture's bands beside the thread submitting it,
+/// started once with the encoder rather than for every frame.
+struct BandPool {
+    shared: Arc<PoolShared>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+    /// One conversion at a time.
+    busy: Mutex<()>,
+}
+
+struct PoolShared {
+    state: Mutex<PoolState>,
+    /// Bands are waiting, or the pool is stopping.
+    work: Condvar,
+    /// A worker finished a band.
+    finished: Condvar,
+}
+
+#[derive(Default)]
+struct PoolState {
+    task: Option<Task>,
+    /// The next band to hand out, and how many the task has.
+    next: usize,
+    bands: usize,
+    /// Bands workers have taken and not finished.
+    running: usize,
+    panicked: bool,
+    stopped: bool,
+}
+
+/// The band conversion [`BandPool::run`] borrows to its workers.
+#[derive(Clone, Copy)]
+struct Task(*const (dyn Fn(usize) + Sync + 'static));
+
+// SAFETY: the task is `Sync`, and `run` keeps it alive until every worker
+// that took a band of it has finished.
+unsafe impl Send for Task {}
+
+impl BandPool {
+    /// A pool converting on `threads` threads in all: the caller's and
+    /// `threads - 1` workers.
+    fn new(threads: usize) -> Self {
+        let shared = Arc::new(PoolShared {
+            state: Mutex::default(),
+            work: Condvar::new(),
+            finished: Condvar::new(),
+        });
+        let workers = (1..threads.clamp(1, MAX_CONVERSION_THREADS))
+            .map_while(|_| {
+                let shared = Arc::clone(&shared);
+                std::thread::Builder::new()
+                    .name("meshrmm-h264-convert".into())
+                    .spawn(move || work(&shared))
+                    .ok()
+            })
+            .collect();
+        Self {
+            shared,
+            workers,
+            busy: Mutex::new(()),
+        }
+    }
+
+    /// One thread for each processor, up to [`MAX_CONVERSION_THREADS`].
+    fn for_this_computer() -> Self {
+        Self::new(std::thread::available_parallelism().map_or(1, |threads| threads.get()))
+    }
+
+    fn threads(&self) -> usize {
+        self.workers.len() + 1
+    }
+
+    /// Runs `task` for each band from 0 to `bands`, on this thread and the
+    /// workers, returning once all have finished.
+    fn run(&self, bands: usize, task: impl Fn(usize) + Sync) {
+        if self.workers.is_empty() || bands <= 1 {
+            (0..bands).for_each(task);
+            return;
+        }
+        let _busy = self.busy.lock().unwrap_or_else(|e| e.into_inner());
+        let borrowed: &(dyn Fn(usize) + Sync) = &task;
+        // SAFETY: only the lifetime changes. `Finish` below waits, even
+        // while unwinding, until no worker runs the task, and takes it from
+        // the state so none can start it after this returns.
+        let erased = Task(unsafe {
+            std::mem::transmute::<
+                *const (dyn Fn(usize) + Sync + '_),
+                *const (dyn Fn(usize) + Sync + 'static),
+            >(borrowed)
+        });
+        {
+            let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.task = Some(erased);
+            state.next = 0;
+            state.bands = bands;
+        }
+        self.shared.work.notify_all();
+        // Withdraws the task when this returns or unwinds.
+        let _finish = Finish(&self.shared);
+        loop {
+            let band = {
+                let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                if state.next >= state.bands {
+                    break;
+                }
+                state.next += 1;
+                state.next - 1
+            };
+            task(band);
+        }
+    }
+}
+
+/// Withdraws a [`BandPool::run`]'s task once the workers that took its
+/// bands have finished them, and passes on a panic in one.
+struct Finish<'a>(&'a PoolShared);
+
+impl Drop for Finish<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.next = state.bands;
+        while state.running > 0 {
+            state = self
+                .0
+                .finished
+                .wait(state)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        state.task = None;
+        let panicked = std::mem::take(&mut state.panicked);
+        drop(state);
+        if panicked && !std::thread::panicking() {
+            panic!("converting a band of the picture panicked");
+        }
+    }
+}
+
+/// A pool worker: takes bands until the pool stops.
+fn work(shared: &PoolShared) {
+    let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if state.stopped {
+            return;
+        }
+        let Some(task) = state.task.filter(|_| state.next < state.bands) else {
+            state = shared.work.wait(state).unwrap_or_else(|e| e.into_inner());
+            continue;
+        };
+        let band = state.next;
+        state.next += 1;
+        state.running += 1;
+        drop(state);
+        // SAFETY: the task stays alive while `running` counts this band.
+        let finished =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*task.0)(band) }))
+                .is_ok();
+        state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.running -= 1;
+        state.panicked |= !finished;
+        if state.running == 0 {
+            shared.finished.notify_all();
+        }
+    }
+}
+
+impl Drop for BandPool {
+    fn drop(&mut self) {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stopped = true;
+        self.shared.work.notify_all();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -323,6 +508,7 @@ struct Shared {
 pub(crate) struct VideoEncoder {
     shared: Arc<Shared>,
     settings: EncoderSettings,
+    pool: BandPool,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -349,6 +535,7 @@ impl VideoEncoder {
         Ok(Self {
             shared,
             settings,
+            pool: BandPool::for_this_computer(),
             thread: Some(thread),
         })
     }
@@ -366,7 +553,7 @@ impl VideoEncoder {
             .spare
             .take()
             .unwrap_or_default();
-        picture.convert(frame, self.settings.grayscale);
+        picture.convert(frame, self.settings.grayscale, &self.pool);
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         state.spare = state.pending.replace(picture);
         drop(state);
@@ -576,11 +763,131 @@ mod tests {
         }
     }
 
+    /// The conversion as it was before the pool: on threads started for
+    /// each frame.
+    fn convert_on_new_threads(frame: &RawFrame<'_>, grayscale: bool) -> Picture {
+        let mut picture = Picture::default();
+        let (width, height) = encoded_size(frame.width, frame.height);
+        let (width, height) = (width as usize, height as usize);
+        picture.width = width;
+        picture.height = height;
+        picture.y.resize(width * height, 0);
+        picture.u.resize(width * height / 4, 0);
+        picture.v.resize(width * height / 4, 0);
+        let scale = ((width, height) != (frame.width as usize & !1, frame.height as usize & !1))
+            .then(|| Scale::new(frame, width, height));
+        let threads = std::thread::available_parallelism().map_or(1, |threads| threads.get());
+        let band = height.div_ceil(2).div_ceil(threads.clamp(1, 8)) * 2;
+        let chroma_width = width / 2;
+        std::thread::scope(|scope| {
+            let mut bands = picture
+                .y
+                .chunks_mut(band * width)
+                .zip(picture.u.chunks_mut(band / 2 * chroma_width))
+                .zip(picture.v.chunks_mut(band / 2 * chroma_width))
+                .enumerate()
+                .map(|(index, ((y, u), v))| {
+                    let scale = scale.as_ref();
+                    move || convert_band(frame, scale, width, index * band, y, u, v, grayscale)
+                });
+            let first = bands.next();
+            for convert in bands {
+                scope.spawn(convert);
+            }
+            if let Some(mut convert) = first {
+                convert();
+            }
+        });
+        picture
+    }
+
+    #[test]
+    fn the_pool_converts_exactly_as_threads_per_frame_did() {
+        let mut seed = 0x2545_f491_u32;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        };
+        let pools: Vec<BandPool> = [1, 3, 4, 8].map(BandPool::new).into();
+        let mut picture = Picture::default();
+        // Even and odd sizes, heights that do and don't split evenly into
+        // 1 to 8 bands, and sizes that are scaled down.
+        for (width, height, stride) in [
+            (2, 2, 8),
+            (3, 3, 12),
+            (16, 16, 64),
+            (34, 10, 140),
+            (65, 17, 300),
+            (640, 480, 2560),
+            (1366, 768, 5464),
+            (1920, 1080, 7680),
+            (4097, 30, 16388),
+            (7680, 26, 30720),
+        ] {
+            let data: Vec<u8> = (0..stride * height).map(|_| random()).collect();
+            for (layout, grayscale) in [
+                (PixelLayout::Bgrx, false),
+                (PixelLayout::Xrgb, false),
+                (PixelLayout::Rgbx, true),
+            ] {
+                let frame = RawFrame {
+                    data: &data,
+                    width: width as u32,
+                    height: height as u32,
+                    stride,
+                    layout,
+                    timestamp_us: 7,
+                };
+                let expected = convert_on_new_threads(&frame, grayscale);
+                for pool in &pools {
+                    // Whatever a band leaves out stays wrong.
+                    for plane in [&mut picture.y, &mut picture.u, &mut picture.v] {
+                        plane.iter_mut().for_each(|byte| *byte = !*byte);
+                    }
+                    picture.convert(&frame, grayscale, pool);
+                    let size = (picture.width, picture.height);
+                    let label = format!("{width}x{height} {layout:?} on {}", pool.threads());
+                    assert_eq!(size, (expected.width, expected.height), "{label}");
+                    assert!(picture.y == expected.y, "{label}: luma differs");
+                    assert!(picture.u == expected.u, "{label}: blue differs");
+                    assert!(picture.v == expected.v, "{label}: red differs");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn frames_are_converted_on_threads_started_once() {
+        let pool = BandPool::new(4);
+        let threads = Mutex::new(std::collections::HashSet::new());
+        for _ in 0..50 {
+            pool.run(4, |_| {
+                threads.lock().unwrap().insert(std::thread::current().id());
+            });
+        }
+        let threads = threads.into_inner().unwrap();
+        assert!(threads.len() <= 4, "{} threads", threads.len());
+        assert!(threads.contains(&std::thread::current().id()));
+        // A panic in a band reaches the caller, and the pool still works.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.run(8, |band| assert_ne!(band, 5));
+        }));
+        assert!(panicked.is_err());
+        let count = std::sync::atomic::AtomicUsize::new(0);
+        pool.run(8, |_| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert_eq!(count.into_inner(), 8);
+    }
+
     #[test]
     fn converts_with_the_bt709_limited_range_matrix() {
         let white = vec![255_u8; 2 * 2 * 4];
+        let pool = BandPool::new(4);
         let mut picture = Picture::default();
-        picture.convert(&frame(&white, 2, 2, PixelLayout::Bgrx), false);
+        picture.convert(&frame(&white, 2, 2, PixelLayout::Bgrx), false, &pool);
         assert_eq!(picture.y, [235; 4]);
         // The Windows encoder's rounding gives white this blue difference too.
         assert_eq!((picture.u[0], picture.v[0]), (127, 128));
@@ -592,10 +899,10 @@ mod tests {
             (PixelLayout::Xbgr, [0, 0, 0, 255]),
         ] {
             let red = pixel.repeat(4);
-            picture.convert(&frame(&red, 2, 2, layout), false);
+            picture.convert(&frame(&red, 2, 2, layout), false, &pool);
             assert_eq!(picture.y[0], 63, "{layout:?}");
             assert_eq!((picture.u[0], picture.v[0]), (102, 240), "{layout:?}");
-            picture.convert(&frame(&red, 2, 2, layout), true);
+            picture.convert(&frame(&red, 2, 2, layout), true, &pool);
             assert_eq!((picture.u[0], picture.v[0]), (128, 128), "{layout:?}");
         }
     }
@@ -603,8 +910,9 @@ mod tests {
     #[test]
     fn odd_sizes_are_cropped_and_short_data_is_refused() {
         let data = vec![0_u8; 3 * 3 * 4];
+        let pool = BandPool::new(4);
         let mut picture = Picture::default();
-        picture.convert(&frame(&data, 3, 3, PixelLayout::Bgrx), false);
+        picture.convert(&frame(&data, 3, 3, PixelLayout::Bgrx), false, &pool);
         assert_eq!((picture.width, picture.height), (2, 2));
         assert!(frame(&data, 3, 3, PixelLayout::Bgrx).valid());
         assert!(!frame(&data[..20], 3, 3, PixelLayout::Bgrx).valid());
@@ -633,8 +941,13 @@ mod tests {
                 pixel.copy_from_slice(&[255; 4]);
             }
         }
+        let pool = BandPool::new(4);
         let mut picture = Picture::default();
-        picture.convert(&frame(&data, width, height, PixelLayout::Bgrx), false);
+        picture.convert(
+            &frame(&data, width, height, PixelLayout::Bgrx),
+            false,
+            &pool,
+        );
         assert_eq!((picture.width, picture.height), (3840, 4));
         assert!(
             picture.y.iter().all(|&luma| (125..=126).contains(&luma)),
@@ -646,7 +959,11 @@ mod tests {
             let white = (index % width as usize) < width as usize / 2;
             pixel.copy_from_slice(&[if white { 255 } else { 0 }; 4]);
         }
-        picture.convert(&frame(&data, width, height, PixelLayout::Bgrx), false);
+        picture.convert(
+            &frame(&data, width, height, PixelLayout::Bgrx),
+            false,
+            &pool,
+        );
         assert_eq!(picture.y[0], 235);
         assert_eq!(picture.y[1918], 235);
         assert_eq!(picture.y[1921], 16);

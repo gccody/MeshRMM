@@ -1,7 +1,15 @@
 //! X11 capture: the root window's part under one monitor, read into shared
-//! memory with MIT-SHM, polled at the frame rate. A frame identical to the
+//! memory with MIT-SHM where the X server has it. A frame identical to the
 //! previous one is not sent. The X server leaves the pointer out of the
 //! image, so it is drawn in from XFixes, which also names its shape.
+//!
+//! The pointer is checked at the frame rate, but the screen is grabbed only
+//! when it may have changed: where the X server has DAMAGE, when it reports
+//! drawing, when the drawn-in pointer moves or changes, and once a second
+//! in case drawing went unreported; without DAMAGE, at the frame rate until
+//! the screen has stayed the same for half a second, then every 250 ms
+//! until a grab finds a change. An X server whose DAMAGE turns out to miss
+//! drawing is polled that way too.
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,12 +18,15 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use meshrmm_protocol::CursorShape;
 use x11rb::connection::Connection;
+use x11rb::protocol::Event;
+use x11rb::protocol::damage::{ConnectionExt as _, ReportLevel};
 use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::shm::ConnectionExt as _;
 use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat};
 use x11rb::rust_connection::RustConnection;
 
+use super::pacing::{DamageTrust, GrabSchedule};
 use super::{Backend, CaptureSettings, FrameSink, Stream};
 use crate::remote::linux::display::Output;
 use crate::remote::linux::encoder::{PixelLayout, RawFrame};
@@ -211,11 +222,21 @@ impl Drop for Segment {
 // SAFETY: the mapping is plain memory used by one thread at a time.
 unsafe impl Send for Segment {}
 
+/// Without DAMAGE, grabs in a row that find the screen unchanged before it
+/// is grabbed less often, and how often then.
+const POLL_IDLE_AFTER: u32 = 15;
+const POLL_IDLE: Duration = Duration::from_millis(250);
+/// With DAMAGE, how often an unchanged screen is grabbed anyway.
+const DAMAGE_IDLE: Duration = Duration::from_secs(1);
+
 struct Grabber {
     x11: X11,
     area: (i16, i16, u16, u16),
     /// MIT-SHM's segment, or `None` where the X server has no MIT-SHM.
     shm: Option<(u32, Segment)>,
+    /// The DAMAGE object watching the root window, reporting when its
+    /// damage stops being empty; `None` where the X server has no DAMAGE.
+    damage: Option<u32>,
     previous: Vec<u8>,
     frame: Vec<u8>,
 }
@@ -240,30 +261,45 @@ impl Grabber {
             bail!("the X server's {depth}-bit screen is not supported");
         }
         let length = usize::from(area.2) * usize::from(area.3) * 4;
-        let shm = match x11.connection.shm_query_version()?.reply() {
-            Ok(_) => {
-                let (segment, fd) = Segment::new(length)?;
-                let id = x11.connection.generate_id()?;
-                x11.connection.shm_attach_fd(id, fd, false)?.check()?;
-                Some((id, segment))
-            }
+        // A server without MIT-SHM, or one across a network that can't share
+        // this memory, is read through the connection instead.
+        let shm = match attach_shm(&x11, length) {
+            Ok(shm) => Some(shm),
             Err(error) => {
-                tracing::info!(%error, "the X server has no MIT-SHM; capturing without it");
+                tracing::info!(error = %format!("{error:#}"), "capturing X11 without MIT-SHM");
                 None
             }
         };
-        // XFixes 4 tells the cursor's image and name.
+        // XFixes 4 tells the cursor's image and name; DAMAGE needs XFixes.
         let _ = x11.connection.xfixes_query_version(4, 0)?.reply();
+        let damage = match watch_damage(&x11) {
+            Ok(damage) => Some(damage),
+            Err(error) => {
+                tracing::info!(
+                    error = %format!("{error:#}"),
+                    "capturing X11 without DAMAGE; polling the screen"
+                );
+                None
+            }
+        };
         Ok(Self {
             x11,
             area,
             shm,
+            damage,
             previous: Vec::new(),
             frame: Vec::with_capacity(length),
         })
     }
 
     fn run(mut self, shared: &Shared, interval: Duration, sink: &FrameSink) -> anyhow::Result<()> {
+        let mut schedule = match self.damage {
+            Some(_) => GrabSchedule::new(interval, 0, DAMAGE_IDLE),
+            None => GrabSchedule::new(interval, POLL_IDLE_AFTER, POLL_IDLE),
+        };
+        let mut trust = DamageTrust::default();
+        // The pointer as drawn into the last grab: where, and which image.
+        let mut drawn = None;
         let mut next = Instant::now();
         while !shared.stopped.load(Ordering::SeqCst) {
             let now = Instant::now();
@@ -275,7 +311,7 @@ impl Grabber {
                 next = Instant::now() + interval;
             }
             let timestamp_us = crate::remote::linux::monotonic_timestamp_us();
-            self.grab()?;
+            let damaged = self.take_damage()?;
             let cursor = self
                 .x11
                 .connection
@@ -287,11 +323,42 @@ impl Grabber {
                     crate::remote::linux::cursor::shape_named(&String::from_utf8_lossy(
                         &cursor.name,
                     ));
-                if shared.capture_cursor.load(Ordering::SeqCst) {
-                    self.draw_cursor(cursor);
-                }
             }
-            if self.frame == self.previous {
+            let pointer = cursor
+                .as_ref()
+                .filter(|_| shared.capture_cursor.load(Ordering::SeqCst));
+            let pointer_state = pointer.map(|cursor| (cursor.x, cursor.y, cursor.cursor_serial));
+            let hinted = damaged || pointer_state != drawn;
+            if !schedule.due(Instant::now(), hinted) {
+                continue;
+            }
+            let first = self.previous.is_empty();
+            if let Some(damage) = self.damage {
+                // Drawing after this reports damage again, and drawing before
+                // it is in the grab, which the X server reads after it.
+                self.x11
+                    .connection
+                    .damage_subtract(damage, x11rb::NONE, x11rb::NONE)?
+                    .ignore_error();
+            }
+            self.grab()?;
+            if let Some(cursor) = pointer {
+                self.draw_cursor(cursor);
+            }
+            drawn = pointer_state;
+            let changed = self.frame != self.previous;
+            schedule.grabbed(Instant::now(), changed);
+            if self.damage.is_some() && !first && trust.grabbed(hinted, changed) {
+                // Some drivers and compositors draw past the X server's
+                // DAMAGE. Its reports still bring a grab forward, but the
+                // screen is polled as where there is no DAMAGE, so the
+                // picture does not stay at one frame a second.
+                tracing::warn!(
+                    "the X server's DAMAGE did not report drawing; polling the screen as well"
+                );
+                schedule = GrabSchedule::new(interval, POLL_IDLE_AFTER, POLL_IDLE);
+            }
+            if !changed {
                 continue;
             }
             sink(&RawFrame {
@@ -305,6 +372,16 @@ impl Grabber {
             std::mem::swap(&mut self.frame, &mut self.previous);
         }
         Ok(())
+    }
+
+    /// Whether the X server reported damage since the last call; never
+    /// without DAMAGE, where polling decides.
+    fn take_damage(&self) -> anyhow::Result<bool> {
+        let mut damaged = false;
+        while let Some(event) = self.x11.connection.poll_for_event()? {
+            damaged |= matches!(event, Event::DamageNotify(_));
+        }
+        Ok(damaged)
     }
 
     /// Reads the monitor's area of the root window into `frame`.
@@ -393,11 +470,34 @@ impl Grabber {
     }
 }
 
+/// Shares a segment of `length` bytes with the X server.
+fn attach_shm(x11: &X11, length: usize) -> anyhow::Result<(u32, Segment)> {
+    x11.connection.shm_query_version()?.reply()?;
+    let (segment, fd) = Segment::new(length)?;
+    let id = x11.connection.generate_id()?;
+    x11.connection.shm_attach_fd(id, fd, false)?.check()?;
+    Ok((id, segment))
+}
+
+/// Starts a DAMAGE object on the root window that reports when its damage
+/// stops being empty.
+fn watch_damage(x11: &X11) -> anyhow::Result<u32> {
+    x11.connection.damage_query_version(1, 1)?.reply()?;
+    let id = x11.connection.generate_id()?;
+    x11.connection
+        .damage_create(id, x11.root, ReportLevel::NON_EMPTY)?
+        .check()?;
+    Ok(id)
+}
+
 impl Drop for Grabber {
     fn drop(&mut self) {
+        if let Some(damage) = self.damage {
+            let _ = self.x11.connection.damage_destroy(damage);
+        }
         if let Some((segment, _)) = &self.shm {
             let _ = self.x11.connection.shm_detach(*segment);
-            let _ = self.x11.connection.flush();
         }
+        let _ = self.x11.connection.flush();
     }
 }

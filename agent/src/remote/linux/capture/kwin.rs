@@ -116,7 +116,13 @@ fn capture(
         }
     };
     tracing::info!(node, output = name, "KWin started a screencast");
-    let pipewire = pipewire::Stream::connect(None, node, sink, Arc::clone(&shared.cursor))?;
+    let pipewire = pipewire::Stream::connect(
+        None,
+        node,
+        settings.frames_per_second,
+        sink,
+        Arc::clone(&shared.cursor),
+    )?;
     let _ = started.send(Ok(()));
     let ended = loop {
         if shared.stopped.load(Ordering::SeqCst) {
