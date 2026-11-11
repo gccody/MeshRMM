@@ -39,6 +39,9 @@ fn desktop(documents: &Path, cache: &Path, drop_files: Option<DropFiles>, pick: 
             std::thread::spawn(work);
         }),
         create_file: None,
+        clipboard_files: Box::new(|| Ok(Vec::new())),
+        set_clipboard_files: Box::new(|_| Ok(())),
+        clipboard_sequence: Box::new(|| 0),
         interactive: false,
     }
 }
@@ -54,13 +57,20 @@ fn refusing_drop() -> Option<DropFiles> {
 
 /// An agent worker whose messages to the peer arrive on the returned channel.
 fn worker(desktop: Desktop) -> (Worker, mpsc::Receiver<FileMessage>, Arc<Mutex<String>>) {
+    worker_as(Role::Agent, desktop)
+}
+
+fn worker_as(
+    role: Role,
+    desktop: Desktop,
+) -> (Worker, mpsc::Receiver<FileMessage>, Arc<Mutex<String>>) {
     let (sender, outgoing) = mpsc::sync_channel(256);
     let out = OutgoingFiles {
         sender,
         ready: Arc::default(),
     };
     let status = Arc::new(Mutex::new(String::new()));
-    let mut worker = Worker::new(Role::Agent, out, status.clone(), || true, None, desktop);
+    let mut worker = Worker::new(role, out, status.clone(), || true, None, desktop);
     worker.available = true;
     (worker, outgoing, status)
 }
@@ -471,4 +481,285 @@ fn closing_while_a_picker_is_open_ends_cleanly() {
     // The picker's thread held a reference to the picker until it ended.
     let FakePicker { picker, .. } = picker;
     assert_eq!(Arc::strong_count(&picker), 1, "the picker's thread ended");
+}
+
+/// A clipboard the test can read and pin: files put there replace what it
+/// holds, unless the test pinned other files there (the user copied a
+/// received file again).
+#[derive(Clone, Default)]
+struct FakeClipboard {
+    files: Arc<Mutex<Vec<PathBuf>>>,
+    pinned: Arc<Mutex<Option<Vec<PathBuf>>>>,
+    set: Arc<AtomicUsize>,
+}
+impl FakeClipboard {
+    fn on(&self, desktop: &mut Desktop) {
+        let (files, pinned, set) = (self.files.clone(), self.pinned.clone(), self.set.clone());
+        desktop.set_clipboard_files = Box::new(move |paths| {
+            set.fetch_add(1, Ordering::SeqCst);
+            *files.lock().unwrap() = paths.to_vec();
+            Ok(())
+        });
+        let files = self.files.clone();
+        desktop.clipboard_files = Box::new(move || {
+            Ok(pinned
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| files.lock().unwrap().clone()))
+        });
+        // Removals run before the worker goes on, so the test sees them.
+        desktop.spawn = Box::new(|work| work());
+    }
+    fn files(&self) -> Vec<PathBuf> {
+        self.files.lock().unwrap().clone()
+    }
+}
+
+/// The folders in the cache's transfer folder whose names start with `prefix`.
+fn cache_folders(cache: &Path, prefix: &str) -> Vec<PathBuf> {
+    let Ok(children) = fs::read_dir(cache.join(TRANSFER_FOLDER)) else {
+        return Vec::new();
+    };
+    children
+        .flatten()
+        .filter(|child| child.file_name().to_string_lossy().starts_with(prefix))
+        .map(|child| child.path())
+        .collect()
+}
+
+/// The bytes of every file under `folder`.
+fn stored_bytes(folder: &Path) -> u64 {
+    fs::read_dir(folder).map_or(0, |children| {
+        children
+            .flatten()
+            .map(|child| match child.file_type() {
+                Ok(kind) if kind.is_dir() => stored_bytes(&child.path()),
+                _ => child.metadata().map_or(0, |metadata| metadata.len()),
+            })
+            .sum()
+    })
+}
+
+/// A file of `size` bytes named like a copied photo, different for each `copy`.
+fn copied_file(source: &Path, copy: u8, size: usize) -> PathBuf {
+    let folder = source.join(format!("copy-{copy}"));
+    fs::create_dir(&folder).unwrap();
+    let file = folder.join("photo.jpg");
+    fs::write(&file, vec![copy; size]).unwrap();
+    file
+}
+
+fn limits(transfers: usize, bytes: u64) -> ClipboardLimits {
+    ClipboardLimits {
+        transfers,
+        bytes,
+        ..CLIPBOARD_LIMITS
+    }
+}
+
+/// Copy after copy from the peer leaves the newest two clipboard batches in
+/// the cache, the one on the clipboard among them, and also any older batch
+/// the clipboard points into again, on both the viewer and the agent.
+#[test]
+fn repeated_clipboard_copies_keep_only_the_newest_batches() {
+    const SIZE: usize = 50_000;
+    for role in [Role::Viewer, Role::Agent] {
+        let source = Sandbox::new();
+        let cache = Sandbox::new();
+        let clipboard = FakeClipboard::default();
+        let mut desktop = desktop(&cache.0, &cache.0, None, no_picker());
+        clipboard.on(&mut desktop);
+        let (mut worker, outgoing, _) = worker_as(role, desktop);
+        let mut first = None;
+        for copy in 1..=5u8 {
+            let file = copied_file(&source.0, copy, SIZE);
+            let messages = transfer(100 + copy as u64, vec![file], FileDestination::Clipboard);
+            receive(&mut worker, &outgoing, messages);
+
+            let on_clipboard = clipboard.files();
+            assert_eq!(on_clipboard.len(), 1);
+            assert_eq!(fs::read(&on_clipboard[0]).unwrap(), vec![copy; SIZE]);
+            let batch = on_clipboard[0].parent().unwrap().to_owned();
+            if copy == 1 {
+                // The user copies the received photo again, in Explorer.
+                *clipboard.pinned.lock().unwrap() = Some(on_clipboard.clone());
+                first = Some(batch.clone());
+            }
+            let batches = cache_folders(&cache.0, "transfer-");
+            assert!(batches.contains(&batch), "{role:?} copy {copy}");
+            assert!(
+                batches.contains(first.as_ref().unwrap()),
+                "{role:?} copy {copy}: the batch the clipboard points into stays"
+            );
+            let expected = (copy as usize).min(2) + usize::from(copy > 2);
+            assert_eq!(batches.len(), expected, "{role:?} copy {copy}: {batches:?}");
+            assert_eq!(
+                stored_bytes(&cache.0.join(TRANSFER_FOLDER)),
+                (expected * SIZE) as u64
+            );
+        }
+        // Once the clipboard moves on, the old batch goes with the next copy.
+        *clipboard.pinned.lock().unwrap() = None;
+        let file = copied_file(&source.0, 6, SIZE);
+        receive(
+            &mut worker,
+            &outgoing,
+            transfer(106, vec![file], FileDestination::Clipboard),
+        );
+        let batches = cache_folders(&cache.0, "transfer-");
+        assert_eq!(batches.len(), 2, "{role:?}: {batches:?}");
+        assert!(!batches.contains(first.as_ref().unwrap()));
+        assert!(cache_folders(&cache.0, ".partial-").is_empty());
+    }
+}
+
+/// Past the number of copies its budget allows, the viewer refuses the
+/// peer's next copy when it begins: the peer learns why, the technician's
+/// status line says the copied files were not fetched, and the messages
+/// that follow write nothing and replace nothing on the clipboard.
+#[test]
+fn clipboard_copies_past_the_count_budget_are_refused_when_they_begin() {
+    let source = Sandbox::new();
+    let cache = Sandbox::new();
+    let clipboard = FakeClipboard::default();
+    let mut desktop = desktop(&cache.0, &cache.0, None, no_picker());
+    clipboard.on(&mut desktop);
+    desktop.create_file = Some(counted);
+    let (mut worker, outgoing, status) = worker_as(Role::Viewer, desktop);
+    worker.admission = Admission::with_limits(Role::Viewer, limits(2, u64::MAX));
+    OPENED.set(0);
+    for copy in 1..=2u8 {
+        let file = copied_file(&source.0, copy, 1000);
+        let messages = transfer(copy as u64, vec![file], FileDestination::Clipboard);
+        receive(&mut worker, &outgoing, messages);
+    }
+    let on_clipboard = clipboard.files();
+    assert_eq!(OPENED.get(), 2);
+
+    let file = copied_file(&source.0, 3, 1000);
+    for message in transfer(3, vec![file], FileDestination::Clipboard) {
+        worker.step(Some(Command::Peer(message))).unwrap();
+    }
+    match outgoing.try_recv().unwrap() {
+        FileMessage::Error { id: 3, reason } => {
+            assert!(reason.contains("at most 2 times in a minute"), "{reason}");
+            assert!(reason.contains("Receive files"), "{reason}");
+        }
+        message => panic!("{message:?}"),
+    }
+    assert!(outgoing.try_recv().is_err(), "nothing else is answered");
+    let notice = status.lock().unwrap().clone();
+    assert!(
+        notice.starts_with("Files copied on the remote device were not fetched"),
+        "{notice}"
+    );
+    assert_eq!(OPENED.get(), 2, "no file of the refused copy was opened");
+    assert_eq!(clipboard.files(), on_clipboard);
+    assert_eq!(clipboard.set.load(Ordering::SeqCst), 2);
+    assert_eq!(cache_folders(&cache.0, "transfer-").len(), 2);
+    assert!(cache_folders(&cache.0, ".partial-").is_empty());
+}
+
+/// A copy that would take the viewer past its byte budget, or below its
+/// free-space floor, is refused at its totals, before any file is opened,
+/// and its staging folder is removed.
+#[test]
+fn clipboard_copies_past_the_byte_budget_or_free_space_are_refused_at_their_totals() {
+    let source = Sandbox::new();
+    let first = copied_file(&source.0, 1, 100_000);
+    let second = copied_file(&source.0, 2, 100_000);
+    let low_space = ClipboardLimits {
+        free_floor: u64::MAX,
+        ..CLIPBOARD_LIMITS
+    };
+    for (limits, accepted, expected) in [
+        (limits(10, 150_000), 1, "at most 1 MiB of files copied here"),
+        (low_space, 0, "low on disk space"),
+    ] {
+        let cache = Sandbox::new();
+        let clipboard = FakeClipboard::default();
+        let mut desktop = desktop(&cache.0, &cache.0, None, no_picker());
+        clipboard.on(&mut desktop);
+        desktop.create_file = Some(counted);
+        let (mut worker, outgoing, status) = worker_as(Role::Viewer, desktop);
+        worker.admission = Admission::with_limits(Role::Viewer, limits);
+        OPENED.set(0);
+        let files = [first.clone(), second.clone()];
+        for (i, file) in files[..accepted].iter().enumerate() {
+            let messages = transfer(
+                10 + i as u64,
+                vec![file.clone()],
+                FileDestination::Clipboard,
+            );
+            receive(&mut worker, &outgoing, messages);
+        }
+        let refused = transfer(
+            20,
+            vec![files[accepted].clone()],
+            FileDestination::Clipboard,
+        );
+        for message in refused {
+            worker.step(Some(Command::Peer(message))).unwrap();
+        }
+        assert_eq!(outgoing.try_recv().unwrap(), FileMessage::Ack { id: 20 });
+        match outgoing.try_recv().unwrap() {
+            FileMessage::Error { id: 20, reason } => {
+                assert!(reason.contains(expected), "{reason}");
+            }
+            message => panic!("{message:?}"),
+        }
+        assert!(outgoing.try_recv().is_err(), "nothing else is answered");
+        assert!(
+            status
+                .lock()
+                .unwrap()
+                .starts_with("Files copied on the remote device were not fetched")
+        );
+        assert_eq!(
+            OPENED.get(),
+            accepted,
+            "no file of the refused copy was opened"
+        );
+        assert_eq!(clipboard.set.load(Ordering::SeqCst), accepted);
+        assert_eq!(cache_folders(&cache.0, "transfer-").len(), accepted);
+        assert!(cache_folders(&cache.0, ".partial-").is_empty());
+    }
+}
+
+/// The clipboard budget is the viewer's alone and only for clipboard
+/// copies: files the technician asked for with Receive files, and copies the
+/// agent receives from the technician, are taken whatever it says.
+#[test]
+fn documents_and_the_agent_are_outside_the_clipboard_budget() {
+    let source = Sandbox::new();
+    let file = copied_file(&source.0, 1, 100_000);
+    let tiny = limits(1, 1);
+
+    let documents = Sandbox::new();
+    let (mut viewer, outgoing, _) = worker_as(
+        Role::Viewer,
+        desktop(&documents.0, &documents.0, None, no_picker()),
+    );
+    viewer.admission = Admission::with_limits(Role::Viewer, tiny);
+    for id in 1..=3 {
+        viewer.step(Some(Command::RequestPeerPick)).unwrap();
+        assert_eq!(outgoing.try_recv().unwrap(), FileMessage::Pick);
+        let messages = transfer(id, vec![file.clone()], FileDestination::Documents);
+        receive(&mut viewer, &outgoing, messages);
+    }
+    let saved = documents.0.join(TRANSFER_FOLDER);
+    assert_eq!(fs::read_dir(&saved).unwrap().count(), 3);
+
+    let cache = Sandbox::new();
+    let clipboard = FakeClipboard::default();
+    let mut desktop = desktop(&cache.0, &cache.0, None, no_picker());
+    clipboard.on(&mut desktop);
+    let (mut agent, outgoing, _) = worker(desktop);
+    agent.admission = Admission::with_limits(Role::Agent, tiny);
+    for id in 1..=3 {
+        let messages = transfer(id, vec![file.clone()], FileDestination::Clipboard);
+        receive(&mut agent, &outgoing, messages);
+    }
+    assert_eq!(clipboard.set.load(Ordering::SeqCst), 3);
 }

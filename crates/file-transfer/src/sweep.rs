@@ -77,15 +77,21 @@ fn latest_write(path: &Path, depth: usize) -> io::Result<SystemTime> {
 
 /// Deletes the cache batch that holds `paths` once they were copied elsewhere.
 pub(super) fn remove_batch(paths: &[PathBuf]) {
-    let Some(batch) = paths.first().and_then(|path| path.parent()) else {
-        return;
-    };
+    if let Some(batch) = paths.first().and_then(|path| path.parent()) {
+        remove_batch_folder(batch);
+    }
+}
+
+/// Deletes a `transfer-*` cache batch. A file an app still has open may
+/// stay (on Windows, unless it was opened for sharing deletion); the cache
+/// sweep removes what is left once it is old.
+pub(super) fn remove_batch_folder(batch: &Path) {
     if batch
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.starts_with("transfer-"))
         && let Err(error) = fs::remove_dir_all(batch)
     {
-        tracing::debug!(%error, "could not remove a copied transfer batch");
+        tracing::debug!(%error, path = %batch.display(), "could not remove a transfer batch");
     }
 }

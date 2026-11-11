@@ -449,20 +449,23 @@ fn ack_window_pipelines_chunks_and_settles_the_rest() {
     // Two chunks go out without waiting; the third waits for one ack.
     window.sent(false).unwrap();
     window.sent(false).unwrap();
-    acks.send(true).unwrap();
+    acks.send(Ok(())).unwrap();
     window.sent(false).unwrap();
     assert_eq!(window.unacknowledged, 2);
     // A settling message waits for every earlier one too.
     for _ in 0..3 {
-        acks.send(true).unwrap();
+        acks.send(Ok(())).unwrap();
     }
     window.sent(true).unwrap();
     assert_eq!(window.unacknowledged, 0);
     window.sent(false).unwrap();
     window.sent(false).unwrap();
-    acks.send(false).unwrap();
+    acks.send(Err("over the budget".into())).unwrap();
     let error = window.sent(false).unwrap_err();
-    assert!(format!("{error:#}").contains("rejected"), "{error:#}");
+    assert_eq!(
+        format!("{error:#}"),
+        "the peer refused the files: over the budget"
+    );
 }
 #[test]
 fn windowed_transfer_keeps_a_window_in_flight() {
@@ -496,7 +499,7 @@ fn windowed_transfer_keeps_a_window_in_flight() {
                 packet => incoming.accept(packet).unwrap(),
             }
             receiver_in_flight.fetch_sub(1, Ordering::SeqCst);
-            acks.send(true).unwrap();
+            acks.send(Ok(())).unwrap();
             if finished {
                 break;
             }
@@ -723,4 +726,142 @@ fn preserves_existing_destination_and_cleans_cancelled_transfer() {
     );
     drop(receiver);
     assert_eq!(fs::read_dir(base).unwrap().count(), 2);
+}
+
+const MIB: u64 = 1024 * 1024;
+
+/// Plenty of free space, as `admit_totals` is told it.
+fn roomy() -> Option<u64> {
+    Some(1 << 50)
+}
+
+/// A clipboard copy the viewer admits at `at` and that announces `bytes`.
+fn copy(viewer: &mut Admission, at: Instant, bytes: u64) -> Result<(), Refusal> {
+    viewer.admit(&FileDestination::Clipboard, true, at)?;
+    viewer.admit_totals(&FileDestination::Clipboard, bytes, roomy, at)
+}
+
+/// The viewer's clipboard budget, with the limits it ships with, on a fake
+/// clock: a seventh copy within a minute and copies past 2 GiB within ten
+/// minutes are refused, a copy must leave the free-space floor, and each
+/// budget recovers once its window passed.
+#[test]
+fn clipboard_budget_refuses_past_its_limits_and_recovers_after_its_window() {
+    let start = Instant::now();
+    let at = |secs: u64| start + Duration::from_secs(secs);
+    let mut viewer = Admission::new(Role::Viewer);
+    for _ in 0..6 {
+        copy(&mut viewer, start, MIB).unwrap();
+    }
+    let refused = copy(&mut viewer, at(59), MIB).unwrap_err();
+    assert!(
+        refused.reason.contains("at most 6 times in a minute"),
+        "{refused}"
+    );
+    assert!(refused.notice.unwrap().contains("not fetched"));
+    copy(&mut viewer, at(60), MIB).expect("a minute later, copies are taken again");
+
+    // Four copies of the largest size fill ten minutes' bytes.
+    let mut viewer = Admission::new(Role::Viewer);
+    for minute in 0..4 {
+        copy(&mut viewer, at(minute * 60), CLIPBOARD_LIMIT_BYTES).unwrap();
+    }
+    let refused = viewer
+        .admit(&FileDestination::Clipboard, true, at(5 * 60))
+        .unwrap_err();
+    assert!(refused.reason.contains("at most 2.0 GiB"), "{refused}");
+    // Ten minutes after the first, its bytes no longer count: one more
+    // copy of the largest size fits, and a byte more than that does not.
+    viewer
+        .admit(&FileDestination::Clipboard, true, at(10 * 60))
+        .unwrap();
+    assert!(
+        viewer
+            .admit_totals(
+                &FileDestination::Clipboard,
+                CLIPBOARD_LIMIT_BYTES + 1,
+                roomy,
+                at(10 * 60)
+            )
+            .is_err()
+    );
+    copy(&mut viewer, at(10 * 60), CLIPBOARD_LIMIT_BYTES).unwrap();
+
+    // A copy leaves at least the floor free.
+    let mut viewer = Admission::new(Role::Viewer);
+    let floor = CLIPBOARD_LIMITS.free_floor;
+    viewer
+        .admit(&FileDestination::Clipboard, true, start)
+        .unwrap();
+    let refused = viewer
+        .admit_totals(
+            &FileDestination::Clipboard,
+            10 * MIB,
+            || Some(floor + 10 * MIB - 1),
+            start,
+        )
+        .unwrap_err();
+    assert!(refused.reason.contains("low on disk space"), "{refused}");
+    viewer
+        .admit(&FileDestination::Clipboard, true, start)
+        .unwrap();
+    viewer
+        .admit_totals(
+            &FileDestination::Clipboard,
+            10 * MIB,
+            || Some(floor + 10 * MIB),
+            start,
+        )
+        .unwrap();
+}
+
+/// Someone copying files on the device as they work, a few times a minute
+/// with now and then a large folder and once a quick run of six copies, is
+/// never refused over two hours.
+#[test]
+fn ordinary_clipboard_use_is_never_refused() {
+    let start = Instant::now();
+    let mut viewer = Admission::new(Role::Viewer);
+    for minute in 0..120u64 {
+        let copies: &[u64] = match minute % 15 {
+            // A quiet minute, then six copies in as many seconds.
+            6 => &[],
+            7 => &[0, 1, 2, 3, 4, 5],
+            _ => &[5, 25, 45],
+        };
+        for (i, second) in copies.iter().enumerate() {
+            let at = start + Duration::from_secs(minute * 60 + second);
+            let bytes = if minute % 5 == 0 && i == 0 {
+                400 * MIB
+            } else {
+                5 * MIB
+            };
+            copy(&mut viewer, at, bytes)
+                .unwrap_or_else(|refusal| panic!("minute {minute}: {refusal}"));
+        }
+    }
+}
+
+/// A copy's totals count once: totals sent again cannot change what the
+/// budget recorded, and the receiver fails that transfer anyway.
+#[test]
+fn clipboard_budget_counts_a_copys_first_totals_only() {
+    let start = Instant::now();
+    let mut viewer = Admission::with_limits(
+        Role::Viewer,
+        ClipboardLimits {
+            bytes: 100,
+            ..CLIPBOARD_LIMITS
+        },
+    );
+    copy(&mut viewer, start, 100).unwrap();
+    viewer
+        .admit_totals(&FileDestination::Clipboard, 0, roomy, start)
+        .unwrap();
+    assert!(
+        viewer
+            .admit(&FileDestination::Clipboard, true, start)
+            .is_err(),
+        "the first totals still count"
+    );
 }
