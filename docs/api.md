@@ -7,6 +7,7 @@ main flows with `curl`. The feature pages hold every route and field:
 [devices](devices.md), [hardware and software](hardware-and-software.md#api),
 [automation](automation.md#api), [patch management](patch-management.md#api),
 [alerts](alerts.md#api), [monitors and self-healing](monitors.md#api),
+[reports](reports.md#api),
 [Wake-on-LAN](wake-on-lan.md#api) and
 [the toolbox](toolbox.md).
 

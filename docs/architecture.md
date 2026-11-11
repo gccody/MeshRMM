@@ -146,6 +146,9 @@ input.
   raise. `notifications`: email and webhook channels, each with a bounded
   queue and one worker that delivers it in order. See
   [alerts](alerts.md).
+- `reports`: report templates, the aggregate queries they read, the HTML page
+  and CSV files rendered from each stored report, and the schedules that make
+  and email them. See [reports](reports.md).
 - `monitors`: monitor rules' settings, sending each Agent the monitors that
   apply to it, taking in their results, and self-healing (`remediation`).
   See [monitors and self-healing](monitors.md).
@@ -170,7 +173,7 @@ input.
   Agent opened. See [file browser](files.md).
 - `maintenance`: the periodic task that purges expired tokens, old runs,
   resolved alerts, old application changes, old update runs, old wake
-  requests and leftover partial files. It deletes each table's due rows in
+  requests, expired reports and leftover partial files. It deletes each table's due rows in
   batches of 2,000 (100 for script runs and update installs), each its own
   short statement with a pause after it, so other writers never wait long
   for the database. It runs until nothing is due. A table that fails is
@@ -245,6 +248,9 @@ task.
   device's readings only as far back as the enabled CPU and memory rules
   look, raises and resolves alerts, and broadcasts them; event sockets of users who may see
   alerts pass them on. See [alerts](alerts.md).
+- **Reports**: the report task makes queued reports one at a time on the
+  readers, outside transactions, fires due schedules (claiming each run with a
+  conditional update) and emails finished reports. See [reports](reports.md).
 - **Monitors**: the engine's task sends each connected Agent its monitors
   when they change, comparing what each was last sent: for the devices a
   presence change names, and for every connected device on rule changes,
@@ -358,7 +364,7 @@ Roles are built from these permissions (`server/src/rbac.rs`):
 `files.browse`, `files.manage`, `files.system`,
 `jobs.run_wide`, `automation.manage`, `updates.view`, `updates.install`,
 `applications.view`, `applications.deploy`, `applications.manage`,
-`alerts.view`, `alerts.respond`, `alerts.manage`, `users.manage`, `roles.manage`, `settings.manage`, `authentication.manage`,
+`alerts.view`, `alerts.respond`, `alerts.manage`, `reports.view`, `reports.manage`, `users.manage`, `roles.manage`, `settings.manage`, `authentication.manage`,
 `api_tokens.manage`, `audit.view`.
 
 Administrator holds every permission and can't be deleted or emptied;

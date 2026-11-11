@@ -67,6 +67,7 @@ pub struct AppState {
     pub notifications: crate::notifications::queue::Queues,
     pub updates: crate::updates::Engine,
     pub wake: crate::wake::Engine,
+    pub reports: crate::reports::Engine,
     pub sessions: Sessions,
     pub terminals: crate::terminals::Terminals,
     pub files: crate::files::Files,
@@ -85,13 +86,13 @@ pub fn router(state: AppState) -> Router {
         .layer(CompressionLayer::new().compress_when(compress))
         .with_state(state.clone());
     // Fleet-wide lists are megabytes of repetitive JSON, so API responses
-    // are compressed when they are JSON; sockets, images and file downloads
-    // pass as they are. Level 1 makes a 5,000-device list a sixth of its
+    // are compressed when they are JSON, as are reports' pages and CSV;
+    // sockets, images and file downloads pass as they are. Level 1 makes a 5,000-device list a sixth of its
     // size with brotli and a quarter with gzip, at a few milliseconds a
     // megabyte; higher levels save little more for several times the time.
     let api_compression = CompressionLayer::new()
         .quality(CompressionLevel::Precise(1))
-        .compress_when(SizeAbove::new(API_COMPRESSION_FLOOR).and(json_response));
+        .compress_when(SizeAbove::new(API_COMPRESSION_FLOOR).and(compressible_response));
     let router = Router::new()
         .route("/healthz", get(health::healthz))
         .nest(
@@ -105,9 +106,9 @@ pub fn router(state: AppState) -> Router {
     headers::apply(router, hsts).layer(TraceLayer::new_for_http())
 }
 
-/// Whether a response is JSON: `application/json`, or a `+json` type such
-/// as SCIM's `application/scim+json`.
-fn json_response(_: StatusCode, _: Version, headers: &HeaderMap, _: &Extensions) -> bool {
+/// Whether a response is JSON (`application/json`, or a `+json` type such
+/// as SCIM's `application/scim+json`), or a report's HTML or CSV.
+fn compressible_response(_: StatusCode, _: Version, headers: &HeaderMap, _: &Extensions) -> bool {
     let Some(content_type) = headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -122,6 +123,8 @@ fn json_response(_: StatusCode, _: Version, headers: &HeaderMap, _: &Extensions)
         .to_ascii_lowercase();
     essence == "application/json"
         || (essence.starts_with("application/") && essence.ends_with("+json"))
+        || essence == "text/html"
+        || essence == "text/csv"
 }
 
 /// Every path the routes above don't take: a website page, or a JSON 404

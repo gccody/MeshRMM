@@ -46,6 +46,8 @@ export const AUDIT_CATEGORIES: readonly { prefix: string; label: string }[] = [
   { prefix: "alert_rule.", label: "Alert rules" },
   { prefix: "monitor.", label: "Monitors" },
   { prefix: "notification_channel.", label: "Notification channels" },
+  { prefix: "report.", label: "Reports" },
+  { prefix: "report_schedule.", label: "Report schedules" },
 ];
 
 const ACTION_LABELS: Record<string, string> = {
@@ -145,6 +147,11 @@ const ACTION_LABELS: Record<string, string> = {
   "notification_channel.update": "Changed a notification channel",
   "notification_channel.delete": "Deleted a notification channel",
   "notification_channel.test": "Tested a notification channel",
+  "report.generate": "Generated a report",
+  "report.delete": "Deleted a report",
+  "report_schedule.create": "Created a report schedule",
+  "report_schedule.update": "Changed a report schedule",
+  "report_schedule.delete": "Deleted a report schedule",
 };
 
 // "Signed in", or the action itself for one this website doesn't know.
@@ -207,6 +214,8 @@ const TARGET_LABELS: Record<string, string> = {
   alert: "Alert",
   alert_rule: "Alert rule",
   notification_channel: "Notification channel",
+  report: "Report",
+  report_schedule: "Report schedule",
 };
 
 // `deviceNames` names devices still in the inventory, rather than their IDs.

@@ -1373,3 +1373,105 @@ CREATE INDEX idx_alert_remediations_run ON alert_remediations (script_run_id);
 -- Self-healing looks for running attempts, with and without a script run,
 -- every evaluation.
 CREATE INDEX idx_alert_remediations_status ON alert_remediations (status, script_run_id);
+
+-- Reports: documents built from what the server holds, on demand or on a
+-- schedule. See docs/reports.md.
+
+-- Reports the server makes by itself: a template on a scope for a period
+-- that ends when it fires, daily at time_of_day, weekly on weekday (Monday =
+-- 1 to Sunday = 7) or monthly on day_of_month, in time_zone. Each one it
+-- makes is emailed to its users and addresses when email is set up.
+CREATE TABLE report_schedules (
+  id TEXT NOT NULL PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE CHECK (length(name) BETWEEN 1 AND 120),
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+  template TEXT NOT NULL CHECK (template IN ('executive_summary', 'patch_compliance', 'hardware_inventory', 'software_inventory', 'alerts')),
+  -- Every device, the companies in report_schedule_companies, or the devices
+  -- with any or all (tag_match) of the tags in report_schedule_tags.
+  target TEXT NOT NULL CHECK (target IN ('all', 'companies', 'tags')),
+  tag_match TEXT NOT NULL DEFAULT 'any' CHECK (tag_match IN ('any', 'all')),
+  period TEXT NOT NULL CHECK (period IN ('last_7_days', 'last_30_days', 'previous_month')),
+  -- The executive summary's "not seen in" days.
+  stale_days INTEGER NOT NULL DEFAULT 30 CHECK (stale_days BETWEEN 1 AND 365),
+  frequency TEXT NOT NULL CHECK (frequency IN ('daily', 'weekly', 'monthly')),
+  time_of_day TEXT NOT NULL,
+  weekday INTEGER CHECK (weekday IS NULL OR weekday BETWEEN 1 AND 7),
+  day_of_month INTEGER CHECK (day_of_month IS NULL OR day_of_month BETWEEN 1 AND 28),
+  time_zone TEXT NOT NULL,
+  -- Recipients who aren't users: a JSON array of email addresses.
+  emails TEXT NOT NULL DEFAULT '[]',
+  -- Whose access it runs with: the user who last saved it.
+  owner_user_id TEXT NOT NULL,
+  -- When it fires next; NULL while it's off.
+  next_run_at INTEGER,
+  last_run_at INTEGER,
+  last_report_id TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX idx_report_schedules_next ON report_schedules (next_run_at);
+
+CREATE TABLE report_schedule_companies (
+  schedule_id TEXT NOT NULL REFERENCES report_schedules (id) ON DELETE CASCADE,
+  company_id TEXT NOT NULL REFERENCES companies (id) ON DELETE CASCADE,
+  PRIMARY KEY (schedule_id, company_id)
+);
+
+CREATE TABLE report_schedule_tags (
+  schedule_id TEXT NOT NULL REFERENCES report_schedules (id) ON DELETE CASCADE,
+  tag_id TEXT NOT NULL REFERENCES tags (id) ON DELETE CASCADE,
+  PRIMARY KEY (schedule_id, tag_id)
+);
+
+-- Users a schedule's reports are emailed to.
+CREATE TABLE report_schedule_users (
+  schedule_id TEXT NOT NULL REFERENCES report_schedules (id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+  PRIMARY KEY (schedule_id, user_id)
+);
+
+-- Each report asked for: by a user ('manual'), by a schedule firing
+-- ('schedule') or by a user running a schedule now ('run_now'). It is
+-- 'queued' until the server's report task takes it, 'running' while it
+-- reads, then 'succeeded', with its document in the data directory, or
+-- 'failed', as error says. Kept until expires_at.
+CREATE TABLE reports (
+  id TEXT NOT NULL PRIMARY KEY,
+  template TEXT NOT NULL CHECK (template IN ('executive_summary', 'patch_compliance', 'hardware_inventory', 'software_inventory', 'alerts')),
+  status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'succeeded', 'failed')),
+  error TEXT,
+  trigger TEXT NOT NULL CHECK (trigger IN ('manual', 'schedule', 'run_now')),
+  -- The schedule, and its name then; the report outlives it.
+  schedule_id TEXT,
+  schedule_name TEXT,
+  -- Whose access it was made with, and who or what asked, in words.
+  requested_by_user_id TEXT,
+  requested_by_label TEXT NOT NULL,
+  -- The devices it covers as chosen (JSON: target, company_ids, tag_ids,
+  -- tag_match), and in words.
+  scope TEXT NOT NULL,
+  scope_label TEXT NOT NULL,
+  -- The period, its bounds (the end excluded) and the zone it was judged in.
+  period TEXT NOT NULL CHECK (period IN ('last_7_days', 'last_30_days', 'previous_month', 'custom')),
+  period_start INTEGER NOT NULL,
+  period_end INTEGER NOT NULL,
+  time_zone TEXT NOT NULL,
+  stale_days INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  started_at INTEGER,
+  finished_at INTEGER,
+  expires_at INTEGER NOT NULL,
+  -- The stored document's size.
+  size_bytes INTEGER,
+  -- Emailing a schedule's report: 'pending' until it is sent, then 'sent',
+  -- 'failed' (as delivery_detail says) or 'not_configured' when email isn't
+  -- set up. NULL when there is nobody to send it to.
+  delivery TEXT CHECK (delivery IS NULL OR delivery IN ('pending', 'sent', 'failed', 'not_configured')),
+  delivery_detail TEXT
+);
+
+CREATE INDEX idx_reports_created ON reports (created_at);
+CREATE INDEX idx_reports_expires ON reports (expires_at);
+CREATE INDEX idx_reports_status ON reports (status, created_at);
+CREATE INDEX idx_reports_delivery ON reports (delivery);

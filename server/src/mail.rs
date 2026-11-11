@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::Context;
 use lettre::{
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
-    message::{Mailbox, header::ContentType},
+    message::{Mailbox, MultiPart, SinglePart, header::ContentType},
     transport::smtp::{
         authentication::Credentials,
         client::{Tls, TlsParameters},
@@ -139,6 +139,63 @@ impl Smtp {
         })?;
         Ok(())
     }
+
+    /// Sends `email`: its text, with its HTML as the alternative and its
+    /// attachment, when it has them.
+    pub async fn send_email(&self, to: &str, email: &Email) -> anyhow::Result<()> {
+        let text = SinglePart::builder()
+            .header(ContentType::TEXT_PLAIN)
+            .body(email.text.clone());
+        let body = match &email.html {
+            Some(html) => MultiPart::alternative().singlepart(text).singlepart(
+                SinglePart::builder()
+                    .header(ContentType::TEXT_HTML)
+                    .body(html.clone()),
+            ),
+            None => MultiPart::mixed().singlepart(text),
+        };
+        let body = match &email.attachment {
+            Some(attachment) => MultiPart::mixed().multipart(body).singlepart(
+                lettre::message::Attachment::new(attachment.filename.clone()).body(
+                    attachment.body.clone(),
+                    ContentType::parse(&attachment.content_type)
+                        .context("invalid attachment type")?,
+                ),
+            ),
+            None => body,
+        };
+        let message = Message::builder()
+            .from(self.from.clone())
+            .to(to
+                .parse()
+                .with_context(|| format!("{to} is not a valid recipient"))?)
+            .subject(&email.subject)
+            .multipart(body)
+            .context("could not build the message")?;
+        self.transport.send(message).await.with_context(|| {
+            format!(
+                "the SMTP server {}:{} refused or failed",
+                self.host, self.port
+            )
+        })?;
+        Ok(())
+    }
+}
+
+/// A message with text, and optionally HTML and one attachment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Email {
+    pub subject: String,
+    pub text: String,
+    pub html: Option<String>,
+    pub attachment: Option<Attachment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    pub filename: String,
+    pub content_type: String,
+    pub body: Vec<u8>,
 }
 
 /// How a one-time link reached its recipient.

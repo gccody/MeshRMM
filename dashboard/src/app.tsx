@@ -20,6 +20,7 @@ import { AuthCard, PublicLayout } from "../features/auth/public-layout";
 import { ResetPage } from "../features/auth/reset-page";
 import { SessionProvider, useDocumentTitle } from "../features/auth/session";
 import { SetupPage } from "../features/auth/setup-page";
+import { ReportsPage } from "../features/reports/reports-page";
 import { RolesPanel } from "../features/roles/roles-panel";
 import { SettingsPanel } from "../features/settings/settings-page";
 import { SoftwarePage } from "../features/system-info/software-page";
@@ -56,6 +57,7 @@ export function App() {
             <Route path="alerts" element={<AlertsPage />} />
             <Route path="alert-rules" element={<RulesPage />} />
             <Route path="notification-channels" element={<ChannelsPage />} />
+            <Route path="reports" element={<ReportsPage />} />
             <Route path="users" element={<UsersPanel />} />
             <Route path="roles" element={<RolesPanel />} />
             <Route path="authentication" element={<AuthenticationPanel />} />

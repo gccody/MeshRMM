@@ -20,6 +20,7 @@ export const PAGES: readonly { path: string; title: string }[] = [
   { path: "/alerts", title: "Alerts" },
   { path: "/alert-rules", title: "Alert rules" },
   { path: "/notification-channels", title: "Notification channels" },
+  { path: "/reports", title: "Reports" },
   { path: "/users", title: "Users" },
   { path: "/roles", title: "Roles" },
   { path: "/authentication", title: "Authentication" },

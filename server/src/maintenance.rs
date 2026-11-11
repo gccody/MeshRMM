@@ -4,7 +4,7 @@
 //! only bounds storage and never decides whether a token is valid. Files in
 //! the data directory that nothing refers to any more are removed too:
 //! partial uploads a stopped server left, library files whose row is gone,
-//! and thumbnails of deleted devices.
+//! thumbnails of deleted devices, and documents of deleted or purged reports.
 use std::{
     collections::{BTreeMap, HashSet},
     time::Duration,
@@ -19,7 +19,7 @@ use crate::{
         tables::{
             AgentInstallTokens, Agents, Alerts, ApiTokens, DeploymentTokenEnrollments,
             DeploymentTokens, DeviceApplicationChanges, DeviceMetrics, FileDeliveries, Invitations,
-            JobDevices, Jobs, PasswordResets, RemoteHandoffs, RemoteSessions, ScriptRuns,
+            JobDevices, Jobs, PasswordResets, RemoteHandoffs, RemoteSessions, Reports, ScriptRuns,
             ToolboxFiles, UpdateRuns, UserSessions, WakeRequests,
         },
     },
@@ -35,7 +35,7 @@ const INTERVAL: Duration = Duration::from_secs(30 * 60);
 const EXPIRED_GRACE_MS: i64 = 10 * MINUTE_MS;
 /// How long toolbox script runs, with their output, file deliveries, jobs
 /// and wake requests are kept. The audit log keeps that they happened.
-const TOOLBOX_HISTORY_MS: i64 = 30 * DAY_MS;
+pub const TOOLBOX_HISTORY_MS: i64 = 30 * DAY_MS;
 /// A file this old belongs to no upload or deletion still in progress.
 const ORPHAN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -104,7 +104,8 @@ pub fn spawn(database: Database, storage: Storage) -> tokio::task::JoinHandle<()
 /// than [`CHANGES_RETENTION_MS`], and jobs (with their devices) and wake
 /// requests (with their relays) older than [`TOOLBOX_HISTORY_MS`], and scans
 /// older than [`crate::updates::SCAN_HISTORY_MS`] and installs (with their
-/// items) older than [`crate::updates::INSTALL_HISTORY_MS`].
+/// items) older than [`crate::updates::INSTALL_HISTORY_MS`], and generated
+/// reports past their `expires_at` ([`crate::reports::RETENTION_MS`]).
 ///
 /// Each table is purged in batches of [`BATCH_ROWS`]. A table that fails is
 /// logged and left for the next run, and the purge goes on to the next.
@@ -148,7 +149,7 @@ pub fn batch_statements(now_ms: i64) -> Vec<(String, DeleteStatement)> {
 
 /// Every table's due rows, in groups purged in order; a failure skips the
 /// rest of its group.
-fn due(now_ms: i64, batch_rows: u64) -> [Vec<Due>; 16] {
+fn due(now_ms: i64, batch_rows: u64) -> [Vec<Due>; 17] {
     let expired = now_ms - EXPIRED_GRACE_MS;
     let history = now_ms - TOOLBOX_HISTORY_MS;
     // Script runs hold up to a megabyte of output each, and installs have
@@ -304,6 +305,14 @@ fn due(now_ms: i64, batch_rows: u64) -> [Vec<Due>; 16] {
             history,
             batch_rows,
         )],
+        // Their documents go with them, in [`remove_orphans`].
+        vec![Due::before(
+            Reports::Table,
+            Reports::Id,
+            Reports::ExpiresAt,
+            now_ms,
+            batch_rows,
+        )],
     ]
 }
 
@@ -396,11 +405,12 @@ impl Due {
 /// thumbnails of deleted devices. Returns how many it removed.
 pub async fn remove_orphans(database: &Database, storage: &Storage) -> anyhow::Result<u64> {
     let listed = storage.clone();
-    let (partial, files, thumbnails) = tokio::task::spawn_blocking(move || {
+    let (partial, files, thumbnails, reports) = tokio::task::spawn_blocking(move || {
         anyhow::Ok((
             listed.sweep_partial(ORPHAN_AGE)?,
             listed.old_toolbox_files(ORPHAN_AGE)?,
             listed.old_thumbnails(ORPHAN_AGE)?,
+            listed.report_ids()?,
         ))
     })
     .await??;
@@ -420,6 +430,13 @@ pub async fn remove_orphans(database: &Database, storage: &Storage) -> anyhow::R
     let kept = existing(database, Agents::Table, Agents::Id, &thumbnails, true).await?;
     for id in thumbnails.iter().filter(|id| !kept.contains(*id)) {
         storage.remove(&storage.thumbnail(id)).await?;
+        removed += 1;
+    }
+    // A report's row is written before its document, so a document of any
+    // age without one belongs to a report that was deleted or purged.
+    let kept = existing(database, Reports::Table, Reports::Id, &reports, false).await?;
+    for id in reports.iter().filter(|id| !kept.contains(*id)) {
+        storage.remove(&storage.report(id)).await?;
         removed += 1;
     }
     Ok(removed)

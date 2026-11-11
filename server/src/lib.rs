@@ -24,6 +24,7 @@ pub mod notes;
 pub mod notifications;
 pub mod rbac;
 pub mod realtime;
+pub mod reports;
 pub mod scim;
 pub mod secrets;
 pub mod serve;
@@ -100,6 +101,7 @@ pub async fn prepare(config: Config) -> anyhow::Result<AppState> {
         notifications: notifications::queue::Queues::default(),
         updates: updates::Engine::default(),
         wake: wake::Engine::default(),
+        reports: reports::Engine::default(),
         sessions: Sessions::new(Timeouts::new(idle)),
         terminals: terminals::Terminals::default(),
         files: files::Files::default(),
@@ -165,6 +167,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let automating = automation::spawn(state.clone());
     let updating = updates::spawn(state.clone());
     let applying = applications::spawn(state.clone());
+    let reporting = reports::spawn(state.clone());
     let storing_metrics = state.metrics.spawn_writer();
     let handle = Handle::<serve::Endpoint>::new();
     tokio::spawn({
@@ -182,6 +185,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     automating.abort();
     updating.abort();
     applying.abort();
+    reporting.abort();
     // Before the database closes, so the finished minutes waiting are kept.
     storing_metrics.stop().await;
     state.turn.stop().await;

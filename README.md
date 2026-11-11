@@ -96,6 +96,11 @@ MeshRMM is in heavy development and not production ready.
   updates pending too long, for every device, chosen companies or tags.
   Alerts are acknowledged and resolved in the website, resolve themselves
   when the condition passes, and notify by email or signed webhook.
+- Reports: an executive summary, patch compliance, hardware and software
+  inventories and alerts, for every device, chosen companies or tags, over
+  the last 7 or 30 days, the previous month or chosen dates in a chosen time
+  zone. Each is one HTML page that prints as PDF and downloads every table
+  as CSV; schedules make them daily, weekly or monthly and email them.
 - Monitors: the Agent watches services, processes, the event log, the
   journal or the unified log, other computers by ping, TCP port, website and
   certificate expiry, and toolbox script checks, on its own schedule. Rules
@@ -244,6 +249,8 @@ For developers:
 - [Hardware and software](docs/hardware-and-software.md): what the Agents
   collect, how the server stores and searches it, and its API
 - [Alerts](docs/alerts.md): rules, alerts and notification channels
+- [Reports](docs/reports.md): report templates, schedules and what each
+  report counts
 - [Monitors and self-healing](docs/monitors.md): checks the Agent runs, and
   fixing problems automatically
 - [Credential autofill](docs/credential-autofill.md)

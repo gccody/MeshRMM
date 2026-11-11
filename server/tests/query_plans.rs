@@ -686,6 +686,11 @@ const PURGE_INDEXES: &[(&str, &str, &[&str])] = &[
         "the purge of old wake requests",
         &["idx_wake_requests_created"],
     ),
+    (
+        "reports",
+        "the purge of expired reports",
+        &["idx_reports_expires"],
+    ),
 ];
 
 async fn sqlite_plan(connection: &mut SqliteConnection, statement: &Statement) -> String {

@@ -24,6 +24,7 @@ mod notification_channels;
 mod passkeys;
 mod password_resets;
 mod remote;
+mod reports;
 mod roles;
 mod runs;
 mod scim;
@@ -83,6 +84,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .merge(monitor_routes())
         .merge(automation_routes())
         .merge(application_routes())
+        .merge(report_routes())
         .layer(middleware::from_fn_with_state(state, csrf::check))
         // Responses carry account data; browsers and proxies must not keep them.
         .layer(SetResponseHeaderLayer::if_not_present(
@@ -456,6 +458,25 @@ fn automation_routes() -> Router<AppState> {
             put(automation::update).delete(automation::delete),
         )
         .route("/automation-policies/{id}/run", post(automation::run))
+}
+
+fn report_routes() -> Router<AppState> {
+    Router::new()
+        .route("/report-templates", get(reports::templates))
+        .route("/reports", get(reports::list).post(reports::run))
+        .route("/reports/{id}", get(reports::get).delete(reports::delete))
+        .route("/reports/{id}/html", get(reports::page))
+        .route("/reports/{id}/tables/{table}", get(reports::table_csv))
+        .route(
+            "/report-schedules",
+            get(reports::list_schedules).post(reports::create_schedule),
+        )
+        .route("/report-schedules/recipients", get(reports::recipients))
+        .route(
+            "/report-schedules/{id}",
+            put(reports::update_schedule).delete(reports::delete_schedule),
+        )
+        .route("/report-schedules/{id}/run", post(reports::run_schedule))
 }
 
 fn monitor_routes() -> Router<AppState> {
