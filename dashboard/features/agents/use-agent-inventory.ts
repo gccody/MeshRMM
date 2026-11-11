@@ -106,7 +106,15 @@ export function useAgentInventory({ enabled, authorizedFetch, onRefused, onAlert
   const applyMetrics = useCallback((readings: MetricsReading[]) => devices.applyReadings(readings), [devices]);
   // The socket sends the readings of the devices the page shows, and none
   // while the tab is hidden.
-  const [watch] = useState(() => metricsWatch({ shown: () => devices.readers(), onWatching: (watched) => devices.watching(watched) }));
+  // The images of devices it starts watching may have changed unseen.
+  const [watch] = useState(() => metricsWatch({
+    shown: () => devices.readers(),
+    onWatching: (watched, added) => {
+      devices.watching(watched);
+      thumbnails.revalidate(added);
+    },
+  }));
+  const onThumbnails = useCallback((ids: string[]) => thumbnails.replaced(ids), [thumbnails]);
   useEffect(() => devices.subscribeReaders(() => watch.changed()), [devices, watch]);
   useEffect(() => {
     const update = () => watch.setVisible(document.visibilityState !== "hidden");
@@ -114,7 +122,7 @@ export function useAgentInventory({ enabled, authorizedFetch, onRefused, onAlert
     document.addEventListener("visibilitychange", update);
     return () => document.removeEventListener("visibilitychange", update);
   }, [watch]);
-  const { connection, since, now, reconnect } = useInventoryConnection({ enabled, revisionRef: revision, inventory: target, onMetrics: applyMetrics, watch, onAlerts, onJobs, onUpdates, onRefused });
+  const { connection, since, now, reconnect } = useInventoryConnection({ enabled, revisionRef: revision, inventory: target, onMetrics: applyMetrics, onThumbnails, watch, onAlerts, onJobs, onUpdates, onRefused });
 
   const refresh = useCallback(
     () => refreshInventory(connection, { wake: reconnect, load: loadAgents }),

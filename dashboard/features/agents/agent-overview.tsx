@@ -541,7 +541,7 @@ const DeviceTile = memo(function DeviceTile({ agent, position, setSize, companyN
   onEditTags: (agents: Agent[], opener: HTMLElement) => void;
   onShowScreen: (agent: Agent, opener: HTMLElement) => void;
 }) {
-  const thumbnail = useDeviceScreen(thumbnails, agent);
+  const thumbnail = useDeviceScreen(thumbnails, agent.id);
   const reading = useDeviceReading(devices, agent.id);
   const tags = useMemo(() => tagsFor(agent.tag_ids), [tagsFor, agent.tag_ids]);
   const state: TileState = { stale, browserOffline, connecting, background, deleting, closing, anyClosing };

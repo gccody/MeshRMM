@@ -80,6 +80,8 @@ type Options = {
   inventory: InventoryTarget;
   // The watched devices' latest resource usage, which carries no revision.
   onMetrics?: (readings: MetricsReading[]) => void;
+  // Watched devices whose screen image the server replaced.
+  onThumbnails?: (ids: string[]) => void;
   // Which devices' readings the socket sends: told of each socket as it
   // opens, which watches nothing until sent the set, and as it goes.
   watch?: { attach: (send: SendWatch) => void; detach: () => void };
@@ -273,10 +275,11 @@ export const watchMessage = (devices: readonly string[]) => JSON.stringify({ typ
 type SocketEnd = "refused" | "revoked" | "dropped";
 
 // Handles one socket's events while it is the stream's current socket.
-function watchSocket(socket: SocketLike, { revision, inventory, onMetrics, onAlerts, onJobs, onUpdates, now, reportError, current, onOpen, onHeard, onLive, onUnusable, onClose }: {
+function watchSocket(socket: SocketLike, { revision, inventory, onMetrics, onThumbnails, onAlerts, onJobs, onUpdates, now, reportError, current, onOpen, onHeard, onLive, onUnusable, onClose }: {
   revision: { current: number };
   inventory: InventoryTarget;
   onMetrics?: (readings: MetricsReading[]) => void;
+  onThumbnails?: (ids: string[]) => void;
   onAlerts?: (event: AlertEvent) => void;
   onJobs?: (event: JobEvent) => void;
   onUpdates?: (event: UpdateEvent) => void;
@@ -351,6 +354,10 @@ function watchSocket(socket: SocketLike, { revision, inventory, onMetrics, onAle
       else sequencer.broken();
       return;
     }
+    if (message.type === "thumbnails" && Array.isArray(message.device_ids)) {
+      deliver(onThumbnails, message.device_ids.filter((id) => typeof id === "string"));
+      return;
+    }
     const readings = parseMetricsEvent(message);
     const alert = readings ? null : parseAlertEvent(message);
     const job = readings || alert ? null : parseJobEvent(message);
@@ -393,6 +400,7 @@ export function inventoryStream({
   revision,
   inventory,
   onMetrics,
+  onThumbnails,
   watch,
   onAlerts,
   onJobs,
@@ -453,6 +461,7 @@ export function inventoryStream({
     revision,
     inventory,
     onMetrics,
+    onThumbnails,
     onAlerts,
     onJobs,
     onUpdates,

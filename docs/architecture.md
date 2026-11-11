@@ -137,7 +137,8 @@ input.
   signs TURN credentials.
 - `storage`: files in the data directory (thumbnails, toolbox library),
   written atomically. Library files are flushed to disk before they take
-  their name; thumbnails, which Agents send again, are not.
+  their name; thumbnails, which Agents send again when they reconnect,
+  are not.
 - `system_info`: devices' hardware and software snapshots, the application
   change log and their searches. See
   [hardware and software](hardware-and-software.md).
@@ -223,7 +224,9 @@ task.
   between watched and not. Each Agent connection's task listens for its
   device (`ReportingInterval`, `server/src/realtime/metrics/interval.rs`)
   and tells the Agent to report every 5 seconds while it is watched and
-  once a minute otherwise, 25 seconds after it stops being watched; the
+  once a minute otherwise, 25 seconds after it stops being watched, and
+  with it to refresh its screen thumbnail every 5 minutes or about hourly
+  (see [screen thumbnails](screen-thumbnails.md)); the
   registry keeps the watched devices in a set of their own, so the feed's
   scan costs what is watched though every online device has a listener.
   Averages weight each reading by the time it covers. While any event socket is

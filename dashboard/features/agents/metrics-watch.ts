@@ -52,7 +52,8 @@ export function metricsWatch({ shown, onWatching, visible: initiallyVisible = tr
   // The devices the page shows a reading of.
   shown: () => Iterable<string>;
   // The socket was told to watch these; readings of any other aren't live.
-  onWatching: (devices: ReadonlySet<string>) => void;
+  // `added` are those it did not watch before: all of them on a new socket.
+  onWatching: (devices: ReadonlySet<string>, added: string[]) => void;
   visible?: boolean;
   timers?: Timers;
 }): MetricsWatch {
@@ -79,10 +80,11 @@ export function metricsWatch({ shown, onWatching, visible: initiallyVisible = tr
     if (!send) return;
     const next = wanted();
     if (sameSet(next, watching)) return;
+    const added = [...next].filter((id) => !watching.has(id));
     watching = next;
     sentAt = timers.now();
     send([...next]);
-    onWatching(next);
+    onWatching(next, added);
   };
 
   // A change sends after whatever else changes with it, as the rest of a

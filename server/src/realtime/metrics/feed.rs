@@ -19,6 +19,14 @@
 //! at once, without waiting for the tick; one that asks for a new snapshot
 //! or falls behind sends every watched device's latest again.
 //!
+//! A socket also hears when the screen thumbnail of a device it watches is
+//! replaced ([`Metrics::thumbnail_replaced`]), as
+//! `{"type":"thumbnails","device_ids":[...]}`, so its tab loads the new
+//! image at once. An upload is announced only while some socket watches the
+//! device, which is when its Agent refreshes the image every few minutes;
+//! every socket hears it and drops it unless it watches the device, a hash
+//! lookup. One that falls behind is sent every device it watches.
+//!
 //! Readings are numbered in the order they are recorded, and a socket keeps
 //! the number of the last reading it sent for each device it watches, so it
 //! never sends a device's reading twice, but when it starts over, or one
@@ -57,6 +65,9 @@ pub const MAX_WATCHED: usize = 500;
 /// Ticks a socket may fall behind by before it sends every watched device's
 /// latest reading again.
 const BACKLOG: usize = 4;
+/// Replaced thumbnails a socket may fall behind by before it sends every
+/// device it watches as replaced.
+pub(super) const THUMBNAIL_BACKLOG: usize = 256;
 
 /// One reading in a tick, and its JSON once a socket asked for it.
 #[derive(Debug)]
@@ -128,6 +139,16 @@ fn message<'a>(readings: impl IntoIterator<Item = &'a str>) -> Utf8Bytes {
     json.into()
 }
 
+/// `{"type":"thumbnails","device_ids":[...]}`.
+fn thumbnails_message<'a>(device_ids: impl IntoIterator<Item = &'a str>) -> Option<Utf8Bytes> {
+    let device_ids: Vec<&str> = device_ids.into_iter().collect();
+    if device_ids.is_empty() {
+        return None;
+    }
+    let json = serde_json::json!({ "type": "thumbnails", "device_ids": device_ids });
+    Some(json.to_string().into())
+}
+
 fn serialize(reading: &Reading) -> String {
     serde_json::to_string(reading).expect("readings serialize")
 }
@@ -159,7 +180,17 @@ impl Metrics {
         Subscription {
             metrics: self.clone(),
             ticks,
+            thumbnails: self.thumbnails.subscribe(),
             watching: WatchSet::new(self.watched().clone()),
+        }
+    }
+
+    /// Tells the event sockets that watch the device that its screen
+    /// thumbnail was replaced. Costs one lookup when none does.
+    pub fn thumbnail_replaced(&self, device_id: &str) {
+        if self.watched.is_watched(device_id) {
+            // No socket subscribed is no one to tell.
+            let _ = self.thumbnails.send(device_id.into());
         }
     }
 
@@ -225,6 +256,7 @@ impl Metrics {
 pub struct Subscription {
     metrics: Metrics,
     ticks: broadcast::Receiver<Arc<Tick>>,
+    thumbnails: broadcast::Receiver<Arc<str>>,
     watching: WatchSet,
 }
 
@@ -299,21 +331,38 @@ impl Subscription {
         Some(message(sent.iter().map(String::as_str)))
     }
 
-    /// The next readings to send. Safe to cancel: nothing is lost by
-    /// dropping it while it waits.
+    /// The next readings, or replaced thumbnails, to send. Safe to cancel:
+    /// nothing is lost by dropping it while it waits.
     pub async fn next(&mut self) -> Utf8Bytes {
         loop {
-            let tick = match self.ticks.recv().await {
-                Ok(tick) => tick,
-                Err(RecvError::Lagged(_)) => match self.restart() {
-                    Some(json) => return json,
-                    None => continue,
-                },
-                // The feed keeps a sender while anyone is subscribed.
-                Err(RecvError::Closed) => std::future::pending().await,
-            };
-            if let Some(json) = self.pick(&tick) {
-                return json;
+            tokio::select! {
+                tick = self.ticks.recv() => {
+                    let tick = match tick {
+                        Ok(tick) => tick,
+                        Err(RecvError::Lagged(_)) => match self.restart() {
+                            Some(json) => return json,
+                            None => continue,
+                        },
+                        // The feed keeps a sender while anyone is subscribed.
+                        Err(RecvError::Closed) => std::future::pending().await,
+                    };
+                    if let Some(json) = self.pick(&tick) {
+                        return json;
+                    }
+                }
+                replaced = self.thumbnails.recv() => {
+                    let json = match replaced {
+                        Ok(device_id) => thumbnails_message(
+                            self.watching.sent_mut(&device_id).is_some().then_some(&*device_id),
+                        ),
+                        Err(RecvError::Lagged(_)) => thumbnails_message(self.watching.ids()),
+                        // The store this holds keeps the sender.
+                        Err(RecvError::Closed) => std::future::pending().await,
+                    };
+                    if let Some(json) = json {
+                        return json;
+                    }
+                }
             }
         }
     }
@@ -483,6 +532,43 @@ mod tests {
             ready(&mut socket).await,
             Some(BTreeMap::from([device("d", 30 * SECOND_MS)]))
         );
+    }
+
+    /// The devices of the socket's next message, if one is ready and it
+    /// announces replaced thumbnails.
+    async fn replaced(socket: &mut Subscription) -> Option<Vec<String>> {
+        let json = tokio::time::timeout(Duration::ZERO, socket.next())
+            .await
+            .ok()?;
+        let message: Value = serde_json::from_str(json.as_str()).unwrap();
+        assert_eq!(message["type"], "thumbnails");
+        let mut ids: Vec<String> = serde_json::from_value(message["device_ids"].clone()).unwrap();
+        ids.sort();
+        Some(ids)
+    }
+
+    #[tokio::test]
+    async fn replaced_thumbnails_reach_only_the_sockets_watching_them() {
+        let metrics = store().await;
+        let mut watching = metrics.subscribe();
+        let mut other = metrics.subscribe();
+        watching.watch(ids(&["a", "b"]));
+        other.watch(ids(&["c"]));
+        metrics.thumbnail_replaced("a");
+        assert_eq!(replaced(&mut watching).await, Some(ids(&["a"])));
+        assert_eq!(replaced(&mut watching).await, None);
+        assert_eq!(replaced(&mut other).await, None);
+        // Nobody watches it: not even sent to be dropped.
+        metrics.thumbnail_replaced("z");
+        assert_eq!(metrics.thumbnails.len(), 0);
+        assert_eq!(replaced(&mut watching).await, None);
+
+        // A socket that fell behind is told every device it watches.
+        for _ in 0..=THUMBNAIL_BACKLOG {
+            metrics.thumbnail_replaced("c");
+        }
+        assert_eq!(replaced(&mut watching).await, Some(ids(&["a", "b"])));
+        assert_eq!(replaced(&mut watching).await, None);
     }
 
     #[tokio::test]

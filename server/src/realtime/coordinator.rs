@@ -5,8 +5,9 @@
 //! gives the Agent its live remote session and any rotated credential it
 //! hasn't used yet, says which application list it holds and asks for a
 //! system information snapshot if the one it has is old, and how often to
-//! report its resource usage, then forwards what the API sends, tells the
-//! Agent when that interval changes, and records the resource usage and
+//! report its resource usage and refresh its screen thumbnail, then forwards
+//! what the API sends, tells the Agent when those intervals change, and
+//! records the resource usage and
 //! reports the Agent sends, until the Agent disconnects or a newer
 //! connection from the device replaces it. Snapshots, which can be megabytes,
 //! don't travel here: the Agent posts them over HTTPS (`crate::api::agent`),
@@ -41,8 +42,9 @@ pub async fn serve(
     // asked for before it are the ones its Agent may not have.
     let connected_at = crate::time::now_ms();
     let mut connection = state.agents.connect(&device_id);
-    // How often the Agent reports follows whether a website tab watches the
-    // device, from before the Agent is greeted with it.
+    // How often the Agent reports and refreshes its thumbnail follows
+    // whether a website tab watches the device, from before the Agent is
+    // greeted with it.
     let mut reporting = state.metrics.reporting_interval(&device_id);
     // Before presence, so a page that sees the device come online reads it
     // as woken.
@@ -65,7 +67,7 @@ pub async fn serve(
     state.automation.device_connected(&device_id);
     tracing::info!(device_id, "Agent connected");
     if let Ok(replayed) = greet(&state, &device_id, system, &mut socket).await
-        && send(&mut socket, command(reporting.greeting())).await
+        && send_all(&mut socket, reporting.greeting()).await
     {
         let mut last_session = replayed;
         let mut last_heard = Instant::now();
@@ -83,10 +85,10 @@ pub async fn serve(
                         break;
                     }
                 }
-                interval = reporting.next() => {
+                intervals = reporting.next() => {
                     // A replaced connection's Agent is going away.
                     if state.agents.is_current(&device_id, connection.id)
-                        && !send(&mut socket, command(interval)).await
+                        && !send_all(&mut socket, intervals).await
                     {
                         break;
                     }
@@ -187,6 +189,19 @@ pub async fn serve(
 
 fn command(command: AgentCommand) -> Message {
     Message::Text(ToAgent::Command(command).to_json().into())
+}
+
+/// Sends each command in turn, and returns whether the socket took them all.
+async fn send_all(
+    socket: &mut WebSocket,
+    commands: impl IntoIterator<Item = AgentCommand>,
+) -> bool {
+    for each in commands {
+        if !send(socket, command(each)).await {
+            return false;
+        }
+    }
+    true
 }
 
 /// What a newly connected Agent is owed: the session it should be in, a

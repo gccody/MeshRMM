@@ -12,6 +12,7 @@ type Options = {
   revisionRef: RefObject<number>;
   inventory: InventoryTarget;
   onMetrics: (readings: MetricsReading[]) => void;
+  onThumbnails: (ids: string[]) => void;
   // Which devices' readings each socket is asked for.
   watch: MetricsWatch;
   onAlerts: (event: AlertEvent) => void;
@@ -24,7 +25,7 @@ type Options = {
 type Link = { connection: InventoryConnection; since: number | null };
 
 // The live inventory socket, and how long it has been down.
-export function useInventoryConnection({ enabled, revisionRef, inventory, onMetrics, watch, onAlerts, onJobs, onUpdates, onRefused }: Options) {
+export function useInventoryConnection({ enabled, revisionRef, inventory, onMetrics, onThumbnails, watch, onAlerts, onJobs, onUpdates, onRefused }: Options) {
   const [link, setLink] = useState<Link>({ connection: "connecting", since: null });
   // Advanced by a timer when the stale grace period ends.
   const [clock, setClock] = useState(0);
@@ -46,6 +47,7 @@ export function useInventoryConnection({ enabled, revisionRef, inventory, onMetr
       revision: revisionRef,
       inventory,
       onMetrics,
+      onThumbnails,
       watch,
       onAlerts: (event) => alerts.current(event),
       onJobs: (event) => jobs.current(event),
@@ -66,7 +68,7 @@ export function useInventoryConnection({ enabled, revisionRef, inventory, onMetr
       current.stop();
       stream.current = null;
     };
-  }, [enabled, inventory, onMetrics, revisionRef, watch]);
+  }, [enabled, inventory, onMetrics, onThumbnails, revisionRef, watch]);
 
   // Check the stream when the network returns or the tab becomes visible
   // again, for example after the computer wakes from sleep: reconnect at

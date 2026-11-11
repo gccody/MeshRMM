@@ -517,6 +517,9 @@ pub struct Metrics {
     feed: Arc<feed::Feed>,
     /// The devices the event sockets watch.
     watched: Watched,
+    /// Watched devices whose screen thumbnail was just replaced, for the
+    /// event sockets watching them.
+    thumbnails: tokio::sync::broadcast::Sender<Arc<str>>,
     /// How long an Agent keeps reporting at the watched interval after its
     /// device stops being watched.
     unwatched_linger: Duration,
@@ -535,6 +538,7 @@ impl Metrics {
             writer: Arc::default(),
             feed: Arc::default(),
             watched: Watched::default(),
+            thumbnails: tokio::sync::broadcast::Sender::new(feed::THUMBNAIL_BACKLOG),
             unwatched_linger: UNWATCHED_LINGER,
         }
     }

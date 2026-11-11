@@ -17,30 +17,23 @@ function useThumbnail(store: ThumbnailStore, id: string): Thumbnail | null {
   return useSyncExternalStore(subscribe, () => store.snapshot(id), () => null);
 }
 
-// The device's latest screen image, kept current while its tile is drawn
-// and the page is in front. The wall draws only the tiles on screen or
-// about to be. A hidden tab checks again as soon as it is shown.
-export function useDeviceScreen(store: ThumbnailStore, agent: Agent): Thumbnail | null {
-  const { id, connected } = agent;
+// The device's latest screen image, loaded when its tile is drawn and the
+// page is in front, and again when the server says it changed or a load
+// failed, which the store sees to. The wall draws only the tiles on screen
+// or about to be.
+export function useDeviceScreen(store: ThumbnailStore, id: string): Thumbnail | null {
   const thumbnail = useThumbnail(store, id);
   useEffect(() => {
-    let timer: number | undefined;
-    let cancelled = false;
-    const check = async () => {
-      window.clearTimeout(timer);
-      if (document.visibilityState !== "visible") return;
-      const delay = await store.refresh(id, connected);
-      if (!cancelled && delay !== null) timer = window.setTimeout(() => void check(), delay);
+    const check = () => {
+      if (document.visibilityState === "visible") void store.refresh(id);
     };
-    const onVisibilityChange = () => void check();
-    timer = window.setTimeout(() => void check(), SETTLE_DELAY_MS);
-    document.addEventListener("visibilitychange", onVisibilityChange);
+    const timer = window.setTimeout(check, SETTLE_DELAY_MS);
+    document.addEventListener("visibilitychange", check);
     return () => {
-      cancelled = true;
       window.clearTimeout(timer);
-      document.removeEventListener("visibilitychange", onVisibilityChange);
+      document.removeEventListener("visibilitychange", check);
     };
-  }, [store, id, connected]);
+  }, [store, id]);
   return thumbnail;
 }
 
@@ -59,7 +52,7 @@ export function ScreenPreview({ agent, store, returnFocus, onClose }: {
     <ModalDialog className="settings-modal thumbnail-modal" labelledBy={titleId} returnFocus={returnFocus} onClose={onClose}>
       <button type="button" className="modal-close" onClick={onClose} aria-label="Close"><X size={18} /></button>
       <h2 id={titleId}>{agent.name}</h2>
-      <p>{agent.connected ? "Refreshes every 5 minutes." : "Offline. This is the last image it sent."}{updated && <> Captured {updated}.</>}</p>
+      <p>{agent.connected ? "Refreshes every 5 minutes while shown." : "Offline. This is the last image it sent."}{updated && <> Captured {updated}.</>}</p>
       <img className="thumbnail-preview" src={thumbnail.url} alt={`The main display of ${agent.name}${updated ? ` at ${updated}` : ""}`} />
     </ModalDialog>
   );
