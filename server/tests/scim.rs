@@ -535,6 +535,72 @@ async fn scim_keeps_an_administrator_who_holds_the_role_through_a_group() {
     }
 }
 
+/// A user SCIM creates has no password, so as an administrator they don't
+/// count while nothing can sign them in: here SSO isn't set up.
+#[tokio::test]
+async fn scim_keeps_an_administrator_who_can_sign_in() {
+    for app in common::apps().await {
+        let name = app.name;
+        let mut admin = common::set_up(&app).await;
+        let admin_id = admin.get("/v1/account").await.body["user"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let scim = token(&app, &mut admin).await;
+        let created = scim.post("/Users", user("grace@example.com")).await;
+        assert_eq!(
+            created.status,
+            StatusCode::CREATED,
+            "{name}: {:?}",
+            created.body
+        );
+        let grace_id = created.body["id"].as_str().unwrap().to_owned();
+        administrators_group(&scim, &mut admin, "Admins", &[&grace_id]).await;
+
+        let deactivated = scim
+            .patch(
+                &format!("/Users/{admin_id}"),
+                json!([{ "op": "replace", "path": "active", "value": false }]),
+            )
+            .await;
+        let deleted = scim.delete(&format!("/Users/{admin_id}")).await;
+        for refused in [deactivated, deleted] {
+            assert_eq!(
+                refused.status,
+                StatusCode::BAD_REQUEST,
+                "{name}: {:?}",
+                refused.body
+            );
+            assert_eq!(refused.body["scimType"], "mutability", "{name}");
+            assert!(
+                refused.body["detail"]
+                    .as_str()
+                    .unwrap()
+                    .contains("without an administrator who can sign in"),
+                "{name}: {:?}",
+                refused.body
+            );
+        }
+        assert_eq!(admin.get("/v1/account").await.status, StatusCode::OK);
+
+        // Another administrator with a password lets the change through.
+        common::add_user(&app, &mut admin, "second@example.com", &["administrator"]).await;
+        let deactivated = scim
+            .patch(
+                &format!("/Users/{admin_id}"),
+                json!([{ "op": "replace", "path": "active", "value": false }]),
+            )
+            .await;
+        assert_eq!(
+            deactivated.status,
+            StatusCode::OK,
+            "{name}: {:?}",
+            deactivated.body
+        );
+        app.finish().await;
+    }
+}
+
 #[tokio::test]
 async fn concurrent_group_deletions_keep_an_administrator() {
     for app in common::apps().await {

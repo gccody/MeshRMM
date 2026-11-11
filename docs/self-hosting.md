@@ -555,7 +555,12 @@ Then, in the website:
 - **Authentication** sets the sign-in policy (password rules, required
   two-factor), single sign-on with an OIDC provider, and SCIM provisioning
   tokens. Only administrators can change single sign-on, SCIM and email,
-  because whoever controls them can sign in as anyone. Its **API tokens**
+  because whoever controls them can sign in as anyone. The server always
+  keeps an enabled administrator who can sign in: one with a password or
+  passkey, or one linked to single sign-on while it is on. So while every
+  administrator signs in only through single sign-on, it can't be turned
+  off or removed; give an administrator a password first (a password reset
+  link from **Users** sets one). The **Authentication → API tokens**
   tab turns users' [API tokens](api.md) on or off, limits how long they last
   (365 days unless you change it), and lists everyone's tokens for whoever
   holds `api_tokens.manage`.

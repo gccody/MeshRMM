@@ -356,6 +356,19 @@ Technician is an editable default. Single sign-on, SCIM and email settings
 are limited to administrators, because whoever controls them can sign in as
 anyone.
 
+The server keeps an administrator who can sign in.
+`rbac::remaining_administrators` counts an enabled user holding the Administrator role (directly, or through
+a SCIM or SSO group) who has a password or a passkey, or whose account is
+linked to SSO while SSO is turned on. An account SSO or SCIM created has no
+password, so it counts only while SSO is on and after its first SSO sign-in.
+Every change that could leave nobody counted is refused inside its
+transaction: taking the role away, disabling or deleting a user (from the
+website, the API or SCIM), unlinking a user's SSO identity, and turning SSO
+off, removing it or moving it to another issuer (which unlinks everyone). A
+sign-in through SSO keeps the groups that hold the last such administrator's
+role. The `meshrmm-server admin` commands are not limited by this; they are
+the way back in.
+
 When no account exists, the server logs a one-time setup link. Without it
 nobody can create the first administrator.
 

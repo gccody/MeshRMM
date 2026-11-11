@@ -158,21 +158,26 @@ impl ScimError {
     }
 }
 
-/// Fails unless an enabled administrator would remain; see
-/// [`rbac::administrator_remains`]. Call inside the transaction that may
+/// Fails unless an enabled administrator who can sign in would remain; see
+/// [`rbac::remaining_administrators`]. Call inside the transaction that may
 /// remove one, after the change and before committing.
 async fn ensure_administrator_remains(executor: &mut impl Executor) -> Result<(), ScimError> {
-    if rbac::administrator_remains(executor).await? {
-        return Ok(());
-    }
     // The request is valid but MeshRMM's state refuses it, which RFC 7644
     // calls `mutability` ("not compatible with ... current state"). The
     // provider's administrator reads the detail in their sync log.
-    Err(ScimError::bad_request(
-        "mutability",
-        "this would leave MeshRMM without an enabled administrator; \
-         give another user the Administrator role in MeshRMM first",
-    ))
+    let detail = match rbac::remaining_administrators(executor).await? {
+        rbac::Administrators::CanSignIn => return Ok(()),
+        rbac::Administrators::NoneCanSignIn => {
+            "this would leave MeshRMM without an administrator who can sign in: the remaining \
+             ones have no password and sign in only through single sign-on, which is off or \
+             not linked to their accounts yet; give a MeshRMM administrator a password first"
+        }
+        rbac::Administrators::None => {
+            "this would leave MeshRMM without an enabled administrator; \
+             give another user the Administrator role in MeshRMM first"
+        }
+    };
+    Err(ScimError::bad_request("mutability", detail))
 }
 
 impl IntoResponse for ScimError {

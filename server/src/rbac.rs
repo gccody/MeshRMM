@@ -5,12 +5,14 @@
 //! implicitly, including ones added by later releases, so it can't be emptied.
 use std::{collections::BTreeSet, fmt, str::FromStr};
 
-use sea_query::{Expr, ExprTrait, LockType, Order, Query};
+use sea_query::{Cond, Expr, ExprTrait, LockType, Order, Query};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::db::{
     self, Executor,
-    tables::{EffectiveUserRoles, RolePermissions, Roles, Settings, Users},
+    tables::{
+        EffectiveUserRoles, OidcProvider, RolePermissions, Roles, Settings, UserPasskeys, Users,
+    },
 };
 
 /// The ID (and `builtin` value) of the role with every permission.
@@ -209,12 +211,32 @@ pub async fn user_roles(executor: &mut impl Executor, user_id: &str) -> db::Resu
     load_roles(executor, Some(&ids)).await
 }
 
-/// Whether an enabled user still holds the Administrator role, assigned to
-/// them or through an identity provider's group. Every change that can take
-/// the role from someone, or disable or delete them, calls this inside its
-/// transaction after making the change, and keeps the change only if an
-/// administrator remains.
-pub async fn administrator_remains(executor: &mut impl Executor) -> db::Result<bool> {
+/// Who is left to administer MeshRMM, as [`remaining_administrators`]
+/// counts them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Administrators {
+    /// An enabled administrator can sign in.
+    CanSignIn,
+    /// Enabled administrators remain, but none of them can sign in: none
+    /// has a password or a passkey, and SSO is off or links none of them.
+    NoneCanSignIn,
+    /// No enabled user holds the Administrator role.
+    None,
+}
+
+/// Whether an administrator who can sign in remains: an enabled user who
+/// holds the Administrator role, assigned to them or through an identity
+/// provider's group, and has a way to sign in that works with the current
+/// settings: a password, a passkey, or an SSO identity linked to the
+/// account while SSO is turned on. An account SSO or SCIM created has
+/// neither of the first two, so it counts only while SSO is on and once it
+/// has signed in with it.
+///
+/// Every change that can take the role from someone, disable or delete
+/// them, take away a way they sign in, or turn SSO off calls this inside
+/// its transaction after making the change, and keeps the change only if
+/// such an administrator remains.
+pub async fn remaining_administrators(executor: &mut impl Executor) -> db::Result<Administrators> {
     // Two transactions removing different administrators would each still
     // count the other. Locking one shared row first makes the second wait
     // and then count what the first committed. (SQLite's write lock already
@@ -229,26 +251,68 @@ pub async fn administrator_remains(executor: &mut impl Executor) -> db::Result<b
                 .to_owned(),
         )
         .await?;
-    let administrator: Option<(String,)> = executor
+    let sso: Option<(bool,)> = executor
         .fetch_optional(
             &Query::select()
-                .column((Users::Table, Users::Id))
-                .from(Users::Table)
-                .inner_join(
-                    EffectiveUserRoles::Table,
-                    Expr::col((EffectiveUserRoles::Table, EffectiveUserRoles::UserId))
-                        .equals((Users::Table, Users::Id)),
-                )
-                .and_where(
-                    Expr::col((EffectiveUserRoles::Table, EffectiveUserRoles::RoleId))
-                        .eq(ADMINISTRATOR_ROLE_ID),
-                )
-                .and_where(Expr::col((Users::Table, Users::Disabled)).eq(false))
-                .limit(1)
+                .column(OidcProvider::Enabled)
+                .from(OidcProvider::Table)
+                .and_where(Expr::col(OidcProvider::Id).eq(1))
                 .to_owned(),
         )
         .await?;
-    Ok(administrator.is_some())
+    let mut can_sign_in = Cond::any()
+        .add(Expr::col((Users::Table, Users::PasswordHash)).is_not_null())
+        .add(Expr::exists(
+            Query::select()
+                .expr(Expr::val(1))
+                .from(UserPasskeys::Table)
+                .and_where(
+                    Expr::col((UserPasskeys::Table, UserPasskeys::UserId))
+                        .equals((Users::Table, Users::Id)),
+                )
+                .to_owned(),
+        ));
+    if sso.is_some_and(|(enabled,)| enabled) {
+        can_sign_in = can_sign_in.add(Expr::col((Users::Table, Users::OidcSubject)).is_not_null());
+    }
+    let signs_in: Option<(String,)> = executor
+        .fetch_optional(&enabled_administrators().cond_where(can_sign_in).to_owned())
+        .await?;
+    if signs_in.is_some() {
+        return Ok(Administrators::CanSignIn);
+    }
+    // Only to say why the change is refused.
+    let enabled: Option<(String,)> = executor.fetch_optional(&enabled_administrators()).await?;
+    Ok(if enabled.is_some() {
+        Administrators::NoneCanSignIn
+    } else {
+        Administrators::None
+    })
+}
+
+/// Whether an administrator who can sign in remains; see
+/// [`remaining_administrators`].
+pub async fn administrator_remains(executor: &mut impl Executor) -> db::Result<bool> {
+    Ok(remaining_administrators(executor).await? == Administrators::CanSignIn)
+}
+
+/// The ID of one enabled user holding the Administrator role.
+fn enabled_administrators() -> sea_query::SelectStatement {
+    Query::select()
+        .column((Users::Table, Users::Id))
+        .from(Users::Table)
+        .inner_join(
+            EffectiveUserRoles::Table,
+            Expr::col((EffectiveUserRoles::Table, EffectiveUserRoles::UserId))
+                .equals((Users::Table, Users::Id)),
+        )
+        .and_where(
+            Expr::col((EffectiveUserRoles::Table, EffectiveUserRoles::RoleId))
+                .eq(ADMINISTRATOR_ROLE_ID),
+        )
+        .and_where(Expr::col((Users::Table, Users::Disabled)).eq(false))
+        .limit(1)
+        .to_owned()
 }
 
 /// Every permission any of `roles` grants.
