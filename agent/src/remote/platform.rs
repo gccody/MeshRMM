@@ -39,6 +39,13 @@ pub trait ScreenStreamer: Send {
         self.start(Some(display_id), stream_id, slot)
     }
     fn stop(&mut self) -> anyhow::Result<()>;
+    /// Ends the current stream so that the next `start` begins another: a
+    /// new encoder with the settings given since. A backend that can restart
+    /// its encoder in place keeps capture running and only stops delivering
+    /// the old stream's frames; the others stop capture.
+    fn end_stream(&mut self) -> anyhow::Result<()> {
+        self.stop()
+    }
     fn shutdown(&mut self) -> anyhow::Result<()> {
         self.stop()
     }
@@ -351,6 +358,17 @@ impl ScreenStreamer for PlatformScreenStreamer {
             CaptureBackend::Desktop(streamer) => streamer.stop(),
         }
         .context("Windows capture stop failed")
+    }
+
+    fn end_stream(&mut self) -> anyhow::Result<()> {
+        match &mut self.inner {
+            // The service's helper restarts its encoder in place.
+            CaptureBackend::Desktop(streamer) => {
+                streamer.end_stream();
+                Ok(())
+            }
+            CaptureBackend::Direct(_) => self.stop(),
+        }
     }
 
     fn shutdown(&mut self) -> anyhow::Result<()> {

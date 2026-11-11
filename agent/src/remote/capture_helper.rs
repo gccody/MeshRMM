@@ -304,6 +304,44 @@ struct ClipboardEvents {
 type HelperClipboard = Arc<ClipboardEvents>;
 type InputWriter = Arc<CommandWriter>;
 type InputRoute = Arc<Mutex<Option<InputWriter>>>;
+/// Starts a helper process on a desktop, with the signed-in user's token
+/// when asked to. Tests replace it with fake helpers.
+type HelperLauncher =
+    Arc<dyn Fn(DesktopTarget, bool) -> anyhow::Result<LaunchedHelper> + Send + Sync>;
+
+/// Where a capture helper's frames go. Each Start names the sink of the
+/// stream it begins, which takes the frames from the helper's next Started
+/// event on: the helper writes that event after the last frame of the old
+/// stream and before the first of the new one, its keyframe.
+#[derive(Default)]
+struct FrameRoute {
+    /// The current stream's sink; without one its frames are dropped.
+    current: Option<EncodedFrameSink>,
+    /// The sink of the stream the helper was asked to start.
+    next: Option<EncodedFrameSink>,
+}
+
+impl FrameRoute {
+    fn starting(sink: EncodedFrameSink) -> Self {
+        Self {
+            current: None,
+            next: Some(sink),
+        }
+    }
+
+    /// The helper started the stream it was asked for.
+    fn started(&mut self) {
+        if let Some(next) = self.next.take() {
+            self.current = Some(next);
+        }
+    }
+}
+
+type HelperFrames = Arc<Mutex<FrameRoute>>;
+
+fn lock_frames(frames: &HelperFrames) -> std::sync::MutexGuard<'_, FrameRoute> {
+    frames.lock().unwrap_or_else(|error| error.into_inner())
+}
 
 /// Brokers a credential-free LocalSystem helper on the visible Windows
 /// desktop. Only frames and remote-control events cross the inherited pipes;
@@ -343,6 +381,10 @@ pub struct DesktopCaptureStreamer {
     prevent_idle_lock: Arc<AtomicBool>,
     chat_enabled: Arc<AtomicBool>,
     headless_resolution: HeadlessResolution,
+    launcher: HelperLauncher,
+    /// How long a running helper may take to restart capture in place
+    /// before it counts as stalled and is replaced.
+    restart_timeout: Duration,
     /// Added while the console has no monitor, and kept until the remote
     /// session ends. Declared last so it is removed after the helpers stop.
     virtual_display: Option<VirtualDisplay>,
@@ -389,6 +431,8 @@ impl DesktopCaptureStreamer {
             prevent_idle_lock: Arc::new(AtomicBool::new(false)),
             chat_enabled: Arc::new(AtomicBool::new(false)),
             headless_resolution: super::virtual_display::last_resolution(),
+            launcher: Arc::new(launch_helper),
+            restart_timeout: START_TIMEOUT,
             virtual_display: None,
         }
     }
@@ -535,6 +579,24 @@ impl DesktopCaptureStreamer {
         Some(result)
     }
 
+    /// Ends the current stream and keeps the helper, so that the next start
+    /// on this desktop restarts its encoder in place, keeping the process,
+    /// its pipes and capture of the display. The old stream's frames are
+    /// dropped from now on.
+    pub fn end_stream(&mut self) {
+        if let Some(running) = &self.running {
+            lock_frames(&running.sink).current = None;
+        }
+    }
+
+    /// Ends a helper that did not do what it was asked in time, or failed.
+    fn terminate(&mut self) {
+        if let Some(mut running) = self.running.take() {
+            terminate_and_wait(&running.process);
+            running.finish();
+        }
+    }
+
     pub fn stop(&mut self) -> anyhow::Result<()> {
         let Some(mut running) = self.running.take() else {
             return Ok(());
@@ -586,7 +648,7 @@ impl Drop for DesktopCaptureStreamer {
 
 struct RunningHelper {
     last_frame: Arc<Mutex<Instant>>,
-    sink: Arc<Mutex<Option<EncodedFrameSink>>>,
+    sink: HelperFrames,
     started: mpsc::Receiver<Result<StartedDesktop, StartFailure>>,
     process: OwnedHandle,
     process_id: u32,

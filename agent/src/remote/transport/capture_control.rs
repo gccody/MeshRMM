@@ -324,8 +324,10 @@ impl CaptureControl {
         self.stream_id = VideoStreamId(self.stream_id.0.wrapping_add(1).max(1));
     }
 
-    fn stop_capture(&mut self) -> anyhow::Result<()> {
-        lock_streamer(&self.streamer)?.stop()?;
+    /// Ends the stream for a restart with new settings on the same display.
+    /// The Windows service's helper keeps running and restarts its encoder.
+    fn end_stream(&mut self) -> anyhow::Result<()> {
+        lock_streamer(&self.streamer)?.end_stream()?;
         self.next_stream();
         Ok(())
     }
@@ -394,7 +396,7 @@ impl CaptureControl {
             return Ok(());
         }
         lock_streamer(&self.streamer)?.set_congestion_bitrate((value < ceiling).then_some(value));
-        self.stop_capture()?;
+        self.end_stream()?;
         let candidates = self.candidates();
         match self.start(self.active_display.id, &candidates) {
             Ok(started) => {
@@ -453,7 +455,7 @@ impl CaptureControl {
             return Ok(());
         }
 
-        self.stop_capture()?;
+        self.end_stream()?;
         let started = self.start(self.active_display.id, &candidates)?;
         self.resume(started).await?;
         tracing::info!(
@@ -479,7 +481,7 @@ impl CaptureControl {
         if !restart || !self.capture_running {
             return Ok(());
         }
-        self.stop_capture()?;
+        self.end_stream()?;
         let candidates = self.candidates();
         match self.start(self.active_display.id, &candidates) {
             Ok(started) => self.resume(started).await?,
@@ -507,7 +509,7 @@ impl CaptureControl {
             Ok(true) => {
                 // The console-mode WGC backend needs its existing
                 // reconfiguration path; service capture updates in place.
-                self.stop_capture()?;
+                self.end_stream()?;
                 let candidates = self.candidates();
                 let started = self.start(self.active_display.id, &candidates)?;
                 self.resume(started).await?;
@@ -530,7 +532,7 @@ impl CaptureControl {
             );
             return Ok(());
         }
-        self.stop_capture()?;
+        self.end_stream()?;
         let started = self.start(self.active_display.id, &candidates)?;
         self.resume(started).await?;
         tracing::info!(
@@ -561,7 +563,7 @@ impl CaptureControl {
             "viewer rejected video profile; trying fallback"
         );
         let candidates = self.candidates();
-        self.stop_capture()?;
+        self.end_stream()?;
         let started = self.start(self.active_display.id, &candidates)?;
         self.resume(started).await
     }
@@ -691,3 +693,6 @@ impl CaptureControl {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;

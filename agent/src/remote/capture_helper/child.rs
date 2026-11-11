@@ -122,113 +122,236 @@ type ChildOutput = Arc<Mutex<BufWriter<io::Stdout>>>;
 
 pub(super) fn run_capture_child(
     command_rx: mpsc::Receiver<io::Result<ParentCommand>>,
-    mut display_id: Option<DisplayId>,
-    mut headless: Option<HeadlessTarget>,
-    mut config: StreamConfig,
+    display_id: Option<DisplayId>,
+    headless: Option<HeadlessTarget>,
+    config: StreamConfig,
 ) -> anyhow::Result<()> {
     let background = is_background_child();
     let mut border_enabled = false;
+    let output: ChildOutput = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
+    let ipc_failed = Arc::new(AtomicBool::new(false));
+    let mut start = CaptureStart {
+        display_id,
+        headless,
+        config,
+    };
+    let mut stream: Option<CaptureStream> = None;
     loop {
-        if config.frames_per_second == 0 || config.bitrate_bits_per_second == 0 {
+        if start.config.frames_per_second == 0 || start.config.bitrate_bits_per_second == 0 {
             anyhow::bail!("desktop-helper frame rate and bitrate must be positive");
         }
-        if let Some(target) = &headless
-            && let Err(error) = crate::remote::virtual_display::show(target, HEADLESS_ARRIVAL)
-        {
-            tracing::warn!(error = format!("{error:#}"), "virtual display is not ready");
-        }
-        if !background && !crate::remote::virtual_display::console_has_display() {
-            let output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
-            emit_child_event(&output, ChildEvent::NoDisplays)?;
+        let restarted = match stream.as_mut() {
+            Some(current) => current.restart_encoder(&start, &output, &ipc_failed)?,
+            None => EncoderRestart::StartOver,
+        };
+        if let EncoderRestart::Failed(message) = restarted {
+            // The parent replaces a helper that could not restart.
+            emit_child_event(&output, ChildEvent::Error(message))?;
             return Ok(());
         }
-        let displays = enumerate_displays()?;
-        let active_display = display_id
-            .and_then(|id| displays.iter().find(|display| display.id == id))
-            .or_else(|| displays.iter().find(|display| display.primary))
-            .or_else(|| displays.first())
-            .cloned()
-            .context("Windows reported no displays on the active desktop")?;
-        let border = if border_enabled && !background {
-            Some(crate::remote::display_border::DisplayBorder::show(
-                &active_display,
-            )?)
-        } else {
-            None
-        };
-        let output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
-        let ipc_failed = Arc::new(AtomicBool::new(false));
-        let sink = frame_sink(Arc::clone(&output), Arc::clone(&ipc_failed));
-        let mut streamer = WindowsDesktopDuplicationStreamer::new();
-        let active = match streamer.start(config, active_display.id.0, sink) {
-            Ok(active) => active,
-            Err(error) => {
-                emit_child_event(&output, ChildEvent::Error(error.to_string()))?;
-                return Ok(());
+        if matches!(restarted, EncoderRestart::StartOver) {
+            // The old stream, and its border, go before the new one starts.
+            if let Some(mut previous) = stream.take() {
+                let _ = previous.streamer.stop();
             }
+            match start_stream(&start, border_enabled, background, &output, &ipc_failed)? {
+                Some(started) => stream = Some(started),
+                None => return Ok(()),
+            }
+        }
+        let Some(current) = stream.as_mut() else {
+            anyhow::bail!("desktop-helper capture stream is missing");
         };
-        emit_child_event(
+        let terminal_error = match current.serve(
+            &command_rx,
+            &mut border_enabled,
+            background,
             &output,
-            ChildEvent::Started(StartedDesktop {
-                format: active,
-                displays,
-                active_display: active_display.clone(),
-            }),
-        )?;
-        let mut stream = CaptureStream {
-            streamer,
-            ipc_failed,
-            output,
-            border,
-            active_display,
-        };
-        let terminal_error = match stream.serve(&command_rx, &mut border_enabled, background)? {
-            CaptureEnd::Restart {
-                display_id: next_display,
-                headless: next_headless,
-                config: next_config,
-            } => {
-                display_id = next_display;
-                headless = next_headless;
-                config = next_config;
+            &ipc_failed,
+        )? {
+            CaptureEnd::Restart(next) => {
+                start = next;
                 continue;
             }
             CaptureEnd::Finished(terminal_error) => terminal_error,
         };
-        let _ = stream.streamer.stop();
-        if stream.ipc_failed.load(Ordering::Acquire) {
+        let _ = current.streamer.stop();
+        if ipc_failed.load(Ordering::Acquire) {
             return Ok(());
         }
         match terminal_error {
-            Some(message) => emit_child_event(&stream.output, ChildEvent::Error(message))?,
-            None => emit_child_event(&stream.output, ChildEvent::Stopped)?,
+            Some(message) => emit_child_event(&output, ChildEvent::Error(message))?,
+            None => emit_child_event(&output, ChildEvent::Stopped)?,
         }
         return Ok(());
     }
 }
 
-/// Writes each encoded frame to the parent, and records a failed write in
-/// `failed` so the capture loop can stop.
-fn frame_sink(output: ChildOutput, failed: Arc<AtomicBool>) -> EncodedFrameSink {
-    Arc::new(move |frame| {
-        let mut output = output.lock().unwrap_or_else(|error| error.into_inner());
-        if write_event(&mut *output, &ChildEvent::Frame(frame))
+/// What the parent's Start asks to capture, and how to encode it.
+#[derive(Clone, Copy)]
+struct CaptureStart {
+    display_id: Option<DisplayId>,
+    headless: Option<HeadlessTarget>,
+    config: StreamConfig,
+}
+
+/// The display `requested` names, else the primary one, else any.
+fn choose_display(displays: &[Display], requested: Option<DisplayId>) -> Option<Display> {
+    requested
+        .and_then(|id| displays.iter().find(|display| display.id == id))
+        .or_else(|| displays.iter().find(|display| display.primary))
+        .or_else(|| displays.first())
+        .cloned()
+}
+
+/// Starts capture and an encoder for `start`, and tells the parent. None
+/// when the helper reported why it cannot, and ends.
+fn start_stream(
+    start: &CaptureStart,
+    border_enabled: bool,
+    background: bool,
+    output: &ChildOutput,
+    ipc_failed: &Arc<AtomicBool>,
+) -> anyhow::Result<Option<CaptureStream>> {
+    if let Some(target) = &start.headless
+        && let Err(error) = crate::remote::virtual_display::show(target, HEADLESS_ARRIVAL)
+    {
+        tracing::warn!(error = format!("{error:#}"), "virtual display is not ready");
+    }
+    if !background && !crate::remote::virtual_display::console_has_display() {
+        emit_child_event(output, ChildEvent::NoDisplays)?;
+        return Ok(None);
+    }
+    let displays = enumerate_displays()?;
+    let active_display = choose_display(&displays, start.display_id)
+        .context("Windows reported no displays on the active desktop")?;
+    let border = if border_enabled && !background {
+        Some(crate::remote::display_border::DisplayBorder::show(
+            &active_display,
+        )?)
+    } else {
+        None
+    };
+    let (sink, announcement) = stream_frames(Arc::clone(output), Arc::clone(ipc_failed));
+    let mut streamer = WindowsDesktopDuplicationStreamer::new();
+    let active = match streamer.start(start.config, active_display.id.0, sink) {
+        Ok(active) => active,
+        Err(error) => {
+            emit_child_event(output, ChildEvent::Error(error.to_string()))?;
+            return Ok(None);
+        }
+    };
+    announcement.announce(StartedDesktop {
+        format: active,
+        displays,
+        active_display: active_display.clone(),
+    })?;
+    Ok(Some(CaptureStream {
+        streamer,
+        border,
+        active_display,
+        display_id: start.display_id,
+        headless: start.headless,
+    }))
+}
+
+/// Frames a stream's encoder makes before its Started event is written.
+/// Few frames can be made in that moment; more are dropped.
+const MAX_FRAMES_BEFORE_STARTED: usize = 16;
+
+/// One stream's frames on their way to the parent. Its Started event goes
+/// first: what the encoder makes before the event is written waits for it.
+/// The parent can then tell the streams apart on the pipe, and the first
+/// frame after Started is the new encoder's keyframe.
+pub(super) struct StreamFrames<W> {
+    output: Arc<Mutex<W>>,
+    failed: Arc<AtomicBool>,
+    /// None once Started is written.
+    waiting: Mutex<Option<Vec<EncodedAccessUnit>>>,
+}
+
+impl<W: Write> StreamFrames<W> {
+    fn write(&self, event: &ChildEvent) {
+        let mut output = self
+            .output
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if write_event(&mut *output, event)
             .and_then(|()| output.flush())
             .is_err()
         {
-            failed.store(true, Ordering::Release);
+            self.failed.store(true, Ordering::Release);
         }
-    })
+    }
+
+    fn frame(&self, frame: EncodedAccessUnit) {
+        let mut waiting = self
+            .waiting
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match waiting.as_mut() {
+            Some(held) if held.len() < MAX_FRAMES_BEFORE_STARTED => held.push(frame),
+            Some(_) => tracing::warn!("dropped a video frame made before its stream started"),
+            None => self.write(&ChildEvent::Frame(frame)),
+        }
+    }
+}
+
+/// Writes a stream's Started event, then the frames waiting for it.
+pub(super) struct StreamAnnouncement<W>(Arc<StreamFrames<W>>);
+
+impl<W: Write> StreamAnnouncement<W> {
+    pub(super) fn announce(self, started: StartedDesktop) -> io::Result<()> {
+        let mut waiting = self
+            .0
+            .waiting
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let held = waiting.take().unwrap_or_default();
+        let mut output = self
+            .0
+            .output
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        write_event(&mut *output, &ChildEvent::Started(started))?;
+        for frame in held {
+            write_event(&mut *output, &ChildEvent::Frame(frame))?;
+        }
+        output.flush()
+    }
+}
+
+/// The sink for a new stream's frames, and what announces the stream. A
+/// failed write is recorded in `failed` so the capture loop can stop.
+pub(super) fn stream_frames<W: Write + Send + 'static>(
+    output: Arc<Mutex<W>>,
+    failed: Arc<AtomicBool>,
+) -> (EncodedFrameSink, StreamAnnouncement<W>) {
+    let frames = Arc::new(StreamFrames {
+        output,
+        failed,
+        waiting: Mutex::new(Some(Vec::new())),
+    });
+    let sink_frames = Arc::clone(&frames);
+    (
+        Arc::new(move |frame| sink_frames.frame(frame)),
+        StreamAnnouncement(frames),
+    )
+}
+
+/// What came of asking a stream to restart its encoder.
+enum EncoderRestart {
+    Restarted,
+    /// The Start asked for other capture, which starts over.
+    StartOver,
+    /// The new encoder did not start, and capture has stopped.
+    Failed(String),
 }
 
 /// How a capture stream ended.
 enum CaptureEnd {
     /// The parent sent new settings, so capture starts again with them.
-    Restart {
-        display_id: Option<DisplayId>,
-        headless: Option<HeadlessTarget>,
-        config: StreamConfig,
-    },
+    Restart(CaptureStart),
     /// The stream is over, with the error to report if it failed.
     Finished(Option<String>),
 }
@@ -237,10 +360,11 @@ enum CaptureEnd {
 /// streamer stops before the display border closes.
 struct CaptureStream {
     streamer: WindowsDesktopDuplicationStreamer,
-    ipc_failed: Arc<AtomicBool>,
-    output: ChildOutput,
     border: Option<crate::remote::display_border::DisplayBorder>,
     active_display: Display,
+    /// What the stream's Start asked to capture.
+    display_id: Option<DisplayId>,
+    headless: Option<HeadlessTarget>,
 }
 
 impl CaptureStream {
@@ -251,9 +375,11 @@ impl CaptureStream {
         command_rx: &mpsc::Receiver<io::Result<ParentCommand>>,
         border_enabled: &mut bool,
         background: bool,
+        output: &ChildOutput,
+        ipc_failed: &AtomicBool,
     ) -> anyhow::Result<CaptureEnd> {
         loop {
-            if self.ipc_failed.load(Ordering::Acquire) {
+            if ipc_failed.load(Ordering::Acquire) {
                 return Ok(CaptureEnd::Finished(None));
             }
             if let Some(result) = self.streamer.poll_ended() {
@@ -264,7 +390,7 @@ impl CaptureStream {
             match command_rx.recv_timeout(Duration::from_millis(16)) {
                 Ok(Ok(ParentCommand::SetDisplayBorder(enabled))) => {
                     *border_enabled = enabled && !background;
-                    self.set_border(*border_enabled)?;
+                    self.set_border(*border_enabled, output)?;
                 }
                 Ok(Ok(ParentCommand::SetCursorCapture(enabled))) => {
                     self.streamer.set_cursor_capture(enabled);
@@ -291,8 +417,7 @@ impl CaptureStream {
                     grayscale,
                     headless,
                 })) => {
-                    self.streamer.stop()?;
-                    return Ok(CaptureEnd::Restart {
+                    return Ok(CaptureEnd::Restart(CaptureStart {
                         display_id,
                         headless,
                         config: StreamConfig {
@@ -303,7 +428,7 @@ impl CaptureStream {
                             capture_cursor,
                             grayscale,
                         },
-                    });
+                    }));
                 }
                 Ok(Ok(
                     ParentCommand::EnumerateDisplays
@@ -341,13 +466,59 @@ impl CaptureStream {
         }
     }
 
-    fn set_border(&mut self, enabled: bool) -> io::Result<()> {
+    /// Restarts the encoder in place when `start` asks for the display this
+    /// stream captures, keeping its capture and border.
+    fn restart_encoder(
+        &mut self,
+        start: &CaptureStart,
+        output: &ChildOutput,
+        ipc_failed: &Arc<AtomicBool>,
+    ) -> io::Result<EncoderRestart> {
+        if start.display_id != self.display_id || start.headless != self.headless {
+            return Ok(EncoderRestart::StartOver);
+        }
+        // The display catalog the parent publishes stays current, and a
+        // display that moved or changed size starts capture over.
+        let displays = match enumerate_displays() {
+            Ok(displays) => displays,
+            Err(error) => {
+                tracing::warn!(
+                    error = format!("{error:#}"),
+                    "could not list displays for an encoder restart"
+                );
+                return Ok(EncoderRestart::StartOver);
+            }
+        };
+        if choose_display(&displays, start.display_id).as_ref() != Some(&self.active_display) {
+            return Ok(EncoderRestart::StartOver);
+        }
+        let begun = Instant::now();
+        let (sink, announcement) = stream_frames(Arc::clone(output), Arc::clone(ipc_failed));
+        match self.streamer.restart_encoder(start.config, sink) {
+            Ok(format) => {
+                tracing::info!(
+                    restart_ms = begun.elapsed().as_millis(),
+                    bits_per_second = format.bitrate_bits_per_second,
+                    "restarted the encoder on the running capture"
+                );
+                announcement.announce(StartedDesktop {
+                    format,
+                    displays,
+                    active_display: self.active_display.clone(),
+                })?;
+                Ok(EncoderRestart::Restarted)
+            }
+            Err(error) => Ok(EncoderRestart::Failed(error.to_string())),
+        }
+    }
+
+    fn set_border(&mut self, enabled: bool, output: &ChildOutput) -> io::Result<()> {
         self.border = None;
         if enabled {
             match crate::remote::display_border::DisplayBorder::show(&self.active_display) {
                 Ok(value) => self.border = Some(value),
                 Err(error) => emit_child_event(
-                    &self.output,
+                    output,
                     ChildEvent::MaintenanceError(format!("Display border: {error:#}")),
                 )?,
             }
