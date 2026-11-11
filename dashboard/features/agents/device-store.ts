@@ -19,7 +19,10 @@ export type Scheduler = (flush: () => void) => void;
 // added or removed, and `meta` loading and when anything last changed.
 export type Topic = "agents" | "ids" | "companies" | "tags" | "meta";
 
-export type DeviceCounts = { total: number; online: number };
+// `maintenance` counts the devices in maintenance now.
+export type DeviceCounts = { total: number; online: number; maintenance: number };
+
+const held = (agent: Agent | undefined) => Number(Boolean(agent?.maintenance?.current));
 
 // The devices by ID as they are now; a new lookup once any changed.
 export type DeviceLookup = { get(id: string): Agent | undefined };
@@ -97,7 +100,8 @@ export class DeviceStore {
   #order: readonly Agent[] = [];
   #moved = new Map<string, Agent | null>();
   #online = 0;
-  #counts: DeviceCounts = { total: 0, online: 0 };
+  #maintenance = 0;
+  #counts: DeviceCounts = { total: 0, online: 0, maintenance: 0 };
   #lookup: DeviceLookup | null = null;
   #companies: readonly Company[] = [];
   #tags: readonly Tag[] = [];
@@ -137,7 +141,11 @@ export class DeviceStore {
     this.#order = [...this.#agents.values()].sort(this.#compare);
     this.#moved = new Map();
     this.#online = 0;
-    for (const agent of this.#agents.values()) if (agent.connected) this.#online++;
+    this.#maintenance = 0;
+    for (const agent of this.#agents.values()) {
+      if (agent.connected) this.#online++;
+      this.#maintenance += held(agent);
+    }
     this.#companies = [...companies].sort(compareByName);
     this.#tags = [...tags].sort(compareByName);
     this.#loaded = true;
@@ -197,6 +205,7 @@ export class DeviceStore {
     this.#order = [];
     this.#moved = new Map();
     this.#online = 0;
+    this.#maintenance = 0;
     this.#companies = [];
     this.#tags = [];
     this.#loaded = false;
@@ -237,7 +246,9 @@ export class DeviceStore {
 
   counts(): DeviceCounts {
     const total = this.#agents.size;
-    if (this.#counts.total !== total || this.#counts.online !== this.#online) this.#counts = { total, online: this.#online };
+    if (this.#counts.total !== total || this.#counts.online !== this.#online || this.#counts.maintenance !== this.#maintenance) {
+      this.#counts = { total, online: this.#online, maintenance: this.#maintenance };
+    }
     return this.#counts;
   }
 
@@ -318,6 +329,7 @@ export class DeviceStore {
     if (!this.#moved.has(agent.id)) this.#moved.set(agent.id, previous ?? null);
     this.#agents.set(agent.id, agent);
     this.#online += Number(agent.connected) - Number(previous?.connected ?? false);
+    this.#maintenance += held(agent) - held(previous);
     if (!agent.connected) this.#dropReading(agent.id);
     if (this.#deviceListeners.has(agent.id)) this.#changedDevices.add(agent.id);
     if (previous) this.#changed("agents");
@@ -330,6 +342,7 @@ export class DeviceStore {
     if (!this.#moved.has(id)) this.#moved.set(id, previous);
     this.#agents.delete(id);
     if (previous.connected) this.#online--;
+    this.#maintenance -= held(previous);
     this.#dropReading(id);
     if (this.#deviceListeners.has(id)) this.#changedDevices.add(id);
     this.#changed("agents", "ids");

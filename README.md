@@ -52,7 +52,8 @@ MeshRMM is in heavy development and not production ready.
   tagged devices or every device, skip devices without the script's interpreter, wait for
   offline ones, and show each device's result and output live.
 - Automation policies that run shared scripts, scan for and install
-  updates, install and update applications, or wake offline devices, every few minutes or hours, daily or weekly at a time in any time
+  updates, install and update applications, wake offline devices, or put
+  devices in maintenance, every few minutes or hours, daily or weekly at a time in any time
   zone, once, or on each newly enrolled device, and notify when their jobs
   fail.
 - Patch management: Agents scan for pending Windows Update, macOS Software
@@ -111,6 +112,13 @@ MeshRMM is in heavy development and not production ready.
   policy before a patch window. Online Agents on the same network send the
   magic packet, and the website shows which ones did and when the device
   came online.
+- Maintenance windows: put devices in maintenance now or later, until a
+  time or until someone ends it, from the device wall, a device's page,
+  whole companies or tagged devices, or on a schedule with a policy. Their
+  alerts, notifications and self-healing are held back, and scheduled
+  automation skips them and says so, while people's own sessions, terminals
+  and jobs run as usual; an update install can put each device in
+  maintenance for as long as it takes.
 - Enrollment with a single-use installer (Windows) or install command
   (macOS and Linux). Agents and viewers update themselves from the server and
   check a release signature first.
@@ -227,6 +235,8 @@ For developers:
   device list, resource monitoring, updates and removal
 - [Wake-on-LAN](docs/wake-on-lan.md): waking offline devices through online
   ones on their network, and what the sleeping computer needs
+- [Maintenance windows](docs/maintenance-windows.md): putting devices in
+  maintenance, what it holds back and what happens when it starts and ends
 - [Remote sessions](docs/remote-sessions.md): what the viewer does and how
   each feature behaves
 - [Video](docs/video.md): capture, encoding, negotiation and presentation

@@ -93,7 +93,7 @@ test("keeps the list in the order sorting it from scratch gives, through random 
         const expected = sortAgents([...model.values()]);
         assert.deepEqual(devices.agents(), expected, `seed ${seed}, step ${step}`);
         const online = expected.filter((agent) => agent.connected).length;
-        assert.deepEqual(devices.counts(), { total: expected.length, online }, `seed ${seed}, step ${step}`);
+        assert.deepEqual(devices.counts(), { total: expected.length, online, maintenance: 0 }, `seed ${seed}, step ${step}`);
       }
       if (random() < 0.1) clock.run();
     }
@@ -106,7 +106,7 @@ test("a snapshot is sorted in the browser's order, not the server's", () => {
   const agents = [device("1", "Zulu", true), device("2", "_build", true), device("3", "Ébène", true), device("4", "zebra", false)];
   devices.replace({ agents, ...empty });
   assert.deepEqual(devices.agents(), sortAgents(agents));
-  assert.deepEqual(devices.counts(), { total: 4, online: 3 });
+  assert.deepEqual(devices.counts(), { total: 4, online: 3, maintenance: 0 });
 });
 
 test("a snapshot already in the list's order costs one comparison a device; one out of order is still sorted", () => {
@@ -134,7 +134,7 @@ test("a snapshot replaces everything", () => {
   devices.replace({ agents: [device("b", "B", false), device("c", "C", true)], companies: [], tags: [] });
   assert.deepEqual(devices.agents().map((agent) => agent.id), ["c", "b"]);
   assert.equal(devices.get("a"), undefined);
-  assert.deepEqual(devices.counts(), { total: 2, online: 1 });
+  assert.deepEqual(devices.counts(), { total: 2, online: 1, maintenance: 0 });
   assert.deepEqual(devices.companies(), []);
   assert.deepEqual(devices.tags(), []);
   assert.equal(devices.reading("a"), undefined, "a device gone takes its reading");
@@ -174,7 +174,7 @@ test("ten thousand changes in one frame notify once and cost a merge, not a sort
   // where re-sorting the list on each change would be ten thousand times that.
   assert.ok(counter.comparisons < count * 20, `${counter.comparisons} comparisons`);
   assert.equal(devices.agents(), list, "reading again does no work");
-  assert.deepEqual(devices.counts(), { total: count, online: count });
+  assert.deepEqual(devices.counts(), { total: count, online: count, maintenance: 0 });
 });
 
 test("one change moves one device", () => {
@@ -187,7 +187,7 @@ test("one change moves one device", () => {
   const list = devices.agents();
   assert.ok(counter.comparisons < 50, `${counter.comparisons} comparisons`);
   assert.deepEqual(list, sortAgents(list));
-  assert.deepEqual(devices.counts(), { total: 10_000, online: 5_001 });
+  assert.deepEqual(devices.counts(), { total: 10_000, online: 5_001, maintenance: 0 });
 });
 
 const reading = (id, cpu) => ({
@@ -346,7 +346,7 @@ test("clearing empties the store and tells every subscriber", () => {
   assert.equal(devices.loaded(), false);
   assert.equal(devices.lastUpdated(), null);
   assert.deepEqual(devices.agents(), []);
-  assert.deepEqual(devices.counts(), { total: 0, online: 0 });
+  assert.deepEqual(devices.counts(), { total: 0, online: 0, maintenance: 0 });
   assert.equal(devices.reading("a"), undefined);
 });
 

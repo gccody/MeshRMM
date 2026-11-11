@@ -807,23 +807,56 @@ async fn take_results(
         .map(|(_, monitor_state)| monitor_state.clone())
         .collect::<Vec<_>>();
     store::upsert(&mut database, &states).await?;
-    let rule_ids = judged
-        .iter()
-        .map(|(rule, _)| rule.id.as_str())
-        .collect::<Vec<_>>();
-    let mut open = alert_store::unresolved_of_rules(&mut database, device_id, &rule_ids)
-        .await?
-        .into_iter()
-        .map(|alert| (alert.rule_id.clone(), alert))
-        .collect::<HashMap<_, _>>();
-    for (rule, monitor_state) in &judged {
-        judge(state, rule, monitor_state, open.remove(&rule.id), now).await?;
+    // A device in maintenance keeps its results, which are judged when it
+    // leaves.
+    if !state.maintenance_windows.in_maintenance(device_id, now) {
+        judge_all(state, device_id, &judged, now).await?;
     }
     state.alerts.publish(AlertEvent::MonitorUpdate {
         device_id: device_id.to_owned(),
         states,
     });
     Ok(())
+}
+
+/// Judges the device's monitor results together, against one read of its
+/// unresolved alerts of their rules.
+async fn judge_all(
+    state: &AppState,
+    device_id: &str,
+    judged: &[(&Rule, MonitorState)],
+    now: i64,
+) -> anyhow::Result<()> {
+    let rule_ids = judged
+        .iter()
+        .map(|(rule, _)| rule.id.as_str())
+        .collect::<Vec<_>>();
+    let mut open = alert_store::unresolved_of_rules(&mut &state.database, device_id, &rule_ids)
+        .await?
+        .into_iter()
+        .map(|alert| (alert.rule_id.clone(), alert))
+        .collect::<HashMap<_, _>>();
+    for (rule, monitor_state) in judged {
+        judge(state, rule, monitor_state, open.remove(&rule.id), now).await?;
+    }
+    Ok(())
+}
+
+/// The device left maintenance: judges its monitors' latest results, which
+/// weren't judged while it was in maintenance, so a check still failing
+/// raises its alert now and one passing resolves it.
+pub async fn maintenance_ended(state: &AppState, device_id: &str, now: i64) -> anyhow::Result<()> {
+    let mut database = &state.database;
+    let rules = state.monitors.rules(&mut database).await?;
+    let judged = store::for_device(&mut database, device_id)
+        .await?
+        .into_iter()
+        .filter_map(|result| Some((rules.rule(&result.rule_id)?, result)))
+        .collect::<Vec<_>>();
+    if judged.is_empty() {
+        return Ok(());
+    }
+    judge_all(state, device_id, &judged, now).await
 }
 
 /// Raises the rule's alert once enough checks in a row failed, keeps its
@@ -1020,6 +1053,7 @@ mod tests {
                 notes_revision: 0,
                 created_at: 0,
                 system: None,
+                maintenance: None,
             },
         }))
     }

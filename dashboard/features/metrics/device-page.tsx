@@ -16,6 +16,7 @@ import { filesPagePath } from "../files/model";
 import { DeviceUpdates } from "../updates/device-updates";
 import { DeviceApplications } from "../applications/device-applications";
 import { DeviceWake } from "../wake/device-wake";
+import { DeviceMaintenance } from "../maintenance/device-maintenance";
 import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
 import { timeFormat } from "../../lib/format";
@@ -178,6 +179,7 @@ export function DevicePage() {
             </span>
           )}
         </div>
+        {agent && <DeviceMaintenance key={agent.id} agent={agent} />}
         {agent && <DeviceWake key={agent.id} agent={agent} />}
         {agent && <DeviceNotes key={agent.id} agent={agent} />}
 

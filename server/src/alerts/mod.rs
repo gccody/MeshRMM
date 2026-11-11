@@ -176,6 +176,12 @@ impl Engine {
         self.inner.serializations.count()
     }
 
+    /// Judges the rules at once, such as when devices leave maintenance and
+    /// their conditions that still hold are to raise their alerts.
+    pub fn judge_now(&self) {
+        self.inner.now.notify_one();
+    }
+
     /// Judges the rules soon, with whatever else is waiting, such as after a
     /// self-healing attempt finished.
     pub fn wake(&self) {
@@ -401,6 +407,12 @@ pub async fn evaluate(state: &AppState, now: i64) -> anyhow::Result<()> {
         HashSet::new()
     };
 
+    // The devices in maintenance, whose rules aren't judged.
+    let in_maintenance = devices
+        .iter()
+        .filter(|device| state.maintenance_windows.in_maintenance(&device.id, now))
+        .map(|device| device.id.as_str())
+        .collect::<HashSet<_>>();
     // Which rule and device pairs have a verdict, and the alerts it wants.
     let mut judged = HashSet::new();
     let mut wanted = Vec::new();
@@ -417,7 +429,9 @@ pub async fn evaluate(state: &AppState, now: i64) -> anyhow::Result<()> {
             .filter(|rule| rule.enabled && rule.condition.clears_itself())
         {
             for covered in &devices {
-                if !rule.covers(covered) {
+                // A device in maintenance isn't judged: its alerts stay as
+                // they are until it leaves.
+                if !rule.covers(covered) || in_maintenance.contains(covered.id.as_str()) {
                     continue;
                 }
                 let device_id = &covered.id;
@@ -886,6 +900,12 @@ async fn check_run(state: &AppState, run_id: &str, now: i64) -> anyhow::Result<(
     let Some((value, detail, by_exit_code)) = run_failure(&run) else {
         return Ok(());
     };
+    if state
+        .maintenance_windows
+        .in_maintenance(&run.device_id, now)
+    {
+        return Ok(());
+    }
     let Some(device) = crate::targets::device(&mut database, &run.device_id).await? else {
         return Ok(());
     };
@@ -986,6 +1006,13 @@ async fn check_install(state: &AppState, run_id: &str, now: i64) -> anyhow::Resu
     let Some(detail) = install_failure(&install) else {
         return Ok(());
     };
+    // The window that covers this install doesn't hold its own result.
+    if state
+        .maintenance_windows
+        .holds_alerts_besides_install(&install.device_id, run_id, now)
+    {
+        return Ok(());
+    }
     let Some(device) = crate::targets::device(&mut database, &install.device_id).await? else {
         return Ok(());
     };

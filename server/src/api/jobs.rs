@@ -57,6 +57,9 @@ pub struct UpdatesJob {
     reboot: Option<RebootBehavior>,
     #[serde(default)]
     reboot_delay_minutes: Option<u32>,
+    /// Puts each device in maintenance while it installs.
+    #[serde(default)]
+    maintenance: bool,
 }
 
 /// A job as the website starts it: a script and the account it runs as, or
@@ -166,6 +169,9 @@ pub async fn start(
             }
             UpdatesAction::Install => {
                 actor.require(Permission::UpdatesInstall)?;
+                if updates.maintenance {
+                    actor.require(Permission::DevicesMaintenance)?;
+                }
                 let reboot_delay_minutes = updates
                     .reboot_delay_minutes
                     .unwrap_or(crate::automation::policies::DEFAULT_REBOOT_DELAY_MINUTES);
@@ -183,6 +189,7 @@ pub async fn start(
                         .reboot
                         .ok_or_else(|| jobs::invalid("choose when the computers restart"))?,
                     reboot_delay_minutes,
+                    maintenance: updates.maintenance,
                 }
             }
         },
@@ -242,6 +249,8 @@ pub async fn start(
             requested_by_user_id: user.user_id.clone(),
             policy: None,
             actor: user.actor.clone(),
+            // A person started it: devices in maintenance run it too.
+            scheduled: None,
         },
     )
     .await?;

@@ -19,8 +19,8 @@ use crate::{
         tables::{
             AgentInstallTokens, Agents, Alerts, ApiTokens, DeploymentTokenEnrollments,
             DeploymentTokens, DeviceApplicationChanges, DeviceMetrics, FileDeliveries, Invitations,
-            JobDevices, Jobs, PasswordResets, RemoteHandoffs, RemoteSessions, Reports, ScriptRuns,
-            ToolboxFiles, UpdateRuns, UserSessions, WakeRequests,
+            JobDevices, Jobs, MaintenanceWindows, PasswordResets, RemoteHandoffs, RemoteSessions,
+            Reports, ScriptRuns, ToolboxFiles, UpdateRuns, UserSessions, WakeRequests,
         },
     },
     realtime::metrics::HISTORY_MS,
@@ -104,8 +104,10 @@ pub fn spawn(database: Database, storage: Storage) -> tokio::task::JoinHandle<()
 /// than [`CHANGES_RETENTION_MS`], and jobs (with their devices) and wake
 /// requests (with their relays) older than [`TOOLBOX_HISTORY_MS`], and scans
 /// older than [`crate::updates::SCAN_HISTORY_MS`] and installs (with their
-/// items) older than [`crate::updates::INSTALL_HISTORY_MS`], and generated
-/// reports past their `expires_at` ([`crate::reports::RETENTION_MS`]).
+/// items) older than [`crate::updates::INSTALL_HISTORY_MS`], maintenance
+/// windows that ended more than [`crate::maintenance_windows::RETENTION_MS`]
+/// ago, and generated reports past their `expires_at`
+/// ([`crate::reports::RETENTION_MS`]).
 ///
 /// Each table is purged in batches of [`BATCH_ROWS`]. A table that fails is
 /// logged and left for the next run, and the purge goes on to the next.
@@ -149,7 +151,7 @@ pub fn batch_statements(now_ms: i64) -> Vec<(String, DeleteStatement)> {
 
 /// Every table's due rows, in groups purged in order; a failure skips the
 /// rest of its group.
-fn due(now_ms: i64, batch_rows: u64) -> [Vec<Due>; 17] {
+fn due(now_ms: i64, batch_rows: u64) -> [Vec<Due>; 18] {
     let expired = now_ms - EXPIRED_GRACE_MS;
     let history = now_ms - TOOLBOX_HISTORY_MS;
     // Script runs hold up to a megabyte of output each, and installs have
@@ -311,6 +313,14 @@ fn due(now_ms: i64, batch_rows: u64) -> [Vec<Due>; 17] {
             Reports::Id,
             Reports::ExpiresAt,
             now_ms,
+            batch_rows,
+        )],
+        // Windows that last until someone ends them have no end to age.
+        vec![Due::before(
+            MaintenanceWindows::Table,
+            MaintenanceWindows::Id,
+            MaintenanceWindows::EndsAt,
+            now_ms - crate::maintenance_windows::RETENTION_MS,
             batch_rows,
         )],
     ]

@@ -93,6 +93,7 @@ pub async fn delete(
     }
     crate::alerts::device_removed(&state, &id).await;
     crate::automation::device_removed(&state, &id).await;
+    crate::maintenance_windows::device_removed(&state, &id).await;
     crate::updates::device_removed(&state, &id).await;
     crate::applications::device_removed(&state, &id).await;
     // An offline Agent is told to uninstall when it next connects. One too

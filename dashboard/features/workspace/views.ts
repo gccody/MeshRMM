@@ -3,13 +3,14 @@
 // Imports carry the .ts extension so node:test can load this module directly.
 import { type Account, type Permission, canAny } from "../auth/types.ts";
 
-export type View = "devices" | "device" | "companies" | "tags" | "deployment" | "software" | "updates" | "applications" | "toolbox" | "alerts" | "alert-rules" | "reports" | "notification-channels" | "users" | "roles" | "authentication" | "settings" | "audit" | "account" | "jobs" | "job" | "policies" | "terminal" | "files";
+export type View = "devices" | "device" | "companies" | "tags" | "maintenance" | "deployment" | "software" | "updates" | "applications" | "toolbox" | "alerts" | "alert-rules" | "reports" | "notification-channels" | "users" | "roles" | "authentication" | "settings" | "audit" | "account" | "jobs" | "job" | "policies" | "terminal" | "files";
 
 export const VIEW_PATHS: Record<View, string> = {
   devices: "/",
   device: "/device",
   companies: "/companies",
   tags: "/tags",
+  maintenance: "/maintenance",
   deployment: "/deployment",
   software: "/software",
   updates: "/updates",
@@ -40,6 +41,7 @@ export const VIEW_COPY: Record<View, { title: string }> = {
   device: { title: "Device" },
   companies: { title: "Companies" },
   tags: { title: "Tags" },
+  maintenance: { title: "Maintenance" },
   deployment: { title: "Deployment tokens" },
   software: { title: "Software" },
   updates: { title: "Updates" },
@@ -72,6 +74,7 @@ const VIEW_ACCESS: Record<View, readonly Permission[]> = {
   device: ["devices.view"],
   companies: ["devices.view"],
   tags: ["devices.view"],
+  maintenance: ["devices.view"],
   deployment: ["devices.enroll"],
   software: ["devices.view"],
   updates: ["updates.view"],
@@ -110,11 +113,11 @@ export function homeView(account: Pick<Account, "permissions" | "is_administrato
 }
 
 // The navigation entry a page sits under: a device, its terminals and files under
-// Devices, tags and deployment tokens under Companies, the alert rules and channels under Alerts,
+// Devices, tags, maintenance and deployment tokens under Companies, the alert rules and channels under Alerts,
 // and a job and the policies under Jobs.
 export function navViewFor(view: View): View {
   if (view === "device" || view === "terminal" || view === "files") return "devices";
-  if (view === "tags" || view === "deployment") return "companies";
+  if (view === "tags" || view === "maintenance" || view === "deployment") return "companies";
   if (view === "job" || view === "policies") return "jobs";
   if (view === "alert-rules" || view === "notification-channels") return "alerts";
   return view;

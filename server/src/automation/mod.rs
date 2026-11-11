@@ -813,6 +813,8 @@ mod tests {
             categories: None,
             reboot: None,
             reboot_delay_minutes: None,
+            maintenance_during_install: None,
+            scheduled: true,
             target: TargetKind::All,
             target_label: "All devices".into(),
             offline: Offline::Skip,

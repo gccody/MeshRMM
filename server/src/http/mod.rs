@@ -68,6 +68,8 @@ pub struct AppState {
     pub updates: crate::updates::Engine,
     pub wake: crate::wake::Engine,
     pub reports: crate::reports::Engine,
+    /// The maintenance windows not over yet.
+    pub maintenance_windows: crate::maintenance_windows::MaintenanceWindows,
     pub sessions: Sessions,
     pub terminals: crate::terminals::Terminals,
     pub files: crate::files::Files,

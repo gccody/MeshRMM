@@ -174,11 +174,13 @@ pub enum Payload {
         destination: FileDeliveryDestination,
     },
     UpdateScan,
-    /// Installs the pending updates in `categories`, or every one.
+    /// Installs the pending updates in `categories`, or every one; with
+    /// `maintenance`, each device is in maintenance while it installs.
     UpdateInstall {
         categories: Vec<UpdateCategory>,
         reboot: RebootBehavior,
         reboot_delay_minutes: u32,
+        maintenance: bool,
     },
     /// Wakes the devices that are offline.
     Wake,
@@ -696,6 +698,12 @@ pub struct Job {
     pub reboot: Option<RebootBehavior>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reboot_delay_minutes: Option<i64>,
+    /// An install's devices are each in maintenance while they install.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maintenance_during_install: Option<bool>,
+    /// A policy's schedule or a device's enrollment started it, not a
+    /// person: devices in maintenance are skipped.
+    pub scheduled: bool,
     pub target: TargetKind,
     pub target_label: String,
     pub offline: Offline,
@@ -816,6 +824,16 @@ pub struct NewJob {
     pub policy: Option<(String, String)>,
     /// Recorded in the audit log as starting it.
     pub actor: Actor,
+    /// Set for a job a policy's schedule or a device's enrollment starts,
+    /// rather than a person: its devices in maintenance are skipped.
+    pub scheduled: Option<Scheduled>,
+}
+
+/// How a scheduled job sees maintenance windows when it is planned.
+#[derive(Debug, Clone)]
+pub struct Scheduled {
+    pub windows: crate::maintenance_windows::MaintenanceWindows,
+    pub at: i64,
 }
 
 /// A created job, before the dispatcher starts anything: its creation ended.
@@ -1060,6 +1078,7 @@ struct Columns<'a> {
     categories: Option<&'a [UpdateCategory]>,
     reboot: Option<&'a str>,
     reboot_delay_minutes: Option<i64>,
+    maintenance_during_install: bool,
 }
 
 impl<'a> Columns<'a> {
@@ -1086,10 +1105,12 @@ impl<'a> Columns<'a> {
                 categories,
                 reboot,
                 reboot_delay_minutes,
+                maintenance,
             } => Self {
                 categories: Some(categories.as_slice()),
                 reboot: Some(reboot.as_str()),
                 reboot_delay_minutes: Some(i64::from(*reboot_delay_minutes)),
+                maintenance_during_install: *maintenance,
                 ..Self::default()
             },
             Payload::UpdateScan | Payload::Wake | Payload::Applications(_) => Self::default(),
@@ -1181,6 +1202,8 @@ pub async fn draft<'a>(
                     Jobs::RequestedByUserId,
                     Jobs::PolicyId,
                     Jobs::PolicyName,
+                    Jobs::Scheduled,
+                    Jobs::MaintenanceDuringInstall,
                     Jobs::CreatedAt,
                     Jobs::Creating,
                 ])
@@ -1204,6 +1227,8 @@ pub async fn draft<'a>(
                     job.requested_by_user_id.as_str().into(),
                     job.policy.as_ref().map(|(id, _)| id.as_str()).into(),
                     job.policy.as_ref().map(|(_, name)| name.as_str()).into(),
+                    job.scheduled.is_some().into(),
+                    columns.maintenance_during_install.into(),
                     now.into(),
                     true.into(),
                 ])
@@ -1548,6 +1573,14 @@ fn initial_state(
     device: Device<'_>,
     connected: &Connected<'_>,
 ) -> (DeviceState, Option<String>) {
+    if let Some(scheduled) = &job.scheduled
+        && let Some(reason) =
+            scheduled
+                .windows
+                .skip_reason(device.id, job.payload.kind(), scheduled.at)
+    {
+        return (DeviceState::Skipped, Some(reason));
+    }
     if job.payload == Payload::Wake {
         return if connected.contains(device.id) {
             (
@@ -1587,6 +1620,8 @@ struct JobRow {
     update_categories: Option<String>,
     reboot: Option<String>,
     reboot_delay_minutes: Option<i64>,
+    maintenance_during_install: bool,
+    scheduled: bool,
     target: String,
     target_label: String,
     offline: String,
@@ -1619,6 +1654,8 @@ fn job_select() -> sea_query::SelectStatement {
             (Jobs::Table, Jobs::UpdateCategories),
             (Jobs::Table, Jobs::Reboot),
             (Jobs::Table, Jobs::RebootDelayMinutes),
+            (Jobs::Table, Jobs::MaintenanceDuringInstall),
+            (Jobs::Table, Jobs::Scheduled),
             (Jobs::Table, Jobs::Target),
             (Jobs::Table, Jobs::TargetLabel),
             (Jobs::Table, Jobs::Offline),
@@ -1669,6 +1706,9 @@ impl JobRow {
                 .then(|| Install::parse_categories(self.update_categories.as_deref())),
             reboot: self.reboot.as_deref().and_then(RebootBehavior::parse),
             reboot_delay_minutes: self.reboot_delay_minutes,
+            maintenance_during_install: (kind == Kind::UpdateInstall)
+                .then_some(self.maintenance_during_install),
+            scheduled: self.scheduled,
             target,
             offline,
             item_id: self.item_id,
