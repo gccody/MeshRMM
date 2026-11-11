@@ -163,9 +163,14 @@ fn api_token_routes() -> Router<AppState> {
 fn administration_routes() -> Router<AppState> {
     Router::new()
         .route("/users", get(users::list))
+        // Enabling a user or changing their roles outlasts the token that did
+        // it, and so does deleting a user whom SSO then creates again,
+        // enabled. Tokens may read users and sign them out.
         .route(
             "/users/{id}",
-            get(users::get).patch(users::update).delete(users::delete),
+            get(users::get).merge(website_only_route(
+                patch(users::update).delete(users::delete),
+            )),
         )
         .route(
             "/users/{id}/reset-two-factor",
@@ -195,8 +200,15 @@ fn administration_routes() -> Router<AppState> {
             "/invitations/{id}/renew",
             website_only_route(post(invitations::renew)),
         )
-        .route("/roles", get(roles::list).post(roles::create))
-        .route("/roles/{id}", patch(roles::update).delete(roles::delete))
+        // What a role grants, its members keep; tokens may read roles.
+        .route(
+            "/roles",
+            get(roles::list).merge(website_only_route(post(roles::create))),
+        )
+        .route(
+            "/roles/{id}",
+            website_only_route(patch(roles::update).delete(roles::delete)),
+        )
         .route("/permissions", get(roles::permissions))
         .route("/settings", get(settings::get).patch(settings::update))
         .route(
@@ -496,8 +508,8 @@ fn remote_routes() -> Router<AppState> {
 /// Routes only the website may use, whatever the token's permissions:
 /// signing in and the account's own security, anything that makes
 /// credentials or changes how people sign in (invitations, email, which
-/// carries the sign-in links, and SSO links included), and the website's
-/// sockets and remote session starts. So a leaked token can't make itself
+/// carries the sign-in links, and SSO links included), changing users and
+/// roles, and the website's sockets and remote session starts. So a leaked token can't make itself
 /// more tokens or take over an account, and revoking it is enough.
 async fn website_only(request: axum::extract::Request, next: middleware::Next) -> Response {
     if crate::api_tokens::bearer(request.headers()).is_some() {
