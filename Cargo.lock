@@ -3060,6 +3060,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "block2",
  "dispatch2",
  "libc",
  "meshrmm-protocol",

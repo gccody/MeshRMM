@@ -71,7 +71,8 @@ enum Kind {
 
 /// Asks with the desktop's own file chooser. Neither zenity nor kdialog picks
 /// files and folders in one dialog, so the user first chooses which to send.
-pub fn pick() -> anyhow::Result<Vec<PathBuf>> {
+/// The dialogs are child processes, which `cancel` ends.
+pub fn pick(cancel: &crate::PickCancel) -> anyhow::Result<Vec<PathBuf>> {
     let kde = std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|desktop| desktop.contains("KDE"));
     let order = if kde {
         [Dialogs::Kdialog, Dialogs::Zenity]
@@ -79,7 +80,7 @@ pub fn pick() -> anyhow::Result<Vec<PathBuf>> {
         [Dialogs::Zenity, Dialogs::Kdialog]
     };
     for dialogs in order {
-        let choice = match ask_kind(dialogs) {
+        let choice = match ask_kind(dialogs, cancel) {
             Ok(choice) => choice,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error).context("could not show the file chooser"),
@@ -87,7 +88,11 @@ pub fn pick() -> anyhow::Result<Vec<PathBuf>> {
         let Some(kind) = choice else {
             return Ok(Vec::new());
         };
-        let output = choose(dialogs, kind).context("could not show the file chooser")?;
+        let Some(output) =
+            run_dialog(choose(dialogs, kind), cancel).context("could not show the file chooser")?
+        else {
+            return Ok(Vec::new());
+        };
         // Both exit with 1 when the user cancels.
         return Ok(String::from_utf8_lossy(&output.stdout)
             .lines()
@@ -98,23 +103,64 @@ pub fn pick() -> anyhow::Result<Vec<PathBuf>> {
     bail!("this desktop has no file chooser the Agent can show (zenity or kdialog)")
 }
 
+/// Runs a dialog and collects what it prints; `None` once `cancel` ended it.
+fn run_dialog(
+    mut command: std::process::Command,
+    cancel: &crate::PickCancel,
+) -> std::io::Result<Option<std::process::Output>> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = child.id() as libc::pid_t;
+    // SAFETY: kill only signals; the child is not waited for until `closed`
+    // returns, after which this no longer runs, so `pid` is still the child's.
+    let open = cancel.closes_with(move || unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    });
+    if !open {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(None);
+    }
+    let mut stdout = Vec::new();
+    let read = child
+        .stdout
+        .take()
+        .expect("stdout is piped")
+        .read_to_end(&mut stdout);
+    cancel.closed();
+    let status = child.wait()?;
+    read?;
+    Ok((!cancel.is_cancelled()).then_some(std::process::Output {
+        status,
+        stdout,
+        stderr: Vec::new(),
+    }))
+}
+
 /// Asks whether to send files or a folder; `None` when the user cancels.
-fn ask_kind(dialogs: Dialogs) -> std::io::Result<Option<Kind>> {
+fn ask_kind(dialogs: Dialogs, cancel: &crate::PickCancel) -> std::io::Result<Option<Kind>> {
     const QUESTION: &str = "Send files, or a whole folder?";
     match dialogs {
         Dialogs::Zenity => {
             // The extra button prints its label and exits with 1, as Cancel
             // does without printing anything.
-            let output = std::process::Command::new("zenity")
-                .args([
-                    "--question",
-                    "--title=Send files",
-                    &format!("--text={QUESTION}"),
-                    "--ok-label=Files",
-                    "--extra-button=Folder",
-                    "--cancel-label=Cancel",
-                ])
-                .output()?;
+            let mut command = std::process::Command::new("zenity");
+            command.args([
+                "--question",
+                "--title=Send files",
+                &format!("--text={QUESTION}"),
+                "--ok-label=Files",
+                "--extra-button=Folder",
+                "--cancel-label=Cancel",
+            ]);
+            let Some(output) = run_dialog(command, cancel)? else {
+                return Ok(None);
+            };
             Ok(if output.status.success() {
                 Some(Kind::Files)
             } else if String::from_utf8_lossy(&output.stdout).trim() == "Folder" {
@@ -124,19 +170,21 @@ fn ask_kind(dialogs: Dialogs) -> std::io::Result<Option<Kind>> {
             })
         }
         Dialogs::Kdialog => {
-            let status = std::process::Command::new("kdialog")
-                .args([
-                    "--title",
-                    "Send files",
-                    "--yes-label",
-                    "Files",
-                    "--no-label",
-                    "Folder",
-                    "--yesnocancel",
-                    QUESTION,
-                ])
-                .status()?;
-            Ok(match status.code() {
+            let mut command = std::process::Command::new("kdialog");
+            command.args([
+                "--title",
+                "Send files",
+                "--yes-label",
+                "Files",
+                "--no-label",
+                "Folder",
+                "--yesnocancel",
+                QUESTION,
+            ]);
+            let Some(output) = run_dialog(command, cancel)? else {
+                return Ok(None);
+            };
+            Ok(match output.status.code() {
                 Some(0) => Some(Kind::Files),
                 Some(1) => Some(Kind::Folders),
                 _ => None,
@@ -145,8 +193,8 @@ fn ask_kind(dialogs: Dialogs) -> std::io::Result<Option<Kind>> {
     }
 }
 
-/// Shows the chooser for `kind`; its output lists the paths, one per line.
-fn choose(dialogs: Dialogs, kind: Kind) -> std::io::Result<std::process::Output> {
+/// The chooser for `kind`; its output lists the paths, one per line.
+fn choose(dialogs: Dialogs, kind: Kind) -> std::process::Command {
     let mut command = match dialogs {
         Dialogs::Zenity => std::process::Command::new("zenity"),
         Dialogs::Kdialog => std::process::Command::new("kdialog"),
@@ -178,7 +226,7 @@ fn choose(dialogs: Dialogs, kind: Kind) -> std::io::Result<std::process::Output>
             command.args(["--getexistingdirectory", ".", "--title", "Send a folder"])
         }
     };
-    command.output()
+    command
 }
 
 /// Counts the clipboard's changes, which the display server announces:
@@ -625,15 +673,6 @@ pub fn set_clipboard_files(paths: &[PathBuf]) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn drop_files(
-    _: &[PathBuf],
-    _: meshrmm_protocol::DisplayId,
-    _: u16,
-    _: u16,
-) -> anyhow::Result<bool> {
-    Ok(false)
-}
-
 fn c_path(path: &Path) -> std::io::Result<std::ffi::CString> {
     use std::os::unix::ffi::OsStrExt;
     Ok(std::ffi::CString::new(path.as_os_str().as_bytes())?)
@@ -893,5 +932,36 @@ mod tests {
         rename_no_replace(&from, &to).unwrap();
         assert_eq!(std::fs::read_to_string(&to).unwrap(), "a");
         std::fs::remove_dir_all(folder).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod pick_tests {
+    use super::*;
+
+    /// A dialog that is open when the pick is cancelled ends at once.
+    #[test]
+    fn cancelling_ends_an_open_dialog() {
+        let cancel = crate::PickCancel::default();
+        let dialog = {
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                let mut command = std::process::Command::new("sleep");
+                command.arg("600");
+                run_dialog(command, &cancel)
+            })
+        };
+        cancel.wait_until_open();
+        cancel.cancel();
+        assert!(dialog.join().unwrap().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_cancelled_pick_opens_no_dialog() {
+        let cancel = crate::PickCancel::default();
+        cancel.cancel();
+        let mut command = std::process::Command::new("sleep");
+        command.arg("600");
+        assert!(run_dialog(command, &cancel).unwrap().is_none());
     }
 }
