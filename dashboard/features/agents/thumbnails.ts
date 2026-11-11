@@ -9,6 +9,8 @@ export const RECENT_THUMBNAILS = 120;
 // At most this many images load at once. Browsers open six connections to a
 // server over HTTP/1.1; this leaves two for the rest of the website.
 export const THUMBNAIL_REQUESTS = 4;
+// A load that failed is tried again this long after.
+export const RETRY_DELAY_MS = 60_000;
 
 export type Thumbnail = {
   url: string;
@@ -30,6 +32,8 @@ type Entry = {
   stale: boolean;
   // The last load failed, and may work if tried again.
   failed: boolean;
+  // Tries it again, while a row shows the device.
+  retry: ReturnType<typeof setTimeout> | undefined;
   load: Load | null;
   listeners: Set<() => void>;
 };
@@ -38,6 +42,8 @@ type Options = {
   fetch: AuthorizedFetch;
   createUrl?: (blob: Blob) => string;
   revokeUrl?: (url: string) => void;
+  // Whether the page is in front.
+  visible?: () => boolean;
 };
 
 // The latest screen image of each device, shared by every row that shows it.
@@ -47,9 +53,11 @@ type Options = {
 // polled. What the socket may not have said, for a device it was not
 // watching, as before it reconnected or while the tab was hidden, is
 // checked when it starts watching it (`revalidate`). Images are revalidated
-// with their ETag, so an unchanged one is not downloaded again. Only visible
-// rows ask for them: a device no row shows any more stops loading, and only
-// the most recently shown keep their image.
+// with their ETag, so an unchanged one is not downloaded again. A load that
+// failed, whoever started it, is tried again a while later while a row
+// shows the device and the page is in front. Only visible rows ask for
+// them: a device no row shows any more stops loading, and only the most
+// recently shown keep their image.
 export class ThumbnailStore {
   #entries = new Map<string, Entry>();
   // The devices no row shows, the longest hidden first.
@@ -61,17 +69,19 @@ export class ThumbnailStore {
   #fetch: AuthorizedFetch;
   #createUrl: (blob: Blob) => string;
   #revokeUrl: (url: string) => void;
+  #visible: () => boolean;
 
-  constructor({ fetch, createUrl = (blob) => URL.createObjectURL(blob), revokeUrl = (url) => URL.revokeObjectURL(url) }: Options) {
+  constructor({ fetch, createUrl = (blob) => URL.createObjectURL(blob), revokeUrl = (url) => URL.revokeObjectURL(url), visible = () => document.visibilityState === "visible" }: Options) {
     this.#fetch = fetch;
     this.#createUrl = createUrl;
     this.#revokeUrl = revokeUrl;
+    this.#visible = visible;
   }
 
   #entry(id: string) {
     let entry = this.#entries.get(id);
     if (!entry) {
-      entry = { thumbnail: null, etag: null, checked: false, stale: false, failed: false, load: null, listeners: new Set() };
+      entry = { thumbnail: null, etag: null, checked: false, stale: false, failed: false, retry: undefined, load: null, listeners: new Set() };
       this.#entries.set(id, entry);
       this.#hide(id);
     }
@@ -106,8 +116,10 @@ export class ThumbnailStore {
     this.#entries.delete(id);
   }
 
-  // Stops the device's load; a response that still comes is dropped.
+  // Stops the device's load, and trying a failed one again; a response
+  // that still comes is dropped.
   #abort(entry: Entry) {
+    clearTimeout(entry.retry);
     entry.load?.controller.abort();
     entry.load = null;
   }
@@ -133,15 +145,13 @@ export class ThumbnailStore {
     };
   }
 
-  // Loads the device's image unless this page has it as it is now, and
-  // returns whether the load failed in a way trying again may fix. A
+  // Loads the device's image unless this page has it as it is now. A
   // locked or cleared website, or a device no row shows any more, loads
   // nothing.
   async refresh(id: string) {
     const entry = this.#entry(id);
     if (!entry.load && !entry.checked) this.#start(id, entry);
     await entry.load?.done;
-    return this.#entries.get(id) === entry && entry.failed && !entry.checked;
   }
 
   // The server replaced these devices' images: the rows showing one load
@@ -166,14 +176,22 @@ export class ThumbnailStore {
   #start(id: string, entry: Entry) {
     const controller = new AbortController();
     const load: Load = { controller, done: Promise.resolve() };
+    clearTimeout(entry.retry);
     entry.stale = false;
     entry.failed = false;
     load.done = this.#load(id, entry, controller.signal).finally(() => {
       if (entry.load !== load) return;
       entry.load = null;
       if (entry.stale) this.replaced([id]);
+      else if (entry.failed && entry.listeners.size) entry.retry = setTimeout(() => this.#retry(id, entry), RETRY_DELAY_MS);
     });
     entry.load = load;
+  }
+
+  // Tries a failed load again. A page not in front waits: its rows check
+  // when it is shown.
+  #retry(id: string, entry: Entry) {
+    if (this.#entries.get(id) === entry && !entry.load && !entry.checked && this.#visible()) this.#start(id, entry);
   }
 
   // Waits for a free request, and returns the function that gives it back,
@@ -237,7 +255,7 @@ export class ThumbnailStore {
       }
     } catch (error) {
       // A locked session has nothing more to load. Other failures keep the
-      // image already shown, for the row to try again.
+      // image already shown, and are tried again.
       entry.failed = current() && !(error instanceof AuthenticationRequired);
       return;
     } finally {

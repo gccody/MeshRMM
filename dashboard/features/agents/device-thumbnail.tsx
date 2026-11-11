@@ -7,8 +7,6 @@ import type { Agent } from "./types";
 // A tile waits this long before asking for its image, so tiles that only
 // scroll past ask for nothing.
 const SETTLE_DELAY_MS = 150;
-// After a failed load.
-const RETRY_DELAY_MS = 60_000;
 
 const formatUpdated = (date: Date | null) =>
   date?.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) ?? null;
@@ -20,26 +18,20 @@ function useThumbnail(store: ThumbnailStore, id: string): Thumbnail | null {
 }
 
 // The device's latest screen image, loaded when its tile is drawn and the
-// page is in front, and again when the server says it changed. The wall
-// draws only the tiles on screen or about to be. A load that failed is
-// tried again a while later.
+// page is in front, and again when the server says it changed or a load
+// failed, which the store sees to. The wall draws only the tiles on screen
+// or about to be.
 export function useDeviceScreen(store: ThumbnailStore, id: string): Thumbnail | null {
   const thumbnail = useThumbnail(store, id);
   useEffect(() => {
-    let timer: number | undefined;
-    let cancelled = false;
-    const check = async () => {
-      window.clearTimeout(timer);
-      if (document.visibilityState !== "visible") return;
-      if (await store.refresh(id) && !cancelled) timer = window.setTimeout(() => void check(), RETRY_DELAY_MS);
+    const check = () => {
+      if (document.visibilityState === "visible") void store.refresh(id);
     };
-    const onVisibilityChange = () => void check();
-    timer = window.setTimeout(() => void check(), SETTLE_DELAY_MS);
-    document.addEventListener("visibilitychange", onVisibilityChange);
+    const timer = window.setTimeout(check, SETTLE_DELAY_MS);
+    document.addEventListener("visibilitychange", check);
     return () => {
-      cancelled = true;
       window.clearTimeout(timer);
-      document.removeEventListener("visibilitychange", onVisibilityChange);
+      document.removeEventListener("visibilitychange", check);
     };
   }, [store, id]);
   return thumbnail;

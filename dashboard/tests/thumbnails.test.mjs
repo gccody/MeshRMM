@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { AuthenticationRequired } from '../lib/http.ts';
-import { RECENT_THUMBNAILS, THUMBNAIL_REQUESTS, ThumbnailStore } from '../features/agents/thumbnails.ts';
+import { RECENT_THUMBNAILS, RETRY_DELAY_MS, THUMBNAIL_REQUESTS, ThumbnailStore } from '../features/agents/thumbnails.ts';
 
 const MINUTE = 60_000;
 const UPLOADED = 1_000_000_000;
@@ -11,6 +11,7 @@ function harness(responses) {
   const signals = [];
   const created = [];
   const revoked = [];
+  const page = { visible: true };
   const store = new ThumbnailStore({
     fetch: async (path, init) => {
       requests.push({ path, ifNoneMatch: init.headers['If-None-Match'] ?? null, cache: init.cache });
@@ -21,8 +22,9 @@ function harness(responses) {
     },
     createUrl: (blob) => { const url = `blob:${created.length}`; created.push({ url, blob }); return url; },
     revokeUrl: (url) => revoked.push(url),
+    visible: () => page.visible,
   });
-  return { store, requests, signals, created, revoked };
+  return { store, requests, signals, created, revoked, page };
 }
 
 const image = (etag, lastModified, bytes = 'jpeg') => new Response(bytes, {
@@ -45,14 +47,14 @@ function later() {
 test('a shown device is loaded once, and not polled', async () => {
   const h = harness([image('"v1"', UPLOADED)]);
   h.store.subscribe('pc-1', () => {});
-  assert.equal(await h.store.refresh('pc-1'), false);
+  await h.store.refresh('pc-1');
   assert.deepEqual(h.requests[0], { path: '/v1/agents/pc-1/thumbnail', ifNoneMatch: null, cache: 'no-store' });
   assert.equal(h.store.snapshot('pc-1').url, 'blob:0');
   assert.equal(h.store.snapshot('pc-1').updatedAt.getTime(), UPLOADED);
   assert.equal(await h.created[0].blob.text(), 'jpeg');
   // The tile checking again, as when the tab is shown, loads nothing: the
   // socket says when there is a new image.
-  for (let check = 0; check < 3; check++) assert.equal(await h.store.refresh('pc-1'), false);
+  for (let check = 0; check < 3; check++) await h.store.refresh('pc-1');
   assert.equal(h.requests.length, 1);
 });
 
@@ -136,21 +138,60 @@ test('devices the socket starts watching again, as after a reconnect, are checke
   assert.equal(h.requests.length, 5, 'a first load is not repeated');
 });
 
-test('a missing image clears the row, and failures keep the last image and ask to try again', async () => {
+test('a missing image clears the row, and failures keep the last image and are tried again', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   const h = harness([image('"v1"', UPLOADED), new Response('{}', { status: 503 }), new Error('offline'), new Response(null, { status: 204 })]);
   h.store.subscribe('pc-1', () => {});
-  assert.equal(await h.store.refresh('pc-1'), false);
+  await h.store.refresh('pc-1');
+  // The socket says there is a new image, and loading it fails.
   h.store.replaced(['pc-1']);
-  assert.equal(await h.store.refresh('pc-1'), true, 'a server error is tried again');
+  await settle();
+  assert.equal(h.requests.length, 2);
   assert.equal(h.store.snapshot('pc-1').url, 'blob:0');
-  assert.equal(await h.store.refresh('pc-1'), true, 'so is a network failure');
+  t.mock.timers.tick(RETRY_DELAY_MS - 1);
+  await settle();
+  assert.equal(h.requests.length, 2, 'a server error is tried again only a while later');
+  t.mock.timers.tick(1);
+  await settle();
+  assert.equal(h.requests.length, 3);
   assert.equal(h.store.snapshot('pc-1').url, 'blob:0');
-  assert.equal(await h.store.refresh('pc-1'), false);
+  t.mock.timers.tick(RETRY_DELAY_MS);
+  await settle();
+  assert.equal(h.requests.length, 4, 'so is a network failure');
   assert.equal(h.requests[3].ifNoneMatch, '"v1"');
   assert.equal(h.store.snapshot('pc-1'), null);
   assert.deepEqual(h.revoked, ['blob:0']);
-  assert.equal(await h.store.refresh('pc-1'), false, 'no image is a checked image');
-  assert.equal(h.requests.length, 4);
+  t.mock.timers.tick(10 * RETRY_DELAY_MS);
+  await h.store.refresh('pc-1');
+  assert.equal(h.requests.length, 4, 'no image is a checked image');
+});
+
+test('a failed load is not tried again while the page is hidden or after its row goes', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const h = harness([new Error('offline'), new Error('offline'), new Error('offline'), image('"v1"', UPLOADED)]);
+  const hide = h.store.subscribe('pc-1', () => {});
+  await h.store.refresh('pc-1');
+  h.page.visible = false;
+  t.mock.timers.tick(10 * RETRY_DELAY_MS);
+  await settle();
+  assert.equal(h.requests.length, 1, 'a hidden page waits');
+  // Shown again, its rows check.
+  h.page.visible = true;
+  await h.store.refresh('pc-1');
+  assert.equal(h.requests.length, 2);
+  // A check before the next try replaces it.
+  await h.store.refresh('pc-1');
+  assert.equal(h.requests.length, 3);
+  t.mock.timers.tick(RETRY_DELAY_MS - 1);
+  await settle();
+  assert.equal(h.requests.length, 3);
+  hide();
+  t.mock.timers.tick(10 * RETRY_DELAY_MS);
+  await settle();
+  assert.equal(h.requests.length, 3, 'a device no row shows is left alone');
+  h.store.subscribe('pc-1', () => {});
+  await h.store.refresh('pc-1');
+  assert.equal(h.store.snapshot('pc-1').url, 'blob:0');
 });
 
 test('concurrent rows share one request', async () => {
@@ -160,7 +201,7 @@ test('concurrent rows share one request', async () => {
   const second = h.store.refresh('pc-1');
   await settle();
   release();
-  assert.equal(await first, await second);
+  await Promise.all([first, second]);
   assert.equal(h.requests.length, 1);
 });
 
@@ -176,7 +217,7 @@ test('clearing discards images, including one still loading', async () => {
   assert.equal(h.store.snapshot('pc-1'), null);
   assert.deepEqual(h.revoked, ['blob:0']);
   release();
-  assert.equal(await loading, false, 'nothing to try again');
+  await loading;
   assert.equal(h.store.snapshot('pc-1'), null, 'a response from before the lock is dropped');
   assert.equal(h.created.length, 1);
   await h.store.refresh('pc-1');
@@ -184,10 +225,15 @@ test('clearing discards images, including one still loading', async () => {
   assert.equal(h.store.snapshot('pc-1').url, 'blob:1');
 });
 
-test('a locked session stops loading', async () => {
+test('a locked session stops loading', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   const h = harness([new AuthenticationRequired()]);
-  assert.equal(await h.store.refresh('pc-1'), false, 'nothing is tried again');
+  h.store.subscribe('pc-1', () => {});
+  await h.store.refresh('pc-1');
   assert.equal(h.store.snapshot('pc-1'), null);
+  t.mock.timers.tick(10 * RETRY_DELAY_MS);
+  await settle();
+  assert.equal(h.requests.length, 1, 'nothing is tried again');
 });
 
 test('devices that left the inventory are forgotten unless a row still shows them', async () => {
@@ -256,7 +302,7 @@ test("a hidden tile's load is stopped, and its response publishes nothing", asyn
   unsubscribe();
   assert.equal(h.signals[0].aborted, true, 'the request is aborted');
   release();
-  assert.equal(await loading, false);
+  await loading;
   assert.equal(h.store.snapshot('pc-1'), null, 'a response that ignored the abort is dropped');
   assert.equal(h.created.length, 0, 'and makes no object URL');
   assert.deepEqual(heard, []);
