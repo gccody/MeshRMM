@@ -102,9 +102,12 @@ enabled = true
 # resolves to a private address.
 # public_ip = "203.0.113.5"
 listen = "0.0.0.0:3478"
-# Each peer that relays uses one port while its session lasts.
-relay_port_min = 49160
-relay_port_max = 49200
+# The UDP ports relays are opened on. Both peers of every remote session hold
+# one while the session lasts, relayed or not, so the range serves half as
+# many sessions as it has ports: these 1,024 serve 512 at once. Open the same
+# range in your firewall.
+relay_port_min = 23000
+relay_port_max = 24023
 # Addresses relays may not send to or receive from, for example your internal
 # network if no Agent runs there. Loopback, link-local, multicast and broadcast
 # addresses, and listen's port on any address, are always refused.

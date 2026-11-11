@@ -158,14 +158,18 @@ MeshRMM is in heavy development and not production ready.
 ## Set up
 
 You need a Linux machine, a DNS name with an A record to it, and TCP 443,
-UDP 3478 and UDP 49160–49200 open from the internet.
+UDP 3478 and UDP 23000–24023 open from the internet. Those 1,024 relay ports
+serve 512 remote sessions at once; [Running a MeshRMM
+server](docs/self-hosting.md#sizing-the-relay-ports) says how to size them.
 
-1. Start the server. It gets its certificate from Let's Encrypt:
+1. Start the server. It gets its certificate from Let's Encrypt. It uses the
+   host's network, so Docker needn't publish the relay ports one by one, and
+   runs as root to bind port 443 there:
 
    ```sh
    docker volume create meshrmm-data
    docker run -d --name meshrmm --restart unless-stopped \
-     -p 443:443/tcp -p 3478:3478/udp -p 49160-49200:49160-49200/udp \
+     --network host --user 0:0 \
      -v meshrmm-data:/var/lib/meshrmm \
      -e MESHRMM_PUBLIC_URL=https://rmm.example.com \
      -e MESHRMM_TLS__MODE=acme \

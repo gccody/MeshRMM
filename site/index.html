@@ -59,8 +59,7 @@
           <div class="terminal-window">
             <div class="terminal-bar" aria-hidden="true"><span></span><span></span><span></span></div>
 <pre class="terminal-body"><code><span class="prompt">$</span> docker run -d --name meshrmm \
-    -p 443:443 -p 3478:3478/udp \
-    -p 49160-49200:49160-49200/udp \
+    --network host --user 0:0 \
     -v meshrmm:/var/lib/meshrmm \
     -e MESHRMM_PUBLIC_URL=https://rmm.example.com \
     -e MESHRMM_TLS__CONTACT_EMAIL=you@example.com \
@@ -251,7 +250,8 @@
         <h2 id="install-title">Install</h2>
         <p class="section-lede">
           You need a Linux machine with a DNS name, TCP port 443, and UDP ports 3478 and
-          49160–49200 open to the internet.
+          23000–24023 open to the internet. Each remote session holds two of those relay
+          ports, so they serve 512 sessions at once.
         </p>
 
         <ol class="steps">

@@ -255,6 +255,15 @@ pub async fn check(config: Config) -> anyhow::Result<()> {
         let ip = turn::resolve(&host).await?;
         println!("TURN relays will use {ip}, the address of {host}");
     }
+    if config.turn.enabled {
+        let turn = &config.turn;
+        println!(
+            "TURN relays will use UDP ports {}-{}, enough for {} remote sessions at once",
+            turn.relay_port_min,
+            turn.relay_port_max,
+            turn.relay_sessions()
+        );
+    }
     let url = config.database_url();
     if let Some(path) = db::sqlite_path(&url)?
         && !path.exists()

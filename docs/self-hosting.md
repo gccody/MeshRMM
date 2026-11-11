@@ -32,7 +32,7 @@ and upgrading it.
 |---|---|---|---|
 | 443 (`http.listen`) | TCP | The website, API, WebSockets, downloads, and the Let's Encrypt challenge | Users, Agents and viewers |
 | 3478 (`turn.listen`) | UDP | STUN and TURN | Agents and viewers |
-| 49160–49200 (`turn.relay_port_min`–`max`) | UDP | TURN relays | Agents and viewers |
+| 23000–24023 (`turn.relay_port_min`–`max`) | UDP | TURN relays | Agents and viewers |
 
 Behind a reverse proxy the server listens on `127.0.0.1:8080` instead of 443,
 and the proxy takes 443. If something else already uses 443 on the machine,
@@ -40,21 +40,32 @@ set `http.listen` to another port and forward port 443 of the public address
 to it: Let's Encrypt's challenge always arrives on port 443. TURN can't go through the proxy: its ports must reach
 the server directly.
 
-Each peer that relays through TURN holds one relay port while its session
-lasts, so the default range serves about 20 relayed sessions at once. Widen it
-if you need more, and open the same range in your firewall.
+With `ufw`, for example:
+
+```sh
+sudo ufw allow 443/tcp
+sudo ufw allow 3478/udp
+sudo ufw allow 23000:24023/udp
+```
+
+Every remote session holds two relay ports, relayed or not, so the default
+range of 1,024 ports serves 512 sessions at once. See [sizing the relay
+ports](#sizing-the-relay-ports) to change it, and open the same range in your
+firewall.
 
 ## Install with Docker
 
 The image is `ghcr.io/gccody/meshrmm-server:<version>` (and `:latest`) for
 `linux/amd64` and `linux/arm64`. It has the server, the website, and the
 release's Agent and viewer builds, and runs as an unprivileged user (UID
-65532). Keep `/var/lib/meshrmm` on a volume.
+65532). Keep `/var/lib/meshrmm` on a volume. The examples use the host's
+network, so the server's ports, including the 1,024 relay ports, are the
+host's; see below for why, and for publishing ports instead.
 
 ```sh
 docker volume create meshrmm-data
 docker run -d --name meshrmm --restart unless-stopped \
-  -p 443:443/tcp -p 3478:3478/udp -p 49160-49200:49160-49200/udp \
+  --network host --user 0:0 \
   -v meshrmm-data:/var/lib/meshrmm \
   --ulimit nofile=1048576:1048576 \
   -e MESHRMM_PUBLIC_URL=https://rmm.example.com \
@@ -71,12 +82,10 @@ services:
   meshrmm:
     image: ghcr.io/gccody/meshrmm-server:latest
     restart: unless-stopped
+    network_mode: host
+    user: "0:0"
     ulimits:
       nofile: 1048576
-    ports:
-      - "443:443/tcp"
-      - "3478:3478/udp"
-      - "49160-49200:49160-49200/udp"
     volumes:
       - meshrmm-data:/var/lib/meshrmm
       # Optional: a configuration file instead of environment variables.
@@ -104,14 +113,42 @@ Run admin commands in the running container, for example
 `docker exec meshrmm meshrmm-server admin reset-password you@example.com`.
 
 TURN relays send traffic from the server's public address, which the server
-reads from `turn.host`'s DNS record at startup. Docker's port publishing on
-Linux keeps peers' addresses, which TURN needs. Docker Desktop on macOS and
-Windows doesn't, so use it only for trying the server out, with
-`MESHRMM_TURN__ENABLED=false` or with peers that connect directly.
+reads from `turn.host`'s DNS record at startup. Both host networking and
+Docker's port publishing on Linux keep peers' addresses, which TURN needs.
+Docker Desktop on macOS and Windows doesn't, so use it only for trying the
+server out, with `MESHRMM_TURN__ENABLED=false` or with peers that connect
+directly.
 
-With `--network host`, the unprivileged user can't bind port 443. Run the
-container with `--user 0:0`, or set `MESHRMM_HTTP__LISTEN=0.0.0.0:8443` and
-forward 443 to it.
+The examples above use host networking because of the relay ports: Docker
+publishes a range port by port, and with its default `userland-proxy` it
+starts a `docker-proxy` process for each, so publishing 1,024 ports is slow to
+start and takes a lot of memory. With `--network host`, the unprivileged user
+can't bind port 443, so the examples run the container as root
+(`--user 0:0`). To keep the unprivileged user, set
+`MESHRMM_HTTP__LISTEN=0.0.0.0:8443` instead and forward port 443 to it.
+
+Or publish the ports instead of using host networking. Set
+`"userland-proxy": false` in `/etc/docker/daemon.json` first, or publish fewer
+relay ports and set `turn.relay_port_min` and `turn.relay_port_max` to match
+(see [sizing the relay ports](#sizing-the-relay-ports)):
+
+```sh
+docker run -d --name meshrmm --restart unless-stopped \
+  -p 443:443/tcp -p 3478:3478/udp -p 23000-24023:23000-24023/udp \
+  -v meshrmm-data:/var/lib/meshrmm \
+  ...
+```
+
+and in Docker Compose, replace `network_mode` and `user` with:
+
+```yaml
+    ports:
+      - "443:443/tcp"
+      - "3478:3478/udp"
+      - "23000-24023:23000-24023/udp"
+```
+
+Docker's published ports bypass `ufw`; host networking doesn't.
 
 ## Install from the tarball
 
@@ -331,6 +368,40 @@ sessions from them need a direct path. Set `turn.blocked_peers` to keep relays
 away from address ranges that no Agent or viewer uses, such as the server's
 own internal network. Loopback, link-local, multicast and broadcast addresses
 are always refused. Set `turn.enabled = false` to turn TURN off.
+
+### Sizing the relay ports
+
+Both peers of a remote session, the Agent and the viewer, open a relay on the
+server while they gather ICE candidates, before anyone knows whether the
+session will need one, and each keeps its relay port until it closes: when the
+session ends, or, for a peer that vanished without closing, when its relay
+expires up to 10 minutes later. So every live session holds two relay ports
+whether or not its traffic goes through the relay, and the range serves half
+as many sessions as it has ports. The default, `turn.relay_port_min = 23000`
+to `turn.relay_port_max = 24023`, is 1,024 ports for 512 sessions at once.
+
+To size it, double the most remote sessions you expect at once and add some
+room. For up to 1,000 sessions, for example, 2,500 ports:
+
+```toml
+[turn]
+relay_port_min = 23000
+relay_port_max = 25499
+```
+
+Only relayed sessions use the server's bandwidth. Keep the range clear of
+`turn.listen`'s port (the server refuses to start otherwise) and of the ports
+other programs on the machine use. The default sits below Linux's ephemeral
+ports (32768–60999), which outgoing connections take their ports from; keep a
+wider range below them too if you can. Open the new range in your firewall,
+and publish it if Docker doesn't use the host's network.
+
+At startup the log says how many sessions the range serves (`serving STUN and
+TURN; the relay ports serve 512 remote sessions at once`), and so does
+`check-config`. When the range is full, new sessions' peers get no relay;
+they still connect if they can reach each other directly. The server logs
+`every TURN relay port is in use` with the range and, in `refused`, how many
+relays it refused since the last such line, at most once a minute.
 
 ## Database
 
@@ -580,8 +651,8 @@ tar -C /var/lib/meshrmm -czf /backup/meshrmm-data.tar.gz .
 
 1. Stop the server.
 2. Restore the data directory, including `instance.key`, owned by the
-   server's user (`meshrmm`, or UID 65532 in Docker) with mode `0700` on the
-   directory and `0600` on the key.
+   server's user (`meshrmm`, or in Docker UID 65532 unless the container runs
+   as root) with mode `0700` on the directory and `0600` on the key.
 3. Restore the database: copy the SQLite file to its path (removing any
    `meshrmm.db-wal` and `meshrmm.db-shm` left there), or for PostgreSQL
    create an empty database and run
@@ -703,7 +774,9 @@ handshake again.
 - **Remote sessions connect only on the same network.** TURN isn't reachable:
   check that UDP 3478 and the relay ports are open and forwarded, that
   `check-config` prints the right relay address, and that `turn.host` isn't
-  behind an HTTP proxy.
+  behind an HTTP proxy. If the log says `every TURN relay port is in use`,
+  widen the relay ports (see [sizing the relay
+  ports](#sizing-the-relay-ports)).
 - **The website shows an error about missing downloads, or Agents don't
   update.** `check-config` reports what the downloads directory holds and
   whether the builds are signed.
