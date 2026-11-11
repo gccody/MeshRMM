@@ -61,7 +61,7 @@ pub async fn serve(
         let mut last_heard = Instant::now();
         loop {
             tokio::select! {
-                outgoing = connection.commands.recv() => {
+                outgoing = connection.next_message() => {
                     let Some(outgoing) = outgoing else {
                         send(&mut socket, close_frame(4000, "superseded Agent connection")).await;
                         break;
