@@ -1,6 +1,5 @@
 //! Bounded, independent system-audio transport. v1 carries interleaved
 //! PCM16; the Opus channel carries 48 kHz stereo Opus.
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 pub const CHANNEL: &str = "meshrmm-audio-v1";
@@ -14,6 +13,8 @@ pub const THIRD_PARTY_NOTICES: &str = include_str!("../../../THIRD_PARTY_NOTICES
 const HEADER: usize = 6;
 const MAX_PACKET: usize = 16_000;
 
+// Compiled wherever `PlaybackState` is; only the viewer plays it.
+mod jitter;
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 mod opus;
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
@@ -76,7 +77,7 @@ pub struct PlaybackState(Arc<Mutex<Buffer>>);
 struct Buffer {
     muted: bool,
     generation: u64,
-    samples: VecDeque<f32>,
+    jitter: jitter::JitterBuffer,
 }
 impl Default for PlaybackState {
     fn default() -> Self {
@@ -88,7 +89,7 @@ impl PlaybackState {
         Self(Arc::new(Mutex::new(Buffer {
             muted,
             generation: 0,
-            samples: VecDeque::new(),
+            jitter: jitter::JitterBuffer::default(),
         })))
     }
     pub fn muted(&self) -> bool {
@@ -101,13 +102,13 @@ impl PlaybackState {
         };
         b.muted = !b.muted;
         b.generation = b.generation.wrapping_add(1);
-        b.samples.clear();
+        b.jitter.clear();
         tracing::info!(muted = b.muted, "viewer audio mute changed");
         b.muted
     }
     pub fn clear(&self) {
         if let Ok(mut b) = self.0.lock() {
-            b.samples.clear();
+            b.jitter.clear();
         }
     }
 }
@@ -160,6 +161,9 @@ struct Resampler {
     previous: [f32; 8],
     initialized: bool,
     position: f64,
+    /// How much faster than nominal to play, as a fraction. Playback sets it
+    /// to hold its queue at the target despite the two ends' clocks.
+    stretch: f64,
 }
 impl Resampler {
     fn convert(&mut self, packet: Packet<'_>, rate: u32, channels: usize) -> Vec<f32> {
@@ -184,6 +188,7 @@ impl Resampler {
         if self.format != (from_rate, from_channels) {
             *self = Self {
                 format: (from_rate, from_channels),
+                stretch: self.stretch,
                 ..Self::default()
             };
         }
@@ -212,7 +217,7 @@ impl Resampler {
                 for (a, b) in self.previous[..channels].iter().zip(&current) {
                     output.push(a + (b - a) * self.position as f32);
                 }
-                self.position += f64::from(from_rate) / f64::from(rate);
+                self.position += f64::from(from_rate) / f64::from(rate) * (1.0 + self.stretch);
             }
             self.position -= 1.0;
             self.previous = current;
@@ -253,11 +258,21 @@ mod tests {
         let state = PlaybackState::default();
         assert!(state.muted());
         assert!(!state.toggle());
-        state.0.lock().unwrap().samples.push_back(1.0);
+        let mut buffer = state.0.lock().unwrap();
+        buffer.jitter.configure(48_000, 1);
+        buffer.jitter.push(&[1.0; 4_800]);
+        drop(buffer);
         assert!(state.toggle());
         assert!(!state.toggle());
         assert!(!state.muted());
-        assert!(state.0.lock().unwrap().samples.is_empty());
+        let mut buffer = state.0.lock().unwrap();
+        assert_eq!(buffer.jitter.level(), 0);
+        // Unmuted playback buffers to the target again before it plays.
+        buffer.jitter.push(&[1.0; 960]);
+        let mut out = [1.0; 480];
+        buffer.jitter.fill(&mut out, 0.0, |s| s);
+        assert_eq!(out, [0.0; 480]);
+        drop(buffer);
         assert!(!PlaybackState::new(false).muted());
     }
     #[test]
@@ -317,6 +332,25 @@ mod tests {
             1,
         );
         assert_eq!(output, vec![0.25]);
+    }
+    #[test]
+    fn stretch_plays_faster_or_slower_without_steps() {
+        let samples: Vec<i16> = (0..7_000).map(|i| (i % 1000) as i16).collect();
+        let bytes = packet(48_000, 1, &samples);
+        for (stretch, frames) in [(0.0, 6_999), (0.002, 6_986), (-0.002, 7_014)] {
+            let mut resampler = Resampler {
+                stretch,
+                ..Resampler::default()
+            };
+            let output = resampler.convert(Packet::decode(&bytes).unwrap(), 48_000, 1);
+            assert_eq!(output.len(), frames, "{stretch}");
+            // Interpolated, not skipped: each ramp rises at most one step a sample.
+            assert!(
+                output
+                    .windows(2)
+                    .all(|w| (w[1] - w[0]).abs() <= 1.01 / 32768.0 || w[1] < w[0])
+            );
+        }
     }
     #[test]
     fn resampling_is_independent_of_packet_boundaries() {
