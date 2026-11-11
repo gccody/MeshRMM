@@ -4,13 +4,16 @@
 //! screen and the login screen alike. The display server applies its own
 //! keyboard layout and maps the pointer onto the whole desktop.
 //!
-//! Only root can open `/dev/uinput`, so the coordinator opens it for each
-//! session helper it starts and passes the descriptors on; the helper
-//! creates the devices the first time the viewer sends input.
+//! Only root can open `/dev/uinput`. The root coordinator holds this
+//! controller and injects the input a session asks for; a session helper,
+//! which runs as the session's user, never opens the device or receives its
+//! descriptor, so another process of that user cannot reach it. A console
+//! Agent that runs as root injects through the same controller directly. The
+//! devices are created the first time input is injected.
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::Write;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::AsRawFd;
 
 use anyhow::{Context, bail};
 use meshrmm_protocol::{Display, PointerButton, RemoteInput};
@@ -18,8 +21,6 @@ use meshrmm_protocol::{Display, PointerButton, RemoteInput};
 use super::display;
 use super::keymap;
 
-/// The descriptors' environment variable: two numbers, keyboard first.
-pub(crate) const DESCRIPTORS_VARIABLE: &str = "MESHRMM_UINPUT_FDS";
 /// The pointer's axes run from zero to this across the whole desktop.
 const AXIS_MAX: i32 = 65_535;
 /// The gap between typed keys.
@@ -163,28 +164,10 @@ pub(crate) struct UinputFiles {
 }
 
 impl UinputFiles {
-    /// The descriptors the coordinator passed, or `/dev/uinput` opened here,
-    /// which works only for root or where the device's permissions allow it.
-    pub(crate) fn take() -> anyhow::Result<Self> {
-        if let Ok(value) = std::env::var(DESCRIPTORS_VARIABLE) {
-            // SAFETY: removing the variable races only with other threads
-            // reading the environment, and the helper reads it here first.
-            unsafe { std::env::remove_var(DESCRIPTORS_VARIABLE) };
-            let mut descriptors = value.split(',').map(str::parse::<i32>);
-            if let (Some(Ok(keyboard)), Some(Ok(pointer))) =
-                (descriptors.next(), descriptors.next())
-            {
-                // SAFETY: the coordinator opened these descriptors for this
-                // process, which owns them from here on.
-                return Ok(unsafe {
-                    Self {
-                        keyboard: File::from_raw_fd(keyboard),
-                        pointer: File::from_raw_fd(pointer),
-                    }
-                });
-            }
-            bail!("{DESCRIPTORS_VARIABLE} is invalid");
-        }
+    /// Opens `/dev/uinput` twice, which works only for root or where the
+    /// device's permissions allow it: the root coordinator or a root console
+    /// Agent, never a session helper that runs as the session's user.
+    pub(crate) fn open() -> anyhow::Result<Self> {
         Ok(Self {
             keyboard: open_uinput()?,
             pointer: open_uinput()?,
@@ -192,7 +175,7 @@ impl UinputFiles {
     }
 }
 
-/// Opens uinput for writing, as the coordinator does for each helper.
+/// Opens uinput for writing. Only root may; a session helper cannot.
 pub(crate) fn open_uinput() -> anyhow::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -245,9 +228,10 @@ impl Devices {
     }
 }
 
-/// The session's input, and the display the viewer sees.
+/// The session's input, and the display the viewer sees. The uinput devices
+/// are opened the first time input is injected, so a controller that only
+/// tracks the displays never touches `/dev/uinput`.
 pub(crate) struct InputController {
-    files: Option<UinputFiles>,
     devices: Option<Devices>,
     active_display: Option<Display>,
     displays: Vec<Display>,
@@ -260,11 +244,7 @@ pub(crate) struct InputController {
 
 impl InputController {
     pub(crate) fn new() -> Self {
-        let files = UinputFiles::take()
-            .inspect_err(|error| tracing::warn!(error = ?error, "remote input is unavailable"))
-            .ok();
         Self {
-            files,
             devices: None,
             active_display: None,
             displays: Vec::new(),
@@ -299,9 +279,7 @@ impl InputController {
 
     fn devices(&mut self) -> anyhow::Result<&Devices> {
         if self.devices.is_none() {
-            let files = self
-                .files
-                .take()
+            let files = UinputFiles::open()
                 .context("remote input is unavailable: the Agent could not open /dev/uinput")?;
             self.devices = Some(Devices::create(files)?);
         }
@@ -588,7 +566,6 @@ mod tests {
 
     fn controller(active: Display, displays: Vec<Display>) -> InputController {
         let mut controller = InputController {
-            files: None,
             devices: None,
             active_display: None,
             displays: Vec::new(),
@@ -675,7 +652,7 @@ mod tests {
     #[test]
     #[ignore = "creates virtual input devices"]
     fn creates_the_virtual_devices() {
-        let devices = Devices::create(UinputFiles::take().unwrap()).unwrap();
+        let devices = Devices::create(UinputFiles::open().unwrap()).unwrap();
         devices.pointer.send(&[(EV_ABS, ABS_X, 100)]).unwrap();
         devices.keyboard.send(&[(EV_KEY, 42, 1)]).unwrap();
         devices.keyboard.send(&[(EV_KEY, 42, 0)]).unwrap();

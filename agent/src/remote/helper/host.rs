@@ -286,6 +286,10 @@ fn handle(request: Request, served: &Served) -> anyhow::Result<Reply> {
     match request {
         Request::BeginSession(session) => {
             active.store(true, Ordering::SeqCst);
+            // On Linux the coordinator holds the uinput descriptors, so a file
+            // paste's Ctrl+V is sent to it rather than injected here.
+            #[cfg(target_os = "linux")]
+            input.use_coordinator_paste(events.clone());
             input.begin_session(&session);
         }
         Request::SetDisplayBorder(enabled) => screen

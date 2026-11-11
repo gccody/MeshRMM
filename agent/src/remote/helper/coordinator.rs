@@ -16,7 +16,7 @@ use std::os::unix::net::UnixStream;
 #[cfg(target_os = "macos")]
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
@@ -49,6 +49,11 @@ pub(crate) struct Registry {
     helpers: Mutex<Vec<Arc<Connection>>>,
     /// Who holds the console: the platform's answer, or a test's.
     console: Box<dyn Fn() -> Console + Send + Sync>,
+    /// Injects input on Linux, where the coordinator holds the uinput
+    /// descriptors rather than the session helper. The default drives
+    /// `/dev/uinput`; a test substitutes one that records what it is asked.
+    #[cfg(target_os = "linux")]
+    inject: Injector,
 }
 
 impl Default for Registry {
@@ -56,8 +61,70 @@ impl Default for Registry {
         Self {
             helpers: Mutex::default(),
             console: Box::new(Console::now),
+            #[cfg(target_os = "linux")]
+            inject: uinput_injector(),
         }
     }
+}
+
+/// What the coordinator injects on Linux. The root coordinator holds the
+/// uinput descriptors and does the injection; a session helper, an ordinary
+/// process of the session's user, never opens the device.
+#[cfg(target_os = "linux")]
+pub(crate) enum Injection {
+    /// The display the viewer's pointer maps onto, and every display, from
+    /// the capture the console's helper just started.
+    ActiveDisplay(meshrmm_protocol::Display, Vec<meshrmm_protocol::Display>),
+    /// A key, pointer move, button or wheel the viewer sent.
+    Input(RemoteInput),
+    /// Ctrl+V, after the session pasted files onto this display.
+    Paste(DisplayId),
+    /// Release every key and button the coordinator is holding for a helper.
+    Release,
+}
+
+#[cfg(target_os = "linux")]
+type Injector = Box<dyn Fn(Injection) -> anyhow::Result<()> + Send + Sync>;
+
+/// The real injector: one keyboard and one pointer the coordinator opens on
+/// `/dev/uinput`, created the first time input is injected.
+#[cfg(target_os = "linux")]
+fn uinput_injector() -> Injector {
+    let controller = Mutex::new(super::platform::input::InputController::new());
+    Box::new(move |injection| {
+        let mut controller = controller.lock().unwrap_or_else(|e| e.into_inner());
+        match injection {
+            Injection::ActiveDisplay(active, displays) => {
+                controller.set_active_display(active, displays)
+            }
+            Injection::Input(input) => controller.apply(input),
+            Injection::Paste(display_id) => press_paste(&mut controller, display_id),
+            Injection::Release => controller.release_all(),
+        }
+    })
+}
+
+/// Presses Ctrl+V on `display_id`, which pastes the files the session just put
+/// on its clipboard. The keys land in the console's session, like any input.
+#[cfg(target_os = "linux")]
+fn press_paste(
+    controller: &mut super::platform::input::InputController,
+    display_id: DisplayId,
+) -> anyhow::Result<()> {
+    for (scan_code, extended, pressed) in [
+        (0x1d, false, true),
+        (0x2f, false, true),
+        (0x2f, false, false),
+        (0x1d, false, false),
+    ] {
+        controller.apply(RemoteInput::Key {
+            display_id,
+            scan_code,
+            extended,
+            pressed,
+        })?;
+    }
+    Ok(())
 }
 
 /// Who holds the console, whose helper a remote session uses.
@@ -215,6 +282,7 @@ impl Registry {
             uid,
             login_window: hello.login_window,
             login_session,
+            registry: Arc::downgrade(self),
             writer: Mutex::new(stream.try_clone()?),
             next_id: AtomicU64::new(1),
             pending: Mutex::default(),
@@ -343,6 +411,13 @@ pub(crate) struct Connection {
     login_window: bool,
     /// The logind session the helper serves, on Linux.
     login_session: Option<String>,
+    /// The registry the helper belongs to, for the console check that gates
+    /// a paste on Linux. Weak to avoid a cycle with the registry's helpers.
+    #[cfg_attr(
+        target_os = "macos",
+        allow(dead_code, reason = "only Linux gates a paste")
+    )]
+    registry: Weak<Registry>,
     writer: Mutex<UnixStream>,
     next_id: AtomicU64,
     pending: Mutex<HashMap<u64, mpsc::SyncSender<Result<Reply, String>>>>,
@@ -390,6 +465,7 @@ impl Connection {
                         let _ = answer.send(decision);
                     }
                 }
+                Event::RequestPaste(display_id) => self.inject_paste(display_id),
                 event => {
                     let session = self
                         .session
@@ -414,6 +490,48 @@ impl Connection {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
     }
+
+    /// Presses Ctrl+V for a session that pasted files, but only when this
+    /// helper is on the console with a running session: the coordinator holds
+    /// the uinput descriptors and a helper, which the session user's processes
+    /// might influence, cannot make root type into another user's session or
+    /// the login screen. The paste runs off the reader thread, which must
+    /// never block, since a "type clipboard" can hold the injector for most of
+    /// a second.
+    #[cfg(target_os = "linux")]
+    fn inject_paste(self: &Arc<Self>, display_id: DisplayId) {
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        let on_console = (registry.console)().served_by(self);
+        let has_session = self
+            .session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+        if !(on_console && has_session) {
+            tracing::warn!(
+                login_session = self.login_session.as_deref(),
+                on_console,
+                has_session,
+                "refused a paste from a helper that is off the console or has no session"
+            );
+            return;
+        }
+        if let Err(error) = std::thread::Builder::new()
+            .name("meshrmm-helper-paste".into())
+            .spawn(move || {
+                if let Err(error) = (registry.inject)(Injection::Paste(display_id)) {
+                    tracing::warn!(error = ?error, "could not paste the session's files");
+                }
+            })
+        {
+            tracing::warn!(%error, "could not start the paste");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn inject_paste(self: &Arc<Self>, _display_id: DisplayId) {}
 
     /// Whether the helper went away.
     #[cfg(target_os = "linux")]
@@ -610,7 +728,8 @@ impl SessionEvents {
                 }
             }
             Event::AudioEnded => self.audio_ended.store(true, Ordering::SeqCst),
-            Event::Reply { .. } | Event::ApprovalDecision(_) => {}
+            // Handled on the reader thread, never reaching the session.
+            Event::Reply { .. } | Event::ApprovalDecision(_) | Event::RequestPaste(_) => {}
         }
         false
     }
@@ -819,6 +938,11 @@ impl Remote {
     }
 
     fn detach(&self, helper: &Connection) {
+        // The coordinator holds the injected keys and buttons for this helper
+        // on Linux, so it releases them as the session stops using the helper,
+        // whether the helper left, lost the console, or the session ended.
+        #[cfg(target_os = "linux")]
+        self.release_injected();
         let _ = helper
             .session
             .lock()
@@ -895,6 +1019,10 @@ impl Remote {
             } => {
                 self.moved.store(false, Ordering::SeqCst);
                 *self.capturing.lock().unwrap_or_else(|e| e.into_inner()) = Some(helper);
+                // The coordinator injects input, so it needs the geometry the
+                // capture just reported to place the viewer's pointer.
+                #[cfg(target_os = "linux")]
+                self.inject_active_display(active_display.clone(), displays.clone());
                 Ok(Started {
                     displays,
                     active_display,
@@ -1073,6 +1201,52 @@ impl Remote {
     }
 }
 
+/// Input injection on Linux, where the coordinator holds the uinput
+/// descriptors instead of handing them to a session helper.
+#[cfg(target_os = "linux")]
+impl Remote {
+    /// Injects the viewer's input, but only while the session's current helper
+    /// is the one on the console. The coordinator knows which session a
+    /// request is for from the helper the session uses; it refuses to inject
+    /// when that helper is not on the console, so input never reaches another
+    /// user's session or the login screen. Input for a session that is between
+    /// helpers, or waiting for the console's helper, is dropped, not sent
+    /// elsewhere.
+    fn inject(&self, input: RemoteInput) -> anyhow::Result<()> {
+        let current = self
+            .current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let console = (self.registry.console)();
+        match current {
+            Some(helper) if !helper.closed.load(Ordering::SeqCst) && console.served_by(&helper) => {
+                (self.registry.inject)(Injection::Input(input))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Releases every key and button the coordinator holds for the session.
+    fn release_injected(&self) {
+        if let Err(error) = (self.registry.inject)(Injection::Release) {
+            tracing::warn!(error = ?error, "could not release the injected keys and buttons");
+        }
+    }
+
+    /// Tells the injector the display geometry the capture reported, so the
+    /// viewer's normalized pointer maps onto the right place.
+    fn inject_active_display(
+        &self,
+        active: meshrmm_protocol::Display,
+        displays: Vec<meshrmm_protocol::Display>,
+    ) {
+        if let Err(error) = (self.registry.inject)(Injection::ActiveDisplay(active, displays)) {
+            tracing::warn!(error = ?error, "could not set the injected display");
+        }
+    }
+}
+
 impl Drop for Remote {
     fn drop(&mut self) {
         let current = self
@@ -1247,7 +1421,9 @@ impl ScreenInput for HelperInput {
     fn set_agent_input_blocked(&self, blocked: bool) -> anyhow::Result<()> {
         #[cfg(target_os = "linux")]
         {
-            self.0.done(Request::ReleaseInput)?;
+            // The coordinator holds the injected input and grabs the local
+            // devices, both as root; the helper does neither.
+            self.0.release_injected();
             super::platform::input_block::set_blocked(blocked)
         }
         #[cfg(target_os = "macos")]
@@ -1268,12 +1444,26 @@ impl ScreenInput for HelperInput {
         Arc::clone(&self.0.events.files_ready)
     }
     fn apply(&self, input: RemoteInput) -> anyhow::Result<()> {
+        // On Linux the coordinator injects the input itself, since it holds
+        // the uinput descriptors; on macOS the helper injects it.
+        #[cfg(target_os = "linux")]
+        {
+            self.0.inject(input)
+        }
+        #[cfg(target_os = "macos")]
         self.0.done(Request::Input(input))
     }
     fn annotate(&self, annotation: Annotation) -> anyhow::Result<()> {
         self.0.done(Request::Annotate(annotation))
     }
     fn release_all(&self) -> anyhow::Result<()> {
+        // On Linux the coordinator holds the injected keys and buttons.
+        #[cfg(target_os = "linux")]
+        {
+            self.0.release_injected();
+            Ok(())
+        }
+        #[cfg(target_os = "macos")]
         self.0.done(Request::ReleaseInput)
     }
     fn cursor_shape(&self) -> CursorShape {
@@ -1532,13 +1722,86 @@ mod tests {
         }
     }
 
-    /// A registry whose console is whatever `console` holds.
-    fn registry_on(console: &Arc<Mutex<Console>>) -> Arc<Registry> {
+    /// A log of what a test registry was asked to inject on Linux, where the
+    /// coordinator injects input rather than the session helper.
+    #[cfg(target_os = "linux")]
+    #[derive(Default)]
+    struct Recorder {
+        log: Mutex<Vec<Injection>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Recorder {
+        /// The viewer inputs the coordinator injected, in order.
+        fn inputs(&self) -> Vec<RemoteInput> {
+            self.log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|injection| match injection {
+                    Injection::Input(input) => Some(input.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// The displays a file paste pressed Ctrl+V on, in order.
+        fn pastes(&self) -> Vec<DisplayId> {
+            self.log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|injection| match injection {
+                    Injection::Paste(id) => Some(*id),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// How many times the coordinator released its held keys and buttons.
+        fn releases(&self) -> usize {
+            self.log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|injection| matches!(injection, Injection::Release))
+                .count()
+        }
+    }
+
+    /// On Linux a handle to the registry's injection log; elsewhere nothing,
+    /// since the helper injects and the tests read what it received.
+    #[cfg(target_os = "linux")]
+    type Injected = Arc<Recorder>;
+    #[cfg(target_os = "macos")]
+    type Injected = ();
+
+    /// A registry whose console is whatever `console` holds, and, on Linux, a
+    /// log of what it was asked to inject.
+    #[cfg(target_os = "linux")]
+    fn registry_on(console: &Arc<Mutex<Console>>) -> (Arc<Registry>, Injected) {
         let console = Arc::clone(console);
-        Arc::new(Registry {
+        let recorder = Arc::new(Recorder::default());
+        let log = Arc::clone(&recorder);
+        let registry = Arc::new(Registry {
             helpers: Mutex::default(),
             console: Box::new(move || console.lock().unwrap().clone()),
-        })
+            inject: Box::new(move |injection| {
+                log.log.lock().unwrap().push(injection);
+                Ok(())
+            }),
+        });
+        (registry, recorder)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn registry_on(console: &Arc<Mutex<Console>>) -> (Arc<Registry>, Injected) {
+        let console = Arc::clone(console);
+        let registry = Arc::new(Registry {
+            helpers: Mutex::default(),
+            console: Box::new(move || console.lock().unwrap().clone()),
+        });
+        (registry, ())
     }
 
     /// A fake helper that answers every call, starting capture on one
@@ -1546,6 +1809,9 @@ mod tests {
     struct FakeHelper {
         connection: Arc<Connection>,
         requests: mpsc::Receiver<Request>,
+        /// A clone of the helper's socket, to close the connection in a test.
+        #[allow(dead_code, reason = "used only in the Linux disconnect test")]
+        socket: UnixStream,
     }
 
     impl FakeHelper {
@@ -1561,6 +1827,9 @@ mod tests {
             let connection = registry
                 .attach(coordinator, seat.uid, Some(seat.session.to_owned()))
                 .unwrap();
+            // A clone of the helper's socket, kept so a test can close the
+            // connection as a helper that exits would.
+            let socket = helper.try_clone().unwrap();
             let (received, requests) = mpsc::channel();
             std::thread::spawn(move || {
                 let mut calls = BufReader::new(helper.try_clone().unwrap());
@@ -1586,12 +1855,19 @@ mod tests {
             Self {
                 connection,
                 requests,
+                socket,
             }
         }
 
         /// The requests received since the last look.
         fn received(&self) -> Vec<Request> {
             self.requests.try_iter().collect()
+        }
+
+        /// Closes the connection, as a helper process that exits does.
+        #[cfg(target_os = "linux")]
+        fn disconnect(&self) {
+            let _ = self.socket.shutdown(std::net::Shutdown::Both);
         }
     }
 
@@ -1665,7 +1941,7 @@ mod tests {
     #[test]
     fn the_session_follows_the_console_to_another_sessions_helper() {
         let console = Arc::new(Mutex::new(A.console()));
-        let registry = registry_on(&console);
+        let (registry, _injected) = registry_on(&console);
         let a = FakeHelper::connect(&registry, A);
         let b = FakeHelper::connect(&registry, B);
         let remote = Arc::new(Remote::with_registry(
@@ -1706,6 +1982,14 @@ mod tests {
         ));
         input.apply(click(true)).unwrap();
         input.apply_chat("hello".into()).unwrap();
+        // On Linux the coordinator injects the click itself and only the chat
+        // reaches the helper; on macOS the helper injects the click too.
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(_injected.inputs(), [click(true)]);
+            assert_eq!(names(&b.received()), ["Chat"]);
+        }
+        #[cfg(target_os = "macos")]
         assert_eq!(names(&b.received()), ["Input", "Chat"]);
         assert!(a.received().is_empty());
         assert!(remote.poll_ended().is_none());
@@ -1714,7 +1998,7 @@ mod tests {
     #[test]
     fn a_paused_session_follows_the_console_and_resumes_capture_where_it_went() {
         let console = Arc::new(Mutex::new(A.console()));
-        let registry = registry_on(&console);
+        let (registry, _injected) = registry_on(&console);
         let a = FakeHelper::connect(&registry, A);
         let b = FakeHelper::connect(&registry, B);
         let remote = Arc::new(Remote::with_registry(
@@ -1749,7 +2033,7 @@ mod tests {
     #[test]
     fn leaving_a_session_off_the_console_releases_what_the_session_held_there() {
         let console = Arc::new(Mutex::new(A.console()));
-        let registry = registry_on(&console);
+        let (registry, _injected) = registry_on(&console);
         let a = FakeHelper::connect(&registry, A);
         let b = FakeHelper::connect(&registry, B);
         #[allow(unused_mut, reason = "only Linux locks sessions again")]
@@ -1771,6 +2055,17 @@ mod tests {
         start(&remote, None).unwrap();
         input.set_prevent_idle_lock(true).unwrap();
         input.apply(click(true)).unwrap();
+        // On Linux the coordinator holds the button; the helper is only asked
+        // to inhibit the idle lock.
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(_injected.inputs(), [click(true)]);
+            assert_eq!(
+                names(&a.received()),
+                ["BeginSession", "Start", "SetPreventIdleLock"]
+            );
+        }
+        #[cfg(target_os = "macos")]
         assert_eq!(
             names(&a.received()),
             ["BeginSession", "Start", "SetPreventIdleLock", "Input"]
@@ -1779,10 +2074,12 @@ mod tests {
         *console.lock().unwrap() = B.console();
         assert!(remote.poll_ended().is_some());
         // Ending the session in A's helper releases the held button and the
-        // idle-lock inhibition there, as at the end of a remote session.
+        // idle-lock inhibition there, as at the end of a remote session. On
+        // Linux the coordinator holds the button, so it releases it itself.
         assert_eq!(names(&a.received()), ["EndSession"]);
         #[cfg(target_os = "linux")]
         {
+            assert!(_injected.releases() >= 1, "the held button is released");
             assert_eq!(*locked.lock().unwrap(), [A.session]);
             assert!(remote.unlocked.lock().unwrap().is_none());
         }
@@ -1801,7 +2098,7 @@ mod tests {
     #[test]
     fn the_session_waits_for_the_helper_of_a_console_session_that_has_none() {
         let console = Arc::new(Mutex::new(A.console()));
-        let registry = registry_on(&console);
+        let (registry, _injected) = registry_on(&console);
         let a = FakeHelper::connect(&registry, A);
         let remote = Arc::new(Remote::with_registry(
             Arc::clone(&registry),
@@ -1824,6 +2121,9 @@ mod tests {
         assert!(start(&remote, Some(DisplayId(7))).is_err());
         assert!(!is_notice(input.maintenance_state()));
         assert!(a.received().is_empty());
+        // Input had nowhere to go: the coordinator injected nothing.
+        #[cfg(target_os = "linux")]
+        assert!(_injected.inputs().is_empty());
 
         let c = FakeHelper::connect(&registry, C);
         start(&remote, Some(DisplayId(7))).unwrap();
@@ -1837,6 +2137,13 @@ mod tests {
             }
         ));
         input.apply(click(true)).unwrap();
+        // C now holds the console, so the input is injected for its session.
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(_injected.inputs(), [click(true)]);
+            assert!(c.received().is_empty());
+        }
+        #[cfg(target_os = "macos")]
         assert_eq!(names(&c.received()), ["Input"]);
         assert!(remote.poll_ended().is_none());
         assert!(a.received().is_empty());
@@ -1845,7 +2152,7 @@ mod tests {
     #[test]
     fn a_console_that_stays_put_changes_nothing() {
         let console = Arc::new(Mutex::new(A.console()));
-        let registry = registry_on(&console);
+        let (registry, _injected) = registry_on(&console);
         let a = FakeHelper::connect(&registry, A);
         let remote = Arc::new(Remote::with_registry(
             Arc::clone(&registry),
@@ -1858,6 +2165,12 @@ mod tests {
             assert!(remote.poll_ended().is_none());
             input.apply(click(true)).unwrap();
         }
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(_injected.inputs(), [click(true), click(true), click(true)]);
+            assert!(a.received().is_empty());
+        }
+        #[cfg(target_os = "macos")]
         assert_eq!(names(&a.received()), ["Input", "Input", "Input"]);
         assert!(!is_notice(input.maintenance_state()));
     }
@@ -1865,7 +2178,7 @@ mod tests {
     #[test]
     fn a_helper_connecting_in_a_session_off_the_console_is_not_used() {
         let console = Arc::new(Mutex::new(A.console()));
-        let registry = registry_on(&console);
+        let (registry, _injected) = registry_on(&console);
         let a = FakeHelper::connect(&registry, A);
         let remote = Arc::new(Remote::with_registry(
             Arc::clone(&registry),
@@ -1881,16 +2194,129 @@ mod tests {
         // A restart for another reason stays in A's session, on its display.
         start(&remote, Some(DisplayId(7))).unwrap();
         let requests = a.received();
-        assert_eq!(names(&requests), ["Input", "Start"]);
-        assert!(matches!(
-            requests[1],
-            Request::Start {
-                display_id: Some(DisplayId(7)),
-                ..
-            }
-        ));
+        // On Linux the coordinator injects the click, so only the restart
+        // reaches A; on macOS A is asked to inject the click too.
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(_injected.inputs(), [click(true)]);
+            assert_eq!(names(&requests), ["Start"]);
+            assert!(matches!(
+                requests[0],
+                Request::Start {
+                    display_id: Some(DisplayId(7)),
+                    ..
+                }
+            ));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(names(&requests), ["Input", "Start"]);
+            assert!(matches!(
+                requests[1],
+                Request::Start {
+                    display_id: Some(DisplayId(7)),
+                    ..
+                }
+            ));
+        }
         assert!(b.received().is_empty());
         assert!(b.connection.session.lock().unwrap().is_none());
+    }
+
+    /// On Linux the coordinator holds the uinput descriptors and injects input
+    /// itself, so these tests check that it injects only for the session on
+    /// the console and releases the keys it holds.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn input_is_not_injected_for_a_session_that_is_off_the_console() {
+        let console = Arc::new(Mutex::new(A.console()));
+        let (registry, injected) = registry_on(&console);
+        let a = FakeHelper::connect(&registry, A);
+        let b = FakeHelper::connect(&registry, B);
+        let remote = Arc::new(Remote::with_registry(
+            Arc::clone(&registry),
+            SessionUi::default(),
+        ));
+        let input = HelperInput(Arc::clone(&remote));
+        start(&remote, None).unwrap();
+        input.apply(click(true)).unwrap();
+        assert_eq!(injected.inputs(), [click(true)]);
+
+        // Another session takes the console before the remote session follows
+        // it. The coordinator knows the session's helper is no longer on the
+        // console and refuses to type into the session that now holds it.
+        *console.lock().unwrap() = B.console();
+        input.apply(click(false)).unwrap();
+        assert_eq!(
+            injected.inputs(),
+            [click(true)],
+            "nothing was injected while the session was off the console"
+        );
+        let _ = (a, b, input);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_paste_is_injected_only_for_the_console_helper_with_a_session() {
+        let console = Arc::new(Mutex::new(A.console()));
+        let (registry, injected) = registry_on(&console);
+        let a = FakeHelper::connect(&registry, A);
+        let b = FakeHelper::connect(&registry, B);
+        let remote = Arc::new(Remote::with_registry(
+            Arc::clone(&registry),
+            SessionUi::default(),
+        ));
+        start(&remote, None).unwrap();
+
+        // B is off the console and has no session: its paste is refused at
+        // once, without pressing anything.
+        b.connection.inject_paste(DisplayId(1));
+        // A is on the console with a running session: its paste presses Ctrl+V.
+        a.connection.inject_paste(DisplayId(2));
+        let deadline = Instant::now() + PROMPTLY;
+        while injected.pastes().is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the console helper's paste was not injected"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(injected.pastes(), [DisplayId(2)]);
+        let _ = (a, b, remote);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_coordinator_releases_held_keys_when_the_console_helper_exits() {
+        let console = Arc::new(Mutex::new(A.console()));
+        let (registry, injected) = registry_on(&console);
+        let a = FakeHelper::connect(&registry, A);
+        let remote = Arc::new(Remote::with_registry(
+            Arc::clone(&registry),
+            SessionUi::default(),
+        ));
+        let input = HelperInput(Arc::clone(&remote));
+        start(&remote, None).unwrap();
+        input.apply(click(true)).unwrap();
+        assert_eq!(injected.releases(), 0);
+
+        // A's helper exits mid-session.
+        a.disconnect();
+        let deadline = Instant::now() + PROMPTLY;
+        while !a.connection.closed() {
+            assert!(Instant::now() < deadline, "the helper did not close");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The session reconnects to the console's helper, and the coordinator
+        // releases the button it was holding for the helper that left.
+        let a2 = FakeHelper::connect(&registry, A);
+        assert!(remote.poll_ended().is_some());
+        start(&remote, None).unwrap();
+        assert!(
+            injected.releases() >= 1,
+            "the held button is released when the helper exits"
+        );
+        let _ = (a2, input);
     }
 
     /// Runs a helper in this process against a coordinator socket and streams
