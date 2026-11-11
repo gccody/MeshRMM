@@ -6,8 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use meshrmm_protocol::{
-    EncodedFrame, FrameReassembler, ReassemblyConfig, ReassemblyOutcome, SessionMessage,
-    VideoPacket, VideoStreamId,
+    EncodedFrame, FrameReassembler, ReassemblyConfig, SessionMessage, VideoPacket, VideoStreamId,
 };
 use webrtc::data_channel::RTCDataChannel;
 
@@ -17,8 +16,17 @@ use crate::debug::DebugInfo;
 use crate::platform::monotonic_timestamp_us;
 
 /// How often the channel expires incomplete frames, and sends keyframe
-/// requests that had to wait or went unanswered.
+/// requests that had to wait or went unanswered. Frames waiting for a lost
+/// one are released at the reassembler's deadline instead.
 const RECOVERY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// What a packet or the recovery poll gave the viewer.
+struct Received {
+    stream_id: Option<VideoStreamId>,
+    /// Frames to present, in order.
+    frames: Vec<EncodedFrame>,
+    request_keyframe: bool,
+}
 
 struct VideoReceiveState {
     reassembler: FrameReassembler,
@@ -43,16 +51,46 @@ impl VideoReceiveState {
         self.waiting_for_keyframe = true;
     }
 
-    /// The stream to ask a keyframe for, when an incomplete frame expired.
-    fn poll_recovery(&mut self, now_us: u64) -> Option<VideoStreamId> {
-        // The last packet of a burst can be lost on a static desktop. Expire
-        // its incomplete frame even when no subsequent packets arrive.
-        if self.reassembler.expire_stale(now_us) {
-            self.mark_loss();
+    /// Reassembles a packet.
+    fn receive(&mut self, packet: VideoPacket, now_us: u64) -> Received {
+        self.observe_stream(packet.stream_id);
+        let incomplete_before = self.reassembler.stats().incomplete_frames_dropped;
+        let frames = self.reassembler.push(packet, now_us).frames;
+        self.accept(frames, incomplete_before)
+    }
+
+    /// Gives up the frames whose wait is over: the last packet of a burst
+    /// can be lost on a static desktop, and the frames after a lost one wait
+    /// only so long for its retransmission.
+    fn poll_recovery(&mut self, now_us: u64) -> Received {
+        let incomplete_before = self.reassembler.stats().incomplete_frames_dropped;
+        let frames = self.reassembler.expire(now_us);
+        if self.reassembler.stats().incomplete_frames_dropped > incomplete_before {
             tracing::warn!("incomplete video frame expired while waiting for more packets");
-            return self.stream_id;
         }
-        None
+        self.accept(frames, incomplete_before)
+    }
+
+    /// The frames to present of those released, and whether the stream needs
+    /// a keyframe: a frame was given up, or a frame cannot be decoded.
+    fn accept(&mut self, released: Vec<EncodedFrame>, incomplete_before: u64) -> Received {
+        let mut request_keyframe = false;
+        // The frames released after a given-up frame come after it.
+        if self.reassembler.stats().incomplete_frames_dropped > incomplete_before {
+            self.mark_loss();
+            request_keyframe = true;
+        }
+        let mut frames = Vec::with_capacity(released.len());
+        for frame in released {
+            let (frame, request) = self.accept_completed(frame);
+            request_keyframe |= request;
+            frames.extend(frame);
+        }
+        Received {
+            stream_id: self.stream_id,
+            frames,
+            request_keyframe,
+        }
     }
 
     fn observe_stream(&mut self, stream_id: VideoStreamId) {
@@ -124,32 +162,46 @@ pub(super) fn install_video_handler(
         }));
     }
     let receive_state = Arc::new(tokio::sync::Mutex::new(VideoReceiveState::new()));
+    // Wakes the recovery task when frames start waiting for a lost one.
+    let frames_waiting = Arc::new(tokio::sync::Notify::new());
+    let output = VideoOutput {
+        presenter,
+        viewer_control: viewer_control.clone(),
+        debug,
+    };
     {
         let receive_state = Arc::clone(&receive_state);
         let viewer_control = viewer_control.clone();
+        let frames_waiting = Arc::clone(&frames_waiting);
+        let output = output.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(RECOVERY_POLL_INTERVAL);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            interval.tick().await;
+            let mut next_poll = tokio::time::Instant::now() + RECOVERY_POLL_INTERVAL;
             while !closed.load(Ordering::Acquire) {
-                interval.tick().await;
-                let now_us = monotonic_timestamp_us();
-                let stream_id = {
-                    let mut state = receive_state.lock().await;
-                    state.poll_recovery(now_us)
-                };
-                if let Some(stream_id) = stream_id {
-                    viewer_control.send(SessionMessage::RequestKeyframe { stream_id });
+                let deadline_us = receive_state.lock().await.reassembler.deadline_us();
+                let wake = deadline_us.map_or(next_poll, |deadline_us| {
+                    let wait_us = deadline_us.saturating_sub(monotonic_timestamp_us());
+                    next_poll.min(
+                        tokio::time::Instant::now() + std::time::Duration::from_micros(wait_us),
+                    )
+                });
+                tokio::select! {
+                    () = tokio::time::sleep_until(wake) => {}
+                    () = frames_waiting.notified() => continue,
                 }
-                viewer_control.poll_keyframe_request(now_us);
+                let now_us = monotonic_timestamp_us();
+                let received = receive_state.lock().await.poll_recovery(now_us);
+                output.deliver(&receive_state, received, now_us).await;
+                if tokio::time::Instant::now() >= next_poll {
+                    next_poll = tokio::time::Instant::now() + RECOVERY_POLL_INTERVAL;
+                    viewer_control.poll_keyframe_request(now_us);
+                }
             }
         });
     }
     channel.on_message(Box::new(move |message| {
         let receive_state = Arc::clone(&receive_state);
-        let presenter = Arc::clone(&presenter);
-        let viewer_control = viewer_control.clone();
-        let debug = debug.clone();
+        let frames_waiting = Arc::clone(&frames_waiting);
+        let output = output.clone();
         Box::pin(async move {
             let received_at_us = monotonic_timestamp_us();
             let packet = match VideoPacket::decode(&message.data) {
@@ -159,68 +211,97 @@ pub(super) fn install_video_handler(
                     return;
                 }
             };
-            let packet_stream_id = packet.stream_id;
-            let mut receive_state = receive_state.lock().await;
-            receive_state.observe_stream(packet_stream_id);
-            let incomplete_before = receive_state.reassembler.stats().incomplete_frames_dropped;
-            let outcome = receive_state.reassembler.push(packet, received_at_us);
-            let stats = receive_state.reassembler.stats();
-            let mut request_keyframe = false;
-            if stats.incomplete_frames_dropped > incomplete_before {
-                receive_state.mark_loss();
-                request_keyframe = true;
-            }
-            let completed = if let ReassemblyOutcome::Completed(frame) = outcome {
-                let (frame, request) = receive_state.accept_completed(frame);
-                request_keyframe |= request;
-                frame
-            } else {
-                None
-            };
-            let log_statistics = completed.is_some() && receive_state.statistics_log.due();
-            drop(receive_state);
-            if request_keyframe {
-                viewer_control.send(SessionMessage::RequestKeyframe {
-                    stream_id: packet_stream_id,
-                });
-            }
-            if let Some(frame) = completed {
-                if frame.keyframe {
-                    viewer_control.keyframe_arrived(frame.stream_id);
-                }
-                let encode_us = frame
-                    .encode_complete_timestamp_us
-                    .saturating_sub(frame.capture_timestamp_us);
-                debug.record_received_frame(
-                    encode_us,
-                    stats.completed_frames,
-                    stats.incomplete_frames_dropped,
-                    stats.stale_packets_dropped,
-                    stats.duplicate_packets,
-                    stats.invalid_packets,
-                );
-                if let Ok(guard) = presenter.lock()
-                    && let Some(active) = guard.as_ref()
-                    && active.stream_id == frame.stream_id
+            let received = {
+                let mut receive_state = receive_state.lock().await;
+                let deadline_before = receive_state.reassembler.deadline_us();
+                let received = receive_state.receive(packet, received_at_us);
+                let deadline = receive_state.reassembler.deadline_us();
+                if deadline
+                    .is_some_and(|deadline| deadline_before.is_none_or(|before| deadline < before))
                 {
-                    viewer_control.recording.receive(&frame, active.format);
-                    active.presenter.publish(frame, received_at_us);
+                    frames_waiting.notify_one();
                 }
-                tracing::trace!(encode_us, received_at_us, "encoded frame reassembled");
-                if log_statistics {
-                    tracing::info!(
-                        frames_received = stats.completed_frames,
-                        incomplete_frames_dropped = stats.incomplete_frames_dropped,
-                        stale_packets_dropped = stats.stale_packets_dropped,
-                        duplicate_packets = stats.duplicate_packets,
-                        invalid_packets = stats.invalid_packets,
-                        "video reassembly statistics"
-                    );
-                }
-            }
+                received
+            };
+            output
+                .deliver(&receive_state, received, received_at_us)
+                .await;
         })
     }));
 }
+
+/// Where reassembled frames go.
+#[derive(Clone)]
+struct VideoOutput {
+    presenter: Arc<Mutex<Option<ActivePresenter>>>,
+    viewer_control: ViewerControlQueue,
+    debug: DebugInfo,
+}
+
+impl VideoOutput {
+    async fn deliver(
+        &self,
+        receive_state: &tokio::sync::Mutex<VideoReceiveState>,
+        received: Received,
+        now_us: u64,
+    ) {
+        if received.request_keyframe
+            && let Some(stream_id) = received.stream_id
+        {
+            self.viewer_control
+                .send(SessionMessage::RequestKeyframe { stream_id });
+        }
+        if received.frames.is_empty() {
+            return;
+        }
+        let (stats, log_statistics) = {
+            let mut state = receive_state.lock().await;
+            (state.reassembler.stats(), state.statistics_log.due())
+        };
+        for frame in received.frames {
+            if frame.keyframe {
+                self.viewer_control.keyframe_arrived(frame.stream_id);
+            }
+            let encode_us = frame
+                .encode_complete_timestamp_us
+                .saturating_sub(frame.capture_timestamp_us);
+            self.debug.record_received_frame(
+                encode_us,
+                stats.completed_frames,
+                stats.incomplete_frames_dropped,
+                stats.stale_packets_dropped,
+                stats.duplicate_packets,
+                stats.invalid_packets,
+            );
+            if let Ok(guard) = self.presenter.lock()
+                && let Some(active) = guard.as_ref()
+                && active.stream_id == frame.stream_id
+            {
+                self.viewer_control.recording.receive(&frame, active.format);
+                active.presenter.publish(frame, now_us);
+            }
+            tracing::trace!(
+                encode_us,
+                received_at_us = now_us,
+                "encoded frame reassembled"
+            );
+        }
+        if log_statistics {
+            tracing::info!(
+                frames_received = stats.completed_frames,
+                incomplete_frames_dropped = stats.incomplete_frames_dropped,
+                stale_packets_dropped = stats.stale_packets_dropped,
+                duplicate_packets = stats.duplicate_packets,
+                invalid_packets = stats.invalid_packets,
+                "video reassembly statistics"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "video_loss_simulation.rs"]
+mod loss_simulation;
 
 #[cfg(test)]
 mod tests {
@@ -279,18 +360,20 @@ mod tests {
         let packet = meshrmm_protocol::fragment_frame(&frame, 3)
             .unwrap()
             .remove(0);
-        assert!(matches!(
-            state.reassembler.push(packet, 2_000),
-            ReassemblyOutcome::Accepted
-        ));
-        assert_eq!(state.poll_recovery(2_001), None);
+        assert_eq!(
+            state.reassembler.push(packet, 2_000).outcome,
+            meshrmm_protocol::ReassemblyOutcome::Accepted
+        );
+        assert!(!state.poll_recovery(2_001).request_keyframe);
 
         let expired_at = 2_000 + ReassemblyConfig::default().stale_after.as_micros() as u64;
-        assert_eq!(state.poll_recovery(expired_at), Some(VideoStreamId(7)));
+        let received = state.poll_recovery(expired_at);
+        assert!(received.request_keyframe);
+        assert_eq!(received.stream_id, Some(VideoStreamId(7)));
         assert_eq!(state.reassembler.stats().incomplete_frames_dropped, 1);
         assert!(state.waiting_for_keyframe);
         // The control queue retries the request; the frame expired once.
-        assert_eq!(state.poll_recovery(expired_at + 1), None);
+        assert!(!state.poll_recovery(expired_at + 1).request_keyframe);
         state.accept_completed(encoded_frame(3, true));
         assert!(!state.waiting_for_keyframe);
     }
@@ -299,7 +382,7 @@ mod tests {
     fn video_recovery_does_not_treat_a_static_desktop_as_packet_loss() {
         let mut state = VideoReceiveState::new();
         state.accept_completed(encoded_frame(1, true));
-        assert_eq!(state.poll_recovery(60_000_000), None);
+        assert!(!state.poll_recovery(60_000_000).request_keyframe);
         assert!(!state.waiting_for_keyframe);
     }
 }
