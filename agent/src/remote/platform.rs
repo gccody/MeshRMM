@@ -15,6 +15,8 @@ use meshrmm_protocol::{
 use meshrmm_protocol::{EncodedFrame, PixelFormat};
 
 use super::video::LatestFrameSlot;
+#[cfg(windows)]
+use super::video::with_codec_config;
 
 pub struct StartedScreen {
     pub displays: Vec<Display>,
@@ -256,8 +258,7 @@ impl ScreenStreamer for PlatformScreenStreamer {
         let sink = Arc::new(
             move |access_unit: meshrmm_remote_screen::EncodedAccessUnit| {
                 let frame_id = next_frame_id.fetch_add(1, Ordering::Relaxed);
-                let mut data = access_unit.codec_config.unwrap_or_default();
-                data.extend_from_slice(&access_unit.data);
+                let data = with_codec_config(access_unit.codec_config, access_unit.data);
                 let frame = EncodedFrame {
                     stream_id,
                     frame_id,
@@ -265,7 +266,7 @@ impl ScreenStreamer for PlatformScreenStreamer {
                     encode_complete_timestamp_us: access_unit.encode_complete_timestamp_us,
                     send_timestamp_us: 0,
                     keyframe: access_unit.keyframe,
-                    data,
+                    data: data.into(),
                 };
                 slot.publish(frame);
             },

@@ -607,7 +607,7 @@ mod tests {
                 encode_complete_timestamp_us: clock_us(start),
                 send_timestamp_us: 0,
                 keyframe,
-                data: vec![0; bytes],
+                data: vec![0; bytes].into(),
             });
         }
     }
@@ -629,7 +629,7 @@ mod tests {
             tokio::time::sleep_until(arrival).await;
             let now_us = clock_us(start);
             let incomplete = reassembler.stats().incomplete_frames_dropped;
-            let pushed = reassembler.push(VideoPacket::decode(&packet).unwrap(), now_us);
+            let pushed = reassembler.push(VideoPacket::decode(packet).unwrap(), now_us);
             let mut want_keyframe = reassembler.stats().incomplete_frames_dropped > incomplete;
             waiting_for_keyframe |= want_keyframe;
             for frame in pushed.frames {

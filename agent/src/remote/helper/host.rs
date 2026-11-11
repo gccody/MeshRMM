@@ -17,6 +17,7 @@ use meshrmm_protocol::DisplayId;
 use super::platform::local::{LocalInput, LocalScreen};
 use super::protocol::{self, Call, Event, Frame, Hello, Reply, Request, StreamSettings};
 use crate::remote::platform::ScreenInput;
+use crate::remote::video::with_codec_config;
 
 #[cfg(target_os = "macos")]
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
@@ -251,10 +252,8 @@ impl Served {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .start(display_id, settings, move |unit| {
-                let mut data = unit.codec_config.unwrap_or_default();
-                data.extend_from_slice(&unit.data);
                 let frame = Frame {
-                    data,
+                    data: with_codec_config(unit.codec_config, unit.data),
                     keyframe: unit.keyframe,
                     capture_timestamp_us: unit.capture_timestamp_us,
                     encode_complete_timestamp_us: unit.encode_complete_timestamp_us,

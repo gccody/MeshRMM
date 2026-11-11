@@ -218,7 +218,7 @@ fn microsoft_h264_decoder_shows_the_fixture_on_every_device() {
                     encode_complete_timestamp_us: 0,
                     send_timestamp_us: 0,
                     keyframe: true,
-                    data: FIXTURE.to_vec(),
+                    data: FIXTURE.to_vec().into(),
                 },
                 received_at_us: 0,
             };
@@ -282,7 +282,7 @@ fn fixture_frame(frame_id: u64) -> QueuedFrame {
             encode_complete_timestamp_us: 0,
             send_timestamp_us: 0,
             keyframe: true,
-            data: FIXTURE.to_vec(),
+            data: FIXTURE.to_vec().into(),
         },
         received_at_us: 0,
     }

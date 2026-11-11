@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use bytes::{Bytes, BytesMut};
 use thiserror::Error;
 
 use crate::VideoStreamId;
@@ -24,7 +25,9 @@ pub struct EncodedFrame {
     /// Filled immediately before fragmentation/send.
     pub send_timestamp_us: u64,
     pub keyframe: bool,
-    pub data: Vec<u8>,
+    /// Shared, not copied, between the queues a frame passes through; its
+    /// fragments are slices of it.
+    pub data: Bytes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,7 +40,9 @@ pub struct VideoPacket {
     pub keyframe: bool,
     pub packet_index: u16,
     pub packet_count: u16,
-    pub payload: Vec<u8>,
+    /// A slice of the frame on the sender, and of the received message on
+    /// the receiver.
+    pub payload: Bytes,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -86,37 +91,38 @@ impl VideoPacket {
         Ok(bytes)
     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self, VideoPacketError> {
+    /// Decodes a received message; the payload is a slice of it.
+    pub fn decode(bytes: Bytes) -> Result<Self, VideoPacketError> {
         if bytes.len() < VIDEO_PACKET_HEADER_LEN {
             return Err(VideoPacketError::Truncated);
         }
-        if read_u32(bytes, 0) != MAGIC {
+        if read_u32(&bytes, 0) != MAGIC {
             return Err(VideoPacketError::InvalidMagic);
         }
         if bytes[4] != VERSION {
             return Err(VideoPacketError::UnsupportedVersion(bytes[4]));
         }
-        let header_len = read_u16(bytes, 6) as usize;
+        let header_len = read_u16(&bytes, 6) as usize;
         if header_len != VIDEO_PACKET_HEADER_LEN {
             return Err(VideoPacketError::InvalidHeaderLength(header_len));
         }
-        let packet_index = read_u16(bytes, 48);
-        let packet_count = read_u16(bytes, 50);
+        let packet_index = read_u16(&bytes, 48);
+        let packet_count = read_u16(&bytes, 50);
         validate_index(packet_index, packet_count)?;
-        let payload_len = read_u16(bytes, 52) as usize;
+        let payload_len = read_u16(&bytes, 52) as usize;
         if bytes.len() != header_len + payload_len {
             return Err(VideoPacketError::PayloadLengthMismatch);
         }
         Ok(Self {
-            stream_id: VideoStreamId(read_u32(bytes, 8)),
-            frame_id: read_u64(bytes, 16),
-            capture_timestamp_us: read_u64(bytes, 24),
-            encode_complete_timestamp_us: read_u64(bytes, 32),
-            send_timestamp_us: read_u64(bytes, 40),
+            stream_id: VideoStreamId(read_u32(&bytes, 8)),
+            frame_id: read_u64(&bytes, 16),
+            capture_timestamp_us: read_u64(&bytes, 24),
+            encode_complete_timestamp_us: read_u64(&bytes, 32),
+            send_timestamp_us: read_u64(&bytes, 40),
             keyframe: bytes[5] & KEYFRAME_FLAG != 0,
             packet_index,
             packet_count,
-            payload: bytes[header_len..].to_vec(),
+            payload: bytes.slice(header_len..),
         })
     }
 }
@@ -134,11 +140,10 @@ pub fn fragment_frame(
     let count = frame.data.len().div_ceil(max_payload);
     let packet_count =
         u16::try_from(count).map_err(|_| VideoPacketError::TooManyFragments(count))?;
-    frame
-        .data
-        .chunks(max_payload)
-        .enumerate()
-        .map(|(index, payload)| {
+    (0..count)
+        .map(|index| {
+            let start = index * max_payload;
+            let end = frame.data.len().min(start + max_payload);
             Ok(VideoPacket {
                 stream_id: frame.stream_id,
                 frame_id: frame.frame_id,
@@ -148,7 +153,7 @@ pub fn fragment_frame(
                 keyframe: frame.keyframe,
                 packet_index: index as u16,
                 packet_count,
-                payload: payload.to_vec(),
+                payload: frame.data.slice(start..end),
             })
         })
         .collect()
@@ -227,7 +232,7 @@ struct PendingFrame {
     last_packet_at_us: u64,
     total_bytes: usize,
     received: usize,
-    fragments: Vec<Option<Vec<u8>>>,
+    fragments: Vec<Option<Bytes>>,
 }
 
 #[derive(Debug)]
@@ -456,10 +461,7 @@ impl FrameReassembler {
         let Some(HeldFrame::Pending(pending)) = self.held.remove(&packet.frame_id) else {
             unreachable!("the frame was just found pending");
         };
-        let mut data = Vec::with_capacity(pending.total_bytes);
-        for fragment in pending.fragments {
-            data.extend_from_slice(fragment.as_deref().unwrap_or_default());
-        }
+        let data = join_fragments(pending.fragments, pending.total_bytes);
         self.held.insert(
             packet.frame_id,
             HeldFrame::Complete {
@@ -601,6 +603,19 @@ impl FrameReassembler {
     }
 }
 
+/// The fragments of a complete frame, in one buffer: copied once into it,
+/// or the only fragment itself.
+fn join_fragments(fragments: Vec<Option<Bytes>>, total_bytes: usize) -> Bytes {
+    if let [Some(fragment)] = fragments.as_slice() {
+        return fragment.clone();
+    }
+    let mut data = BytesMut::with_capacity(total_bytes);
+    for fragment in fragments.iter().flatten() {
+        data.extend_from_slice(fragment);
+    }
+    data.freeze()
+}
+
 fn validate_index(index: u16, count: u16) -> Result<(), VideoPacketError> {
     if count == 0 || index >= count {
         Err(VideoPacketError::InvalidPacketIndex { index, count })
@@ -647,7 +662,7 @@ mod tests {
             encode_complete_timestamp_us: 110,
             send_timestamp_us: 120,
             keyframe: id == 1,
-            data: data.to_vec(),
+            data: Bytes::copy_from_slice(data),
         }
     }
 
@@ -683,9 +698,39 @@ mod tests {
     fn packet_round_trip() {
         let packet = fragment_frame(&frame(1, b"hello"), 16).unwrap().remove(0);
         assert_eq!(
-            VideoPacket::decode(&packet.encode().unwrap()).unwrap(),
+            VideoPacket::decode(packet.encode().unwrap().into()).unwrap(),
             packet
         );
+    }
+
+    /// Fragmenting, decoding and reassembling a frame copy its bytes only
+    /// into the message that goes on the wire and, for a frame of several
+    /// fragments, into the reassembled frame.
+    #[test]
+    fn fragments_share_the_frame_and_decoding_shares_the_message() {
+        let source = frame(1, b"abcdefghij");
+        let packets = fragments(&source);
+        for (index, packet) in packets.iter().enumerate() {
+            assert_eq!(packet.payload.as_ptr(), source.data[index * 3..].as_ptr());
+        }
+
+        let message = Bytes::from(packets[1].encode().unwrap());
+        let decoded = VideoPacket::decode(message.clone()).unwrap();
+        assert_eq!(
+            decoded.payload.as_ptr(),
+            message[VIDEO_PACKET_HEADER_LEN..].as_ptr()
+        );
+    }
+
+    #[test]
+    fn a_frame_of_one_fragment_is_its_payload() {
+        let source = frame(1, b"abc");
+        let packet = VideoPacket::decode(fragments(&source)[0].encode().unwrap().into()).unwrap();
+        let payload = packet.payload.as_ptr();
+        let mut assembler = FrameReassembler::new(ReassemblyConfig::default());
+        let released = assembler.push(packet, 1).frames;
+        assert_eq!(released, [source]);
+        assert_eq!(released[0].data.as_ptr(), payload);
     }
 
     #[test]
@@ -1029,7 +1074,7 @@ mod tests {
                 keyframe: next(8) == 0,
                 packet_index: next(u64::from(packet_count) + 1) as u16,
                 packet_count,
-                payload: vec![0; next(1_200) as usize],
+                payload: vec![0; next(1_200) as usize].into(),
             };
             released += assembler.push(packet, step * 1_000).frames.len();
             assert!(assembler.held.len() <= config.max_held_frames);
@@ -1045,7 +1090,10 @@ mod tests {
 
     #[test]
     fn malformed_packets_are_rejected_without_panicking() {
-        assert_eq!(VideoPacket::decode(&[]), Err(VideoPacketError::Truncated));
+        assert_eq!(
+            VideoPacket::decode(Bytes::new()),
+            Err(VideoPacketError::Truncated)
+        );
         let mut packet = fragment_frame(&frame(1, b"hello"), 10)
             .unwrap()
             .remove(0)
@@ -1053,7 +1101,7 @@ mod tests {
             .unwrap();
         packet[0] = 0;
         assert_eq!(
-            VideoPacket::decode(&packet),
+            VideoPacket::decode(packet.into()),
             Err(VideoPacketError::InvalidMagic)
         );
     }

@@ -234,7 +234,8 @@ impl Simulation {
                 } else {
                     self.stream.delta_bytes
                 }
-            ],
+            ]
+            .into(),
         };
         self.next_frame_id += 1;
         // Frames of the last second may still be on their way at the end.
@@ -316,7 +317,7 @@ impl Simulation {
     }
 
     fn arrive(&mut self, bytes: Vec<u8>) {
-        let packet = VideoPacket::decode(&bytes).unwrap();
+        let packet = VideoPacket::decode(bytes.into()).unwrap();
         if let Some(remaining) = self.remaining.get_mut(&packet.frame_id) {
             *remaining -= 1;
             if *remaining == 0 {
