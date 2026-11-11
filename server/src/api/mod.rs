@@ -1,6 +1,7 @@
 //! The `/v1` API used by the website, and by Agents and viewers.
 mod account;
 mod agent;
+mod agent_rollout;
 mod alerts;
 mod api_tokens;
 mod applications;
@@ -214,6 +215,10 @@ fn administration_routes() -> Router<AppState> {
         .route("/permissions", get(roles::permissions))
         .route("/settings", get(settings::get).patch(settings::update))
         .route(
+            "/settings/agent-rollout",
+            get(agent_rollout::get).patch(agent_rollout::update),
+        )
+        .route(
             "/settings/authentication",
             website_only_route(
                 get(settings::get_authentication).patch(settings::update_authentication),
@@ -287,6 +292,7 @@ fn device_routes() -> Router<AppState> {
             patch(companies::update).delete(companies::delete),
         )
         .route("/agents/{id}/connect", get(agent::connect))
+        .route("/agents/{id}/update-check", post(agent_rollout::check))
         .route(
             "/agents/{id}/terminals",
             website_only_route(post(terminals::open)),

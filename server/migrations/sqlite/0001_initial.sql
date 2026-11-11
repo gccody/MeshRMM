@@ -53,6 +53,19 @@ CREATE TABLE settings (
   api_tokens_enabled INTEGER NOT NULL DEFAULT 1 CHECK (api_tokens_enabled IN (0, 1)),
   api_token_max_lifetime_days INTEGER DEFAULT 365
     CHECK (api_token_max_lifetime_days IS NULL OR api_token_max_lifetime_days BETWEEN 1 AND 3650),
+  -- How new Agent releases reach devices (see agent_rollout.rs): 'everyone'
+  -- offers each release to every device at once; 'staged' offers it to the
+  -- devices whose rollout_bucket is below agent_rollout_percent, unless
+  -- paused, and an administrator raises the percentage.
+  agent_rollout_mode TEXT NOT NULL DEFAULT 'everyone' CHECK (agent_rollout_mode IN ('everyone', 'staged')),
+  -- Where each new release starts in staged mode.
+  agent_rollout_first_percent INTEGER NOT NULL DEFAULT 10
+    CHECK (agent_rollout_first_percent BETWEEN 1 AND 100),
+  -- The release the stage belongs to. A server that ships another release
+  -- starts it again at the first percentage, not paused, when it starts.
+  agent_rollout_version TEXT,
+  agent_rollout_percent INTEGER NOT NULL DEFAULT 10 CHECK (agent_rollout_percent BETWEEN 1 AND 100),
+  agent_rollout_paused INTEGER NOT NULL DEFAULT 0 CHECK (agent_rollout_paused IN (0, 1)),
   smtp_host TEXT,
   smtp_port INTEGER CHECK (smtp_port IS NULL OR smtp_port BETWEEN 1 AND 65535),
   smtp_security TEXT NOT NULL DEFAULT 'starttls' CHECK (smtp_security IN ('starttls', 'tls', 'none')),
@@ -366,7 +379,12 @@ CREATE TABLE agents (
   company_id TEXT REFERENCES companies (id) ON DELETE SET NULL,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
-  deletion_requested_at INTEGER
+  deletion_requested_at INTEGER,
+  -- The device's place in a staged Agent rollout, 0 to 99, from a hash of
+  -- its ID (agent_rollout::bucket). Enrollment sets it.
+  rollout_bucket INTEGER NOT NULL DEFAULT 0 CHECK (rollout_bucket BETWEEN 0 AND 99),
+  -- The Agent version the device reported at its last update check.
+  agent_version TEXT
 );
 
 CREATE INDEX idx_agents_name ON agents (name);

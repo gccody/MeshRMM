@@ -41,6 +41,11 @@ pub enum Settings {
     FileTransferLimitMb,
     ApiTokensEnabled,
     ApiTokenMaxLifetimeDays,
+    AgentRolloutMode,
+    AgentRolloutFirstPercent,
+    AgentRolloutVersion,
+    AgentRolloutPercent,
+    AgentRolloutPaused,
     SmtpHost,
     SmtpPort,
     SmtpSecurity,
@@ -296,6 +301,8 @@ pub enum Agents {
     CreatedAt,
     UpdatedAt,
     DeletionRequestedAt,
+    RolloutBucket,
+    AgentVersion,
 }
 
 #[derive(Iden)]

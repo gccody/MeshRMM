@@ -11,7 +11,6 @@ pub struct Config {
     pub server: String,
     pub device_id: String,
     pub agent_token: String,
-    pub update_manifest_url: String,
     pub frames_per_second: u32,
     pub bitrate_bits_per_second: u32,
     pub json_logs: bool,
@@ -55,10 +54,6 @@ struct Arguments {
     #[arg(long, env = "MESHRMM_AGENT_TOKEN", hide_env_values = true)]
     agent_token: Option<String>,
 
-    /// HTTPS release manifest used for automatic Agent updates.
-    #[arg(long, env = "MESHRMM_UPDATE_MANIFEST_URL")]
-    update_manifest_url: Option<String>,
-
     #[arg(long, env = "MESHRMM_REMOTE_FPS")]
     frames_per_second: Option<u32>,
 
@@ -74,7 +69,6 @@ struct FileConfig {
     server: Option<String>,
     device_id: Option<String>,
     agent_token: Option<String>,
-    update_manifest_url: Option<String>,
     frames_per_second: Option<u32>,
     bitrate_bits_per_second: Option<u32>,
     json_logs: Option<bool>,
@@ -108,11 +102,6 @@ impl Config {
             .agent_token
             .or(file.agent_token)
             .context("missing Agent token in agent.json or --agent-token")?;
-        let update_manifest_url = arguments
-            .update_manifest_url
-            .or(file.update_manifest_url)
-            .context("missing update manifest URL in agent.json or --update-manifest-url")?;
-        meshrmm_self_update::validate_manifest_url(&update_manifest_url)?;
         let frames_per_second = arguments
             .frames_per_second
             .or(file.frames_per_second)
@@ -131,7 +120,6 @@ impl Config {
                 server,
                 device_id,
                 agent_token,
-                update_manifest_url,
                 frames_per_second,
                 bitrate_bits_per_second,
                 json_logs: arguments.json_logs || file.json_logs.unwrap_or(false),

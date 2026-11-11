@@ -42,6 +42,13 @@ pub struct Settings {
     /// The longest a new API token may last; `None` allows tokens that never
     /// expire.
     pub api_token_max_lifetime_days: Option<i64>,
+    /// How new Agent releases reach devices; see [`crate::agent_rollout`].
+    pub agent_rollout_mode: String,
+    pub agent_rollout_first_percent: i64,
+    /// The release the stage below belongs to.
+    pub agent_rollout_version: Option<String>,
+    pub agent_rollout_percent: i64,
+    pub agent_rollout_paused: bool,
     pub smtp_host: Option<String>,
     pub smtp_port: Option<i64>,
     pub smtp_security: String,
@@ -59,7 +66,7 @@ impl Settings {
     }
 }
 
-const COLUMNS: [SettingsTable; 34] = [
+const COLUMNS: [SettingsTable; 39] = [
     SettingsTable::InstanceName,
     SettingsTable::DashboardIdleTimeoutMinutes,
     SettingsTable::BlackoutMessage,
@@ -86,6 +93,11 @@ const COLUMNS: [SettingsTable; 34] = [
     SettingsTable::FileTransferLimitMb,
     SettingsTable::ApiTokensEnabled,
     SettingsTable::ApiTokenMaxLifetimeDays,
+    SettingsTable::AgentRolloutMode,
+    SettingsTable::AgentRolloutFirstPercent,
+    SettingsTable::AgentRolloutVersion,
+    SettingsTable::AgentRolloutPercent,
+    SettingsTable::AgentRolloutPaused,
     SettingsTable::SmtpHost,
     SettingsTable::SmtpPort,
     SettingsTable::SmtpSecurity,

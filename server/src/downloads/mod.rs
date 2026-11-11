@@ -229,8 +229,10 @@ impl Downloads {
         }
     }
 
-    /// The update manifest, or `None` without downloads.
-    fn manifest(&self) -> Option<Vec<u8>> {
+    /// The update manifest, or `None` without downloads. The public file
+    /// that viewers read, and what an Agent offered the release gets from its
+    /// update check (see [`crate::agent_rollout`]).
+    pub fn manifest(&self) -> Option<Vec<u8>> {
         let inner = &self.inner;
         let (version, builds) = inner.release.as_ref()?;
         let signed = inner

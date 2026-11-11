@@ -514,7 +514,9 @@ long, and when the next attempt starts (`remote/src/reconnect.rs`).
 
 A release is one version of the server, the Agent and the viewer. The server
 serves its release's builds and writes their update manifest itself, so
-upgrading a server upgrades its Agents and viewers. Every updater checks the
+upgrading a server upgrades its Agents and viewers; Agents ask for theirs as
+themselves, so the server can stage a release (`server/src/agent_rollout.rs`).
+Every updater checks the
 release signature and the SHA-256 before replacing anything, and rolls back
 if the new build does not start. See [releases](releases.md) for the signing
 scheme and [devices](devices.md#agent-updates) for what the Agent does.

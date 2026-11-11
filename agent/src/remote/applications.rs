@@ -1156,7 +1156,6 @@ mod tests {
             server: "https://rmm.example.com".into(),
             device_id: "device".into(),
             agent_token: String::new(),
-            update_manifest_url: String::new(),
             frames_per_second: 30,
             bitrate_bits_per_second: 1_000_000,
             json_logs: false,

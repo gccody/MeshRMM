@@ -706,9 +706,16 @@ The server restarts in a few seconds. Agents reconnect by themselves, each
 within about two minutes of the server coming back and spread out at random
 so they don't all arrive at once, and remote sessions that were open resume where the viewer and Agent can.
 
-Agents then update themselves from the server: each checks the server's update
-manifest when it starts and every six hours, and installs a newer build that
-carries a valid release signature. Viewers check when a session starts. An
+Agents then update themselves from the server: each asks the server for its
+update when it starts and every six hours, and installs a newer build that
+carries a valid release signature. By default every device is offered the new
+release at once. To try it on a few devices first, choose **Some devices
+first** under **Settings → Agent updates** before upgrading: the new release
+then starts at the first share (10 percent unless changed), and you advance,
+pause or resume it there. A change reaches each device at its next check, up
+to about six and a half hours later, and pausing doesn't undo installs; see
+[staged rollouts](devices.md#staged-rollouts). Viewers check when a session
+starts. An
 Agent or viewer never installs a build without the release signature, whatever
 the server offers, except that a Mac app signed with your Developer ID installs
 only builds signed by the same team instead. With macOS signing set up, Macs

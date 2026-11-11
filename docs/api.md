@@ -335,6 +335,22 @@ curl -fsS -H "Authorization: Bearer $MESHRMM_TOKEN" -H "Content-Type: applicatio
 with filters and the fleet's totals; a job with
 `"updates": {"action": "install", …}` installs on many.
 
+### Agent rollout
+
+```sh
+# Where the Agent release stands, then offer it to a quarter of the devices.
+curl -fsS -H "Authorization: Bearer $MESHRMM_TOKEN" "$MESHRMM/v1/settings/agent-rollout" |
+  jq '{release, mode, percent, paused, devices}'
+curl -fsS -X PATCH -H "Authorization: Bearer $MESHRMM_TOKEN" -H "Content-Type: application/json" \
+  -d '{"percent": 25}' "$MESHRMM/v1/settings/agent-rollout"
+```
+
+| Route | |
+|---|---|
+| `GET /v1/settings/agent-rollout` | `settings.manage`. `{release, mode, first_percent, percent, paused, offered_percent, devices, updated_at}`: `release` is the Agent release the server ships (`null` without downloads), `mode` `everyone` or `staged`, `offered_percent` the share of devices without the release that are offered it now (100 for everyone, 0 while paused), and `devices` `{on_release, offered, waiting}`: how many enrolled devices reported the release or newer at their last check, are offered it and don't have it, and aren't offered it yet (`null` without a release). |
+| `PATCH /v1/settings/agent-rollout` | `settings.manage`. Any of `{mode, first_percent, percent, paused}`. Percentages are 1 to 100; `percent` and `paused` apply in staged mode only (`400` otherwise). Switching to `staged` starts the current release at `first_percent`, not paused, unless the request says otherwise. Answers like `GET`; recorded as `settings.agent_rollout_update`. |
+| `POST /v1/agents/{id}/update-check` | The Agent, with its own credential: `{version}`, its version. `200` with the update manifest: naming the release when the device is offered it or has it, `{"schema_version": 3, "releases": {}}` otherwise and for a deleted device. `401 agent_unauthenticated` for any other credential, `404` without downloads. |
+
 ### Applications
 
 ```sh

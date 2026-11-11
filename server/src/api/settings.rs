@@ -28,7 +28,7 @@ const MAX_SESSION_LIFETIME_HOURS: u32 = 365 * 24;
 const MAX_UPDATE_SCAN_INTERVAL_HOURS: u32 = 7 * 24;
 
 /// Writes `values` to the settings row, recording who changed it.
-async fn save(
+pub(super) async fn save(
     state: &AppState,
     actor: &Authorized,
     action: &str,
