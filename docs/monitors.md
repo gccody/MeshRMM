@@ -45,21 +45,52 @@ alert shows the latest failure's sentence and output.
 |---|---|---|---|
 | Service | the Service Control Manager, by service name or display name; automatic means the Automatic start type (delayed or not) | `systemctl show`: running is `active`; automatic is `enabled`, `static`, `generated`, `indirect` or an alias | `launchctl print system/<label>`, launchd's system domain only; automatic means not disabled |
 | Process | a process snapshot, by file name with or without `.exe`, ignoring case | `/proc`: the command name or the program's file name | `ps`: the program's file name or path |
-| Event log | the named log through the Event Log API, newest first: the records it wrote since the previous check (on the first, those logged within the last interval); the source matches the provider; event IDs and levels filter; at most 1,000 matching entries a check | the journal (`journalctl`), at most the newest 5,000 entries of the source and levels a check; the source matches the unit (with or without `.service`), syslog identifier or command exactly, as given or in lower case, and an entry shows the one that matched (else its syslog identifier); event IDs don't apply | the unified log (`log show`); the source matches the subsystem, process or sender; event IDs don't apply |
+| Event log | the named log through the Event Log API, oldest first: the records it wrote after the last one the previous check read (on the first, those logged within the last interval); the source matches the provider; event IDs and levels filter; at most 1,000 matching entries a check, the next reading on from there | the journal (`journalctl`), at most the newest 5,000 entries of the source and levels a check; the source matches the unit (with or without `.service`), syslog identifier or command exactly, as given or in lower case, and an entry shows the one that matched (else its syslog identifier); event IDs don't apply | the unified log (`log show`); the source matches the subsystem, process or sender; event IDs don't apply |
 | Ping | the ICMP API, IPv4 and IPv6 | `ping` | `ping`, or `ping6` for an IPv6 address |
 
 The event log levels map onto the journal's priorities (critical is 0 to 2,
 error 3, warning 4, information 5 and 6) and the unified log's types (fault,
 error, default and info). With no level chosen, every level but debug counts.
 An event log rule that names no Windows log isn't sent to Windows devices.
-A check that reads as many entries as it may says so in its result ("At
-least N matching events…"), since older entries since the last check went
-unread. So does a Windows check that runs out of time, which happens on a
-busy log with a message to search for (each event's message is read from
-its publisher, about 0.15 ms an event): what it found by then raises the
-alert, the result names the log as too busy to search in the time limit
-and suggests a source or event IDs, and the next check reads on from the
-records written after this one started, rather than reading these again.
+A Linux or Mac check that reads as many entries as it may says so in its
+result ("At least N matching events…"), since older entries since the last
+check went unread.
+
+A Windows check reads each record once. It remembers the last record it
+read (its place, by record number, since many events can share a time) and
+the next check reads on after it. One that stops part way, at its cap or
+because it runs out of time, which happens on a busy log with a message to
+search for (each event's message is read from its publisher, about 0.15 ms
+an event), raises the alert for what it found by then, or passes; either
+way its result says so ("At least N…" or "No matching events in the entries
+read…"), names the time of the last entry it read and how far behind that
+is, names the log as too busy to search in the time limit and suggests a
+source or event IDs. The next check reads the rest, so a match in the part
+it didn't get to raises the alert then, and a match found is reported once.
+A result's sentence puts the latest match before these notes, which the
+output holds in full.
+
+- **Falling behind.** When a check stopped part way at an entry logged
+  more than 3 intervals before the next check starts (`BEHIND_INTERVALS`),
+  the next doesn't read on from there: it reads what was logged in the last
+  interval, as a first check does, and its result says which entries,
+  logged from when to when, it skipped. A burst gets two more
+  checks to catch up before anything is skipped; a log too busy ever to
+  keep up with raises its alerts at most about 3 intervals late. A check
+  that read to the end isn't behind, however long ago that was (a computer
+  that slept), and reads on from its place.
+- **A cleared log** numbers its records from 1 again, so a place past its
+  newest record (or a log now empty) is gone: the check reads by time from
+  where the last one got to, saying the log was cleared. A log cleared and
+  refilled past the place between two checks isn't noticed.
+- **A full log** overwrites its oldest records; when some after the place
+  went before a check read them, the result says how many, and the check
+  reads on from the oldest left.
+- **The place resets** to a first check (the last interval) when the rule's
+  check changes, since it belongs to the old query, and when the Agent
+  starts, since monitors' memory isn't kept on disk. The server sending the
+  same monitors again (on reconnecting) keeps it.
+
 A service monitor is sent to a Linux device only if its name is a
 systemd unit name (letters, digits and `:-_.@\`), and to a Mac only if it is
 a launchd label (letters, digits and `.-_`); the device's Monitors tab says
@@ -331,7 +362,10 @@ carries `output`, `notified` and the `remediation_*` columns;
 - `cargo test -p meshrmm-agent monitors` covers the scheduler, which results
   go at once and which wait for the refresh, what a reconnect sends given
   what the server holds, results the socket refused, every check's
-  judging, and reading each tool's output from captures of the real tools
+  judging, an event log read on Windows against a log in memory (reading on
+  after a check that stopped part way, each match once, a cleared or full
+  log, skipping ahead at the bound, keeping the place until the rule
+  changes), and reading each tool's output from captures of the real tools
   (`agent/src/remote/monitors/testdata/`): Windows Event Log XML, journal
   JSON, `systemctl show`, `/proc/<pid>/stat`, `ping` and certificates.
   On Windows it also reads the Service Control Manager, processes, the

@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use super::command::{self, Finished};
-use super::parse::{self, EventFilter, LogRead, ProcessSample, ServiceStatus};
+use super::parse::{self, EventFilter, LogPlace, LogRead, LogWindow, ProcessSample, ServiceStatus};
 
 const TOOL_TIMEOUT: Duration = Duration::from_secs(20);
 const RESTART_TIMEOUT: Duration = Duration::from_secs(120);
@@ -129,12 +129,12 @@ pub(super) fn end_processes(name: &str) -> anyhow::Result<usize> {
 pub(super) fn events(
     _log: &str,
     filter: &EventFilter,
-    since_ms: i64,
-    _now_ms: i64,
+    window: &LogWindow,
     timeout: Duration,
     // The journal is read by time.
-    _log_record: &mut Option<u64>,
+    _place: &mut Option<LogPlace>,
 ) -> anyhow::Result<LogRead> {
+    let since_ms = window.since_ms;
     let arguments = journal_arguments(filter, since_ms);
     let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
     let finished = command::run("journalctl", &arguments, timeout)?;
@@ -149,7 +149,7 @@ pub(super) fn events(
             // `--since` counts whole seconds.
             .filter(|event| event.at_ms >= since_ms)
             .collect(),
-        out_of_time: false,
+        ..LogRead::default()
     })
 }
 
@@ -289,8 +289,11 @@ mod tests {
         events(
             "",
             &filter,
-            now - 24 * 60 * 60 * 1000,
-            now,
+            &LogWindow {
+                now_ms: now,
+                since_ms: now - 24 * 60 * 60 * 1000,
+                interval_ms: 24 * 60 * 60 * 1000,
+            },
             Duration::from_secs(20),
             &mut None,
         )

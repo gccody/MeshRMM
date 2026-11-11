@@ -4,7 +4,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use super::command::{self, Finished};
-use super::parse::{self, EventFilter, LogRead, ProcessSample, ServiceStatus};
+use super::parse::{self, EventFilter, LogPlace, LogRead, LogWindow, ProcessSample, ServiceStatus};
 
 const TOOL_TIMEOUT: Duration = Duration::from_secs(20);
 const RESTART_TIMEOUT: Duration = Duration::from_secs(120);
@@ -119,12 +119,12 @@ pub(super) fn predicate(filter: &EventFilter) -> String {
 pub(super) fn events(
     _log: &str,
     filter: &EventFilter,
-    since_ms: i64,
-    _now_ms: i64,
+    window: &LogWindow,
     timeout: Duration,
     // The unified log is read by time.
-    _log_record: &mut Option<u64>,
+    _place: &mut Option<LogPlace>,
 ) -> anyhow::Result<LogRead> {
+    let since_ms = window.since_ms;
     let start = format!(
         "{}+0000",
         parse::format_time(since_ms).trim_end_matches(" UTC")
@@ -155,7 +155,7 @@ pub(super) fn events(
             .collect(),
         // Only the output cap stops it.
         truncated: finished.truncated,
-        out_of_time: false,
+        ..LogRead::default()
     })
 }
 

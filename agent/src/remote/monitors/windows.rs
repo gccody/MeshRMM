@@ -1,7 +1,7 @@
 //! Monitors on Windows: the Service Control Manager for services, a
 //! process snapshot for processes, the Event Log API for events, and the
 //! ICMP API for ping, so nothing depends on a tool's localized output.
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::time::{Duration, Instant};
 
@@ -21,8 +21,8 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 };
 use windows::Win32::System::EventLog::{
     EVT_HANDLE, EvtClose, EvtFormatMessage, EvtFormatMessageEvent, EvtNext,
-    EvtOpenPublisherMetadata, EvtQuery, EvtQueryChannelPath, EvtQueryReverseDirection, EvtRender,
-    EvtRenderEventXml,
+    EvtOpenPublisherMetadata, EvtQuery, EvtQueryChannelPath, EvtQueryForwardDirection,
+    EvtQueryReverseDirection, EvtRender, EvtRenderEventXml,
 };
 use windows::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows::Win32::System::Threading::{
@@ -34,10 +34,13 @@ use windows_service::service::{ServiceAccess, ServiceStartType, ServiceState};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use super::network;
-use super::parse::{self, EventFilter, LogEvent, LogRead, ProcessSample, ServiceStatus};
+use super::parse::{
+    self, BEHIND_INTERVALS, Behind, EventFilter, LogEvent, LogPlace, LogRead, LogWindow,
+    ProcessSample, ServiceStatus,
+};
 
 const SERVICE_WAIT: Duration = Duration::from_secs(60);
-/// The most events one check reads, newest first.
+/// The most matching events one check reads; the next reads on from there.
 const MAX_EVENTS: usize = 1000;
 /// Events whose message is read when the filter doesn't need every one's:
 /// those a failing result lists.
@@ -368,15 +371,21 @@ fn message(publisher: &Event, event: &Event) -> Option<String> {
     }
 }
 
-/// The events of a query's result set, newest first.
-fn query(log: &str, query: &str) -> anyhow::Result<Event> {
+/// The events of a query's result set, oldest first, or newest first when
+/// `reverse`.
+fn query(log: &str, query: &str, reverse: bool) -> anyhow::Result<Event> {
+    let direction = if reverse {
+        EvtQueryReverseDirection.0
+    } else {
+        EvtQueryForwardDirection.0
+    };
     // SAFETY: the result set is closed on drop.
     let results = unsafe {
         EvtQuery(
             None,
             &HSTRING::from(log),
             &HSTRING::from(query),
-            EvtQueryChannelPath.0 | EvtQueryReverseDirection.0,
+            EvtQueryChannelPath.0 | direction,
         )
     }
     .map_err(|error| anyhow::anyhow!("could not read the “{log}” log: {}", error.message()))?;
@@ -424,12 +433,16 @@ trait Records {
     type Record;
     /// The number of the log's newest record; `None` when it has none.
     fn newest(&mut self) -> anyhow::Result<Option<u64>>;
-    /// Starts reading the records the filter's query selects, newest first.
+    /// The number of the log's oldest record; `None` when it has none.
+    fn oldest(&mut self) -> anyhow::Result<Option<u64>>;
+    /// Starts reading the records the filter's query selects, oldest first.
     fn select(&mut self, filter: &EventFilter, records: parse::Records) -> anyhow::Result<()>;
     /// How long the check has left.
     fn left(&self) -> Duration;
     /// The next record selected, waiting at most `left`.
     fn next(&mut self, left: Duration) -> anyhow::Result<Next<Self::Record>>;
+    /// The record's number.
+    fn number(&self, record: &Self::Record) -> Option<u64>;
     /// The record's event, with the message its own XML holds: the rendered
     /// one, else its data.
     fn event(&self, record: &Self::Record) -> Option<LogEvent>;
@@ -445,27 +458,86 @@ enum Next<R> {
     OutOfTime,
 }
 
-/// Reads the records written to the log since `log_record`, the newest one
-/// an earlier check read up to; with none, or when the log was cleared
-/// since (it numbers its records from 1 again), those logged since
-/// `since_ms`. Newest first, until the check's time is up: what it found by
-/// then counts, and the read says it ran out of time. `log_record` becomes
-/// the newest record when it started, so the next check reads only what
-/// was written after, and a log with nothing new costs one record's read.
+/// Reads the records written to the log since `place`, where an earlier
+/// check got to, oldest first, until the check's time is up or it found as
+/// many as it may: what it found by then counts, the read says how far it
+/// got, and `place` becomes the last record it read, so the next check
+/// reads on from there and reads each record once. A read to the end
+/// leaves `place` at the newest record when it started.
+///
+/// With no place (a monitor's first check, also after its rule changed or
+/// the Agent started), it reads those logged within `window`; when the
+/// place is gone because the log was cleared (it numbers its records from
+/// 1 again), those logged since the place's time. A place left by a check
+/// that stopped part way more than [`BEHIND_INTERVALS`] intervals ago
+/// skips to the last interval, saying so. A log with nothing new costs one
+/// record's read.
 fn read_records<R: Records>(
     records: &mut R,
     filter: &EventFilter,
-    since_ms: i64,
-    now_ms: i64,
-    log_record: &mut Option<u64>,
+    window: &LogWindow,
+    place: &mut Option<LogPlace>,
 ) -> anyhow::Result<LogRead> {
-    let Some(newest) = records.newest()? else {
-        *log_record = None;
-        return Ok(LogRead::default());
+    let now_ms = window.now_ms;
+    let read_to_end = |record| LogPlace {
+        record,
+        read_to_ms: now_ms,
+        behind: false,
     };
-    let after = log_record.filter(|after| *after <= newest);
-    if after == Some(newest) {
-        return Ok(LogRead::default());
+    let mut read = LogRead::default();
+    let previous = *place;
+    let Some(newest) = records.newest()? else {
+        if let Some(LogPlace {
+            record: Some(_),
+            read_to_ms,
+            ..
+        }) = previous
+        {
+            read.cleared_since_ms = Some(read_to_ms);
+        }
+        *place = Some(read_to_end(None));
+        return Ok(read);
+    };
+    // After a record, or by time from `since_ms`.
+    let mut after = None;
+    let mut since_ms = window.since_ms;
+    let oldest_ms = now_ms - BEHIND_INTERVALS * window.interval_ms;
+    match previous {
+        Some(previous) if previous.record == Some(newest) => {
+            *place = Some(read_to_end(Some(newest)));
+            return Ok(read);
+        }
+        Some(previous) if previous.behind && previous.read_to_ms < oldest_ms => {
+            since_ms = now_ms - window.interval_ms;
+            read.skipped = Some((previous.read_to_ms, since_ms));
+        }
+        Some(LogPlace {
+            record: Some(record),
+            read_to_ms,
+            ..
+        }) if record > newest => {
+            since_ms = read_to_ms;
+            read.cleared_since_ms = Some(read_to_ms);
+        }
+        Some(LogPlace {
+            record: Some(record),
+            read_to_ms,
+            ..
+        }) => {
+            after = Some(record);
+            since_ms = read_to_ms;
+            // A full log overwrites its oldest records, which may be some
+            // not read yet; reading on starts at the oldest left.
+            if let Some(oldest) = records.oldest()? {
+                read.overwritten = oldest.saturating_sub(record + 1);
+            }
+        }
+        Some(LogPlace {
+            record: None,
+            read_to_ms,
+            ..
+        }) => since_ms = read_to_ms,
+        None => {}
     }
     records.select(
         filter,
@@ -481,42 +553,81 @@ fn read_records<R: Records>(
         message: String::new(),
         ..filter.clone()
     };
-    let mut read = LogRead::default();
-    while read.events.len() < MAX_EVENTS {
+    // Without a message to search for, only the messages a result lists
+    // are formatted: the newest events', once the read is done.
+    let mut unformatted = VecDeque::new();
+    let (mut last_record, mut last_at_ms) = (None, None);
+    // Whether it stopped part way, at the time limit or else at the cap.
+    let mut stopped = None;
+    loop {
+        if read.events.len() >= MAX_EVENTS {
+            stopped = Some(false);
+            break;
+        }
         let left = records.left();
         if left.is_zero() {
-            read.out_of_time = true;
+            stopped = Some(true);
             break;
         }
         let record = match records.next(left)? {
             Next::Record(record) => record,
             Next::End => break,
             Next::OutOfTime => {
-                read.out_of_time = true;
+                stopped = Some(true);
                 break;
             }
         };
-        let Some(mut event) = records.event(&record) else {
+        let event = records.event(&record);
+        if let Some(number) = records.number(&record) {
+            last_record = Some(number);
+            last_at_ms = event.as_ref().map(|event| event.at_ms).or(last_at_ms);
+        }
+        let Some(mut event) = event else {
             continue;
         };
         if !unworded.matches(&event) {
             continue;
         }
-        if (!filter.message.is_empty() || read.events.len() < MESSAGES_LISTED)
-            && let Some(message) = records.message(&record)
-        {
+        if filter.message.is_empty() {
+            read.events.push(event);
+            unformatted.push_back((record, read.events.len() - 1));
+            if unformatted.len() > MESSAGES_LISTED {
+                unformatted.pop_front();
+            }
+            continue;
+        }
+        if let Some(message) = records.message(&record) {
             event.message = message.trim().to_owned();
         }
         if filter.matches(&event) {
             read.events.push(event);
         }
     }
-    read.truncated = read.events.len() >= MAX_EVENTS;
-    // Reverse direction is record order, which isn't strictly time order:
-    // an event can be written with an earlier time than the one before it.
+    for (record, index) in unformatted {
+        if let Some(message) = records.message(&record) {
+            read.events[index].message = message.trim().to_owned();
+        }
+    }
+    *place = Some(match stopped {
+        None => read_to_end(Some(newest)),
+        Some(out_of_time) => {
+            // Times mostly follow record order, but not strictly.
+            let read_to_ms = last_at_ms.map_or(since_ms, |at_ms: i64| at_ms.max(since_ms));
+            read.behind = Some(Behind {
+                out_of_time,
+                read_to_ms,
+                lag_ms: now_ms - read_to_ms,
+            });
+            LogPlace {
+                record: last_record.or(after),
+                read_to_ms,
+                behind: true,
+            }
+        }
+    });
+    // A result lists the newest first.
     read.events
         .sort_by_key(|event| std::cmp::Reverse(event.at_ms));
-    *log_record = Some(newest);
     Ok(read)
 }
 
@@ -535,11 +646,11 @@ struct Rendered {
     xml: String,
 }
 
-impl Records for EventLog<'_> {
-    type Record = Rendered;
-
-    fn newest(&mut self) -> anyhow::Result<Option<u64>> {
-        let results = query(self.log, "*")?;
+impl EventLog<'_> {
+    /// The number of the log's newest record, or when not `newest`, its
+    /// oldest.
+    fn end(&self, newest: bool) -> anyhow::Result<Option<u64>> {
+        let results = query(self.log, "*", newest)?;
         let event = match next_batch(&results, 1, self.left())? {
             Batch::Events(events) => events.into_iter().next(),
             Batch::End => None,
@@ -551,11 +662,27 @@ impl Records for EventLog<'_> {
         let xml = render(&event)?;
         parse::windows_record(&xml)
             .map(Some)
-            .ok_or_else(|| anyhow::anyhow!("the log's newest record has no number"))
+            .ok_or_else(|| anyhow::anyhow!("the log's record has no number"))
+    }
+}
+
+impl Records for EventLog<'_> {
+    type Record = Rendered;
+
+    fn newest(&mut self) -> anyhow::Result<Option<u64>> {
+        self.end(true)
+    }
+
+    fn oldest(&mut self) -> anyhow::Result<Option<u64>> {
+        self.end(false)
     }
 
     fn select(&mut self, filter: &EventFilter, records: parse::Records) -> anyhow::Result<()> {
-        self.results = Some(query(self.log, &parse::windows_query(filter, records))?);
+        self.results = Some(query(
+            self.log,
+            &parse::windows_query(filter, records),
+            false,
+        )?);
         Ok(())
     }
 
@@ -579,6 +706,10 @@ impl Records for EventLog<'_> {
                 Batch::OutOfTime => return Ok(Next::OutOfTime),
             }
         }
+    }
+
+    fn number(&self, record: &Rendered) -> Option<u64> {
+        parse::windows_record(&record.xml)
     }
 
     fn event(&self, record: &Rendered) -> Option<LogEvent> {
@@ -605,10 +736,9 @@ impl Records for EventLog<'_> {
 pub(super) fn events(
     log: &str,
     filter: &EventFilter,
-    since_ms: i64,
-    now_ms: i64,
+    window: &LogWindow,
     timeout: Duration,
-    log_record: &mut Option<u64>,
+    place: &mut Option<LogPlace>,
 ) -> anyhow::Result<LogRead> {
     let mut records = EventLog {
         log,
@@ -617,7 +747,7 @@ pub(super) fn events(
         batch: Vec::new().into_iter(),
         publishers: HashMap::new(),
     };
-    read_records(&mut records, filter, since_ms, now_ms, log_record)
+    read_records(&mut records, filter, window, place)
 }
 
 pub(super) fn ping(host: &str, timeout: Duration) -> anyhow::Result<Option<f64>> {
@@ -728,7 +858,7 @@ mod tests {
 
     #[test]
     fn the_event_log_is_queried() {
-        let now = parse::parse_timestamp("2100-01-01T00:00:00Z").unwrap();
+        let far = parse::parse_timestamp("2100-01-01T00:00:00Z").unwrap();
         let filter = EventFilter {
             levels: vec![
                 meshrmm_protocol::EventLevel::Information,
@@ -736,34 +866,41 @@ mod tests {
             ],
             ..EventFilter::default()
         };
-        let since = super::super::now_ms() - 7 * 24 * 60 * 60 * 1000;
-        let mut log_record = None;
+        let now = super::super::now_ms();
+        let week = 7 * 24 * 60 * 60 * 1000;
+        let window = LogWindow {
+            now_ms: now,
+            since_ms: now - week,
+            interval_ms: week,
+        };
+        let mut place = None;
         let found = events(
             "System",
             &filter,
-            since,
-            super::super::now_ms(),
+            &window,
             Duration::from_secs(30),
-            &mut log_record,
+            &mut place,
         )
         .unwrap()
         .events;
         assert!(
             found
                 .iter()
-                .all(|event| event.at_ms >= since - 1000 && event.at_ms < now)
+                .all(|event| event.at_ms >= window.since_ms - 1000 && event.at_ms < far)
         );
         assert!(
             found.windows(2).all(|pair| pair[0].at_ms >= pair[1].at_ms),
             "newest first"
         );
-        assert!(log_record.is_some(), "the System log is never empty");
+        assert!(
+            place.and_then(|place| place.record).is_some(),
+            "the System log is never empty"
+        );
         assert!(
             events(
                 "No Such Log",
                 &filter,
-                since,
-                super::super::now_ms(),
+                &window,
                 Duration::from_secs(5),
                 &mut None,
             )
@@ -782,40 +919,52 @@ mod tests {
             message: "no such message".into(),
         };
         let now = super::super::now_ms();
-        let mut log_record = None;
+        let hour = 60 * 60 * 1000;
+        let window = LogWindow {
+            now_ms: now,
+            since_ms: now - hour,
+            interval_ms: hour,
+        };
+        let mut place = None;
         // The first read selects by time, ...
         let first = events(
             "Application",
             &filter,
-            now - 60 * 60 * 1000,
-            now,
+            &window,
             Duration::from_secs(30),
-            &mut log_record,
+            &mut place,
         )
         .unwrap();
-        assert!(first.events.is_empty() && !first.out_of_time);
-        // ... later ones by record number.
-        let newest = log_record.expect("the Application log is never empty");
-        log_record = Some(newest.saturating_sub(500));
+        assert!(first.events.is_empty() && first.behind.is_none());
+        // ... later ones by record number, after the oldest is looked up.
+        let newest = place
+            .and_then(|place| place.record)
+            .expect("the Application log is never empty");
+        place = Some(LogPlace {
+            record: Some(newest.saturating_sub(500)),
+            read_to_ms: now,
+            behind: false,
+        });
         let later = events(
             "Application",
             &filter,
-            now,
-            now,
+            &window,
             Duration::from_secs(30),
-            &mut log_record,
+            &mut place,
         )
         .unwrap();
         assert!(later.events.is_empty());
-        assert!(log_record >= Some(newest));
+        assert!(place.and_then(|place| place.record) >= Some(newest));
     }
 
     /// A log in memory: its records, oldest first, the time the check has
     /// left, and how much of it each message takes.
     struct Fake {
         records: Vec<(u64, LogEvent)>,
+        next_number: u64,
         now_ms: i64,
-        selected: Vec<(u64, LogEvent)>,
+        interval_ms: i64,
+        selected: VecDeque<(u64, LogEvent)>,
         left_ms: u64,
         message_ms: u64,
         selects: usize,
@@ -827,8 +976,10 @@ mod tests {
         fn new(now_ms: i64) -> Self {
             Self {
                 records: Vec::new(),
+                next_number: 1,
                 now_ms,
-                selected: Vec::new(),
+                interval_ms: 60_000,
+                selected: VecDeque::new(),
                 left_ms: 0,
                 message_ms: 10,
                 selects: 0,
@@ -839,9 +990,8 @@ mod tests {
 
         /// Writes an event of `level` at `at_ms`, whose message is `text`.
         fn write(&mut self, at_ms: i64, level: meshrmm_protocol::EventLevel, text: &str) {
-            let number = self.records.last().map_or(1, |(number, _)| number + 1);
             self.records.push((
-                number,
+                self.next_number,
                 LogEvent {
                     at_ms,
                     level: Some(level),
@@ -850,21 +1000,33 @@ mod tests {
                     message: text.into(),
                 },
             ));
+            self.next_number += 1;
         }
 
-        /// A check with `left_ms` to read in.
+        /// Clears the log, which numbers its records from 1 again.
+        fn clear(&mut self) {
+            self.records.clear();
+            self.next_number = 1;
+        }
+
+        /// A check with `left_ms` to read in, `since_ms` being the last
+        /// check's start.
         fn check(
             &mut self,
             filter: &EventFilter,
             since_ms: i64,
             left_ms: u64,
-            log_record: &mut Option<u64>,
+            place: &mut Option<LogPlace>,
         ) -> LogRead {
             self.left_ms = left_ms;
             (self.selects, self.messages) = (0, 0);
             self.returned.clear();
-            let now = self.now_ms;
-            read_records(self, filter, since_ms, now, log_record).unwrap()
+            let window = LogWindow {
+                now_ms: self.now_ms,
+                since_ms,
+                interval_ms: self.interval_ms,
+            };
+            read_records(self, filter, &window, place).unwrap()
         }
     }
 
@@ -875,6 +1037,10 @@ mod tests {
             Ok(self.records.last().map(|(number, _)| *number))
         }
 
+        fn oldest(&mut self) -> anyhow::Result<Option<u64>> {
+            Ok(self.records.first().map(|(number, _)| *number))
+        }
+
         /// Selects by number or time; the rest of the filter is left to
         /// the reading.
         fn select(&mut self, _: &EventFilter, records: parse::Records) -> anyhow::Result<()> {
@@ -883,7 +1049,6 @@ mod tests {
             self.selected = self
                 .records
                 .iter()
-                .rev()
                 .filter(|(number, event)| {
                     *number <= records.through
                         && records
@@ -900,12 +1065,15 @@ mod tests {
         }
 
         fn next(&mut self, _: Duration) -> anyhow::Result<Next<(u64, LogEvent)>> {
-            if self.selected.is_empty() {
+            let Some(record) = self.selected.pop_front() else {
                 return Ok(Next::End);
-            }
-            let record = self.selected.remove(0);
+            };
             self.returned.push(record.0);
             Ok(Next::Record(record))
+        }
+
+        fn number(&self, (number, _): &(u64, LogEvent)) -> Option<u64> {
+            Some(*number)
         }
 
         /// Its message only from its publisher.
@@ -923,65 +1091,167 @@ mod tests {
         }
     }
 
+    fn judge(read: &LogRead, filter: &EventFilter) -> super::super::Outcome {
+        super::super::checks::judge_events(read, filter, "Security", Duration::from_secs(30))
+    }
+
     #[test]
-    fn a_log_too_busy_to_search_in_time_keeps_what_it_found_and_reads_on() {
+    fn a_log_too_busy_to_search_in_time_reads_on_from_where_it_stopped() {
         use meshrmm_protocol::EventLevel::{Error, Warning};
         let now = 1_000_000_000;
         let mut log = Fake::new(now);
+        log.interval_ms = 10 * 60_000;
         for number in 1..=100 {
-            let text = if number % 10 == 0 {
+            let text = if number == 75 {
                 "Disk D: failed"
             } else {
                 "All well"
             };
-            log.write(now - 1000 + number, Error, text);
+            log.write(now - 600_000 + number * 1000, Error, text);
         }
         let filter = EventFilter {
             levels: vec![Error],
             message: "disk d".into(),
             ..EventFilter::default()
         };
-        let mut log_record = None;
+        let mut place = None;
 
-        // Time for the newest 30 messages: what they hold counts.
-        let read = log.check(&filter, now - 60_000, 300, &mut log_record);
-        assert!(read.out_of_time && !read.truncated);
+        // Time for the oldest 30 messages, none of them matching: it
+        // passes, saying how far it got.
+        let read = log.check(&filter, now - 700_000, 300, &mut place);
+        assert_eq!(log.returned, (1..=30).collect::<Vec<_>>(), "oldest first");
+        assert!(read.events.is_empty());
+        let reached = now - 570_000;
+        assert_eq!(
+            read.behind,
+            Some(Behind {
+                out_of_time: true,
+                read_to_ms: reached,
+                lag_ms: 570_000,
+            })
+        );
+        assert_eq!(
+            place,
+            Some(LogPlace {
+                record: Some(30),
+                read_to_ms: reached,
+                behind: true,
+            })
+        );
+        let outcome = judge(&read, &filter);
+        assert!(outcome.passing);
+        assert!(
+            outcome.detail.contains(&format!(
+                "this check read the entries logged up to {} (9 minutes behind) and the next reads on from there",
+                parse::format_time(reached)
+            )),
+            "{}",
+            outcome.detail
+        );
+
+        // The next check reads the rest, finding the match the first never
+        // got to, and what was written since, whatever the events' times
+        // say; none of the levels it doesn't ask for costs a message.
+        log.write(now - 700_000, Error, "Disk D: failed again");
+        log.write(now, Warning, "Disk D: slow");
+        log.write(now, Error, "All well");
+        let read = log.check(&filter, now - 1, 10_000, &mut place);
+        assert_eq!(
+            log.returned,
+            (31..=103).collect::<Vec<_>>(),
+            "nothing read twice"
+        );
+        assert_eq!(log.messages, 72);
+        assert_eq!(read.behind, None);
         assert_eq!(
             read.events
                 .iter()
-                .map(|event| event.at_ms)
+                .map(|event| event.message.as_str())
                 .collect::<Vec<_>>(),
-            [now - 900, now - 910, now - 920],
+            ["Disk D: failed", "Disk D: failed again"],
             "newest first"
         );
-        assert_eq!(log.messages, 30);
-        assert_eq!(log_record, Some(100));
+        assert!(!judge(&read, &filter).passing);
+        assert_eq!(
+            place,
+            Some(LogPlace {
+                record: Some(103),
+                read_to_ms: now,
+                behind: false,
+            })
+        );
 
-        // The next check reads only what was written since, whatever the
-        // events' times say, and none of the levels it doesn't ask for
-        // costs a message.
-        log.write(now - 5000, Error, "Disk D: failed again");
-        log.write(now, Warning, "Disk D: slow");
-        log.write(now, Error, "All well");
-        let read = log.check(&filter, now - 1, 1000, &mut log_record);
-        assert_eq!(log.returned, [103, 102, 101], "nothing read twice");
-        assert_eq!(log.messages, 2);
-        assert!(!read.out_of_time);
-        assert_eq!(read.events.len(), 1);
-        assert_eq!(read.events[0].message, "Disk D: failed again");
-        assert_eq!(log_record, Some(103));
-
-        // Nothing new: nothing is selected or formatted.
-        let read = log.check(&filter, now - 1, 1000, &mut log_record);
+        // Nothing new: nothing is selected or formatted, and nothing found
+        // is found again.
+        let read = log.check(&filter, now - 1, 1000, &mut place);
         assert_eq!(read, LogRead::default());
         assert_eq!((log.selects, log.messages), (0, 0));
-        assert_eq!(log_record, Some(103));
+        assert_eq!(place.unwrap().record, Some(103));
 
-        // A check with no time left says so, with nothing found.
-        log.write(now, Error, "Disk D: failed");
-        let read = log.check(&filter, now - 1, 0, &mut log_record);
-        assert!(read.out_of_time && read.events.is_empty());
-        assert_eq!(log_record, Some(104), "the next one starts after it");
+        // A check with no time left reads nothing and stays where it was;
+        // the next finds what it missed, once.
+        log.now_ms += 60_000;
+        log.write(now + 30_000, Error, "Disk D: failed");
+        let read = log.check(&filter, now, 0, &mut place);
+        assert!(read.events.is_empty());
+        assert_eq!(read.behind.map(|behind| behind.read_to_ms), Some(now));
+        assert_eq!(place.unwrap().record, Some(103));
+        let read = log.check(&filter, now, 1000, &mut place);
+        assert_eq!(log.returned, [104]);
+        assert_eq!(read.events.len(), 1);
+        let read = log.check(&filter, now, 1000, &mut place);
+        assert!(read.events.is_empty());
+    }
+
+    #[test]
+    fn a_check_that_keeps_falling_behind_skips_ahead_at_the_bound() {
+        use meshrmm_protocol::EventLevel::Error;
+        let interval = 60_000;
+        let mut log = Fake::new(1_000_000_000);
+        log.interval_ms = interval;
+        let filter = EventFilter {
+            message: "disk d".into(),
+            ..EventFilter::default()
+        };
+        let mut place: Option<LogPlace> = None;
+        let mut skips = Vec::new();
+        for check in 1..=10 {
+            // 100 events an interval, of which a check has time for 10.
+            log.now_ms += interval;
+            let first = log.next_number;
+            for index in 0..100 {
+                log.write(log.now_ms - interval + index * 600, Error, "All well");
+            }
+            let previous = place;
+            let read = log.check(&filter, log.now_ms - interval, 100, &mut place);
+            assert_eq!(log.returned.len(), 10);
+            let reached = place.unwrap();
+            assert!(reached.behind);
+            assert!(
+                log.now_ms - reached.read_to_ms <= BEHIND_INTERVALS * interval,
+                "never further behind than the bound"
+            );
+            if let Some((from_ms, to_ms)) = read.skipped {
+                skips.push(check);
+                assert_eq!(from_ms, previous.unwrap().read_to_ms);
+                assert_eq!(to_ms, log.now_ms - interval);
+                assert_eq!(log.returned[0], first, "it reads on from the last interval");
+                let outcome = judge(&read, &filter);
+                assert!(outcome.passing);
+                assert!(
+                    outcome.output.contains(&format!(
+                        "the checks had fallen more than 3 intervals behind the “Security” log, so the entries logged from {} to {} were skipped",
+                        parse::format_time(from_ms),
+                        parse::format_time(to_ms)
+                    )),
+                    "{}",
+                    outcome.output
+                );
+            }
+        }
+        // 54 seconds further behind each check: the fourth is more than
+        // three intervals behind.
+        assert_eq!(skips, [4, 7, 10]);
     }
 
     #[test]
@@ -991,47 +1261,108 @@ mod tests {
         let mut log = Fake::new(now);
         log.write(now - 120_000, Error, "Too old");
         for number in 0..50 {
-            log.write(now - 1000 + number, Error, "Disk D: failed");
+            log.write(
+                now - 1000 + number,
+                Error,
+                &format!("Disk D: failed {number}"),
+            );
         }
         // The first check reads the window back from now, and without a
-        // message to search for, formats only the messages a result lists.
-        let mut log_record = None;
-        let read = log.check(
-            &EventFilter::default(),
-            now - 60_000,
-            10_000,
-            &mut log_record,
-        );
+        // message to search for, formats only the messages a result lists:
+        // the newest.
+        let mut place = None;
+        let read = log.check(&EventFilter::default(), now - 60_000, 10_000, &mut place);
         assert_eq!(read.events.len(), 50);
         assert_eq!(log.messages, MESSAGES_LISTED);
-        assert!(!read.out_of_time && !read.truncated);
-        assert_eq!(log_record, Some(51));
+        assert_eq!(read.events[0].message, "Disk D: failed 49");
+        assert_eq!(
+            read.events[MESSAGES_LISTED - 1].message,
+            "Disk D: failed 30"
+        );
+        assert_eq!(read.events[MESSAGES_LISTED].message, "");
+        assert!(read.behind.is_none() && !read.truncated);
+        assert_eq!(place.unwrap().record, Some(51));
 
         // A cleared log numbers its records from 1 again: it is read by
-        // time again, not skipped until its numbers pass the last one.
-        log.records.clear();
+        // time again, from where the last check got to, not skipped until
+        // its numbers pass the last one, and the result says so.
+        log.now_ms += 60_000;
+        log.clear();
         log.write(now - 120_000, Error, "Too old");
-        log.write(now - 10, Error, "Disk D: failed");
-        let read = log.check(
-            &EventFilter::default(),
-            now - 60_000,
-            10_000,
-            &mut log_record,
-        );
+        log.write(now + 10, Error, "Disk D: failed");
+        let read = log.check(&EventFilter::default(), now, 10_000, &mut place);
         assert_eq!(log.returned, [2]);
         assert_eq!(read.events.len(), 1);
-        assert_eq!(log_record, Some(2));
-
-        // An empty log has nothing to read.
-        log.records.clear();
-        let read = log.check(
-            &EventFilter::default(),
-            now - 60_000,
-            10_000,
-            &mut log_record,
+        assert_eq!(read.cleared_since_ms, Some(now));
+        assert!(
+            judge(&read, &EventFilter::default()).detail.contains(&format!(
+                "the “Security” log was cleared since the last check, so this one read the entries logged since {}",
+                parse::format_time(now)
+            ))
         );
+        assert_eq!(place.unwrap().record, Some(2));
+
+        // An empty log has nothing to read; one emptied since was cleared.
+        log.now_ms += 60_000;
+        log.clear();
+        let read = log.check(&EventFilter::default(), now, 10_000, &mut place);
         assert_eq!((read.events.len(), log.selects), (0, 0));
-        assert_eq!(log_record, None);
+        assert_eq!(read.cleared_since_ms, Some(now + 60_000));
+        assert_eq!(
+            place,
+            Some(LogPlace {
+                record: None,
+                read_to_ms: now + 120_000,
+                behind: false,
+            })
+        );
+        // Then it reads by time from there.
+        log.write(now + 120_000, Error, "Disk D: failed");
+        let read = log.check(&EventFilter::default(), now, 10_000, &mut place);
+        assert_eq!(
+            (log.returned.as_slice(), read.events.len()),
+            ([1].as_slice(), 1)
+        );
+        assert_eq!(read.cleared_since_ms, None);
+    }
+
+    #[test]
+    fn a_full_log_that_overwrote_records_not_yet_read_says_how_many() {
+        use meshrmm_protocol::EventLevel::Error;
+        let now = 1_000_000_000;
+        let mut log = Fake::new(now);
+        for number in 1..=100 {
+            log.write(now - 1000 + number, Error, "All well");
+        }
+        let filter = EventFilter {
+            message: "disk d".into(),
+            ..EventFilter::default()
+        };
+        let mut place = None;
+        log.check(&filter, now - 60_000, 300, &mut place);
+        assert_eq!(place.unwrap().record, Some(30));
+        // The log overwrites its oldest 49 to make room.
+        log.records.drain(..49);
+        let read = log.check(&filter, now - 1, 10_000, &mut place);
+        assert_eq!(read.overwritten, 19);
+        assert_eq!(log.returned.first(), Some(&50));
+        let outcome = judge(&read, &filter);
+        assert!(outcome.passing);
+        assert!(
+            outcome.detail.contains(
+                "the “Security” log is full and overwrote 19 entries before a check read them"
+            ),
+            "{}",
+            outcome.detail
+        );
+        // Records it read up to, then overwritten, are no news.
+        log.records.drain(..50);
+        log.write(now, Error, "All well");
+        let read = log.check(&filter, now - 1, 10_000, &mut place);
+        assert_eq!(
+            (read.overwritten, log.returned.as_slice()),
+            (0, [101].as_slice())
+        );
     }
 
     #[test]
