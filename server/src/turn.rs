@@ -17,7 +17,7 @@ use std::{
     io::ErrorKind,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{Arc, Mutex, OnceLock, PoisonError},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, bail};
@@ -118,6 +118,7 @@ impl Turn {
                 public_ip.is_loopback(),
                 &turn.blocked_peers,
             )),
+            refusals: Refusals::default(),
         };
         let server = Server::new(ServerConfig {
             conn_configs: vec![ConnConfig {
@@ -152,7 +153,8 @@ impl Turn {
             %public_ip,
             %host,
             relay_ports = format!("{}-{}", turn.relay_port_min, turn.relay_port_max),
-            "serving STUN and TURN"
+            "serving STUN and TURN; the relay ports serve {} remote sessions at once, two ports each",
+            turn.relay_sessions()
         );
         Ok(Some(address))
     }
@@ -268,6 +270,7 @@ struct Relays {
     /// First and last relay port.
     ports: (u16, u16),
     peers: Arc<PeerFilter>,
+    refusals: Refusals,
 }
 
 #[async_trait]
@@ -318,12 +321,61 @@ impl RelayAddressGenerator for Relays {
                 }
             }
         }
-        tracing::warn!(
-            first,
-            last,
-            "every TURN relay port is in use; widen turn.relay_port_min to turn.relay_port_max"
-        );
+        // A reserved port that was taken since is not the range running out.
+        if requested_port == 0 {
+            self.exhausted(Instant::now());
+        }
         Err(turn::Error::ErrMaxRetriesExceeded)
+    }
+}
+
+impl Relays {
+    /// Says that a relay was refused for want of a free port, at most once
+    /// every [`EXHAUSTED_LOG_INTERVAL`].
+    fn exhausted(&self, now: Instant) {
+        if let Some(refused) = self.refusals.refused(now) {
+            let (first, last) = self.ports;
+            let range = format!("{first}-{last}");
+            tracing::warn!(
+                relay_ports = %range,
+                refused,
+                "every TURN relay port is in use, so remote session peers were refused a relay; each live session holds two, so widen turn.relay_port_min to turn.relay_port_max"
+            );
+        }
+    }
+}
+
+/// How often at most a full relay range is logged.
+const EXHAUSTED_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Relays refused because every port was in use.
+#[derive(Debug, Default)]
+struct Refusals {
+    state: Mutex<RefusalState>,
+}
+
+#[derive(Debug, Default)]
+struct RefusalState {
+    last_logged: Option<Instant>,
+    /// Refusals since then.
+    unlogged: u64,
+}
+
+impl Refusals {
+    /// Counts a refusal at `now`. Returns how many there were since the last
+    /// time it returned, this one included, if it's time to log them.
+    fn refused(&self, now: Instant) -> Option<u64> {
+        // Nothing panics while holding the lock, so a poisoned one is whole.
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.unlogged += 1;
+        if state
+            .last_logged
+            .is_some_and(|last| now.saturating_duration_since(last) < EXHAUSTED_LOG_INTERVAL)
+        {
+            return None;
+        }
+        state.last_logged = Some(now);
+        Some(std::mem::take(&mut state.unlogged))
     }
 }
 
@@ -480,6 +532,120 @@ mod tests {
     #[test]
     fn no_ice_servers_until_the_server_runs() {
         assert!(Turn::new(&key()).ice_servers("s1").is_empty());
+    }
+
+    /// Log lines written while `f` runs.
+    fn logged(f: impl FnOnce()) -> Vec<String> {
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl tracing_subscriber::fmt::MakeWriter<'_> for Capture {
+            type Writer = Self;
+            fn make_writer(&self) -> Self {
+                self.clone()
+            }
+        }
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = capture.0.lock().unwrap().clone();
+        String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn relays(ports: (u16, u16)) -> Relays {
+        Relays {
+            bind_ip: Ipv4Addr::LOCALHOST,
+            public_ip: Ipv4Addr::LOCALHOST,
+            ports,
+            peers: Arc::new(PeerFilter::new(3478, true, &[])),
+            refusals: Refusals::default(),
+        }
+    }
+
+    #[test]
+    fn a_full_relay_range_is_logged_once_a_minute_with_a_count() {
+        let relays = relays((23000, 24023));
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        let lines = logged(|| {
+            relays.exhausted(at(0));
+            // Two more within the minute, then one when it's up.
+            relays.exhausted(at(1));
+            relays.exhausted(at(59));
+            relays.exhausted(at(60));
+            // A quiet spell, then five within a minute: the first is logged
+            // at once, the other four with the next line.
+            for seconds in [300, 310, 320, 330, 340] {
+                relays.exhausted(at(seconds));
+            }
+            relays.exhausted(at(400));
+        });
+        assert_eq!(lines.len(), 4, "{lines:#?}");
+        for (line, refused) in lines.iter().zip([1, 3, 1, 5]) {
+            assert!(line.trim_start().starts_with("WARN "), "{line}");
+            assert!(
+                line.contains("widen turn.relay_port_min to turn.relay_port_max"),
+                "{line}"
+            );
+            assert!(line.contains("relay_ports=23000-24023"), "{line}");
+            assert!(line.ends_with(&format!(" refused={refused}")), "{line}");
+        }
+    }
+
+    #[test]
+    fn allocating_from_a_full_range_warns() {
+        // Another socket holds the range's only port.
+        let held = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = held.local_addr().unwrap().port();
+        let relays = relays((port, port));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // A reserved port someone took since is not the range running out.
+        let lines = logged(|| {
+            runtime.block_on(async {
+                assert!(relays.allocate_conn(true, port).await.is_err());
+            })
+        });
+        assert!(lines.is_empty(), "{lines:#?}");
+
+        let lines = logged(|| {
+            runtime.block_on(async {
+                for _ in 0..3 {
+                    assert!(relays.allocate_conn(true, 0).await.is_err());
+                }
+            })
+        });
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert!(
+            lines[0].contains(&format!("relay_ports={port}-{port}")),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[0].ends_with(" refused=1"), "{}", lines[0]);
+
+        // Once the port is free again, a relay opens on it.
+        drop(held);
+        let (_, address) = runtime.block_on(relays.allocate_conn(true, 0)).unwrap();
+        assert_eq!(address, SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
     }
 
     #[test]

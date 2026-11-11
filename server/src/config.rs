@@ -221,7 +221,10 @@ pub struct TurnConfig {
     /// The UDP address STUN and TURN requests arrive at.
     #[serde(default = "default_turn_listen")]
     pub listen: SocketAddr,
-    /// The UDP ports relays are opened on, one per peer of a relayed session.
+    /// The UDP ports relays are opened on. Each peer of a remote session
+    /// opens a relay while it gathers ICE candidates, whether or not the
+    /// session ends up relayed, and keeps it until it closes, so each live
+    /// session holds two.
     #[serde(default = "default_relay_port_min")]
     pub relay_port_min: u16,
     #[serde(default = "default_relay_port_max")]
@@ -231,6 +234,19 @@ pub struct TurnConfig {
     /// port on any address.
     #[serde(default)]
     pub blocked_peers: Vec<IpNet>,
+}
+
+impl TurnConfig {
+    /// How many relay ports there are.
+    pub fn relay_ports(&self) -> u32 {
+        u32::from(self.relay_port_max.saturating_sub(self.relay_port_min)) + 1
+    }
+
+    /// How many remote sessions the relay ports serve at once: each of a
+    /// session's two peers holds one.
+    pub fn relay_sessions(&self) -> u32 {
+        self.relay_ports() / 2
+    }
 }
 
 impl Default for TurnConfig {
@@ -310,12 +326,16 @@ fn default_turn_listen() -> SocketAddr {
     SocketAddr::from((Ipv4Addr::UNSPECIFIED, 3478))
 }
 
+// 1,024 ports, enough for 512 sessions at once. They sit below Linux's
+// ephemeral ports (32768-60999) and the IANA dynamic range (49152-65535),
+// which outgoing sockets take their ports from, and below Kubernetes'
+// NodePort range (30000-32767).
 fn default_relay_port_min() -> u16 {
-    49160
+    23000
 }
 
 fn default_relay_port_max() -> u16 {
-    49200
+    24023
 }
 
 fn default_log_level() -> String {
@@ -727,7 +747,14 @@ mod tests {
         assert_eq!(config.turn.listen, "0.0.0.0:3478".parse().unwrap());
         assert_eq!(
             (config.turn.relay_port_min, config.turn.relay_port_max),
-            (49160, 49200)
+            (23000, 24023)
+        );
+        assert_eq!(config.turn.relay_ports(), 1024);
+        assert_eq!(config.turn.relay_sessions(), 512);
+        let defaults = TurnConfig::default();
+        assert_eq!(
+            (defaults.relay_port_min, defaults.relay_port_max),
+            (23000, 24023)
         );
         let config = Config::from_toml(
             r#"
@@ -747,7 +774,11 @@ mod tests {
             "turn.listen = \"[::]:3478\"",
             "turn.relay_port_min = 0",
             "turn = { relay_port_min = 50000, relay_port_max = 49999 }",
-            "turn.listen = \"0.0.0.0:49170\"",
+            // The listener inside the default relay ports, at either end or between.
+            "turn.listen = \"0.0.0.0:23000\"",
+            "turn.listen = \"0.0.0.0:23517\"",
+            "turn.listen = \"0.0.0.0:24023\"",
+            "turn = { listen = \"0.0.0.0:49170\", relay_port_min = 49160, relay_port_max = 49200 }",
             "turn.host = \"turn.example.com:3478\"",
             "turn.host = \"[2001:db8::1]\"",
             "turn.host = \"2001:db8::1\"",
