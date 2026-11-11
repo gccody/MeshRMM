@@ -156,21 +156,16 @@ pub async fn greeting(state: &AppState, device_id: &str) -> db::Result<AgentComm
 }
 
 /// The instance's scan interval was saved as `hours`: every connected Agent
-/// is told once. Each keeps the last scan it knows of, so only the interval
-/// is sent, without reading any device.
+/// is told once, one far behind on what it was sent as soon as its
+/// connection next sends anything. Each keeps the last scan it knows of, so
+/// only the interval is sent, without reading any device.
 pub fn interval_changed(state: &AppState, hours: i64) {
-    let told = state
-        .agents
-        .send_to_all(AgentCommand::SetUpdateScanSchedule {
-            schedule: UpdateScanSchedule {
-                interval_hours: interval_hours(hours),
-                last_scan: None,
-            },
-        });
+    let announced = state.agents.announce_scan_interval(interval_hours(hours));
     tracing::info!(
         hours,
-        told,
-        "told the connected Agents the new update scan interval"
+        agents = announced.connected,
+        behind = announced.behind,
+        "telling the connected Agents the new update scan interval"
     );
 }
 

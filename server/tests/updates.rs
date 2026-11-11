@@ -10,8 +10,9 @@ use common::{
     App, Browser, Ws, apps, audit_events, receive_any_json, receive_json, send_json, set_up,
     user_with,
 };
+use meshrmm_protocol_types::{AgentCommand, UpdateScanSchedule};
 use meshrmm_server::{
-    alerts, automation,
+    alerts, automation, realtime,
     time::{DAY_MS, HOUR_MS, now_ms},
     updates,
 };
@@ -1786,6 +1787,128 @@ async fn a_scan_for_a_device_too_far_behind_is_busy_and_records_nothing() {
             })
         );
         drop(connection);
+        app.finish().await;
+    }
+}
+
+/// The next message a stand-in Agent connection sends, which must come
+/// without waiting on anything but the connection.
+async fn sent_next(connection: &mut realtime::AgentConnection) -> Option<realtime::ToAgent> {
+    tokio::time::timeout(common::SOCKET_WAIT, connection.next_message())
+        .await
+        .expect("the connection had something to send")
+}
+
+fn interval_sent(interval_hours: Option<u32>) -> Option<realtime::ToAgent> {
+    Some(realtime::ToAgent::Command(
+        AgentCommand::SetUpdateScanSchedule {
+            schedule: UpdateScanSchedule {
+                interval_hours,
+                last_scan: None,
+            },
+        },
+    ))
+}
+
+/// Queues a command the test expects back next, to show nothing was sent
+/// ahead of it.
+async fn assert_sends_nothing_more(app: &App, connection: &mut realtime::AgentConnection) {
+    app.state
+        .agents
+        .send(&connection.device_id, AgentCommand::Uninstall)
+        .unwrap();
+    assert_eq!(
+        sent_next(connection).await,
+        Some(realtime::ToAgent::Command(AgentCommand::Uninstall))
+    );
+}
+
+#[tokio::test]
+async fn an_agent_too_far_behind_still_gets_the_newest_scan_interval() {
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let desk = app.enroll(&mut admin, "Desk").await;
+        let laptop = app.enroll(&mut admin, "Laptop").await;
+        // The desk's Agent reads nothing until the test lets it.
+        let mut behind = app.state.agents.connect(&desk.device_id);
+        let queued = common::fill_backlog(&app, &desk.device_id);
+        let mut ready = app.state.agents.connect(&laptop.device_id);
+
+        for hours in [6, 0] {
+            let saved = admin
+                .patch(
+                    "/v1/settings",
+                    json!({ "update_scan_interval_hours": hours }),
+                )
+                .await;
+            assert_eq!(saved.status, StatusCode::OK, "{name}: {:?}", saved.body);
+            // An Agent with room has it at once, and once.
+            let expected = interval_sent(u32::try_from(hours).ok().filter(|hours| *hours > 0));
+            assert_eq!(sent_next(&mut ready).await, expected, "{name}");
+            assert_sends_nothing_more(&app, &mut ready).await;
+        }
+
+        // Once it reads again, only the newest interval, then its backlog.
+        assert_eq!(sent_next(&mut behind).await, interval_sent(None), "{name}");
+        for _ in 0..queued {
+            assert_eq!(
+                sent_next(&mut behind).await,
+                Some(realtime::ToAgent::Command(AgentCommand::CollectSystemInfo)),
+                "{name}"
+            );
+        }
+        assert_sends_nothing_more(&app, &mut behind).await;
+        drop((behind, ready));
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn an_agent_connecting_as_the_scan_interval_changes_ends_with_the_new_one() {
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let desk = app.enroll(&mut admin, "Desk").await;
+        let laptop = app.enroll(&mut admin, "Laptop").await;
+
+        // As the socket does: registered, then greeted with the interval it
+        // read, here before the change was saved, and behind from the start.
+        let mut connection = app.state.agents.connect(&desk.device_id);
+        let queued = common::fill_backlog(&app, &desk.device_id);
+        let AgentCommand::SetUpdateScanSchedule { schedule } =
+            updates::greeting(&app.state, &desk.device_id)
+                .await
+                .unwrap()
+        else {
+            panic!("the greeting is the schedule");
+        };
+        assert_eq!(schedule.interval_hours, Some(24), "{name}");
+        let saved = admin
+            .patch("/v1/settings", json!({ "update_scan_interval_hours": 6 }))
+            .await;
+        assert_eq!(saved.status, StatusCode::OK, "{name}: {:?}", saved.body);
+        assert_eq!(
+            sent_next(&mut connection).await,
+            interval_sent(Some(6)),
+            "{name}"
+        );
+        common::drain_backlog(&mut connection, queued).await;
+        assert_sends_nothing_more(&app, &mut connection).await;
+
+        // Connecting after the change, the greeting has it and nothing is
+        // owed.
+        let mut later = app.state.agents.connect(&laptop.device_id);
+        let AgentCommand::SetUpdateScanSchedule { schedule } =
+            updates::greeting(&app.state, &laptop.device_id)
+                .await
+                .unwrap()
+        else {
+            panic!("the greeting is the schedule");
+        };
+        assert_eq!(schedule.interval_hours, Some(6), "{name}");
+        assert_sends_nothing_more(&app, &mut later).await;
+        drop((connection, later));
         app.finish().await;
     }
 }

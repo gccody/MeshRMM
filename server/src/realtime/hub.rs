@@ -7,6 +7,11 @@
 //! connection whose backlog is full is behind, not offline. A new
 //! connection from the same device replaces the old one, whose stream then
 //! ends.
+//!
+//! The instance's update scan interval is not queued: the hub holds the
+//! newest one announced ([`AgentHub::announce_scan_interval`]), and every
+//! connection sends its Agent a change the next time it turns to what it has
+//! to send ([`AgentConnection::next_message`]), however full its backlog.
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -15,8 +20,8 @@ use std::{
     },
 };
 
-use meshrmm_protocol_types::{AgentCommand, AgentSessionRequest};
-use tokio::sync::mpsc;
+use meshrmm_protocol_types::{AgentCommand, AgentSessionRequest, UpdateScanSchedule};
+use tokio::sync::{mpsc, watch};
 
 use crate::http::ApiError;
 
@@ -57,10 +62,24 @@ impl ToAgent {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AgentHub {
     connections: Arc<Mutex<HashMap<String, Registered>>>,
     next_id: Arc<AtomicU64>,
+    /// The update scan interval last announced, in hours. Each connection
+    /// watches it from when it registers; the value before any announcement
+    /// is never sent.
+    scan_interval: watch::Sender<Option<u32>>,
+}
+
+impl Default for AgentHub {
+    fn default() -> Self {
+        Self {
+            connections: Arc::default(),
+            next_id: Arc::default(),
+            scan_interval: watch::channel(None).0,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -111,6 +130,16 @@ impl Reserved {
     }
 }
 
+/// Who [`AgentHub::announce_scan_interval`] reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Announced {
+    /// The connections that will send it.
+    pub connected: usize,
+    /// Of those, the ones whose backlog was full: each sends it once its
+    /// writer has finished what it is sending, ahead of its backlog.
+    pub behind: usize,
+}
+
 /// A connected Agent's end of the hub. Dropping it unregisters the
 /// connection, unless a newer one has replaced it.
 #[derive(Debug)]
@@ -121,7 +150,33 @@ pub struct AgentConnection {
     /// What to send the Agent. Ends when another connection replaces this
     /// one or the device is disconnected.
     pub commands: mpsc::Receiver<ToAgent>,
+    /// The announced update scan interval, seen as of when the connection
+    /// registered.
+    scan_interval: watch::Receiver<Option<u32>>,
     hub: AgentHub,
+}
+
+impl AgentConnection {
+    /// What to send the Agent next: the update scan interval if one was
+    /// announced since it was last sent (only the newest of several), else
+    /// the next queued message. `None` once the connection was replaced or
+    /// the device disconnected. Cancelling it loses nothing.
+    pub async fn next_message(&mut self) -> Option<ToAgent> {
+        tokio::select! {
+            biased;
+            // The hub, which holds the sender, outlives the connection.
+            Ok(()) = self.scan_interval.changed() => {}
+            message = self.commands.recv() => return message,
+        }
+        let interval_hours = *self.scan_interval.borrow_and_update();
+        // Each Agent keeps the last scan it knows of.
+        Some(ToAgent::Command(AgentCommand::SetUpdateScanSchedule {
+            schedule: UpdateScanSchedule {
+                interval_hours,
+                last_scan: None,
+            },
+        }))
+    }
 }
 
 impl Drop for AgentConnection {
@@ -141,12 +196,16 @@ impl AgentHub {
     pub fn connect(&self, device_id: &str) -> AgentConnection {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, commands) = mpsc::channel(COMMAND_BACKLOG);
+        // Watched before the connection reads the interval to greet its
+        // Agent with, so an announcement after that read is not missed.
+        let scan_interval = self.scan_interval.subscribe();
         self.lock()
             .insert(device_id.to_owned(), Registered { id, sender });
         AgentConnection {
             device_id: device_id.to_owned(),
             id,
             commands,
+            scan_interval,
             hub: self.clone(),
         }
     }
@@ -215,19 +274,24 @@ impl AgentHub {
         }
     }
 
-    /// Queues `message` for every connection, returning how many accepted
-    /// it. The connections are only copied under the lock.
-    pub fn send_to_all(&self, message: impl Into<ToAgent>) -> usize {
-        let message = message.into();
-        let senders = self
-            .lock()
+    /// Has every connection send its Agent the update scan interval
+    /// `interval_hours`, replacing one announced earlier that a connection
+    /// has not sent yet. Nothing is queued, so a full backlog only delays
+    /// it, and nothing is read.
+    pub fn announce_scan_interval(&self, interval_hours: Option<u32>) -> Announced {
+        self.scan_interval.send_replace(interval_hours);
+        let connections = self.lock();
+        let open = connections
             .values()
-            .map(|registered| registered.sender.clone())
-            .collect::<Vec<_>>();
-        senders
-            .iter()
-            .filter(|sender| sender.try_send(message.clone()).is_ok())
-            .count()
+            .filter(|registered| !registered.sender.is_closed());
+        let (mut connected, mut behind) = (0, 0);
+        for registered in open {
+            connected += 1;
+            if registered.sender.capacity() == 0 {
+                behind += 1;
+            }
+        }
+        Announced { connected, behind }
     }
 
     /// Ends the device's connection, if any.
@@ -333,6 +397,74 @@ mod tests {
         drop(connection);
         assert!(!held.send(AgentCommand::Uninstall), "it went away");
         assert_eq!(hub.reserve("device-1").unwrap_err(), Unsent::Offline);
+    }
+
+    fn schedule(interval_hours: Option<u32>) -> Option<ToAgent> {
+        Some(ToAgent::Command(AgentCommand::SetUpdateScanSchedule {
+            schedule: UpdateScanSchedule {
+                interval_hours,
+                last_scan: None,
+            },
+        }))
+    }
+
+    #[tokio::test]
+    async fn the_newest_scan_interval_goes_ahead_of_a_full_backlog() {
+        let hub = AgentHub::default();
+        let mut behind = hub.connect("device-1");
+        let mut ready = hub.connect("device-2");
+        for _ in 0..COMMAND_BACKLOG {
+            assert_eq!(hub.send("device-1", AgentCommand::Uninstall), Ok(()));
+        }
+        assert_eq!(
+            hub.send("device-1", AgentCommand::Uninstall),
+            Err(Unsent::Full)
+        );
+
+        let first = hub.announce_scan_interval(Some(6));
+        // Read straight away by the connection with room, and only once.
+        assert_eq!(ready.next_message().await, schedule(Some(6)));
+        assert_eq!(
+            hub.send("device-2", AgentCommand::CollectSystemInfo),
+            Ok(())
+        );
+        assert_eq!(
+            ready.next_message().await,
+            Some(ToAgent::Command(AgentCommand::CollectSystemInfo))
+        );
+        let second = hub.announce_scan_interval(None);
+
+        // The connection far behind sends only the newest, once, then its
+        // backlog.
+        assert_eq!(behind.next_message().await, schedule(None));
+        for _ in 0..COMMAND_BACKLOG {
+            assert_eq!(behind.next_message().await, uninstall());
+        }
+        assert_eq!(
+            hub.send("device-1", AgentCommand::CollectSystemInfo),
+            Ok(())
+        );
+        assert_eq!(
+            behind.next_message().await,
+            Some(ToAgent::Command(AgentCommand::CollectSystemInfo))
+        );
+        assert_eq!(ready.next_message().await, schedule(None));
+        assert_eq!(
+            first,
+            Announced {
+                connected: 2,
+                behind: 1
+            }
+        );
+        assert_eq!(second, first);
+
+        // A connection made after an announcement owes nothing: its Agent
+        // is greeted with the interval as it then is.
+        let mut later = hub.connect("device-3");
+        assert_eq!(hub.send("device-3", AgentCommand::Uninstall), Ok(()));
+        assert_eq!(later.next_message().await, uninstall());
+        hub.disconnect("device-3");
+        assert_eq!(later.next_message().await, None);
     }
 
     #[test]
