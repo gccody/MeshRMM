@@ -254,11 +254,23 @@ pub(super) fn adopt_parent_owner(account: &Account, path: &Path) {
         let parent = open_dir(parent)?;
         let owner = fstat(parent.as_fd())?;
         let entry = open_no_follow(parent.as_fd(), name)?;
+        if !only_name(&fstat(entry.as_fd())?) {
+            return Err(io::Error::other("the entry has another name"));
+        }
         std::os::unix::fs::fchown(&entry, Some(owner.st_uid), Some(owner.st_gid))
     };
     if let Err(error) = adopt() {
         tracing::debug!(%error, path = %path.display(), "could not give a new entry its folder's owner");
     }
+}
+
+/// Whether an opened entry is a folder, or a file with no other name. What
+/// the Agent just made has one name; a file with more is a hard link a user
+/// put in its place, to another file root would then give them.
+// `st_mode` is 32 bits on Linux and 16 on macOS.
+#[allow(clippy::unnecessary_cast)]
+fn only_name(stat: &libc::stat) -> bool {
+    (stat.st_mode as u32) & (libc::S_IFMT as u32) == (libc::S_IFDIR as u32) || stat.st_nlink == 1
 }
 
 /// Changes `child`'s owner and group to those of the opened directory
@@ -322,7 +334,9 @@ fn open_dir_at(dir: BorrowedFd, name: &OsStr) -> io::Result<OwnedFd> {
 
 /// Opens `name` inside `dir` for reading without following a link in its
 /// place. A directory opens too; the caller checks the kind on the
-/// descriptor. A link fails with `ELOOP`.
+/// descriptor. A link fails with `ELOOP`. The open never waits: a named
+/// pipe swapped in would otherwise hold it until someone wrote to the pipe.
+/// Reading a regular file is the same either way.
 fn open_no_follow(dir: BorrowedFd, name: &OsStr) -> io::Result<OwnedFd> {
     let name = c_name(name)?;
     // SAFETY: the name is NUL-terminated; the flags are constants.
@@ -330,7 +344,7 @@ fn open_no_follow(dir: BorrowedFd, name: &OsStr) -> io::Result<OwnedFd> {
         libc::openat(
             dir.as_raw_fd(),
             name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
         )
     };
     if fd < 0 {
@@ -1131,6 +1145,38 @@ mod tests {
         std::os::unix::fs::symlink("/etc/passwd", dir.0.join("swapped")).unwrap();
         assert!(open_no_follow(parent.as_fd(), OsStr::new("made")).is_ok());
         assert!(open_no_follow(parent.as_fd(), OsStr::new("swapped")).is_err());
+    }
+
+    #[test]
+    fn ownership_adoption_skips_a_file_with_another_name() {
+        let dir = TempDir::new("names");
+        fs::write(dir.0.join("made"), b"x").unwrap();
+        fs::create_dir(dir.0.join("folder")).unwrap();
+        let parent = open_dir(&dir.0).unwrap();
+        let stat = |name: &str| {
+            let entry = open_no_follow(parent.as_fd(), OsStr::new(name)).unwrap();
+            fstat(entry.as_fd()).unwrap()
+        };
+        assert!(only_name(&stat("made")));
+        // A folder always has more than one link, and can't be hard linked.
+        assert!(only_name(&stat("folder")));
+        // A hard link a user put where the new file was is another file's
+        // second name: root must not give that file away.
+        fs::hard_link(dir.0.join("made"), dir.0.join("linked")).unwrap();
+        assert!(!only_name(&stat("linked")));
+        assert!(!only_name(&stat("made")));
+    }
+
+    #[test]
+    fn opening_a_named_pipe_swapped_in_for_a_file_does_not_wait() {
+        let dir = TempDir::new("pipe");
+        let name = CString::new(dir.0.join("pipe").as_os_str().as_bytes()).unwrap();
+        // SAFETY: the path is NUL-terminated.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let parent = open_dir(&dir.0).unwrap();
+        // Without O_NONBLOCK this open would wait for a writer forever.
+        let pipe = open_no_follow(parent.as_fd(), OsStr::new("pipe")).unwrap();
+        assert!(!fs::File::from(pipe).metadata().unwrap().is_file());
     }
 
     #[test]

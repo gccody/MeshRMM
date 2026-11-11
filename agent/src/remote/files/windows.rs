@@ -19,7 +19,7 @@ use windows::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_ATTRIBUTE_SYSTEM, FILE_CREATION_DISPOSITION, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileTimeToLocalFileTime,
+    FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileTimeToLocalFileTime,
     GetDiskFreeSpaceExW, GetDriveTypeW, GetFileAttributesW, GetFileInformationByHandle,
     GetLogicalDrives, GetVolumeInformationW, GetVolumePathNameW, INVALID_FILE_ATTRIBUTES,
     OPEN_EXISTING, SetFileAttributesW,
@@ -202,12 +202,13 @@ fn changed(path: &Path) -> FileError {
 }
 
 /// Opens `path` through a handle without following a reparse point in its
-/// place, with the access and flags given, and reads its information from the
-/// handle. `FILE_FLAG_OPEN_REPARSE_POINT` opens a junction or link itself, so
-/// the caller can see it on the handle and refuse it.
+/// place, with the access, sharing and flags given, and reads its information
+/// from the handle. `FILE_FLAG_OPEN_REPARSE_POINT` opens a junction or link
+/// itself, so the caller can see it on the handle and refuse it.
 fn open_handle(
     path: &Path,
     access: u32,
+    share: FILE_SHARE_MODE,
     disposition: FILE_CREATION_DISPOSITION,
     flags: FILE_FLAGS_AND_ATTRIBUTES,
 ) -> io::Result<(fs::File, BY_HANDLE_FILE_INFORMATION)> {
@@ -216,7 +217,7 @@ fn open_handle(
         CreateFileW(
             PCWSTR(wide_path.as_ptr()),
             access,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            share,
             None,
             disposition,
             flags | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -251,12 +252,17 @@ fn identity(info: &BY_HANDLE_FILE_INFORMATION) -> (u32, u32, u32) {
     )
 }
 
-/// Opens a real directory through a handle, refusing a junction or link in
-/// its place.
+/// Opens a directory through a handle, so the caller can refuse a junction
+/// or link in its place. The handle does not share deletion: while it is
+/// open nobody can rename or remove the directory, and Windows refuses to
+/// rename a folder above one that is open. So for as long as the walk holds
+/// the handle, a path through this directory leads where it did when the
+/// handle was checked, and a user can't swap a junction into it.
 fn open_directory(path: &Path) -> io::Result<(fs::File, BY_HANDLE_FILE_INFORMATION)> {
     open_handle(
         path,
         FILE_GENERIC_READ.0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
         OPEN_EXISTING,
         FILE_FLAG_BACKUP_SEMANTICS,
     )
@@ -323,6 +329,7 @@ fn copy_entry(source: &Path, target: &Path, deadline: &Deadline) -> Result<(), F
         let (mut source_file, source_info) = open_handle(
             source,
             FILE_GENERIC_READ.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             OPEN_EXISTING,
             FILE_FLAGS_AND_ATTRIBUTES(0),
         )
@@ -335,6 +342,7 @@ fn copy_entry(source: &Path, target: &Path, deadline: &Deadline) -> Result<(), F
         let (mut target_file, _target_info) = open_handle(
             target,
             FILE_GENERIC_WRITE.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             CREATE_NEW,
             FILE_FLAGS_AND_ATTRIBUTES(0),
         )
@@ -664,6 +672,25 @@ mod tests {
         let (year, ..) = local_civil(SystemTime::now()).unwrap();
         assert!(year >= 2026);
         assert_eq!(random_id().len(), 6);
+    }
+
+    #[test]
+    fn a_folder_the_copy_holds_open_cannot_be_swapped_for_another() {
+        let base = std::env::temp_dir().join(format!("meshrmm-held-{}", uuid::Uuid::new_v4()));
+        let folder = base.join("above").join("folder");
+        fs::create_dir_all(&folder).unwrap();
+        let moved = base.join("above").join("moved");
+        let held = open_directory(&folder).unwrap();
+        // Neither the folder nor one above it can be moved out of the way
+        // for a junction to take its place.
+        assert!(fs::rename(&folder, &moved).is_err());
+        assert!(fs::rename(base.join("above"), base.join("elsewhere")).is_err());
+        // The walk can still read it and check it again.
+        assert_eq!(fs::read_dir(&folder).unwrap().count(), 0);
+        assert!(open_directory(&folder).is_ok());
+        drop(held);
+        fs::rename(&folder, &moved).unwrap();
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
