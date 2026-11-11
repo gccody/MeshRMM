@@ -260,7 +260,7 @@ impl State {
             .join("\r\n");
         ensure!(!text.is_empty(), "Select an item first.");
         meshrmm_clipboard::ClipboardSync::new(false)?
-            .apply(meshrmm_protocol::ClipboardContent::Text(text))?;
+            .apply(meshrmm_protocol::ClipboardContent::from(text))?;
         set_text(self.status, "Paths copied to clipboard.");
         Ok(())
     }

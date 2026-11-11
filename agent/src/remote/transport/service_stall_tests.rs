@@ -256,7 +256,7 @@ async fn the_latest_copy_is_sent_once_the_clipboard_channel_has_room_again() {
     let (_clipboard, mut task) =
         spawn_clipboard_worker(device.clone(), channels[0].clone(), None).unwrap();
     link.cut();
-    let earlier = ClipboardContent::Text("e".repeat(600 * 1024));
+    let earlier = ClipboardContent::from("e".repeat(600 * 1024));
     let earlier_chunks = earlier.messages().unwrap().len();
     device.copy(earlier);
     assert_eq!(within(events.recv()).await, Some("clipboard polled"));

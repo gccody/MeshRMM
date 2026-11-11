@@ -74,8 +74,8 @@ async fn helper_pipe_notifies_services_and_coalesces_clipboard_changes() {
         HelperKind::Clipboard,
         &[
             ChildEvent::InputStarted,
-            ChildEvent::Clipboard(ClipboardContent::Text("first".into())),
-            ChildEvent::Clipboard(ClipboardContent::Text("latest".into())),
+            ChildEvent::Clipboard(ClipboardContent::from("first")),
+            ChildEvent::Clipboard(ClipboardContent::from("latest")),
             ChildEvent::Stopped,
         ],
     );
@@ -108,7 +108,7 @@ async fn helper_pipe_notifies_services_and_coalesces_clipboard_changes() {
     .unwrap();
     assert_eq!(
         clipboard.clipboard.latest.lock().unwrap().take(),
-        Some(ClipboardContent::Text("latest".into()))
+        Some(ClipboardContent::from("latest"))
     );
     assert_eq!(
         chat.chat.queue.lock().unwrap().pop_front().as_deref(),
@@ -140,7 +140,7 @@ fn helpers_are_trusted_only_for_events_their_run_loops_send() {
             message: "done".into(),
         }),
         ChildEvent::Files(meshrmm_protocol::FileMessage::Available),
-        ChildEvent::Clipboard(ClipboardContent::Text("copied".into())),
+        ChildEvent::Clipboard(ClipboardContent::from("copied")),
         ChildEvent::Chat("hello".into()),
         ChildEvent::ApprovalDecision(crate::remote::connection_approval::Decision::Accepted),
     ];
@@ -195,7 +195,7 @@ fn user_token_helpers_cannot_forge_other_helpers_events() {
         ),
         (
             HelperKind::Files,
-            ChildEvent::Clipboard(ClipboardContent::Text("forged".into())),
+            ChildEvent::Clipboard(ClipboardContent::from("forged")),
         ),
         (HelperKind::Files, ChildEvent::CredentialPrompt(true)),
         (
@@ -204,7 +204,7 @@ fn user_token_helpers_cannot_forge_other_helpers_events() {
         ),
         (
             HelperKind::Chat,
-            ChildEvent::Clipboard(ClipboardContent::Text("forged".into())),
+            ChildEvent::Clipboard(ClipboardContent::from("forged")),
         ),
         (HelperKind::Input, ChildEvent::Chat("forged chat".into())),
     ];

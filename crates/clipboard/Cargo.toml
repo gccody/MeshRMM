@@ -14,5 +14,12 @@ meshrmm-file-transfer = { path = "../file-transfer" }
 [target.'cfg(target_os = "linux")'.dependencies]
 # Wayland compositors with a data-control protocol; others through Xwayland.
 arboard = { workspace = true, features = ["wayland-data-control"] }
+# Windows and macOS set several formats in one update, encoding images as arboard does.
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5.4.1"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+[target.'cfg(target_os = "macos")'.dependencies]
+image = { version = "0.25.10", default-features = false, features = ["tiff"] }
+objc2 = "0.6.3"
+objc2-app-kit = "0.3.2"
+objc2-foundation = "0.3.2"

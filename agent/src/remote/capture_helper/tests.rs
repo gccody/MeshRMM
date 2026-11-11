@@ -658,14 +658,15 @@ fn input_started_event_round_trips() {
 fn clipboard_commands_and_events_round_trip_all_formats() {
     for content in [
         ClipboardContent::from("winget install Example.Package\n"),
-        ClipboardContent::Html {
-            html: "<b>Zoë 王</b>".repeat(10000),
-            text: "Zoë 王".into(),
-        },
-        ClipboardContent::Image {
-            width: 512,
-            height: 512,
-            rgba: vec![255; 512 * 512 * 4],
+        ClipboardContent {
+            text: Some("Zoë 王".into()),
+            html: Some("<b>Zoë 王</b>".repeat(10000)),
+            image: Some(meshrmm_protocol::ClipboardImage {
+                width: 512,
+                height: 512,
+                rgba: vec![255; 512 * 512 * 4],
+            }),
+            left_out: None,
         },
     ] {
         let mut bytes = Vec::new();
