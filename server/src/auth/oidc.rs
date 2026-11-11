@@ -108,8 +108,8 @@ pub async fn group_roles(executor: &mut impl Executor) -> db::Result<Vec<(String
 
 /// Replaces the SSO groups `user_id` holds with `groups` as they sign in
 /// from `ip`. Groups granting the Administrator role that the user would
-/// lose stay if no enabled administrator would remain otherwise, with a
-/// warning and an audit record: the provider leaving everyone out of its
+/// lose stay if no administrator who can sign in would remain otherwise,
+/// with a warning and an audit record: the provider leaving everyone out of its
 /// administrators' group must not leave nobody able to administer MeshRMM.
 /// The sign-in goes ahead either way. Call inside the sign-in's transaction.
 pub async fn replace_user_groups(

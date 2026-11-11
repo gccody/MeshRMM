@@ -27,7 +27,7 @@ use crate::{
     },
     http::{ApiError, AppState, JsonBody},
     mail::{self, Delivery},
-    rbac::{self, Permission, Role},
+    rbac::{self, Administrators, Permission, Role},
     settings,
     time::{HOUR_MS, now_ms},
     users::{self, User},
@@ -230,19 +230,26 @@ fn not_self(actor: &Authorized, user: &User) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Fails unless an enabled administrator would remain; see
-/// [`rbac::administrator_remains`]. Call inside the transaction that may
+/// Fails unless an enabled administrator who can sign in would remain; see
+/// [`rbac::remaining_administrators`]. Call inside the transaction that may
 /// remove one, after the change and before committing.
 pub(crate) async fn ensure_administrator_remains(
     executor: &mut impl Executor,
 ) -> Result<(), ApiError> {
-    if rbac::administrator_remains(executor).await? {
-        return Ok(());
+    match rbac::remaining_administrators(executor).await? {
+        Administrators::CanSignIn => Ok(()),
+        Administrators::NoneCanSignIn => Err(ApiError::conflict(
+            "this would leave no administrator who can sign in: the remaining ones have no \
+             password and sign in only through single sign-on, which is off or not linked to \
+             their accounts yet; give an administrator a password first (send them a password \
+             reset link)",
+        )
+        .with_code("no_administrator_can_sign_in")),
+        Administrators::None => Err(ApiError::conflict(
+            "at least one enabled user must keep the Administrator role",
+        )
+        .with_code("last_administrator")),
     }
-    Err(
-        ApiError::conflict("at least one enabled user must keep the Administrator role")
-            .with_code("last_administrator"),
-    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -472,7 +479,8 @@ pub async fn sign_out(
 
 /// `POST /v1/users/{id}/unlink-sso`: forgets the user's SSO identity, so
 /// their next SSO sign-in links the account again by email. For a user
-/// recreated at the provider, who has a new identity there.
+/// recreated at the provider, who has a new identity there. Refused when no
+/// administrator could sign in afterwards.
 pub async fn unlink_sso(
     State(state): State<AppState>,
     actor: Authorized,

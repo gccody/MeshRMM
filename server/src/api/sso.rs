@@ -694,7 +694,8 @@ pub async fn put_settings(
     store_provider(&mut transaction, &request, &settings, secret).await?;
     store_group_roles(&mut transaction, &settings).await?;
     // Unlinking or remapping can take away the role someone held as an
-    // administrator through an SSO group.
+    // administrator through an SSO group, and turning SSO off or unlinking
+    // leaves administrators without a password unable to sign in.
     super::ensure_administrator_remains(&mut transaction).await?;
     audit::record(
         &mut transaction,
@@ -862,7 +863,8 @@ async fn unlink_everyone(executor: &mut impl Executor) -> crate::db::Result<()> 
 }
 
 /// `DELETE /v1/settings/sso`: removes the provider. Accounts keep working
-/// with their passwords and passkeys; roles from SSO groups end.
+/// with their passwords and passkeys; roles from SSO groups end. Refused
+/// while no administrator could sign in without SSO.
 pub async fn delete_settings(
     State(state): State<AppState>,
     actor: Authorized,

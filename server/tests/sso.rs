@@ -433,6 +433,163 @@ async fn sign_ins_keep_the_last_administrators_sso_group() {
     }
 }
 
+/// An administrator with no password or passkey counts as one who remains
+/// only while SSO is on and linked to their account: otherwise nobody can
+/// sign in as them.
+#[tokio::test]
+async fn administrators_without_a_password_count_only_while_sso_signs_them_in() {
+    let provider = MockProvider::start().await;
+    let other = MockProvider::start().await;
+    for app in common::apps().await {
+        let name = app.name;
+        let mut ada = common::set_up(&app).await;
+        let ada_id = ada.get("/v1/account").await.body["user"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let on = settings(&provider, json!({}));
+        let off = settings(&provider, json!({ "enabled": false }));
+        let saved = ada.put("/v1/settings/sso", on.clone()).await;
+        assert_eq!(saved.status, StatusCode::OK, "{name}: {:?}", saved.body);
+        // SSO creates Grace's account, so it has no password.
+        let (mut grace, location) = sign_in(&app, &provider, verified("grace")).await;
+        assert_eq!(location, format!("{ORIGIN}/toolbox"), "{name}");
+        let grace_id = grace.get("/v1/account").await.body["user"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let promoted = ada
+            .patch(
+                &format!("/v1/users/{grace_id}"),
+                json!({ "role_ids": ["administrator"] }),
+            )
+            .await;
+        assert_eq!(
+            promoted.status,
+            StatusCode::OK,
+            "{name}: {:?}",
+            promoted.body
+        );
+
+        // While SSO is on, Grace can sign in, so Ada may step down.
+        for role in ["technician", "administrator"] {
+            let changed = grace
+                .patch(
+                    &format!("/v1/users/{ada_id}"),
+                    json!({ "role_ids": [role] }),
+                )
+                .await;
+            assert_eq!(changed.status, StatusCode::OK, "{name}: {:?}", changed.body);
+        }
+
+        // With SSO off nobody can sign in as Grace, so Ada, the last
+        // administrator with a password, stays one.
+        let turned_off = ada.put("/v1/settings/sso", off.clone()).await;
+        assert_eq!(
+            turned_off.status,
+            StatusCode::OK,
+            "{name}: {:?}",
+            turned_off.body
+        );
+        let demoted = grace
+            .patch(
+                &format!("/v1/users/{ada_id}"),
+                json!({ "role_ids": ["technician"] }),
+            )
+            .await;
+        let disabled = grace
+            .patch(&format!("/v1/users/{ada_id}"), json!({ "disabled": true }))
+            .await;
+        let deleted = grace.delete(&format!("/v1/users/{ada_id}")).await;
+        for refused in [demoted, disabled, deleted] {
+            assert_no_administrator_could_sign_in(name, &refused);
+        }
+        let account = ada.get("/v1/account").await;
+        assert_eq!(account.body["is_administrator"], true, "{name}");
+
+        // With SSO back on, Ada may go, leaving Grace the only administrator.
+        let turned_on = ada.put("/v1/settings/sso", on.clone()).await;
+        assert_eq!(
+            turned_on.status,
+            StatusCode::OK,
+            "{name}: {:?}",
+            turned_on.body
+        );
+        let disabled = grace
+            .patch(&format!("/v1/users/{ada_id}"), json!({ "disabled": true }))
+            .await;
+        assert_eq!(
+            disabled.status,
+            StatusCode::OK,
+            "{name}: {:?}",
+            disabled.body
+        );
+
+        // Then nothing may stop SSO signing Grace in: turning it off,
+        // removing it, moving to another provider (which unlinks every
+        // account), or unlinking her account.
+        let turned_off = grace.put("/v1/settings/sso", off.clone()).await;
+        let removed = grace.delete("/v1/settings/sso").await;
+        let moved = grace
+            .put("/v1/settings/sso", settings(&other, json!({})))
+            .await;
+        let unlinked = grace
+            .post(&format!("/v1/users/{grace_id}/unlink-sso"), json!({}))
+            .await;
+        for refused in [turned_off, removed, moved, unlinked] {
+            assert_no_administrator_could_sign_in(name, &refused);
+        }
+        let kept = grace.get("/v1/settings/sso").await;
+        assert_eq!(kept.body["provider"]["enabled"], true, "{name}");
+        assert_eq!(kept.body["provider"]["issuer_url"], provider.issuer);
+        let user = grace.get(&format!("/v1/users/{grace_id}")).await;
+        assert_eq!(user.body["sso_linked"], true, "{name}");
+        let (_, location) = sign_in(&app, &provider, verified("grace")).await;
+        assert_eq!(location, format!("{ORIGIN}/toolbox"), "{name}");
+
+        // Once an administrator has a password again, SSO may go.
+        let enabled = grace
+            .patch(&format!("/v1/users/{ada_id}"), json!({ "disabled": false }))
+            .await;
+        assert_eq!(enabled.status, StatusCode::OK, "{name}: {:?}", enabled.body);
+        let turned_off = grace.put("/v1/settings/sso", off).await;
+        assert_eq!(
+            turned_off.status,
+            StatusCode::OK,
+            "{name}: {:?}",
+            turned_off.body
+        );
+        let removed = grace.delete("/v1/settings/sso").await;
+        assert_eq!(
+            removed.status,
+            StatusCode::NO_CONTENT,
+            "{name}: {:?}",
+            removed.body
+        );
+        app.finish().await;
+    }
+}
+
+/// A change refused because no administrator could sign in after it.
+#[track_caller]
+fn assert_no_administrator_could_sign_in(name: &str, refused: &common::Response) {
+    assert_eq!(
+        refused.status,
+        StatusCode::CONFLICT,
+        "{name}: {:?}",
+        refused.body
+    );
+    assert_eq!(refused.code(), "no_administrator_can_sign_in", "{name}");
+    assert!(
+        refused.body["error"]
+            .as_str()
+            .unwrap()
+            .contains("give an administrator a password first"),
+        "{name}: {:?}",
+        refused.body
+    );
+}
+
 #[tokio::test]
 async fn sso_links_existing_accounts_only_by_a_verified_email() {
     let provider = MockProvider::start().await;
