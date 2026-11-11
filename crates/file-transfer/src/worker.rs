@@ -9,12 +9,14 @@ use std::{
 };
 
 use crate::{
-    AckWindow, Admission, CACHE_SWEEP_INTERVAL, Command, Incoming, OutgoingFiles, PEER_PICK_ID,
-    PasteShortcut, Placement, Role, SEND_WINDOW, answers_peer_pick, commit_documents, end_transfer,
-    id, message_id, native,
+    AckWindow, Admission, CACHE_SWEEP_INTERVAL, Command, Incoming, KEPT_CLIPBOARD_BATCHES,
+    OutgoingFiles, PEER_PICK_ID, PasteShortcut, Placement, Refusal, Role, SEND_WINDOW,
+    answers_peer_pick, commit_documents, end_transfer, id, message_id, native,
     pick::{OpenPick, PickFor, Picker},
     receive::{CreateFile, move_to_documents},
-    remove_batch, send_paths, sweep_cache, sweep_transfer_folders,
+    remove_batch, remove_batch_folder,
+    send::Answer,
+    send_paths, sweep_cache, sweep_transfer_folders,
 };
 
 /// The session's outgoing channel closed, which ends the worker.
@@ -25,6 +27,8 @@ type Job = (Vec<PathBuf>, FileDestination);
 pub(super) type DropFiles = Box<dyn Fn(&[PathBuf], DisplayId, u16, u16) -> anyhow::Result<bool>>;
 /// Runs work that would hold up the worker on a thread of its own.
 pub(super) type Spawn = Box<dyn Fn(Box<dyn FnOnce() + Send>)>;
+/// Puts files on this computer's clipboard.
+pub(super) type SetClipboardFiles = Box<dyn Fn(&[PathBuf]) -> anyhow::Result<()>>;
 
 /// What the worker asks of this computer's desktop. Tests replace it.
 pub(super) struct Desktop {
@@ -36,6 +40,11 @@ pub(super) struct Desktop {
     pub(super) pick: Picker,
     pub(super) spawn: Spawn,
     pub(super) create_file: Option<CreateFile>,
+    /// The files on this computer's clipboard.
+    pub(super) clipboard_files: Box<dyn Fn() -> anyhow::Result<Vec<PathBuf>>>,
+    pub(super) set_clipboard_files: SetClipboardFiles,
+    /// The clipboard's change counter.
+    pub(super) clipboard_sequence: Box<dyn Fn() -> u64>,
     /// Shows a progress window for incoming transfers and follows the clipboard.
     pub(super) interactive: bool,
 }
@@ -61,6 +70,9 @@ impl Desktop {
                 });
             }),
             create_file: None,
+            clipboard_files: Box::new(native::clipboard_files),
+            set_clipboard_files: Box::new(native::set_clipboard_files),
+            clipboard_sequence: Box::new(native::clipboard_sequence),
             interactive: true,
         }
     }
@@ -122,17 +134,19 @@ pub(super) struct Worker {
     pub(super) available: bool,
     pending: VecDeque<Job>,
     sender_thread: Option<JoinHandle<()>>,
-    sender: Option<(u64, mpsc::SyncSender<bool>)>,
+    sender: Option<(u64, mpsc::SyncSender<Answer>)>,
     progress_updated: Instant,
     progress: Option<native::Progress>,
     /// Transfers rejected or failed here, whose in-flight messages are dropped.
     ended: VecDeque<u64>,
     pub(super) incoming: Option<Incoming>,
-    admission: Admission,
+    pub(super) admission: Admission,
     /// The file picker that is open, at most one.
     pick: Option<OpenPick>,
     /// Cache batches being copied into Documents, which the cache sweep keeps.
     copying: Arc<Mutex<Vec<PathBuf>>>,
+    /// The cache batches this worker put on the clipboard, oldest first.
+    clipboard_batches: VecDeque<PathBuf>,
 }
 
 impl Worker {
@@ -159,17 +173,14 @@ impl Worker {
             sender_thread: None,
             pending: VecDeque::new(),
             available: false,
-            last_clipboard_sequence: if desktop.interactive {
-                native::clipboard_sequence()
-            } else {
-                0
-            },
+            last_clipboard_sequence: (desktop.clipboard_sequence)(),
             desktop,
             // The sweep at startup covered the cache.
             last_cache_sweep: Instant::now(),
             poll: Instant::now(),
             pick: None,
             copying: Arc::default(),
+            clipboard_batches: VecDeque::new(),
         }
     }
 
@@ -209,20 +220,21 @@ impl Worker {
             if destination == FileDestination::Documents {
                 self.admission.close_peer_pick();
             }
-            Err("Another transfer is in progress")
+            Err("Another transfer is in progress".into())
         } else {
             self.admission
                 .admit(&destination, (self.clipboard_enabled)(), Instant::now())
         };
         match admitted {
             Ok(()) => Ok(Some(Command::Peer(FileMessage::Begin { id, destination }))),
-            Err(reason) => {
+            Err(Refusal { reason, notice }) => {
                 tracing::info!(id, ?destination, reason, "rejected file transfer");
                 end_transfer(&mut self.ended, id);
-                if self.role == Role::Viewer && destination != FileDestination::Clipboard {
-                    self.set_status(reason);
+                if let Some(notice) = notice {
+                    self.set_status(notice);
+                } else if self.role == Role::Viewer && destination != FileDestination::Clipboard {
+                    self.set_status(reason.clone());
                 }
-                let reason = reason.into();
                 self.out.send(FileMessage::Error { id, reason })?;
                 Ok(None)
             }
@@ -275,7 +287,7 @@ impl Worker {
                 None
             }
             Some(Command::Peer(FileMessage::Ack { id })) => {
-                self.settle_sender(id, true);
+                self.settle_sender(id, Ok(()));
                 None
             }
             Some(Command::Peer(FileMessage::Error { id, reason })) => {
@@ -358,11 +370,11 @@ impl Worker {
     }
 
     /// Tells the sending thread whether the peer took its message for transfer `id`.
-    fn settle_sender(&self, id: u64, accepted: bool) {
+    fn settle_sender(&self, id: u64, answer: Answer) {
         if let Some((active, tx)) = &self.sender
             && *active == id
         {
-            let _ = tx.try_send(accepted);
+            let _ = tx.try_send(answer);
         }
     }
 
@@ -376,7 +388,7 @@ impl Worker {
         if sending || receiving {
             self.set_status(format!("Transfer failed: {reason}"));
         }
-        self.settle_sender(id, false);
+        self.settle_sender(id, Err(reason.into()));
         if receiving {
             self.incoming = None;
             self.progress = None;
@@ -399,7 +411,10 @@ impl Worker {
                 end_transfer(&mut self.ended, packet_id);
                 let reason = format!("{e:#}");
                 tracing::warn!(id = packet_id, %reason, "file transfer failed");
-                self.set_status(reason.clone());
+                match e.downcast_ref::<Refusal>().and_then(|r| r.notice.clone()) {
+                    Some(notice) => self.set_status(notice),
+                    None => self.set_status(reason.clone()),
+                }
                 FileMessage::Error {
                     id: packet_id,
                     reason,
@@ -445,6 +460,15 @@ impl Worker {
 
     fn accept_incoming(&mut self, packet_id: u64, message: FileMessage) -> anyhow::Result<()> {
         let state = active_incoming(&mut self.incoming, packet_id)?;
+        if let FileMessage::Totals { bytes, .. } = message {
+            // Refused here, the transfer ends before any file is opened.
+            self.admission.admit_totals(
+                &state.destination,
+                bytes,
+                || native::available_space(&state.stage).ok(),
+                Instant::now(),
+            )?;
+        }
         let refresh = !matches!(message, FileMessage::Chunk { .. });
         state.accept(message)?;
         if refresh || self.progress_updated.elapsed() >= Duration::from_millis(100) {
@@ -475,18 +499,66 @@ impl Worker {
         // Hide before native delivery so the progress window cannot
         // obscure the user's Explorer/browser drop target.
         self.progress = None;
-        self.deliver(packet_id, &paths, &destination, placement)?;
+        let clipboard = matches!(
+            destination,
+            FileDestination::Clipboard | FileDestination::ClipboardPaste { .. }
+        );
+        if clipboard
+            && placement == Placement::Batch
+            && let Some(batch) = paths.first().and_then(|path| path.parent())
+        {
+            self.clipboard_batches.push_back(batch.to_owned());
+        }
+        let delivered = self.deliver(packet_id, &paths, &destination, placement);
+        if clipboard {
+            self.release_clipboard_batches();
+        }
+        delivered?;
         if placement == Placement::Batch && self.last_cache_sweep.elapsed() >= CACHE_SWEEP_INTERVAL
         {
             self.last_cache_sweep = Instant::now();
             // Off this thread, which acknowledges the peer's transfers.
-            let mut keep = native::clipboard_files().unwrap_or_default();
+            let mut keep = (self.desktop.clipboard_files)().unwrap_or_default();
             keep.extend(self.copying.lock().unwrap().iter().cloned());
             std::thread::spawn(move || sweep_cache(&base, &keep));
         }
         tracing::info!(id = packet_id, "file transfer received and verified");
         self.set_status("Transfer complete");
         Ok(())
+    }
+
+    /// Removes, off this thread, the clipboard batches this worker received
+    /// before the newest [`KEPT_CLIPBOARD_BATCHES`]. Each copy replaces the
+    /// clipboard, so an older batch is still used only while the clipboard
+    /// points into it (the user copied a received file again) or while it is
+    /// being copied into Documents; those stay until a later copy. Nothing is
+    /// removed while the clipboard cannot be read.
+    fn release_clipboard_batches(&mut self) {
+        let excess = self
+            .clipboard_batches
+            .len()
+            .saturating_sub(KEPT_CLIPBOARD_BATCHES);
+        if excess == 0 {
+            return;
+        }
+        let Ok(mut keep) = (self.desktop.clipboard_files)() else {
+            return;
+        };
+        keep.extend(self.copying.lock().unwrap().iter().cloned());
+        let (held, released): (Vec<_>, Vec<_>) = self
+            .clipboard_batches
+            .drain(..excess)
+            .partition(|batch| keep.iter().any(|kept| kept.starts_with(batch)));
+        for batch in held.into_iter().rev() {
+            self.clipboard_batches.push_front(batch);
+        }
+        if !released.is_empty() {
+            (self.desktop.spawn)(Box::new(move || {
+                for batch in released {
+                    remove_batch_folder(&batch);
+                }
+            }));
+        }
     }
 
     /// Hands received files to the clipboard or the drop target; files
@@ -500,8 +572,8 @@ impl Worker {
     ) -> anyhow::Result<()> {
         match destination {
             FileDestination::Clipboard | FileDestination::ClipboardPaste { .. } => {
-                native::set_clipboard_files(paths)?;
-                self.last_clipboard_sequence = native::clipboard_sequence();
+                (self.desktop.set_clipboard_files)(paths)?;
+                self.last_clipboard_sequence = (self.desktop.clipboard_sequence)();
                 if let FileDestination::ClipboardPaste { display_id } = destination {
                     self.paste
                         .as_ref()
@@ -570,12 +642,12 @@ impl Worker {
     /// The local file clipboard to send, when it changed since the last poll.
     fn poll_clipboard(&mut self) -> Option<Job> {
         self.poll = Instant::now();
-        let sequence = native::clipboard_sequence();
+        let sequence = (self.desktop.clipboard_sequence)();
         if sequence != self.last_clipboard_sequence && !(self.clipboard_enabled)() {
             // Copies made while clipboard sync is off stay local after re-enabling.
             self.last_clipboard_sequence = sequence;
         } else if sequence != self.last_clipboard_sequence
-            && let Ok(paths) = native::clipboard_files()
+            && let Ok(paths) = (self.desktop.clipboard_files)()
         {
             tracing::info!(files = paths.len(), "native file clipboard changed");
             self.last_clipboard_sequence = sequence;

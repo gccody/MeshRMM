@@ -1,4 +1,4 @@
-use anyhow::{Context, ensure};
+use anyhow::{Context, anyhow, ensure};
 use meshrmm_protocol::{FILE_CHUNK_BYTES, FileDestination, FileMessage};
 use sha2::{Digest, Sha256};
 use std::{
@@ -11,15 +11,19 @@ use std::{
 
 use crate::{check_limit, valid_path};
 
+/// Peer answers to a transfer's messages: an acknowledgement, or the reason
+/// it failed or was refused.
+pub(super) type Answer = Result<(), String>;
+
 /// Keeps up to `limit` transfer messages unacknowledged. The receiver
 /// acknowledges each message in order or answers with an error.
 pub(super) struct AckWindow<'a> {
-    acknowledgements: &'a mpsc::Receiver<bool>,
+    acknowledgements: &'a mpsc::Receiver<Answer>,
     limit: usize,
     pub(super) unacknowledged: usize,
 }
 impl<'a> AckWindow<'a> {
-    pub(super) fn new(acknowledgements: &'a mpsc::Receiver<bool>, limit: usize) -> Self {
+    pub(super) fn new(acknowledgements: &'a mpsc::Receiver<Answer>, limit: usize) -> Self {
         Self {
             acknowledgements,
             limit,
@@ -41,12 +45,10 @@ impl<'a> AckWindow<'a> {
         self.unacknowledged += 1;
         let limit = if settle { 1 } else { self.limit };
         while self.unacknowledged >= limit {
-            ensure!(
-                self.acknowledgements
-                    .recv_timeout(Duration::from_secs(120))
-                    .context("transfer acknowledgement timed out")?,
-                "peer rejected transfer"
-            );
+            self.acknowledgements
+                .recv_timeout(Duration::from_secs(120))
+                .context("transfer acknowledgement timed out")?
+                .map_err(|reason| anyhow!("the peer refused the files: {reason}"))?;
             self.unacknowledged -= 1;
         }
         Ok(())

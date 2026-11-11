@@ -26,6 +26,7 @@ use windows as native;
 pub use native::{available_space, mark_received};
 pub use rename::rename_no_replace;
 
+mod budget;
 mod pick;
 mod receive;
 mod rename;
@@ -33,10 +34,11 @@ mod send;
 mod sweep;
 mod worker;
 
+use budget::{CLIPBOARD_LIMITS, ClipboardBudget, ClipboardLimits, Refusal};
 pub use pick::PickCancel;
 use receive::{Incoming, Placement};
 use send::{AckWindow, send_paths};
-use sweep::{remove_batch, sweep_cache, sweep_transfer_folders};
+use sweep::{remove_batch, remove_batch_folder, sweep_cache, sweep_transfer_folders};
 
 /// Native change counter, shared by text/image and file clipboard polling.
 pub fn clipboard_sequence() -> u64 {
@@ -79,14 +81,20 @@ pub const COMMAND_QUEUE: usize = 64;
 const STALE_PARTIAL_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// Clipboard and drop copies live in the cache while an app may still read them.
 const CACHE_BATCH_AGE: Duration = Duration::from_secs(60 * 60);
+/// Clipboard batches a worker keeps: the one on the clipboard and the one
+/// before it, which a paste that started just before the newest copy arrived
+/// may still be reading. Older ones are removed once a new copy is delivered.
+const KEPT_CLIPBOARD_BATCHES: usize = 2;
 /// Receipts sweep the cache at most this often, since walking it can take a while and batches
 /// only expire after [`CACHE_BATCH_AGE`].
 const CACHE_SWEEP_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// Which end of a session a worker serves. The agent follows the viewer's
-/// requests. The viewer never opens its own picker for the peer and saves only
-/// the files it asked for, so a compromised endpoint cannot push files onto the
-/// technician's machine or make it upload local files.
+/// requests. The viewer never opens its own picker for the peer and saves to
+/// Documents only the files it asked for, so a compromised endpoint cannot
+/// push files onto the technician's machine or make it upload local files.
+/// Files copied on the device reach the viewer's clipboard unasked, within the
+/// budget of [`ClipboardBudget`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     Viewer,
@@ -241,12 +249,18 @@ struct Admission {
     role: Role,
     /// When this side asked the peer to pick files, oldest first.
     peer_picks: VecDeque<Instant>,
+    /// The viewer's recent clipboard copies from the peer.
+    clipboard: ClipboardBudget,
 }
 impl Admission {
     fn new(role: Role) -> Self {
+        Self::with_limits(role, CLIPBOARD_LIMITS)
+    }
+    fn with_limits(role: Role, limits: ClipboardLimits) -> Self {
         Self {
             role,
             peer_picks: VecDeque::new(),
+            clipboard: ClipboardBudget::new(limits),
         }
     }
     fn request_peer_pick(&mut self, now: Instant) {
@@ -269,30 +283,45 @@ impl Admission {
         destination: &FileDestination,
         clipboard_enabled: bool,
         now: Instant,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), Refusal> {
         let clipboard = matches!(
             destination,
             FileDestination::Clipboard | FileDestination::ClipboardPaste { .. }
         );
         if clipboard && !clipboard_enabled {
-            return Err("Clipboard file transfers are disabled");
+            return Err("Clipboard file transfers are disabled".into());
         }
         if self.role == Role::Agent {
             return Ok(());
         }
         match destination {
-            FileDestination::Clipboard => Ok(()),
+            FileDestination::Clipboard => self.clipboard.begin(now),
             FileDestination::Documents => {
                 self.peer_picks
                     .retain(|requested| now.duration_since(*requested) < PEER_PICK_WINDOW);
                 self.peer_picks
                     .pop_front()
                     .map(drop)
-                    .ok_or("Files are accepted only after you choose Receive files")
+                    .ok_or("Files are accepted only after you choose Receive files".into())
             }
             FileDestination::ClipboardPaste { .. } | FileDestination::Drop { .. } => {
-                Err("The viewer does not accept pasted or dropped files")
+                Err("The viewer does not accept pasted or dropped files".into())
             }
+        }
+    }
+    /// An admitted transfer announced its size. The viewer checks a clipboard
+    /// copy's against its budget and the free space `free` reports.
+    fn admit_totals(
+        &mut self,
+        destination: &FileDestination,
+        bytes: u64,
+        free: impl FnOnce() -> Option<u64>,
+        now: Instant,
+    ) -> Result<(), Refusal> {
+        if self.role == Role::Viewer && *destination == FileDestination::Clipboard {
+            self.clipboard.totals(bytes, free, now)
+        } else {
+            Ok(())
         }
     }
 }
