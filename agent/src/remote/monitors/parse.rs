@@ -129,12 +129,63 @@ pub(crate) struct LogEvent {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct LogRead {
     pub(crate) events: Vec<LogEvent>,
-    /// The read stopped at its cap, so older entries since the last check
-    /// went unread.
+    /// A read newest first (the journal, the unified log) stopped at its
+    /// cap, so older entries since the last check went unread.
     pub(crate) truncated: bool,
-    /// The read stopped at the check's time limit, so older entries since
-    /// the last check went unread.
+    /// A read oldest first (a Windows log) stopped part way; the next check
+    /// reads on from where it got to.
+    pub(crate) behind: Option<Behind>,
+    /// The check had fallen too far behind, so it skipped the entries
+    /// logged from `.0` to `.1` and read on from `.1`.
+    pub(crate) skipped: Option<(i64, i64)>,
+    /// The record the last check got to is gone because the log was
+    /// cleared, so the read went by time again, from then.
+    pub(crate) cleared_since_ms: Option<i64>,
+    /// Records after the one the last check got to were overwritten by the
+    /// log (it was full) before they were read: how many.
+    pub(crate) overwritten: u64,
+}
+
+/// Where a read that stopped part way got to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Behind {
+    /// At the check's time limit; else at the cap on matching entries.
     pub(crate) out_of_time: bool,
+    /// The time of the last entry it read, which entries logged after it
+    /// follow.
+    pub(crate) read_to_ms: i64,
+    /// How long before the check started that was.
+    pub(crate) lag_ms: i64,
+}
+
+/// What a log read starts from when it has no place of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LogWindow {
+    /// When the check started.
+    pub(crate) now_ms: i64,
+    /// Since the last check, or one interval back on the first.
+    pub(crate) since_ms: i64,
+    pub(crate) interval_ms: i64,
+}
+
+/// How many intervals a monitor's checks may fall behind a log: one that
+/// stopped part way reads on from where it got to, unless that is longer
+/// ago than this, when it skips to the last interval. A burst gets two
+/// more checks to catch up in before anything is skipped, and a log too
+/// busy ever to keep up with raises its alerts at most this late.
+pub(crate) const BEHIND_INTERVALS: i64 = 3;
+
+/// How far a monitor read a Windows log, which its next check reads on
+/// from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LogPlace {
+    /// The last record read; with none, the next check reads by time.
+    pub(crate) record: Option<u64>,
+    /// Everything logged before this was read: the check's start when it
+    /// read to the end, else the time of the last entry it read.
+    pub(crate) read_to_ms: i64,
+    /// The check stopped before the end.
+    pub(crate) behind: bool,
 }
 
 /// An event log monitor's filters.

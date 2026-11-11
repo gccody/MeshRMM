@@ -134,8 +134,8 @@ pub(crate) struct Memory {
     pub(crate) checked_at_ms: Option<i64>,
     /// Since when a process has been over its threshold.
     pub(crate) over_since_ms: Option<i64>,
-    /// The newest record of a Windows event log that it has read up to.
-    pub(crate) log_record: Option<u64>,
+    /// How far it has read a Windows event log.
+    pub(crate) log_place: Option<parse::LogPlace>,
 }
 
 /// What a check runs with.
@@ -948,7 +948,7 @@ impl Scheduler {
         // An overrun was reported when it overran.
         if finished.abandoned {
             entry.memory.checked_at_ms = memory.checked_at_ms;
-            entry.memory.log_record = memory.log_record;
+            entry.memory.log_place = memory.log_place;
             return;
         }
         self.record(&finished.monitor_id, checked_at_ms, outcome, memory);
@@ -1250,6 +1250,50 @@ mod tests {
     }
 
     #[test]
+    fn a_monitor_keeps_its_place_in_a_log_until_its_rule_changes() {
+        let event_log = |message: &str| MonitorDefinition {
+            id: "log".into(),
+            interval_seconds: 300,
+            timeout_seconds: 30,
+            check: MonitorCheck::EventLog {
+                log: "Security".into(),
+                source: String::new(),
+                event_ids: Vec::new(),
+                levels: Vec::new(),
+                message: message.into(),
+            },
+        };
+        let outbox = outbox();
+        let (mut scheduler, _receiver) = scheduler(&outbox);
+        scheduler.set(vec![event_log("disk")], None);
+        let place = parse::LogPlace {
+            record: Some(42),
+            read_to_ms: 7,
+            behind: true,
+        };
+        scheduler.record(
+            "log",
+            7,
+            Outcome::passing("behind"),
+            Memory {
+                checked_at_ms: Some(7),
+                log_place: Some(place),
+                ..Memory::default()
+            },
+        );
+        // The server sends the same monitors again on reconnecting: the
+        // next check reads on from where the last got to.
+        scheduler.set(
+            vec![event_log("disk")],
+            Some(vec![known("log", 7, true, 0)]),
+        );
+        assert_eq!(scheduler.entries["log"].memory.log_place, Some(place));
+        // The place belongs to the old rule's query.
+        scheduler.set(vec![event_log("disk d")], None);
+        assert_eq!(scheduler.entries["log"].memory, Memory::default());
+    }
+
+    #[test]
     fn invalid_monitors_fail_with_the_reason() {
         let outbox = outbox();
         let (mut scheduler, _receiver) = scheduler(&outbox);
@@ -1327,16 +1371,25 @@ mod tests {
             outcome: Outcome::passing("late"),
             memory: Memory {
                 checked_at_ms: Some(7),
-                log_record: Some(42),
+                log_place: Some(place(42)),
                 ..Memory::default()
             },
         });
         assert!(results(&outbox).is_empty(), "the late result is dropped");
         let memory = &scheduler.entries["one"].memory;
         assert_eq!(
-            (memory.checked_at_ms, memory.log_record),
-            (Some(7), Some(42))
+            (memory.checked_at_ms, memory.log_place),
+            (Some(7), Some(place(42)))
         );
+    }
+
+    /// A place in a log, after its record `record`.
+    fn place(record: u64) -> parse::LogPlace {
+        parse::LogPlace {
+            record: Some(record),
+            read_to_ms: record as i64,
+            behind: false,
+        }
     }
 
     /// Starts nothing: the test finishes each check itself, with [`done`].
@@ -1562,7 +1615,7 @@ mod tests {
         let remembered = Memory {
             checked_at_ms: Some(5),
             over_since_ms: Some(3),
-            log_record: Some(8),
+            log_place: Some(place(8)),
         };
         scheduler.entries.get_mut("one").unwrap().memory = remembered.clone();
         scheduler.step(None, now);
@@ -1570,7 +1623,7 @@ mod tests {
             // Halfway through changing what it remembers.
             memory.checked_at_ms = Some(99);
             memory.over_since_ms = None;
-            memory.log_record = Some(9);
+            memory.log_place = Some(place(9));
             panic!("byte index 1 is not a char boundary");
         });
         scheduler.step(Some(receiver.try_recv().unwrap()), now);
@@ -1622,7 +1675,7 @@ mod tests {
             Memory {
                 checked_at_ms: Some(checked_at),
                 over_since_ms: Some(42),
-                log_record: Some(8),
+                log_place: Some(place(8)),
             }
         );
     }
