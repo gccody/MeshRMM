@@ -11,7 +11,7 @@
 //! link swapped in can't redirect), so neither is left part done by the
 //! deadline.
 use std::fs;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use meshrmm_file_transfer::rename_no_replace;
@@ -22,9 +22,6 @@ use meshrmm_protocol::{
 
 use super::listing::entry_at;
 use super::{Account, Deadline, io_error, paths, platform, timed_out, unix_ms};
-
-/// How much of a file a copy writes between looks at its deadline.
-const COPY_PIECE: u64 = 16 * 1024 * 1024;
 
 /// Fails each of `texts` as not reached before the deadline.
 fn not_reached(batch: &mut FileBatch, texts: &[String]) {
@@ -215,7 +212,7 @@ fn move_across(
     if target.symlink_metadata().is_ok() {
         return Err(io_error(&io::ErrorKind::AlreadyExists.into(), target));
     }
-    if let Err(error) = copy_tree(account, path, target, deadline) {
+    if let Err(error) = platform::copy_tree(account, path, target, deadline) {
         let _ = delete_tree(target);
         if error.code == FileErrorCode::TimedOut {
             return Err(timed_out(format!(
@@ -226,61 +223,6 @@ fn move_across(
         return Err(error);
     }
     delete_tree(path)
-}
-
-/// Copies `source` to `target`, a folder with everything in it. Links are
-/// copied as links, never followed. Stops at the deadline, before an entry
-/// or a piece of a file.
-fn copy_tree(
-    account: &Account,
-    source: &Path,
-    target: &Path,
-    deadline: &Deadline,
-) -> Result<(), FileError> {
-    if deadline.passed() {
-        return Err(timed_out("The device ran out of time."));
-    }
-    let metadata = fs::symlink_metadata(source).map_err(|error| io_error(&error, source))?;
-    if metadata.file_type().is_symlink() {
-        return platform::copy_link(source, target);
-    }
-    if metadata.is_dir() {
-        fs::create_dir(target).map_err(|error| io_error(&error, target))?;
-        platform::adopt_parent_owner(account, target);
-        for item in fs::read_dir(source).map_err(|error| io_error(&error, source))? {
-            let item = item.map_err(|error| io_error(&error, source))?;
-            copy_tree(
-                account,
-                &item.path(),
-                &target.join(item.file_name()),
-                deadline,
-            )?;
-        }
-        return Ok(());
-    }
-    // Never replaces: the target was checked, and is new.
-    let mut from = fs::File::open(source).map_err(|error| io_error(&error, source))?;
-    let mut to = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(target)
-        .map_err(|error| io_error(&error, target))?;
-    loop {
-        let copied = io::copy(&mut from.by_ref().take(COPY_PIECE), &mut to)
-            .map_err(|error| io_error(&error, target))?;
-        if copied < COPY_PIECE {
-            break;
-        }
-        if deadline.passed() {
-            return Err(timed_out("The device ran out of time."));
-        }
-    }
-    let _ = to.set_permissions(metadata.permissions());
-    if let Ok(modified) = metadata.modified() {
-        let _ = to.set_modified(modified);
-    }
-    platform::adopt_parent_owner(account, target);
-    Ok(())
 }
 
 pub(super) fn delete_all(
@@ -764,6 +706,28 @@ mod tests {
         move_across(&account, &source, &target, &Deadline::distant()).unwrap();
         assert!(!source.exists());
         assert_eq!(fs::read(target.join("sub/three")).unwrap(), b"sub/three");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cross_volume_copy_keeps_a_link_as_a_link() {
+        let folder = Folder::new();
+        let account = own();
+        let source = folder.0.join("src");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("file"), b"data").unwrap();
+        std::os::unix::fs::symlink("file", source.join("link")).unwrap();
+        let target = folder.0.join("dst");
+        move_across(&account, &source, &target, &Deadline::distant()).unwrap();
+        // The link arrived as a link to the same place, never followed.
+        let copied = fs::symlink_metadata(target.join("link")).unwrap();
+        assert!(copied.file_type().is_symlink());
+        assert_eq!(
+            fs::read_link(target.join("link")).unwrap(),
+            Path::new("file")
+        );
+        assert_eq!(fs::read(target.join("file")).unwrap(), b"data");
+        assert!(!source.exists(), "the move removed the original");
     }
 
     #[test]
