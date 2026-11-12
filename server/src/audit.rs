@@ -192,6 +192,17 @@ pub async fn record(
     target: Target<'_>,
     metadata: Value,
 ) -> db::Result<()> {
+    // The event's time is the one in its ID. The uuid crate keeps a
+    // process's IDs increasing even when the wall clock steps back, so the
+    // log, newest first by time and then ID, keeps the order events
+    // happened in.
+    let id = uuid::Uuid::now_v7();
+    let created_at = id.get_timestamp().map_or_else(now_ms, |time| {
+        let (seconds, nanos) = time.to_unix();
+        i64::try_from(seconds).map_or(i64::MAX, |seconds| {
+            seconds * 1000 + i64::from(nanos / 1_000_000)
+        })
+    });
     executor
         .execute(
             &Query::insert()
@@ -210,9 +221,7 @@ pub async fn record(
                     AuditEvents::CreatedAt,
                 ])
                 .values_panic([
-                    // Time-ordered, and increasing within a millisecond, so
-                    // events in the same millisecond keep their order.
-                    uuid::Uuid::now_v7().to_string().into(),
+                    id.to_string().into(),
                     actor.user_id.clone().into(),
                     actor.label.clone().into(),
                     action.into(),
@@ -230,7 +239,7 @@ pub async fn record(
                         .as_ref()
                         .map(|token| token.name.clone())
                         .into(),
-                    now_ms().into(),
+                    created_at.into(),
                 ])
                 .to_owned(),
         )
