@@ -51,7 +51,7 @@ mod toolbar;
 
 use app::close_connecting_window;
 #[cfg(test)]
-use app::{WheelNormalizer, normalized_video_position};
+use app::normalized_video_position;
 pub use app::{monotonic_timestamp_us, run_application, show_launch_status, show_notice};
 pub use install::{install_if_needed, launch_installed};
 pub use presenter::{Presenter, refresh_open_controls};
@@ -93,33 +93,6 @@ const VIEWER_TOOLBAR_HEIGHT: f64 = crate::toolbar::HEIGHT;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn wheel_delta_accumulates_precise_trackpad_movement_into_smooth_steps() {
-        let mut normalizer = WheelNormalizer::default();
-
-        assert_eq!(normalizer.normalize(0.0, 2.5, true), (0, 0));
-        assert_eq!(normalizer.normalize(0.0, 2.5, true), (0, 0));
-        assert_eq!(normalizer.normalize(0.0, 2.5, true), (0, 15));
-        assert_eq!(normalizer.normalize(0.0, 52.5, true), (0, 105));
-        assert_eq!(normalizer.normalize(-120.0, 0.0, true), (-240, 0));
-    }
-
-    #[test]
-    fn wheel_delta_converts_coarse_mouse_steps_to_windows_notches() {
-        let mut normalizer = WheelNormalizer::default();
-
-        assert_eq!(normalizer.normalize(1.0, -2.0, false), (120, -240));
-    }
-
-    #[test]
-    fn wheel_delta_discards_stale_remainder_when_direction_changes() {
-        let mut normalizer = WheelNormalizer::default();
-
-        assert_eq!(normalizer.normalize(0.0, 3.75, true), (0, 0));
-        assert_eq!(normalizer.normalize(0.0, -3.75, true), (0, 0));
-        assert_eq!(normalizer.normalize(0.0, -3.75, true), (0, -15));
-    }
 
     #[test]
     fn pointer_position_uses_aspect_fit_video_rect() {

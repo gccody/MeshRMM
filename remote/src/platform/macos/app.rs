@@ -11,6 +11,7 @@ use super::toolbar::ToolbarView;
 use super::*;
 use crate::input::HeldInput;
 use crate::reconnect::ReconnectStatus;
+use crate::wheel::WheelNormalizer;
 use meshrmm_protocol::{HeadlessResolution, SessionCloseAction};
 use objc2::runtime::AnyObject;
 use objc2_app_kit::{
@@ -490,64 +491,6 @@ define_class!(
         }
     }
 );
-
-const WINDOWS_WHEEL_DELTA: f64 = 120.0;
-const PRECISE_SCROLL_POINTS_PER_NOTCH: f64 = 60.0;
-const PRECISE_SCROLL_STEPS_PER_NOTCH: f64 = 8.0;
-
-/// Converts high-frequency trackpad motion into small, high-resolution Windows
-/// wheel steps. Accumulation prevents every tiny AppKit event from becoming a
-/// scroll action, while subdivisions avoid the jump caused by full notches.
-#[derive(Default)]
-pub(super) struct WheelNormalizer {
-    horizontal_remainder: f64,
-    vertical_remainder: f64,
-}
-
-impl WheelNormalizer {
-    pub(super) fn normalize(
-        &mut self,
-        horizontal: f64,
-        vertical: f64,
-        precise: bool,
-    ) -> (i16, i16) {
-        if precise {
-            (
-                precise_wheel_delta(horizontal, &mut self.horizontal_remainder),
-                precise_wheel_delta(vertical, &mut self.vertical_remainder),
-            )
-        } else {
-            self.horizontal_remainder = 0.0;
-            self.vertical_remainder = 0.0;
-            (coarse_wheel_delta(horizontal), coarse_wheel_delta(vertical))
-        }
-    }
-}
-
-fn precise_wheel_delta(delta: f64, remainder: &mut f64) -> i16 {
-    if !delta.is_finite() || delta == 0.0 {
-        return 0;
-    }
-    if *remainder != 0.0 && remainder.signum() != delta.signum() {
-        *remainder = 0.0;
-    }
-    *remainder += delta;
-    let points_per_step = PRECISE_SCROLL_POINTS_PER_NOTCH / PRECISE_SCROLL_STEPS_PER_NOTCH;
-    let wheel_delta_per_step = WINDOWS_WHEEL_DELTA / PRECISE_SCROLL_STEPS_PER_NOTCH;
-    let steps = (*remainder / points_per_step).trunc();
-    *remainder -= steps * points_per_step;
-    clamp_wheel_delta(steps * wheel_delta_per_step)
-}
-
-fn coarse_wheel_delta(delta: f64) -> i16 {
-    clamp_wheel_delta(delta * WINDOWS_WHEEL_DELTA)
-}
-
-fn clamp_wheel_delta(delta: f64) -> i16 {
-    delta
-        .round()
-        .clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16
-}
 
 impl RemoteView {
     #[allow(clippy::too_many_arguments)]

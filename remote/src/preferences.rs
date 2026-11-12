@@ -49,11 +49,21 @@ static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn path() -> anyhow::Result<PathBuf> {
     #[cfg(windows)]
-    let root = PathBuf::from(std::env::var_os("APPDATA").context("APPDATA is unavailable")?);
-    #[cfg(not(windows))]
-    let root = PathBuf::from(std::env::var_os("HOME").context("Home directory is unavailable")?)
-        .join("Library/Application Support");
-    Ok(root.join("MeshRMM/viewer-preferences.json"))
+    let directory = PathBuf::from(std::env::var_os("APPDATA").context("APPDATA is unavailable")?)
+        .join("MeshRMM");
+    #[cfg(target_os = "macos")]
+    let directory =
+        PathBuf::from(std::env::var_os("HOME").context("Home directory is unavailable")?)
+            .join("Library/Application Support/MeshRMM");
+    // Where Linux desktops keep a user's settings.
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let directory = match std::env::var_os("XDG_CONFIG_HOME").filter(|path| !path.is_empty()) {
+        Some(path) => PathBuf::from(path),
+        None => PathBuf::from(std::env::var_os("HOME").context("Home directory is unavailable")?)
+            .join(".config"),
+    }
+    .join("meshrmm-remote");
+    Ok(directory.join("viewer-preferences.json"))
 }
 fn load(path: &Path) -> Preferences {
     match std::fs::read(path) {

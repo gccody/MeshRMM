@@ -132,17 +132,18 @@ jobs:
       - run: cargo clippy --locked -p meshrmm-remote -p meshrmm-agent -p meshrmm-session-transport --all-targets -- -D warnings
       - run: cargo test --locked -p meshrmm-remote -p meshrmm-agent -p meshrmm-session-transport
 
-  # The Linux Agent and the crates it shares with the other platforms.
+  # The Linux Agent and viewer, and the crates they share with the other
+  # platforms. The viewer's tests need no display.
   rust-linux-agent:
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.agent == 'true') }}
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.remote == 'true') }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: sudo apt-get update && sudo apt-get install -y nasm
-      - run: cargo clippy --locked -p meshrmm-agent -p meshrmm-file-transfer -p meshrmm-clipboard -p meshrmm-audio -p meshrmm-chat --all-targets -- -D warnings
-      - run: cargo test --locked -p meshrmm-agent -p meshrmm-file-transfer -p meshrmm-clipboard -p meshrmm-audio -p meshrmm-chat
+      - run: cargo clippy --locked -p meshrmm-agent -p meshrmm-remote -p meshrmm-session-transport -p meshrmm-file-transfer -p meshrmm-clipboard -p meshrmm-audio -p meshrmm-chat --all-targets -- -D warnings
+      - run: cargo test --locked -p meshrmm-agent -p meshrmm-remote -p meshrmm-file-transfer -p meshrmm-clipboard -p meshrmm-audio -p meshrmm-chat
 
   server:
     needs: changes

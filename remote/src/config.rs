@@ -15,7 +15,7 @@ pub struct Config {
     pub json_logs: bool,
     /// The dashboard's device ID from the link. It only selects which viewer
     /// a new link replaces; the handoff token alone authorizes the session.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub device_id: Option<String>,
 }
 

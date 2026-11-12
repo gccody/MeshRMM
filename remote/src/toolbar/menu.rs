@@ -214,6 +214,7 @@ pub fn restart_confirmation(safe_mode: bool) -> (&'static str, &'static str, &'s
 /// The commands of `entries`, in order, for platforms that number menu
 /// items. A submenu takes a place itself, followed by its entries. Status
 /// lines, separators and submenus have no command.
+#[cfg(any(windows, target_os = "macos", test))]
 pub fn commands(entries: &[MenuEntry]) -> Vec<Option<Command>> {
     fn collect(entries: &[MenuEntry], commands: &mut Vec<Option<Command>>) {
         for entry in entries {

@@ -9,8 +9,9 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchStatus {
-    /// Windows allows one viewer per device and waits for the open one to end.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    /// Windows and Linux allow one viewer per device and wait for the open
+    /// one to end.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     ClosingPreviousViewer,
     RequestingSession,
     CheckingForUpdate,
@@ -142,7 +143,6 @@ pub fn report(status: LaunchStatus) {
             phase_started,
         });
     }
-    #[cfg(any(windows, target_os = "macos"))]
     crate::platform::show_launch_status(status.message(), status.cancellable());
 }
 

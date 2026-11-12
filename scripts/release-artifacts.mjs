@@ -26,6 +26,8 @@ export const ARTIFACTS = {
   "agent-windows-arm64": "meshrmm-agent-windows-arm64.exe",
   "client-windows-x64": "meshrmm-remote-windows-x64.exe",
   "client-macos-arm64": "meshrmm-remote-macos-arm64.zip",
+  "client-linux-x64": "meshrmm-remote-linux-x64",
+  "client-linux-arm64": "meshrmm-remote-linux-arm64",
   "agent-macos": "meshrmm-agent-macos.zip",
   "agent-linux-x64": "meshrmm-agent-linux-x64",
   "agent-linux-arm64": "meshrmm-agent-linux-arm64",

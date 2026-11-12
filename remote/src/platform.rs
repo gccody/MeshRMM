@@ -4,6 +4,9 @@ mod windows;
 #[cfg(target_os = "macos")]
 mod macos;
 
+#[cfg(target_os = "linux")]
+mod linux;
+
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -692,9 +695,16 @@ pub use macos::{
     run_application, show_launch_status, show_notice, supported_video_profiles,
 };
 
+#[cfg(target_os = "linux")]
+pub use linux::{
+    Presenter, claim_instance, install_if_needed, is_uninstall_invocation, monotonic_timestamp_us,
+    refresh_open_controls, register, run_application, show_launch_status, show_notice,
+    supported_video_profiles, uninstall,
+};
+
 /// Windows pumps its window's messages every few milliseconds, which shows
 /// any change.
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 pub fn refresh_open_controls() {}
 
 #[cfg(test)]

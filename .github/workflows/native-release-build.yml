@@ -1,8 +1,8 @@
 name: Publish release
 
-# Builds a server release: the Agent and viewer for Windows and macOS, the
-# Agent for ARM64 Windows and for x64 and arm64 Linux, signed with the release
-# key, inside a server tarball per Linux architecture and a multi-architecture
+# Builds a server release: the Agent and viewer for Windows, macOS and x64 and
+# arm64 Linux, and the Agent for ARM64 Windows, signed with the release key,
+# inside a server tarball per Linux architecture and a multi-architecture
 # Docker image. On main it publishes them as a GitHub release and to GHCR; a
 # manual run on another branch builds and tests everything without signing or
 # publishing.
@@ -182,7 +182,7 @@ jobs:
           retention-days: 14
 
   linux:
-    name: Build the ${{ matrix.arch }} Linux Agent
+    name: Build the ${{ matrix.arch }} Linux Agent and viewer
     needs: validate
     # zig cross-compiles both against glibc 2.28.
     runs-on: ubuntu-24.04
@@ -214,10 +214,14 @@ jobs:
           cache-on-failure: true
       - name: Build the Agent
         run: sh scripts/build-agent-linux.sh ${{ matrix.arch }}
+      - name: Build the viewer
+        run: sh scripts/build-remote-linux.sh ${{ matrix.arch }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: native-linux-${{ matrix.arch }}-${{ needs.validate.outputs.version }}
-          path: dist/downloads/meshrmm-agent-linux-${{ matrix.arch }}
+          path: |
+            dist/downloads/meshrmm-agent-linux-${{ matrix.arch }}
+            dist/downloads/meshrmm-remote-linux-${{ matrix.arch }}
           if-no-files-found: error
           retention-days: 14
 
@@ -397,5 +401,5 @@ jobs:
         shell: bash
         run: |
           gh release create "v$VERSION" --target "$GITHUB_SHA" --title "MeshRMM $VERSION" \
-            --notes "Server tarballs for x86_64 and arm64 Linux, each with the Windows, macOS and Linux Agents and the Windows and macOS viewers. The Docker image is ghcr.io/${GITHUB_REPOSITORY,,}-server:$VERSION." \
+            --notes "Server tarballs for x86_64 and arm64 Linux, each with the Windows, macOS and Linux Agents and viewers. The Docker image is ghcr.io/${GITHUB_REPOSITORY,,}-server:$VERSION." \
             dist/release/*.tar.gz dist/release/SHA256SUMS

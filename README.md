@@ -13,8 +13,8 @@ MeshRMM is in heavy development and not production ready.
 
 **Remote desktop**
 
-- Native viewers for Windows and macOS, opened from the website with a
-  one-time link. Video goes peer to peer over WebRTC, and through the
+- Native viewers for Windows, macOS and Linux, opened from the website with
+  a one-time link. Video goes peer to peer over WebRTC, and through the
   server's built-in TURN relay only when no direct path exists.
 - Hardware H.265 or H.264 at up to 60 FPS, in 4:2:0 or crisp-text 4:4:4, with
   software H.264 as the final fallback at both ends. Four quality presets

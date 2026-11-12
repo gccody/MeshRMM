@@ -7,9 +7,6 @@
 //! Lengths are in logical pixels (96-DPI pixels on Windows, points on
 //! macOS), with the origin at the toolbar's top-left corner.
 
-// Linux builds only the tests of the viewer's shared code.
-#![cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
-
 mod icons;
 mod items;
 mod menu;
@@ -18,7 +15,9 @@ use meshrmm_protocol::{ChromaMode, CredentialState, DevicePlatform, QualityPrese
 
 pub use icons::icon;
 pub use items::items;
-pub use menu::{Command, MenuEntry, commands, menu, restart_confirmation, toolbox_menu};
+#[cfg(any(windows, target_os = "macos", test))]
+pub use menu::commands;
+pub use menu::{Command, MenuEntry, menu, restart_confirmation, toolbox_menu};
 
 /// The toolbar's height.
 pub const HEIGHT: f64 = 40.0;
@@ -252,6 +251,8 @@ impl Rect {
         }
     }
 
+    // The Linux viewer's controls find the mouse themselves.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub fn contains(&self, x: f64, y: f64) -> bool {
         x >= self.x && x < self.x + self.width && y >= self.y && y < self.y + self.height
     }
@@ -278,6 +279,7 @@ pub struct Layout {
 impl Layout {
     /// The item under a point, if any. The rest of the toolbar moves the
     /// window.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub fn hit(&self, x: f64, y: f64) -> Option<usize> {
         self.rects.iter().position(|rect| rect.contains(x, y))
     }
