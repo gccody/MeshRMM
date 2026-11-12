@@ -1,8 +1,10 @@
 # Remote sessions
 
 What the viewer does during a session, and how each feature behaves. The
-Windows and macOS viewers offer the same features; where a control sits
-differs, and each section says where. For how a session is set up, see
+Windows, macOS and Linux viewers offer the same features; where a control
+sits differs, and each section says where. The Linux viewer's controls sit
+where the macOS viewer's do: a toolbar over the video, whose gear menu holds
+the session's options. For how a session is set up, see
 [architecture](architecture.md#how-a-session-is-set-up); for the video
 itself, see [video](video.md).
 
@@ -31,6 +33,21 @@ Then it moves the downloaded copy in `~/Downloads` to the Trash. A bundle
 opened from anywhere else, such as a build folder, is copied and left in
 place. To uninstall, move `MeshRMM Remote.app` to the Trash.
 
+On Linux, the download is one executable for x64 or arm64, which runs on X11
+and Wayland desktops with glibc 2.28 or newer and a Vulkan or OpenGL ES 3
+driver (Mesa's software drivers will do). A browser saves it without the
+right to run, so allow that first: `chmod +x`, or the file's properties in
+the file manager. Opened from anywhere but its install folder, it copies
+itself to `~/.local/share/meshrmm-remote`, which needs no administrator
+rights, adds a launcher in `~/.local/share/applications` that makes it the
+desktop's handler for `meshrmm` links, and passes its link to the installed
+copy; opened without one, it says the viewer is installed. The download can
+then be deleted. Both folders follow `$XDG_DATA_HOME`. A viewer the user
+does not own, such as one a system package installed, stays where it is,
+registers the link and leaves updates to its package.
+`meshrmm-remote --uninstall` removes the program, the launcher and its icon,
+and keeps the viewer's settings and logs.
+
 ## Starting and ending
 
 **Connect** on a device opens the viewer with a single-use link. If the
@@ -47,8 +64,8 @@ A viewer can also redeem a link from the command line:
 ```
 
 An Agent accepts one session at a time. A second viewer gets a busy
-response; closing the first releases the device. On Windows a new link for
-the same device replaces the viewer already open for it.
+response; closing the first releases the device. On Windows and Linux a new
+link for the same device replaces the viewer already open for it.
 
 Closing the viewer asks for confirmation first. **Disconnect confirmation**
 is a per-user preference, on by default.
@@ -95,8 +112,11 @@ with `➤`.
 When no window of a session shows the video for two seconds, the viewer asks
 the Agent to pause it, and the device stops capturing, encoding and sending
 video. A window shows nothing while it is minimised on Windows, or while it is
-miniaturised or the viewer is hidden (⌘H) on macOS. A window that other
-windows cover still counts as showing the video. Restoring the window resumes
+miniaturised or the viewer is hidden (⌘H) on macOS. On Linux it is while the
+window is minimised on an X11 desktop; Wayland desktops do not say, so there
+the video keeps running. A window that other windows cover still counts as
+showing the video, except on an X11 desktop without a compositor, which
+reports a fully covered window. Restoring the window resumes
 the video at once, starting with a keyframe and the current display list and
 pointer, and until then the window keeps the last picture.
 
@@ -126,17 +146,20 @@ split it.
 Shortcuts, each of which can be set to F8–F12 or turned off so the key goes
 to the device:
 
-| | Windows viewer | macOS viewer |
-|---|---|---|
-| Next display | F8 | Control-Option-Left/Right Arrow |
-| Diagnostics overlay | F12 | F12 |
-| Where to change | **Settings → Keyboard** | gear menu, **Diagnostics shortcut** |
+| | Windows viewer | macOS viewer | Linux viewer |
+|---|---|---|---|
+| Next display | F8 | Control-Option-Left/Right Arrow | F8 |
+| Diagnostics overlay | F12 | F12 | F12 |
+| Where to change | **Settings → Keyboard** | gear menu, **Diagnostics shortcut** | gear menu, **This viewer** |
 
 While it has keyboard focus the Windows viewer also sends the Windows key,
 Alt+Tab, Alt+Esc and Ctrl+Esc to the device; turn that off under
 **Settings → Keyboard**. Ctrl+Alt+Del and Windows+L always stay local. With a
 Mac on the other end, the macOS viewer's Command key is Command and the
-Windows viewer's Windows key is Command too.
+Windows viewer's Windows key is Command too. The Linux viewer sends each key
+by its position on the keyboard, the Super key as the Windows key. It does
+not take the shortcuts its own desktop keeps, such as Alt+Tab or the Super
+key alone, so those act on the viewer's computer.
 
 **Send Ctrl+Alt+Del** (keyboard icon) sends the secure attention sequence to
 a Windows device through the installed service. When Windows policy blocks
@@ -155,8 +178,8 @@ when the session connects, and later copies on either side are picked up
 every 250 ms. A copy is limited to 32 MiB (of uncompressed pixels, for an
 image) and sent in paced 60 KiB chunks. RTF-only formatting is not synced.
 
-**Sync clipboard** (gear menu on macOS; **Settings → Troubleshooting** on
-Windows) turns the exchange off in both directions, copied files included.
+**Sync clipboard** (gear menu on macOS and Linux; **Settings →
+Troubleshooting** on Windows) turns the exchange off in both directions, copied files included.
 It is saved per viewer user and is on by default. Turning it back on sends
 only later copies.
 
@@ -173,7 +196,9 @@ Other ways to move files:
 - Drag files from Finder or Explorer onto the remote view. On a Windows
   device they arrive as a native drop at that position: in Explorer, on the
   desktop, or on a browser's drop target. A target that declines them, and
-  every Mac or Linux device, leaves them in the transfer folder.
+  every Mac or Linux device, leaves them in the transfer folder. The Linux
+  viewer takes drops on X11 desktops only and always sends them to the
+  transfer folder.
 - Copy files on one computer and paste on the other, while **Sync
   clipboard** is on. The viewer's paste shortcut sends the copied files
   first, and the device presses paste (Ctrl+V, or Command+V on a Mac) once
@@ -222,9 +247,10 @@ its history.
 
 The device's system audio (the output mix, not the microphone) plays in the
 viewer. It starts muted, and the Agent captures and sends nothing while
-muted. Turn it on with **Play remote audio** in the macOS gear menu or by
-clearing **Mute audio** under **Settings → Troubleshooting** on Windows; the
-choice is saved for the viewer's user.
+muted. Turn it on with **Play remote audio** in the macOS or Linux gear menu
+or by clearing **Mute audio** under **Settings → Troubleshooting** on
+Windows; the choice is saved for the viewer's user. The Linux viewer plays
+through PulseAudio or PipeWire's PulseAudio server.
 
 Audio is 48 kHz stereo Opus at about 96 kbps, downmixed from surround, on a
 channel of its own that drops audio instead of falling behind. Video pacing
@@ -233,8 +259,8 @@ the default playback device.
 
 ## Recording
 
-**Record video to Downloads** (macOS gear menu, **Session**; Windows
-**Settings → Troubleshooting**) records the remote display on the viewer's
+**Record video to Downloads** (macOS and Linux gear menu, **Session**;
+Windows **Settings → Troubleshooting**) records the remote display on the viewer's
 computer. A red **REC** item stays in the toolbar; click it to stop.
 
 - Files are video-only Matroska (`.mkv`) under
@@ -288,8 +314,8 @@ Unless company policy turns them off, the person at the computer sees:
 
 ## Session options
 
-These are chosen per session in the gear menu (macOS) or **Settings**
-(Windows). The company sets the defaults of those marked *policy* under
+These are chosen per session in the gear menu (macOS and Linux) or
+**Settings** (Windows). The company sets the defaults of those marked *policy* under
 **Settings → Remote sessions** in the website, and whether users may change
 them; when they may not, the Agent enforces the default whatever the viewer
 asks.
@@ -321,13 +347,16 @@ signed-in user; logout uses `WTSLogoffSession`.
 
 ## Diagnostics
 
-- The viewer logs to `%LOCALAPPDATA%\MeshRMM\remote.log` on Windows and
-  `~/Library/Logs/MeshRMM/remote.log` on macOS, rotated at 10 MiB with three
-  older files kept. Connection and video statistics are logged every 30
+- The viewer logs to `%LOCALAPPDATA%\MeshRMM\remote.log` on Windows,
+  `~/Library/Logs/MeshRMM/remote.log` on macOS and
+  `~/.local/state/meshrmm-remote/remote.log` on Linux (under
+  `$XDG_STATE_HOME`), rotated at 10 MiB with three older files kept. Connection and video statistics are logged every 30
   seconds, and ICE logs say whether the connection is `direct` or `turn`.
 - The diagnostics overlay (F12) updates every two seconds.
 - Viewer preferences are in `MeshRMM/viewer-preferences.json` under
-  Application Support (macOS) or `%APPDATA%` (Windows).
+  Application Support (macOS) or `%APPDATA%` (Windows), and in
+  `~/.config/meshrmm-remote/viewer-preferences.json` on Linux (under
+  `$XDG_CONFIG_HOME`).
 - An optional `remote.json` beside the executable (in `Contents/MacOS` on
   macOS) holds local settings: `auto_update` and `json_logs`.
 
@@ -336,7 +365,8 @@ signed-in user; logout uses `WTSLogoffSession`.
 The viewer checks its server's update manifest at the start of each launch
 from the website, after it has redeemed the link. For a newer release it
 checks the signature and SHA-256, has a helper replace the executable or app
-bundle, and relaunches with the session it already holds. With no update, or
+bundle (the Linux viewer replaces its own file), and relaunches with the
+session it already holds. With no update, or
 when the check can't reach the server, it carries on at once. A replacement
 that fails rolls back.
 
@@ -347,3 +377,6 @@ that fails rolls back.
 - Ctrl+Alt+Del needs the installed Windows service; a console-mode Agent
   cannot send it.
 - The macOS viewer decodes 4:2:0 only.
+- The Linux viewer decodes H.264 4:2:0 in software only, so it offers no
+  H.265 or 4:4:4, and it draws its text with built-in Latin fonts: chat and
+  script output in other scripts show placeholder boxes.

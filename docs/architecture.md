@@ -535,7 +535,8 @@ Downloads folder, it installs itself for the current user first: on Windows
 in `%LOCALAPPDATA%\Programs\MeshRMM Remote`, where it registers the
 `meshrmm` URL scheme; on macOS in `~/Applications` (a viewer in
 `/Applications` stays there), where the bundle's `Info.plist` registers the
-scheme. See [remote sessions](remote-sessions.md#installing-the-viewer).
+scheme; on Linux in `~/.local/share/meshrmm-remote`, with a launcher that
+registers the scheme with the desktop. See [remote sessions](remote-sessions.md#installing-the-viewer).
 Network work, decoding and each session service run off the UI thread, with
 their own send queues, so local clipboard work cannot hold up input.
 

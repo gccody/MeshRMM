@@ -82,7 +82,7 @@ start. H.264 4:2:0 comes last.
 - **4:4:4** keeps text crisp. It needs a GPU driver with an AYUV and
   High 4:4:4 or RExt hardware path at both ends; the viewer disables the
   choice otherwise. The macOS viewer advertises 4:2:0 only, and Mac Agents
-  encode 4:2:0 only.
+  encode 4:2:0 only. The Linux viewer advertises H.264 4:2:0 only.
 
 The hardware encoders run a streaming configuration: CBR, real-time and
 low-latency modes, no B-frames or reordering, a short recovery GOP, a buffer
@@ -187,6 +187,11 @@ Software H.264 4:2:0 is the last resort at both ends.
   renders with WARP.
 - **macOS viewer.** VideoToolbox decodes H.264 in software when there is no
   hardware decoder.
+- **Linux viewer.** It always decodes with the bundled OpenH264, on a thread
+  of its own that keeps only the newest picture, and draws the three planes
+  with wgpu (Vulkan, or OpenGL ES where there is no Vulkan driver), which
+  converts them to RGB in a shader
+  (`remote/src/platform/linux/decoder.rs`, `video.rs`).
 
 Startup still fails, with an error that says why, when neither path exists,
 for example on a Windows N edition without the Media Feature Pack.

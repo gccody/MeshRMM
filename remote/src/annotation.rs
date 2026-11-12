@@ -4,9 +4,6 @@
 //! sessions can annotate too. The Agent draws the strokes on the device's
 //! screen, where its user sees them and the video shows them.
 
-// Linux builds only the tests of the viewer's shared code.
-#![cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
-
 use meshrmm_protocol::{Annotation, DisplayId, SessionMessage};
 
 #[derive(Debug, Default)]

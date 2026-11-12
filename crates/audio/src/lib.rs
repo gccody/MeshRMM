@@ -19,9 +19,9 @@ mod jitter;
 mod opus;
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub use opus::OpusEncoder;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 mod playback;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub use playback::Player;
 #[cfg(windows)]
 mod capture;
@@ -35,6 +35,8 @@ pub use capture_macos::{Capture, capture};
 
 #[cfg(target_os = "linux")]
 mod capture_linux;
+#[cfg(target_os = "linux")]
+mod pulse;
 #[cfg(target_os = "linux")]
 pub use capture_linux::{Capture, capture};
 

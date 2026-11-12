@@ -2,7 +2,6 @@
 // Fatal errors are shown in a message box, and the log is a file.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-#[cfg(any(windows, target_os = "macos", test))]
 mod annotation;
 mod clipboard;
 mod config;
@@ -27,15 +26,15 @@ mod signaling;
 mod single_instance;
 #[cfg(any(windows, test))]
 mod stream_reset;
-#[cfg(any(windows, target_os = "macos", test))]
 mod toolbar;
 mod toolbox;
 mod transport;
-#[cfg(any(windows, target_os = "macos"))]
 mod updater;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", test))]
 mod video_layout;
 mod video_pause;
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+mod wheel;
 
 use anyhow::Context;
 use launch_status::LaunchStatus;
@@ -45,7 +44,7 @@ use std::time::{Duration, Instant};
 
 /// How long a new viewer waits for the previous viewer of the same device to
 /// release its session. Ending a session retries for up to about 16 seconds.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 const VIEWER_REPLACEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn initialize(launch_deep_link: Option<&str>) -> anyhow::Result<config::Config> {
@@ -64,11 +63,15 @@ fn initialize(launch_deep_link: Option<&str>) -> anyhow::Result<config::Config> 
         config::Config::load()?
     };
     initialize_tracing(&config)?;
-    #[cfg(windows)]
+    #[cfg(target_os = "linux")]
+    let registration = std::env::current_exe()
+        .context("could not locate the viewer executable")
+        .and_then(|executable| platform::register(&executable));
+    #[cfg(any(windows, target_os = "linux"))]
     if let Err(error) = registration {
         tracing::warn!(error = ?error, "could not register the installed viewer");
     }
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     updater::remove_stale_files();
     if let Some(ready) = std::env::var_os("MESHRMM_UPDATE_READY_FILE") {
         std::fs::write(ready, b"ready").context("could not acknowledge viewer initialization")?;
@@ -80,7 +83,6 @@ fn initialize_tracing(config: &config::Config) -> anyhow::Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
-    #[cfg(any(windows, target_os = "macos"))]
     let log_path = {
         let (path, writer) = open_log()?;
         if config.json_logs {
@@ -103,17 +105,6 @@ fn initialize_tracing(config: &config::Config) -> anyhow::Result<()> {
         path
     };
 
-    #[cfg(all(not(windows), not(target_os = "macos")))]
-    if config.json_logs {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .json()
-            .init();
-    } else {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
-    }
-
-    #[cfg(any(windows, target_os = "macos"))]
     tracing::info!(
         process_id = std::process::id(),
         version = env!("CARGO_PKG_VERSION"),
@@ -124,7 +115,6 @@ fn initialize_tracing(config: &config::Config) -> anyhow::Result<()> {
 }
 
 /// Opens the viewer's log, which rotates at 10 MiB and keeps three older files.
-#[cfg(any(windows, target_os = "macos"))]
 fn open_log() -> anyhow::Result<(
     std::path::PathBuf,
     std::sync::Mutex<meshrmm_log_file::RotatingFile>,
@@ -141,6 +131,18 @@ fn open_log() -> anyhow::Result<(
         .join("Logs")
         .join("MeshRMM")
         .join("remote.log");
+    // Where Linux desktops keep what a program records about its runs.
+    #[cfg(target_os = "linux")]
+    let path = match std::env::var_os("XDG_STATE_HOME").filter(|path| !path.is_empty()) {
+        Some(path) => std::path::PathBuf::from(path),
+        None => std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .context("Linux did not provide HOME for viewer logging")?
+            .join(".local")
+            .join("state"),
+    }
+    .join("meshrmm-remote")
+    .join("remote.log");
     let parent = path
         .parent()
         .context("viewer log has no parent directory")?;
@@ -646,7 +648,102 @@ fn main() -> anyhow::Result<()> {
     })
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+/// Ends the session as closing the window does when the desktop asks the
+/// viewer to quit, such as at logout, so the device is free at once rather
+/// than when the server gives up on the viewer. A second signal quits
+/// without waiting.
+#[cfg(target_os = "linux")]
+async fn end_on_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let (Ok(mut terminate), Ok(mut interrupt), Ok(mut hangup)) = (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+        signal(SignalKind::hangup()),
+    ) else {
+        tracing::warn!("could not listen for requests to quit");
+        return;
+    };
+    for asked in 0..2 {
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
+            _ = hangup.recv() => {}
+        }
+        if asked == 0 {
+            shutdown::request("the viewer was asked to quit");
+        }
+    }
+    std::process::exit(1);
+}
+
+#[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
-    anyhow::bail!("MeshRMM remote-client supports Windows and macOS")
+    if third_party_notices_requested() {
+        print!("{}", meshrmm_audio::THIRD_PARTY_NOTICES);
+        return Ok(());
+    }
+    if meshrmm_session_transport::identity::handle_command(
+        meshrmm_session_transport::identity::viewer_directory,
+    )? {
+        return Ok(());
+    }
+    if platform::is_uninstall_invocation() {
+        platform::uninstall().context("MeshRMM Remote could not be uninstalled")?;
+        println!("MeshRMM Remote was uninstalled.");
+        return Ok(());
+    }
+    platform::run_application(move || {
+        // A downloaded viewer installs itself and hands this launch to the
+        // installed copy.
+        if platform::install_if_needed().context("MeshRMM Remote could not be installed")? {
+            return Ok(());
+        }
+        let mut config = initialize(None)?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("failed to create the viewer network runtime")?;
+        runtime.spawn(end_on_signal());
+        // Held until the session has ended.
+        let instance = match config.device_id.as_deref() {
+            Some(device_id) => Some(platform::claim_instance(
+                device_id,
+                VIEWER_REPLACEMENT_TIMEOUT,
+                || shutdown::request("a new dashboard link opened this device"),
+            )?),
+            None => None,
+        };
+        // Cancel while the previous viewer was closing takes effect here:
+        // the request below returns at once, and a session passed in by an
+        // update is ended when the session starts.
+        if config.bootstrap.is_none() {
+            match runtime.block_on(request_session(&config))? {
+                Some(bootstrap) => config.bootstrap = Some(bootstrap),
+                None => return Ok(()),
+            }
+        }
+        let update = runtime.block_on(async {
+            tokio::select! {
+                biased;
+                // Downloads stay in memory, so abandoning one leaves nothing behind.
+                () = shutdown::wait() => Ok(false),
+                update = updater::check_and_schedule(&config) => update,
+            }
+        });
+        let mut notices = Vec::new();
+        let result = match update {
+            Ok(true) => Ok(()),
+            Ok(false) => runtime.block_on(run_session(config, &mut notices)),
+            Err(error) => {
+                tracing::warn!(error = ?error, "client update check failed; continuing with this launch");
+                runtime.block_on(run_session(config, &mut notices))
+            }
+        };
+        // A new link does not wait on these notices.
+        drop(instance);
+        for (title, notice) in notices {
+            platform::show_notice(title, &notice);
+        }
+        result
+    })
 }

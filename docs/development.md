@@ -25,9 +25,12 @@ migrations or compatibility paths for old versions (see `AGENTS.md`).
   them.
 - For the macOS viewer: macOS 12 or newer. For the macOS Agent: 12.3 or
   newer.
-- For the Linux Agent: `cargo-zigbuild` and zig, which build it against
-  glibc 2.28 from Linux or macOS, and `nasm` for OpenH264's x86 assembly
-  (without it OpenH264 builds slower C code). It runs on Linux with systemd.
+- For the Linux Agent and viewer: `cargo-zigbuild` and zig, which build them
+  against glibc 2.28 from Linux or macOS, and `nasm` for OpenH264's x86
+  assembly (without it OpenH264 builds slower C code). The Agent runs on
+  Linux with systemd. The viewer needs a desktop session (X11 or Wayland)
+  with a Vulkan or OpenGL ES 3 driver; it loads the desktop's libraries when
+  it runs, so building it needs none of their development packages.
 - For the server: Linux to run a release, though it builds and runs on macOS
   for development. PostgreSQL is optional, and so is Docker, which only the
   packaging test uses.
@@ -42,7 +45,7 @@ machine they run on.
 | Target | Windows | macOS | Linux |
 |---|---|---|---|
 | `meshrmm-agent` | yes | yes | yes (also cross-built from macOS) |
-| `meshrmm-remote` (viewer) | yes | yes | no |
+| `meshrmm-remote` (viewer) | yes | yes | yes (also cross-built from macOS) |
 | `meshrmm-server` | not supported | development only | yes |
 | `dashboard/` | yes | yes | yes |
 
@@ -83,6 +86,7 @@ These scripts read the version from `release.json`, put the build in
 sh scripts/build-agent-macos.sh    # universal; also dist/agent-macos/
 sh scripts/build-remote-macos.sh   # this Mac's architecture; also dist/remote-macos/
 sh scripts/build-agent-linux.sh    # x64 and arm64, from Linux or macOS
+sh scripts/build-remote-linux.sh   # x64 and arm64, from Linux or macOS
 ```
 
 The builds are unsigned unless `MESHRMM_RELEASE_SIGNING_KEY` holds a key. A
@@ -152,6 +156,15 @@ sudo systemctl restart meshrmm-agent
 `meshrmm-agent --console --config agent.json` runs the Agent in the current
 desktop session instead; see [Linux Agent](linux-agent.md#development).
 
+For the viewer, `cargo build -p meshrmm-remote` and open
+`target/debug/meshrmm-remote` once: like a downloaded viewer, it installs
+itself over the installed one (see
+[remote sessions](remote-sessions.md#installing-the-viewer)), so the next
+**Connect** in the website opens the new build. The platform code is in
+`remote/src/platform/linux/`: winit for the windows, wgpu for the video and
+egui for the toolbar, menus and dialogs, which it draws from the same
+`remote/src/toolbar.rs` model as the other viewers.
+
 ## Checks
 
 CI (`.github/workflows/ci.yml`) runs each of these only when a path it
@@ -172,11 +185,12 @@ cargo clippy --locked -p meshrmm-remote -p meshrmm-agent -p meshrmm-session-tran
 cargo test --locked -p meshrmm-remote -p meshrmm-agent -p meshrmm-session-transport
 ```
 
-On Linux, for the Linux Agent and its session services:
+On Linux, for the Linux Agent, the viewer and their session services (the
+viewer's tests need no display):
 
 ```sh
-cargo clippy --locked -p meshrmm-agent -p meshrmm-file-transfer -p meshrmm-clipboard -p meshrmm-audio -p meshrmm-chat --all-targets -- -D warnings
-cargo test --locked -p meshrmm-agent -p meshrmm-file-transfer -p meshrmm-clipboard -p meshrmm-audio -p meshrmm-chat
+cargo clippy --locked -p meshrmm-agent -p meshrmm-remote -p meshrmm-session-transport -p meshrmm-file-transfer -p meshrmm-clipboard -p meshrmm-audio -p meshrmm-chat --all-targets -- -D warnings
+cargo test --locked -p meshrmm-agent -p meshrmm-remote -p meshrmm-file-transfer -p meshrmm-clipboard -p meshrmm-audio -p meshrmm-chat
 ```
 
 From a Mac, Clippy can check the Linux build through cargo-zigbuild, which

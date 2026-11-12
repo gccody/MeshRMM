@@ -975,7 +975,7 @@ mod tests {
         ..CURRENT_FORMAT
     };
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn monitor_resolution_changes_reuse_the_presenter_but_codec_changes_do_not() {
         assert!(Presenter::can_reset_in_place(

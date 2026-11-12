@@ -17,6 +17,8 @@ import {
 const WINDOWS_CHROME = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
 const MAC_SAFARI = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
 const LINUX_FIREFOX = "Mozilla/5.0 (X11; Linux x86_64; rv:142.0) Gecko/20100101 Firefox/142.0";
+const LINUX_ARM_FIREFOX = "Mozilla/5.0 (X11; Linux aarch64; rv:142.0) Gecko/20100101 Firefox/142.0";
+const CHROMEOS_CHROME = "Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
 const ANDROID_CHROME = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36";
 
 test("the viewer build follows the browser's platform", () => {
@@ -27,7 +29,10 @@ test("the viewer build follows the browser's platform", () => {
     ["macOS Safari", { userAgent: MAC_SAFARI, maxTouchPoints: 0 }, "macos-arm64"],
     ["macOS with a touch-emulating extension", { userAgent: MAC_SAFARI, maxTouchPoints: 1 }, "macos-arm64"],
     ["iPad asking for the desktop site", { userAgent: MAC_SAFARI, maxTouchPoints: 5 }, null],
-    ["Linux", { userAgent: LINUX_FIREFOX, maxTouchPoints: 0 }, null],
+    ["Linux", { userAgent: LINUX_FIREFOX, maxTouchPoints: 0 }, "linux-x64"],
+    ["Linux on ARM", { userAgent: LINUX_ARM_FIREFOX, maxTouchPoints: 0 }, "linux-arm64"],
+    ["UA-CH Linux with a reduced user agent", { userAgent: "Mozilla/5.0", userAgentData: { platform: "Linux" } }, "linux-x64"],
+    ["ChromeOS", { userAgent: CHROMEOS_CHROME, maxTouchPoints: 0, userAgentData: { platform: "Chrome OS" } }, null],
     ["Android", { userAgent: ANDROID_CHROME, maxTouchPoints: 5, userAgentData: { platform: "Android" } }, null],
     ["no navigator (server render)", null, null],
   ];

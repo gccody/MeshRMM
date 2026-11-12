@@ -130,6 +130,12 @@ impl ChatSession {
             .outgoing
             .pop_front()
     }
+    /// The conversation so far, oldest first, each entry as "Who: text",
+    /// for a viewer that draws the chat itself.
+    pub fn transcript(&self) -> Vec<String> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.transcript.iter().cloned().collect()
+    }
 }
 
 #[cfg(target_os = "macos")]

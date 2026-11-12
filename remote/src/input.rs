@@ -39,7 +39,7 @@ impl HeldInput {
     /// it released everything, is not sent, so the device does not press a
     /// key by itself that the technician pressed elsewhere. The release of a
     /// key the device does not hold is not sent either.
-    #[cfg(any(windows, test))]
+    #[cfg(any(windows, target_os = "linux", test))]
     pub fn key_event(
         &mut self,
         display_id: DisplayId,
@@ -120,8 +120,8 @@ impl HeldInput {
         Some(input)
     }
 
-    /// Whether a drag is in progress, which keeps the Windows mouse capture.
-    #[cfg(any(windows, test))]
+    /// Whether a drag is in progress, which keeps the mouse with the video.
+    #[cfg(any(windows, target_os = "linux", test))]
     pub fn buttons_held(&self) -> bool {
         !self.buttons.is_empty()
     }

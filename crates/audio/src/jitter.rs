@@ -20,7 +20,10 @@
 //! at the target by playing up to 0.2% faster or slower (`stretch`, applied by
 //! the resampler): far below an audible change of pitch, and ten times the
 //! 100 ppm a typical pair of clocks differs by.
-#![cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+#![cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 use std::collections::VecDeque;
 
 /// The longest packet expected, an Opus frame.

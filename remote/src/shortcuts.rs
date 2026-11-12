@@ -47,6 +47,19 @@ impl ShortcutKey {
         }
     }
 
+    /// The key's Windows scan code, which the Linux viewer knows keys by.
+    #[cfg(any(target_os = "linux", test))]
+    fn scan_code(self) -> Option<u16> {
+        match self {
+            Self::F8 => Some(0x42),
+            Self::F9 => Some(0x43),
+            Self::F10 => Some(0x44),
+            Self::F11 => Some(0x57),
+            Self::F12 => Some(0x58),
+            Self::Off => None,
+        }
+    }
+
     #[cfg(any(target_os = "macos", test))]
     fn macos_key_code(self) -> Option<u16> {
         match self {
@@ -60,12 +73,12 @@ impl ShortcutKey {
     }
 }
 
-/// What a viewer shortcut does. Only the Windows viewer has a display key; the
-/// macOS viewer switches displays with Control-Option-Arrow.
+/// What a viewer shortcut does. The Windows and Linux viewers have a display
+/// key; the macOS viewer switches displays with Control-Option-Arrow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ViewerShortcut {
     Diagnostics,
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     NextDisplay,
 }
 
@@ -79,6 +92,26 @@ pub fn windows_shortcut(
     if next_display.windows_virtual_key() == Some(virtual_key) {
         Some(ViewerShortcut::NextDisplay)
     } else if diagnostics.windows_virtual_key() == Some(virtual_key) {
+        Some(ViewerShortcut::Diagnostics)
+    } else {
+        None
+    }
+}
+
+/// The shortcut the key with a Windows scan code triggers on the Linux
+/// viewer, if any.
+#[cfg(any(target_os = "linux", test))]
+pub fn linux_shortcut(
+    scan_code: u16,
+    extended: bool,
+    diagnostics: ShortcutKey,
+    next_display: ShortcutKey,
+) -> Option<ViewerShortcut> {
+    if extended {
+        None
+    } else if next_display.scan_code() == Some(scan_code) {
+        Some(ViewerShortcut::NextDisplay)
+    } else if diagnostics.scan_code() == Some(scan_code) {
         Some(ViewerShortcut::Diagnostics)
     } else {
         None
@@ -195,6 +228,22 @@ mod tests {
         assert!(!macos_toggles_diagnostics(111, F11));
         assert!(macos_toggles_diagnostics(103, F11));
         assert!(!macos_toggles_diagnostics(111, Off));
+        assert_eq!(
+            linux_shortcut(0x42, false, F12, F8),
+            Some(ViewerShortcut::NextDisplay)
+        );
+        assert_eq!(
+            linux_shortcut(0x58, false, F12, F8),
+            Some(ViewerShortcut::Diagnostics)
+        );
+        assert_eq!(linux_shortcut(0x57, false, F12, F8), None);
+        assert_eq!(linux_shortcut(0x58, false, Off, F8), None);
+        assert_eq!(
+            linux_shortcut(0x57, false, F11, Off),
+            Some(ViewerShortcut::Diagnostics)
+        );
+        // An extended key shares its scan code with another key.
+        assert_eq!(linux_shortcut(0x58, true, F12, F8), None);
     }
 
     #[test]

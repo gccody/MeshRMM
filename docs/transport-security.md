@@ -71,6 +71,7 @@ The certificates survive restarts and upgrades:
 | Linux Agent | `/var/lib/meshrmm-agent/identity` | Root only |
 | Windows viewer | `%APPDATA%\MeshRMM\viewer-identity` | The user's profile permissions |
 | macOS viewer | `~/Library/Application Support/MeshRMM/viewer-identity` | Owner-only directory, key file mode 0600 |
+| Linux viewer | `~/.config/meshrmm-remote/viewer-identity` (under `$XDG_CONFIG_HOME`) | Owner-only directory, key file mode 0600 |
 
 Keys expire after five years. A corrupt or expired identity is not replaced
 silently. Keep identity files out of release artifacts and don't copy them

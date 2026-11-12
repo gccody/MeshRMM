@@ -26,6 +26,8 @@ pub const AGENT_LINUX_ARM64: &str = "agent-linux-arm64";
 pub const CLIENT_WINDOWS_X64: &str = "client-windows-x64";
 pub const CLIENT_MACOS_X64: &str = "client-macos-x64";
 pub const CLIENT_MACOS_ARM64: &str = "client-macos-arm64";
+pub const CLIENT_LINUX_X64: &str = "client-linux-x64";
+pub const CLIENT_LINUX_ARM64: &str = "client-linux-arm64";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct UpdateManifest {
