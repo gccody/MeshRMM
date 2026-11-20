@@ -3,6 +3,7 @@ name = "meshrmm-protocol-types"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 publish.workspace = true
 description = "Lightweight JSON and identity types shared across MeshRMM components"
 

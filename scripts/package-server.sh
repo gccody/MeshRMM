@@ -63,6 +63,7 @@ install -D -m 0644 "$ROOT_DIR/packaging/meshrmm-server.service" \
     "$TREE/lib/systemd/system/meshrmm-server.service"
 install -D -m 0644 "$ROOT_DIR/server/server.example.toml" "$TREE/etc/meshrmm/server.example.toml"
 install -m 0755 "$ROOT_DIR/packaging/install.sh" "$TREE/install.sh"
+install -m 0644 "$ROOT_DIR/LICENSE" "$TREE/LICENSE"
 install -m 0644 "$ROOT_DIR/THIRD_PARTY_NOTICES.txt" "$TREE/THIRD_PARTY_NOTICES.txt"
 
 # The same bytes for the same commit.
