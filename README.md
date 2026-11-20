@@ -178,7 +178,7 @@ MeshRMM is in heavy development and not production ready.
 |---|---|
 | Server | Linux, x86_64 or arm64 |
 | Agent | Windows 10 version 1903 or newer; macOS 12.3 or newer (in development); Linux, x86_64 or arm64, with systemd and glibc 2.28 or newer |
-| Viewer | Windows 10 version 1903 or newer; macOS 12 or newer (releases ship an Apple silicon build) |
+| Viewer | Windows 10 version 1903 or newer; macOS 12 or newer (releases ship an Apple silicon build); Linux, x86_64 or arm64, with an X11 or Wayland desktop, a Vulkan or OpenGL ES 3 driver, and glibc 2.28 or newer |
 | Website | A current browser |
 
 ## Set up

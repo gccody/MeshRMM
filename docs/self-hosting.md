@@ -452,7 +452,8 @@ toward the wait.
 
 Both backends hold the same data; choose one at install. The server creates
 its tables on first start and applies any new migrations when an upgraded
-server starts. There's no tool to move an install from one backend to the
+server starts, though [not every upgrade before 1.0.0](#upgrades) can keep
+its database. There's no tool to move an install from one backend to the
 other.
 
 ## Sign the macOS builds
@@ -691,6 +692,14 @@ old entries and enroll them again with a new installer from **Add device**.
 A release updates the server, the website, and the Agent and viewer builds
 together. The server applies database migrations when it starts, so there's
 nothing to run by hand.
+
+Before 1.0.0 the database's layout isn't settled, and a release can change it
+without a migration. The new server then refuses to start on the older
+release's database, logs `database migration failed`, and leaves the database
+as it was. Either go back to the old release, or start the new one on an
+empty database, create the first administrator again, and enroll every device
+again with a new installer from **Add device**. From 1.0.0 on, each release
+migrates the database of the one before it.
 
 1. Back up the database and data directory.
 2. Install the new release:
