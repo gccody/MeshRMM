@@ -290,3 +290,9 @@ For developers:
   Windows, macOS and Linux, and why the gaps exist
 - [Transport security](docs/transport-security.md)
 - [The website](dashboard/README.md) and [the marketing page](site/README.md)
+
+## License
+
+MeshRMM is released under the [MIT License](LICENSE). The components it
+includes from other projects keep their own licenses, listed in
+[THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).

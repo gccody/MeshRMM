@@ -29,6 +29,7 @@ turn = { path = "vendor/turn" }
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.97"
+license = "MIT"
 publish = false
 
 [workspace.dependencies]
