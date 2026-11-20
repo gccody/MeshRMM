@@ -8,9 +8,9 @@ use std::{
 };
 
 use common::{
-    Agent, App, Received, SOCKET_WAIT, Server, Ws, apps, apps_with, metrics_interval_within, quiet,
-    receive, receive_any_json, receive_close, receive_json, send_json, send_text, set_up,
-    thumbnail_interval_within, user_with,
+    Agent, App, Received, SOCKET_WAIT, Server, Ws, apps, apps_with, greeted,
+    metrics_interval_within, quiet, receive, receive_any_json, receive_close, receive_json,
+    send_json, send_text, set_up, thumbnail_interval_within, user_with,
 };
 use meshrmm_server::realtime::{
     metrics::WatchedSignal,
@@ -130,8 +130,11 @@ async fn an_agent_that_goes_offline_to_update_shows_as_updating() {
         let mut events = admin.events(&server).await.unwrap();
         receive_json(&mut events).await;
 
+        // The server reads what an Agent says once it has greeted it, and an
+        // Agent that hangs up before then may never be heard.
         let mut control = agent.connect(&server).await.unwrap();
         receive_json(&mut events).await;
+        greeted(&mut control).await;
         send_json(
             &mut control,
             json!({ "type": "updating", "version": "1.2.3" }),
@@ -154,6 +157,7 @@ async fn an_agent_that_goes_offline_to_update_shows_as_updating() {
         // One that does clears it at once.
         let mut control = agent.connect(&server).await.unwrap();
         receive_json(&mut events).await;
+        greeted(&mut control).await;
         send_json(
             &mut control,
             json!({ "type": "updating", "version": "1.2.4" }),

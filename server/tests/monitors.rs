@@ -5,7 +5,9 @@ mod common;
 use std::time::Duration;
 
 use axum::http::{Method, StatusCode};
-use common::{App, Browser, Ws, apps, audit_events, receive, send_json, set_up, user_with};
+use common::{
+    App, Browser, Ws, apps, audit_events, greeted, receive, send_json, set_up, user_with,
+};
 use meshrmm_protocol_types::{
     AgentCommand, MonitorActionResult, MonitorCheck, MonitorResult, RemediationAction, RunAs,
 };
@@ -2439,7 +2441,10 @@ async fn a_reconnecting_agent_is_told_what_the_server_holds() {
         assert_eq!(known, expected, "{name}");
 
         // Saying so costs one read more than the monitors alone, and
-        // nothing for a device without monitors.
+        // nothing for a device without monitors. The connection reads the
+        // device once more after it sends the monitors, so it is counted
+        // only once it has finished greeting.
+        greeted(&mut socket).await;
         monitors::greeting(&app.state, &device).await.unwrap();
         let before = app.db().counts();
         monitors::greeting(&app.state, &device).await.unwrap();
