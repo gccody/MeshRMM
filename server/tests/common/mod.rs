@@ -1248,6 +1248,18 @@ pub async fn thumbnail_interval_within(socket: &mut Ws, wait: std::time::Duratio
     interval_within(socket, "set_thumbnail_interval", wait).await
 }
 
+/// Waits until the server has finished greeting the Agent on `socket`,
+/// skipping what it sent meanwhile. Until then the connection's task is
+/// still reading the database, which a test that counts statements would
+/// count too, and it hasn't begun to read what the Agent says: an Agent that
+/// hangs up while it is greeted may never be heard. The thumbnail interval
+/// is the last thing a new connection is sent.
+pub async fn greeted(socket: &mut Ws) {
+    thumbnail_interval_within(socket, SOCKET_WAIT)
+        .await
+        .expect("the server greets a connecting Agent");
+}
+
 async fn interval_within(socket: &mut Ws, kind: &str, wait: std::time::Duration) -> Option<u64> {
     use futures_util::StreamExt;
     use tokio_tungstenite::tungstenite::Message;
