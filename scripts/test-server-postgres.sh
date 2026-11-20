@@ -8,11 +8,19 @@
 # Debian's packages put them. The cluster lives in a temporary directory,
 # listens only on 127.0.0.1 (port 54329, or MESHRMM_TEST_POSTGRES_PORT) and is
 # removed when the tests end.
+#
+# Where the system has /dev/shm (Linux), the cluster and the tests' own data
+# are kept there, in memory, unless TMPDIR says where to put them: waiting
+# for a real disk to sync them takes longer than the tests themselves.
 set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ROOT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 PORT=${MESHRMM_TEST_POSTGRES_PORT:-54329}
+if [ -z "${TMPDIR:-}" ] && [ -d /dev/shm ] && [ -w /dev/shm ]; then
+    TMPDIR=/dev/shm
+    export TMPDIR
+fi
 
 if ! command -v initdb >/dev/null 2>&1; then
     if command -v pg_config >/dev/null 2>&1; then
