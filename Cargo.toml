@@ -63,6 +63,14 @@ dbg_macro = "deny"
 todo = "deny"
 unimplemented = "deny"
 
+# Unoptimized, Argon2 takes about a third of a second for each password, and
+# the server's tests hash one for every account they create.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
 [profile.server-release]
 inherits = "release"
 codegen-units = 1

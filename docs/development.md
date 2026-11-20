@@ -224,6 +224,14 @@ sh scripts/test-server-postgres.sh   # arguments go to cargo test
 
 It starts a throwaway PostgreSQL in a temporary directory, which needs only
 PostgreSQL's `initdb` and `pg_ctl` installed, and removes it afterwards.
+
+Each test starts a server of its own in a temporary directory, and that
+server syncs its key, its database and each checkpoint to the disk. On a real
+disk those waits are most of the tests' time, so on Linux keep the
+directories in memory: `TMPDIR=/dev/shm cargo test --locked -p
+meshrmm-server` takes about half as long. The script above and CI do that
+already, and CI keeps its PostgreSQL's data in memory as well.
+
 `tests/schema_parity.rs` checks that the two backends' migrations make the
 same tables and columns; change both `server/migrations/sqlite` and
 `server/migrations/postgres` together.

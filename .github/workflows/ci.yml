@@ -157,7 +157,10 @@ jobs:
           POSTGRES_PASSWORD: postgres
         ports:
           - 5432:5432
+        # Its data is in memory: every test makes and drops a database, and
+        # waiting for the disk to sync each one is most of what that costs.
         options: >-
+          --tmpfs /var/lib/postgresql/data
           --health-cmd pg_isready
           --health-interval 5s
           --health-timeout 5s
@@ -169,7 +172,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo clippy --locked -p meshrmm-server --all-targets -- -D warnings
+      # The tests' data directories and SQLite databases are in memory too:
+      # the server syncs its key, its database and each checkpoint to the
+      # disk, which on a real disk takes longer than the tests themselves.
       - run: cargo test --locked -p meshrmm-server
+        env:
+          TMPDIR: /dev/shm
       - run: python3 -m unittest discover -s scripts/tests -v
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
